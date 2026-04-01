@@ -1,0 +1,11 @@
+{
+  "rocoStatus": "ACTIVE",
+  "outreachEnabled": true,
+  "followupEnabled": true,
+  "enrichmentEnabled": true,
+  "researchEnabled": true,
+  "linkedinEnabled": true,
+  "activeDealIds": [],
+  "outreachPausedUntil": null,
+  "lastUpdated": "2026-03-10T23:41:48.49541+00:00"
+}

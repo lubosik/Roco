@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ROCO — Mission Control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=DM+Mono:wght@300;400;500&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --gold: #d4a847;
+      --gold-dim: rgba(212, 168, 71, 0.15);
+      --gold-glow: rgba(212, 168, 71, 0.4);
+      --bg: #0a0a0b;
+      --surface: #111113;
+      --border: rgba(212, 168, 71, 0.15);
+      --text: #e8e4d9;
+      --muted: rgba(232, 228, 217, 0.4);
+    }
+
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: var(--bg);
+      font-family: 'Inter', sans-serif;
+      color: var(--text);
+    }
+
+    /* ── CANVAS BACKGROUND ── */
+    #bg-canvas {
+      position: fixed; inset: 0; z-index: 0;
+      opacity: 0.6;
+    }
+
+    /* ── WELCOME SCREEN ── */
+    #welcome-screen {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 0;
+      cursor: pointer;
+      transition: opacity 0.8s ease;
+    }
+
+    .welcome-eyebrow {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 0.35em;
+      text-transform: uppercase;
+      color: var(--gold);
+      opacity: 0;
+      transform: translateY(12px);
+      animation: fadeUp 1s ease 0.3s forwards;
+      margin-bottom: 28px;
+    }
+
+    .roco-wordmark {
+      font-family: 'Playfair Display', serif;
+      font-size: clamp(72px, 12vw, 140px);
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1;
+      color: var(--text);
+      opacity: 0;
+      transform: translateY(20px);
+      animation: fadeUp 1.2s ease 0.6s forwards;
+      position: relative;
+    }
+
+    .roco-wordmark::after {
+      content: '';
+      position: absolute;
+      bottom: -8px; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+      transform: scaleX(0);
+      animation: lineReveal 1s ease 1.6s forwards;
+    }
+
+    .welcome-tagline {
+      font-family: 'DM Mono', monospace;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-top: 28px;
+      opacity: 0;
+      animation: fadeIn 1s ease 1.8s forwards;
+    }
+
+    .enter-prompt {
+      position: absolute;
+      bottom: 48px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--muted);
+      opacity: 0;
+      animation: pulse 2s ease 2.5s infinite;
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    .enter-prompt::before, .enter-prompt::after {
+      content: '';
+      display: block;
+      width: 24px; height: 1px;
+      background: var(--gold);
+      opacity: 0.5;
+    }
+
+    /* ── AUTH SCREEN ── */
+    #auth-screen {
+      position: fixed; inset: 0; z-index: 20;
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.6s ease;
+    }
+
+    #auth-screen.visible {
+      opacity: 1; pointer-events: all;
+    }
+
+    .auth-panel {
+      width: 420px;
+      background: rgba(17, 17, 19, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 2px;
+      padding: 48px;
+      backdrop-filter: blur(20px);
+      box-shadow:
+        0 0 0 1px rgba(212,168,71,0.05),
+        0 40px 80px rgba(0,0,0,0.6),
+        0 0 60px rgba(212,168,71,0.04);
+      transform: translateY(20px);
+      transition: transform 0.6s ease;
+    }
+
+    #auth-screen.visible .auth-panel {
+      transform: translateY(0);
+    }
+
+    .auth-logo {
+      font-family: 'Playfair Display', serif;
+      font-size: 28px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 6px;
+      letter-spacing: -0.01em;
+    }
+
+    .auth-subtitle {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      color: var(--gold);
+      text-transform: uppercase;
+      margin-bottom: 40px;
+    }
+
+    .auth-field {
+      margin-bottom: 20px;
+    }
+
+    .auth-label {
+      display: block;
+      font-family: 'DM Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .auth-input {
+      width: 100%;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 2px;
+      padding: 13px 16px;
+      font-family: 'DM Mono', monospace;
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      letter-spacing: 0.05em;
+    }
+
+    .auth-input:focus {
+      border-color: var(--gold);
+      box-shadow: 0 0 0 1px rgba(212,168,71,0.15), 0 0 20px rgba(212,168,71,0.05);
+    }
+
+    .auth-input::placeholder { color: rgba(255,255,255,0.15); }
+
+    .auth-btn {
+      width: 100%;
+      background: var(--gold);
+      border: none;
+      border-radius: 2px;
+      padding: 14px;
+      font-family: 'DM Mono', monospace;
+      font-size: 12px;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: #000;
+      font-weight: 500;
+      cursor: pointer;
+      margin-top: 32px;
+      transition: opacity 0.2s, transform 0.1s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .auth-btn:hover { opacity: 0.9; }
+    .auth-btn:active { transform: scale(0.99); }
+
+    .auth-btn.loading::after {
+      content: '';
+      position: absolute;
+      top: 0; left: -100%; width: 100%; height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+      animation: shimmer 1s infinite;
+    }
+
+    .auth-error {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: #ef4444;
+      margin-top: 12px;
+      text-align: center;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .auth-error.show { opacity: 1; }
+
+    .auth-back {
+      display: block;
+      text-align: center;
+      font-family: 'DM Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-top: 24px;
+      cursor: pointer;
+      background: none; border: none;
+      transition: color 0.2s;
+    }
+    .auth-back:hover { color: var(--gold); }
+
+    /* ── WELCOME BACK SCREEN ── */
+    #welcome-back-screen {
+      position: fixed; inset: 0; z-index: 30;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 0; opacity: 0; pointer-events: none;
+      transition: opacity 0.4s ease;
+    }
+
+    #welcome-back-screen.visible { opacity: 1; }
+
+    .wb-greeting {
+      font-family: 'DM Mono', monospace;
+      font-size: 12px;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--gold);
+      margin-bottom: 16px;
+      animation: fadeUp 0.8s ease forwards;
+    }
+
+    .wb-name {
+      font-family: 'Playfair Display', serif;
+      font-size: clamp(40px, 8vw, 80px);
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.02em;
+      animation: fadeUp 0.8s ease 0.15s both;
+    }
+
+    .wb-loading {
+      margin-top: 48px;
+      display: flex; gap: 8px; align-items: center;
+      animation: fadeIn 0.5s ease 0.6s both;
+    }
+
+    .wb-dot {
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: var(--gold);
+      animation: dotPulse 1.4s ease infinite;
+    }
+    .wb-dot:nth-child(2) { animation-delay: 0.2s; }
+    .wb-dot:nth-child(3) { animation-delay: 0.4s; }
+
+    /* ── AUDIO CONTROLS ── */
+    #audio-toggle {
+      position: fixed; bottom: 24px; right: 24px; z-index: 100;
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      background: rgba(17,17,19,0.8);
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      opacity: 0;
+      animation: fadeIn 1s ease 3s forwards;
+      transition: border-color 0.2s;
+      backdrop-filter: blur(8px);
+    }
+    #audio-toggle:hover { border-color: var(--gold); }
+    #audio-toggle svg { width: 14px; height: 14px; fill: var(--muted); }
+
+    /* ── TICKER ── */
+    #market-ticker {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
+      height: 32px;
+      background: rgba(10,10,11,0.9);
+      border-top: 1px solid var(--border);
+      overflow: hidden;
+      display: flex; align-items: center;
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      opacity: 0;
+      animation: fadeIn 1s ease 2s forwards;
+    }
+
+    .ticker-track {
+      display: flex; gap: 64px;
+      animation: tickerScroll 40s linear infinite;
+      white-space: nowrap;
+      padding: 0 32px;
+    }
+
+    .ticker-item { display: flex; align-items: center; gap: 10px; }
+    .ticker-up { color: #4ade80; }
+    .ticker-down { color: #ef4444; }
+    .ticker-label { color: var(--gold); font-weight: 500; }
+
+    /* ── GRID OVERLAY ── */
+    .grid-overlay {
+      position: fixed; inset: 0; z-index: 1;
+      background-image:
+        linear-gradient(rgba(212,168,71,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(212,168,71,0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      pointer-events: none;
+    }
+
+    /* ── CORNER DECORATIONS ── */
+    .corner {
+      position: fixed; z-index: 2;
+      width: 40px; height: 40px;
+      pointer-events: none;
+      opacity: 0;
+      animation: fadeIn 1s ease 1s forwards;
+    }
+    .corner-tl { top: 24px; left: 24px; border-top: 1px solid var(--gold); border-left: 1px solid var(--gold); }
+    .corner-tr { top: 24px; right: 24px; border-top: 1px solid var(--gold); border-right: 1px solid var(--gold); }
+    .corner-bl { bottom: 48px; left: 24px; border-bottom: 1px solid var(--gold); border-left: 1px solid var(--gold); }
+    .corner-br { bottom: 48px; right: 24px; border-bottom: 1px solid var(--gold); border-right: 1px solid var(--gold); }
+
+    /* ── ANIMATIONS ── */
+    @keyframes fadeUp {
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeIn {
+      to { opacity: 1; }
+    }
+    @keyframes lineReveal {
+      to { transform: scaleX(1); }
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.3; }
+      50% { opacity: 0.8; }
+    }
+    @keyframes shimmer {
+      to { left: 100%; }
+    }
+    @keyframes tickerScroll {
+      from { transform: translateX(0); }
+      to { transform: translateX(-50%); }
+    }
+    @keyframes dotPulse {
+      0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+      40% { transform: scale(1); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Background canvas (animated particles) -->
+<canvas id="bg-canvas"></canvas>
+<div class="grid-overlay"></div>
+
+<!-- Corner decorations -->
+<div class="corner corner-tl"></div>
+<div class="corner corner-tr"></div>
+<div class="corner corner-bl"></div>
+<div class="corner corner-br"></div>
+
+<!-- Market ticker -->
+<div id="market-ticker">
+  <div class="ticker-track" id="ticker-content"></div>
+</div>
+
+<!-- Ambient audio -->
+<audio id="ambient-audio" src="/audio/ambient.mp3" loop preload="auto" muted></audio>
+
+<!-- Audio toggle -->
+<button id="audio-toggle" onclick="toggleAudio()" title="Toggle ambient audio">
+  <svg id="audio-icon-on" viewBox="0 0 24 24" style="display:none"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+  <svg id="audio-icon-off" viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+</button>
+
+<!-- Welcome screen -->
+<div id="welcome-screen" onclick="showAuth()">
+  <div class="welcome-eyebrow">Novastone Capital Advisors</div>
+  <div class="roco-wordmark">ROCO</div>
+  <div class="welcome-tagline">Autonomous Fundraising Intelligence</div>
+  <div class="enter-prompt">Enter Mission Control</div>
+</div>
+
+<!-- Auth screen -->
+<div id="auth-screen">
+  <div class="auth-panel">
+    <div class="auth-logo">ROCO</div>
+    <div class="auth-subtitle">Mission Control</div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="auth-user">Access ID</label>
+      <input class="auth-input" type="text" id="auth-user" placeholder="Enter your ID"
+        autocomplete="username" spellcheck="false">
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="auth-pass">Passphrase</label>
+      <input class="auth-input" type="password" id="auth-pass" placeholder="••••••••••••"
+        autocomplete="current-password">
+    </div>
+
+    <button class="auth-btn" id="auth-submit-btn" onclick="submitAuth()">
+      Authenticate
+    </button>
+
+    <div class="auth-error" id="auth-error">Invalid credentials. Access denied.</div>
+
+    <button class="auth-back" onclick="showWelcome()">← Return</button>
+  </div>
+</div>
+
+<!-- Welcome back screen -->
+<div id="welcome-back-screen">
+  <div class="wb-greeting">Welcome back</div>
+  <div class="wb-name" id="wb-name">Dom</div>
+  <div class="wb-loading">
+    <div class="wb-dot"></div>
+    <div class="wb-dot"></div>
+    <div class="wb-dot"></div>
+  </div>
+</div>
+
+<script>
+// ── PARTICLE CANVAS ──
+const canvas = document.getElementById('bg-canvas');
+const ctx = canvas.getContext('2d');
+let particles = [];
+let W, H;
+
+function initCanvas() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  particles = Array.from({length: 80}, () => ({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    vx: (Math.random() - 0.5) * 0.3,
+    vy: (Math.random() - 0.5) * 0.3,
+    r: Math.random() * 1.5 + 0.5,
+    a: Math.random() * 0.4 + 0.1,
+  }));
+}
+
+function drawParticles() {
+  ctx.clearRect(0, 0, W, H);
+  // Draw connections
+  particles.forEach((p, i) => {
+    particles.slice(i+1).forEach(q => {
+      const d = Math.hypot(p.x-q.x, p.y-q.y);
+      if (d < 120) {
+        ctx.strokeStyle = `rgba(212,168,71,${0.06 * (1-d/120)})`;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(q.x, q.y);
+        ctx.stroke();
+      }
+    });
+    // Draw particle
+    ctx.fillStyle = `rgba(212,168,71,${p.a})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+    ctx.fill();
+    // Move
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < 0) p.x = W;
+    if (p.x > W) p.x = 0;
+    if (p.y < 0) p.y = H;
+    if (p.y > H) p.y = 0;
+  });
+  requestAnimationFrame(drawParticles);
+}
+
+window.addEventListener('resize', initCanvas);
+initCanvas();
+drawParticles();
+
+// ── MARKET TICKER ──
+const tickerItems = [
+  {label:'PE DEALS 2025',val:'$2.0T',dir:'up'},
+  {label:'LMM EBITDA AVG',val:'7.2x',dir:'up'},
+  {label:'HEALTHCARE EV',val:'12.8x',dir:'up'},
+  {label:'DRY POWDER',val:'$3.9T',dir:'up'},
+  {label:'TECH EV/EBITDA',val:'12.5x',dir:'up'},
+  {label:'DEAL TIME AVG',val:'19mo',dir:'down'},
+  {label:'EXIT ACTIVITY',val:'+10.7%',dir:'up'},
+  {label:'SECONDARY VOL',val:'▲ HIGH',dir:'up'},
+  {label:'SENIOR DEBT',val:'SOFR+625',dir:'down'},
+  {label:'LBO MULTIPLE',val:'11.8x',dir:'up'},
+];
+const tc = document.getElementById('ticker-content');
+const doubled = [...tickerItems,...tickerItems];
+tc.innerHTML = doubled.map(t=>`
+  <span class="ticker-item">
+    <span class="ticker-label">${t.label}</span>
+    <span class="${t.dir==='up'?'ticker-up':'ticker-down'}">${t.val}</span>
+  </span>
+`).join('');
+
+// ── AMBIENT AUDIO ──
+const audio = document.getElementById('ambient-audio');
+audio.loop = true;
+audio.volume = 0.3;
+
+function unlockAudio() {
+  audio.play().catch(() => {});
+  document.getElementById('audio-icon-on').style.display = 'block';
+  document.getElementById('audio-icon-off').style.display = 'none';
+}
+
+// Muted autoplay — always permitted by browsers
+audio.muted = true;
+audio.play().then(() => {
+  // Unmute immediately; if the browser allows it, audio plays right away
+  audio.muted = false;
+  document.getElementById('audio-icon-on').style.display = 'block';
+  document.getElementById('audio-icon-off').style.display = 'none';
+}).catch(() => {
+  // Autoplay fully blocked — unlock on first interaction
+  const unlock = () => {
+    unlockAudio();
+    document.removeEventListener('click', unlock);
+    document.removeEventListener('keydown', unlock);
+  };
+  document.addEventListener('click', unlock);
+  document.addEventListener('keydown', unlock);
+});
+
+function toggleAudio() {
+  if (audio.paused || audio.muted) {
+    audio.muted = false;
+    audio.play().catch(() => {});
+    document.getElementById('audio-icon-on').style.display = 'block';
+    document.getElementById('audio-icon-off').style.display = 'none';
+  } else {
+    audio.pause();
+    document.getElementById('audio-icon-on').style.display = 'none';
+    document.getElementById('audio-icon-off').style.display = 'block';
+  }
+}
+
+// ── SCREEN TRANSITIONS ──
+function showAuth() {
+  document.getElementById('welcome-screen').style.opacity = '0';
+  setTimeout(() => {
+    document.getElementById('welcome-screen').style.pointerEvents = 'none';
+    const auth = document.getElementById('auth-screen');
+    auth.classList.add('visible');
+    setTimeout(() => document.getElementById('auth-user').focus(), 300);
+  }, 400);
+}
+
+function showWelcome() {
+  document.getElementById('auth-screen').classList.remove('visible');
+  setTimeout(() => {
+    document.getElementById('welcome-screen').style.opacity = '1';
+    document.getElementById('welcome-screen').style.pointerEvents = 'all';
+  }, 400);
+}
+
+async function submitAuth() {
+  const user = document.getElementById('auth-user').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const btn = document.getElementById('auth-submit-btn');
+  const err = document.getElementById('auth-error');
+
+  if (!user || !pass) return;
+
+  btn.classList.add('loading');
+  btn.textContent = 'Authenticating...';
+  err.classList.remove('show');
+
+  try {
+    const res = await fetch('/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({username: user, password: pass}),
+    });
+    const data = await res.json();
+
+    if (data.success) {
+      btn.classList.remove('loading');
+
+      // Fade out ambient music over ~280ms
+      if (!audio.paused && !audio.muted) {
+        const fadeOut = setInterval(() => {
+          if (audio.volume > 0.03) {
+            audio.volume = Math.max(0, audio.volume - 0.05);
+          } else {
+            audio.pause();
+            audio.volume = 0;
+            clearInterval(fadeOut);
+          }
+        }, 40);
+      }
+
+      // Show welcome back screen
+      document.getElementById('auth-screen').classList.remove('visible');
+      const wb = document.getElementById('welcome-back-screen');
+      document.getElementById('wb-name').textContent = data.displayName || user;
+      wb.classList.add('visible');
+
+      // Play ElevenLabs welcome voice
+      const audioPath = data.welcomeAudioPath;
+
+      if (audioPath) {
+        setTimeout(() => {
+          const voiceAudio = new Audio(audioPath);
+          voiceAudio.volume = 1.0;
+
+          voiceAudio.play().catch(err => {
+            console.warn('[VOICE] Playback failed:', err.message);
+          });
+
+          voiceAudio.onended = () => {
+            setTimeout(() => {
+              wb.style.opacity = '0';
+              setTimeout(() => window.location.href = '/dashboard', 500);
+            }, 400);
+          };
+
+          // Fallback redirect if audio errors or hangs
+          setTimeout(() => {
+            if (window.location.pathname !== '/dashboard') {
+              wb.style.opacity = '0';
+              setTimeout(() => window.location.href = '/dashboard', 500);
+            }
+          }, 5000);
+
+        }, 300);
+
+      } else {
+        // No audio — fallback timing
+        setTimeout(() => {
+          wb.style.opacity = '0';
+          setTimeout(() => window.location.href = '/dashboard', 600);
+        }, 2200);
+      }
+    } else {
+      btn.classList.remove('loading');
+      btn.textContent = 'Authenticate';
+      err.classList.add('show');
+      document.getElementById('auth-pass').value = '';
+      document.getElementById('auth-pass').focus();
+    }
+  } catch(e) {
+    btn.classList.remove('loading');
+    btn.textContent = 'Authenticate';
+    err.textContent = 'Connection failed. Try again.';
+    err.classList.add('show');
+  }
+}
+
+// Enter key submits
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const auth = document.getElementById('auth-screen');
+    if (auth.classList.contains('visible')) submitAuth();
+    else if (document.getElementById('welcome-screen').style.pointerEvents !== 'none') showAuth();
+  }
+});
+
+// Check if already logged in
+(async () => {
+  try {
+    const res = await fetch('/api/me');
+    if (res.ok) window.location.href = '/dashboard';
+  } catch {}
+})();
+</script>
+</body>
+</html>

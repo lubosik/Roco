@@ -1,0 +1,1747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ROCO — Mission Control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@300;400;500&family=Figtree:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- API Alert Banner -->
+<div id="api-alert" class="api-alert hidden">
+  <span id="api-alert-msg">&#9888; API connectivity issue detected</span>
+  <button class="api-alert-close" onclick="document.getElementById('api-alert').classList.add('hidden')">&#215;</button>
+</div>
+
+<!-- App Shell -->
+<div class="app-shell" id="app-shell">
+
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-mark">R</div>
+      <div class="logo-text">
+        <div class="logo-name">ROCO</div>
+        <div class="logo-sub">Mission Control</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <a href="#overview" class="nav-item" data-view="overview">
+        <span class="nav-icon">&#9889;</span>
+        <span class="nav-label">Overview</span>
+      </a>
+      <a href="#launch" class="nav-item" data-view="launch">
+        <span class="nav-icon">&#128640;</span>
+        <span class="nav-label">Launch Deal</span>
+      </a>
+      <a href="#deals" class="nav-item" data-view="deals">
+        <span class="nav-icon">&#128202;</span>
+        <span class="nav-label">Active Deals</span>
+      </a>
+      <a href="#pipeline" class="nav-item" data-view="pipeline">
+        <span class="nav-icon">&#128203;</span>
+        <span class="nav-label">Pipeline</span>
+      </a>
+      <a href="#queue" class="nav-item" data-view="queue">
+        <span class="nav-icon">&#9993;</span>
+        <span class="nav-label">Approval Queue</span>
+        <span class="nav-badge" id="queue-badge" style="display:none">0</span>
+      </a>
+      <a href="#activity" class="nav-item" data-view="activity">
+        <span class="nav-icon">&#128225;</span>
+        <span class="nav-label">Live Activity</span>
+      </a>
+      <a href="#analytics" class="nav-item" data-view="analytics">
+        <span class="nav-icon">&#128200;</span>
+        <span class="nav-label">Analytics</span>
+      </a>
+      <a href="#sourcing" class="nav-item" data-view="sourcing">
+        <span class="nav-icon">&#128269;</span>
+        <span class="nav-label">Sourcing Campaigns</span>
+        <span class="nav-badge" id="sourcing-badge" style="display:none">0</span>
+      </a>
+      <a href="#archive" class="nav-item" data-view="archive">
+        <span class="nav-icon">&#128193;</span>
+        <span class="nav-label">Deal Archive</span>
+      </a>
+      <a href="#train" class="nav-item" data-view="train">
+        <span class="nav-icon">&#129504;</span>
+        <span class="nav-label">Train Your Agent</span>
+      </a>
+      <a href="#database" class="nav-item" data-view="database">
+        <span class="nav-icon">&#128196;</span>
+        <span class="nav-label">Database</span>
+      </a>
+      <a href="#controls" class="nav-item" data-view="controls">
+        <span class="nav-icon">&#9881;</span>
+        <span class="nav-label">Controls</span>
+      </a>
+      <a href="#env" class="nav-item" data-view="env">
+        <span class="nav-icon">&#128273;</span>
+        <span class="nav-label">Environment</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="connection-status">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span class="conn-label" id="conn-label">Connecting&#8230;</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main wrapper -->
+  <div class="main-wrapper">
+
+    <!-- Top Bar -->
+    <header class="topbar">
+      <button class="hamburger" id="hamburger" onclick="toggleSidebar()" aria-label="Toggle sidebar">&#9776;</button>
+      <div class="topbar-left">
+        <div class="topbar-clock" id="clock">--:--:--</div>
+        <div class="topbar-date" id="topbar-date"></div>
+        <button onclick="fetch('/logout',{method:'POST'}).then(()=>window.location.href='/')" style="background:none;border:1px solid rgba(212,168,71,0.2);border-radius:3px;color:rgba(232,228,217,0.35);font-family:'DM Mono',monospace;font-size:10px;letter-spacing:0.12em;text-transform:uppercase;padding:4px 10px;cursor:pointer;margin-left:16px;transition:color 0.2s,border-color 0.2s;flex-shrink:0" onmouseover="this.style.color='#d4a847';this.style.borderColor='rgba(212,168,71,0.45)'" onmouseout="this.style.color='rgba(232,228,217,0.35)';this.style.borderColor='rgba(212,168,71,0.2)'">Sign out</button>
+      </div>
+      <div class="topbar-center">
+        <select class="deal-selector" id="deal-selector" onchange="onDealSelectorChange(this.value)">
+          <option value="">&#8212; Select Deal &#8212;</option>
+        </select>
+      </div>
+      <div class="topbar-right">
+        <div class="master-power">
+          <span class="power-label">ROCO</span>
+          <label class="toggle-switch large">
+            <input type="checkbox" id="master-toggle" onchange="onMasterToggle(this.checked)" />
+            <span class="toggle-track"></span>
+          </label>
+          <span class="power-status" id="power-status">OFFLINE</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content" id="main-content">
+
+      <!-- ══════════════════════════════════ OVERVIEW ══════════════════════════════════ -->
+      <section id="view-overview" class="view-section">
+        <div class="section-header">
+          <h1 class="section-title">Overview</h1>
+          <button class="btn btn-ghost btn-sm" onclick="fullRefresh()">&#8635; Refresh</button>
+        </div>
+
+        <!-- Stats Bar -->
+        <div class="stats-bar" id="stats-bar">
+          <div class="stat-card">
+            <div class="stat-label">Active Deals</div>
+            <div class="stat-value mono gold" id="stat-active-deals">&#8212;</div>
+            <div class="stat-sub" id="stat-active-deals-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Total Launched</div>
+            <div class="stat-value mono" id="stat-total-deals">&#8212;</div>
+            <div class="stat-sub" id="stat-total-deals-sub">all time</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Emails Sent</div>
+            <div class="stat-value mono" id="stat-emails-sent">&#8212;</div>
+            <div class="stat-sub" id="stat-emails-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Response Rate</div>
+            <div class="stat-value mono" id="stat-response-rate">&#8212;</div>
+            <div class="stat-sub" id="stat-response-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Active Prospects</div>
+            <div class="stat-value mono" id="stat-prospects">&#8212;</div>
+            <div class="stat-sub" id="stat-prospects-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Approval Queue</div>
+            <div class="stat-value mono amber" id="stat-queue">&#8212;</div>
+            <div class="stat-sub" id="stat-queue-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Total Funds Raised</div>
+            <div class="stat-value mono gold" id="stat-capital">&#8212;</div>
+            <div class="stat-sub" id="stat-capital-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">LI Invites Sent</div>
+            <div class="stat-value mono" id="stat-li-invites">&#8212;</div>
+            <div class="stat-sub" id="stat-li-invites-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">LI Accept Rate</div>
+            <div class="stat-value mono" id="stat-li-acceptance">&#8212;</div>
+            <div class="stat-sub" id="stat-li-acceptance-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">LI DMs Sent</div>
+            <div class="stat-value mono" id="stat-li-dms">&#8212;</div>
+            <div class="stat-sub" id="stat-li-dms-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">LI DM Response</div>
+            <div class="stat-value mono" id="stat-li-dm-response">&#8212;</div>
+            <div class="stat-sub" id="stat-li-dm-response-sub"></div>
+          </div>
+        </div>
+
+        <!-- API Health Grid -->
+        <div class="card mt-24">
+          <div class="card-header">
+            <h2 class="card-title">API Health</h2>
+            <button class="btn btn-ghost btn-sm" onclick="refreshHealth()">&#8635;</button>
+          </div>
+          <div class="health-grid" id="health-grid">
+            <div class="health-item" id="health-anthropic">
+              <span class="health-dot unknown"></span><span class="health-name">Anthropic</span>
+            </div>
+            <div class="health-item" id="health-openai">
+              <span class="health-dot unknown"></span><span class="health-name">OpenAI</span>
+            </div>
+            <div class="health-item" id="health-gemini">
+              <span class="health-dot unknown"></span><span class="health-name">Gemini</span>
+            </div>
+            <div class="health-item" id="health-kaspr">
+              <span class="health-dot unknown"></span><span class="health-name">KASPR</span>
+            </div>
+            <div class="health-item" id="health-notion">
+              <span class="health-dot unknown"></span><span class="health-name">Notion</span>
+            </div>
+            <div class="health-item" id="health-gmail">
+              <span class="health-dot unknown"></span><span class="health-name">Gmail</span>
+            </div>
+            <div class="health-item" id="health-telegram">
+              <span class="health-dot unknown"></span><span class="health-name">Telegram</span>
+            </div>
+            <div class="health-item" id="health-serpapi">
+              <span class="health-dot unknown"></span><span class="health-name">SerpAPI</span>
+            </div>
+            <div class="health-item" id="health-apify">
+              <span class="health-dot unknown"></span><span class="health-name">Apify</span>
+            </div>
+            <div class="health-item" id="health-grok">
+              <span class="health-dot unknown"></span><span class="health-name">Grok</span>
+            </div>
+            <div class="health-item" id="health-millionverifier">
+              <span class="health-dot unknown"></span><span class="health-name">MillionVerifier</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Recent Activity Feed -->
+        <div class="card mt-24">
+          <div class="card-header">
+            <h2 class="card-title">Recent Activity</h2>
+            <span class="live-indicator"><span class="live-dot"></span>LIVE</span>
+          </div>
+          <div class="activity-feed" id="overview-activity">
+            <div class="feed-empty">No recent activity</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ LAUNCH DEAL ══════════════════════════════════ -->
+      <section id="view-launch" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Launch Deal</h1>
+        </div>
+        <div class="launch-form-wrap">
+
+          <!-- ── Step 1: Document Upload ── -->
+          <div id="launch-step-1">
+            <div class="card" style="margin-bottom:24px">
+              <div class="card-header">
+                <h2 class="card-title">Step 1 — Upload Deal Document</h2>
+                <span style="font-size:12px;color:var(--text-muted)">PDF or DOCX — Roco will extract deal details automatically</span>
+              </div>
+              <div style="padding:0 24px 24px">
+                <div class="file-drop-zone" id="deal-doc-drop-zone"
+                     onclick="document.getElementById('deal-doc-input').click()"
+                     ondragover="event.preventDefault(); this.classList.add('drag-over')"
+                     ondragleave="this.classList.remove('drag-over')"
+                     ondrop="onDealDocDrop(event)">
+                  <input type="file" id="deal-doc-input" accept=".pdf,.docx" style="display:none" onchange="onDealDocSelected(this)" />
+                  <div class="file-drop-icon" id="deal-doc-icon">&#128196;</div>
+                  <div class="file-drop-text" id="deal-doc-text">Drop PDF or DOCX here, or click to browse</div>
+                  <div class="file-drop-hint">Roco will parse the document and pre-fill your deal form</div>
+                </div>
+                <div id="deal-parse-spinner" style="display:none;text-align:center;padding:20px 0">
+                  <div class="spinner" style="display:inline-block;width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin 0.8s linear infinite"></div>
+                  <div style="margin-top:10px;color:var(--text-muted);font-size:13px">Roco is reading your document&#8230;</div>
+                  <button onclick="cancelDealDocUpload()" style="margin-top:10px;padding:6px 16px;background:transparent;border:1px solid #3a3a3a;color:#6b7280;border-radius:6px;cursor:pointer;font-size:12px">Cancel</button>
+                </div>
+                <div style="margin-top:16px;text-align:center">
+                  <button type="button" class="btn btn-ghost btn-sm" onclick="showManualForm()" style="color:var(--text-muted)">
+                    Prefer to fill in manually instead &rarr;
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Step 2: Deal Form (hidden until doc parsed or skipped) ── -->
+          <div id="launch-step-2" style="display:none">
+            <div class="card" style="margin-bottom:16px;padding:14px 24px;display:flex;align-items:center;gap:12px">
+              <span style="font-size:18px">&#10003;</span>
+              <div>
+                <div style="font-size:13px;font-weight:600;color:var(--text-bright)" id="launch-doc-label">Document parsed</div>
+                <div style="font-size:12px;color:var(--text-muted)">Review and edit the extracted details below, then click Launch.</div>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="resetLaunchStep()">&#8592; Change document</button>
+            </div>
+
+          <form id="launch-form" onsubmit="submitNewDeal(event)" autocomplete="off">
+          <input type="hidden" id="launch-document-id" name="document_id" value="" />
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label class="form-label">Deal Name <span class="req">*</span></label>
+                <input type="text" name="dealName" id="lf-deal-name" class="form-input" placeholder="e.g. Apex Capital Series B" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Deal Type <span class="req">*</span></label>
+                <select name="raiseType" id="lf-raise-type" class="form-input" required>
+                  <option value="">Select&#8230;</option>
+                  <option value="Buyout">Buyout</option>
+                  <option value="MBO">MBO</option>
+                  <option value="Growth Equity">Growth Equity</option>
+                  <option value="Minority">Minority</option>
+                  <option value="Equity">Equity</option>
+                  <option value="Debt">Debt</option>
+                  <option value="Mezzanine">Mezzanine</option>
+                  <option value="Secondary">Secondary</option>
+                  <option value="Venture">Venture</option>
+                  <option value="Real Estate">Real Estate</option>
+                  <option value="Independent Sponsor">Independent Sponsor</option>
+                  <option value="Other">Other</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row-3">
+              <div class="form-group">
+                <label class="form-label">Target Amount <span class="req">*</span></label>
+                <input type="text" name="targetAmount" id="lf-target-amount" class="form-input" placeholder="e.g. &#163;50,000,000" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Min Cheque Size <span class="label-optional">(optional)</span></label>
+                <input type="text" name="minCheque" class="form-input" placeholder="e.g. &#163;250,000" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max Cheque Size <span class="label-optional">(optional)</span></label>
+                <input type="text" name="maxCheque" class="form-input" placeholder="e.g. &#163;5,000,000" />
+              </div>
+            </div>
+
+            <div class="form-row-3">
+              <div class="form-group">
+                <label class="form-label">EBITDA ($M) <span class="label-optional">(optional)</span></label>
+                <input type="number" name="ebitda_usd_m" id="lf-ebitda" class="form-input" placeholder="e.g. 5.2" step="0.1" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Enterprise Value ($M) <span class="label-optional">(optional)</span></label>
+                <input type="number" name="enterprise_value_usd_m" id="lf-ev" class="form-input" placeholder="e.g. 40" step="0.1" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Equity Required ($M) <span class="label-optional">(optional)</span></label>
+                <input type="number" name="equity_required_usd_m" id="lf-equity" class="form-input" placeholder="e.g. 20" step="0.1" />
+              </div>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label class="form-label">Sector <span class="req">*</span></label>
+                <input type="text" name="sector" id="lf-sector" class="form-input" placeholder="e.g. PropTech, FinTech, Healthcare" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Geography <span class="label-optional">(optional)</span></label>
+                <div class="checkbox-group">
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="UK" /> UK</label>
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="Europe" /> Europe</label>
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="US" /> US</label>
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="Global" /> Global</label>
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="MENA" /> MENA</label>
+                  <label class="checkbox-item"><input type="checkbox" name="geography" value="APAC" /> APAC</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label class="form-label">Ideal Investor Types <span class="label-optional">(optional)</span></label>
+                <input type="text" name="idealInvestorTypes" id="lf-investor-types" class="form-input" placeholder="e.g. PE/Buyout, Family Office, Independent Sponsor" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Min Investor Score <span class="label-optional">(default 60)</span></label>
+                <input type="number" name="minInvestorScore" id="lf-min-score" class="form-input" value="60" min="0" max="100" />
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Deal Description <span class="req">*</span></label>
+              <textarea name="description" class="form-textarea" rows="5" placeholder="Describe the opportunity, company background, and investment thesis&#8230;" required></textarea>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label class="form-label">Key Metrics / USP <span class="label-optional">(optional)</span></label>
+                <textarea name="keyMetrics" class="form-textarea" rows="3" placeholder="ARR, growth rate, margins, competitive moat&#8230;"></textarea>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Investor Profile <span class="label-optional">(optional)</span></label>
+                <textarea name="investorProfile" class="form-textarea" rows="3" placeholder="Target investor type, cheque size, preferred sectors&#8230;"></textarea>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Deck URL <span class="label-optional">(optional)</span></label>
+              <input type="url" name="deckUrl" class="form-input" placeholder="https://&#8230;" />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Meeting / Booking Link <span class="label-optional">(optional)</span></label>
+              <input type="url" name="calendlyUrl" class="form-input" placeholder="https://calendly.com/&#8230;" />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" style="margin-bottom:8px">Additional Deal Assets <span class="label-optional">(optional)</span> <span style="font-size:11px;color:var(--text-dim);font-weight:400">— Roco will reference these when crafting replies</span></label>
+              <div id="launch-assets-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+              <button type="button" class="btn" style="font-size:12px;padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--text-muted)" onclick="addLaunchAssetRow()">+ Add Asset</button>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">LinkedIn URLs to Seed <span class="label-optional">(optional)</span></label>
+              <textarea name="linkedinUrls" class="form-textarea" rows="4" placeholder="https://linkedin.com/in/investor-one&#10;https://linkedin.com/in/investor-two&#10;One URL per line"></textarea>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">CSV Upload <span class="label-optional">(optional)</span></label>
+              <div class="file-drop-zone" id="file-drop-zone" onclick="document.getElementById('csv-input').click()"
+                   ondragover="event.preventDefault(); this.classList.add('drag-over')"
+                   ondragleave="this.classList.remove('drag-over')"
+                   ondrop="onCsvDrop(event)">
+                <input type="file" id="csv-input" name="csvFile" accept=".csv" style="display:none" onchange="onCsvSelected(this)" />
+                <div class="file-drop-icon">&#128196;</div>
+                <div class="file-drop-text" id="file-drop-text">Drop CSV here or click to browse</div>
+                <div class="file-drop-hint">Columns: firstName, lastName, email, company, linkedinUrl</div>
+              </div>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label class="form-label">Send Window From</label>
+                <input type="time" class="form-input" id="nd-email-from" value="08:00" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Send Window Until</label>
+                <input type="time" class="form-input" id="nd-email-until" value="18:00" />
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Timezone</label>
+              <select class="form-input" id="nd-timezone">
+                <option value="Europe/London">Europe/London</option>
+                <option value="America/New_York">America/New_York</option>
+                <option value="America/Chicago">America/Chicago</option>
+                <option value="America/Los_Angeles">America/Los_Angeles</option>
+                <option value="Europe/Paris">Europe/Paris</option>
+                <option value="Europe/Berlin">Europe/Berlin</option>
+                <option value="Asia/Dubai">Asia/Dubai</option>
+                <option value="Asia/Singapore">Asia/Singapore</option>
+                <option value="Asia/Tokyo">Asia/Tokyo</option>
+                <option value="Australia/Sydney">Australia/Sydney</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">LinkedIn Daily Limit</label>
+              <input type="number" name="linkedinDailyLimit" id="lf-li-daily-limit" class="form-input" value="20" min="1" max="100" placeholder="20" />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Active Days</label>
+              <div class="day-picker" id="nd-active-days">
+                <button type="button" class="day-pill on" data-day="Mon" onclick="this.classList.toggle('on')">MON</button>
+                <button type="button" class="day-pill on" data-day="Tue" onclick="this.classList.toggle('on')">TUE</button>
+                <button type="button" class="day-pill on" data-day="Wed" onclick="this.classList.toggle('on')">WED</button>
+                <button type="button" class="day-pill on" data-day="Thu" onclick="this.classList.toggle('on')">THU</button>
+                <button type="button" class="day-pill on" data-day="Fri" onclick="this.classList.toggle('on')">FRI</button>
+                <button type="button" class="day-pill" data-day="Sat" onclick="this.classList.toggle('on')">SAT</button>
+                <button type="button" class="day-pill" data-day="Sun" onclick="this.classList.toggle('on')">SUN</button>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">LinkedIn Connections Window</label>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input type="time" class="form-input" id="nd-li-connect-from" value="08:00" style="flex:1" />
+                <span style="color:var(--text-muted);font-size:12px">to</span>
+                <input type="time" class="form-input" id="nd-li-connect-until" value="20:00" style="flex:1" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">LinkedIn DM Window</label>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input type="time" class="form-input" id="nd-li-dm-from" value="20:00" style="flex:1" />
+                <span style="color:var(--text-muted);font-size:12px">to</span>
+                <input type="time" class="form-input" id="nd-li-dm-until" value="23:00" style="flex:1" />
+              </div>
+            </div>
+
+            <!-- Exclusion List Upload -->
+            <div style="margin-bottom:24px">
+              <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Exclusion List <span style="font-weight:400;font-size:11px;text-transform:none;letter-spacing:0">(optional)</span></h3>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Contacts or firms that should never be touched for this deal.</p>
+              <div id="exclusion-drop-zone"
+                style="border:1px dashed #2a2a2a;border-radius:6px;padding:20px;text-align:center;cursor:pointer;background:#0f0f0f;transition:border-color 0.2s"
+                onclick="document.getElementById('exclusion-csv-input').click()"
+                ondragover="event.preventDefault();this.style.borderColor='#d4a847'"
+                ondragleave="this.style.borderColor='#2a2a2a'"
+                ondrop="handleExclusionDrop(event)">
+                <div style="color:#4a4a4a;font-size:13px;margin-bottom:4px">Drop exclusion CSV here or click to browse</div>
+                <div style="color:#2a2a2a;font-size:11px;font-family:'DM Mono',monospace">firm_name, person_name, email — any one column is enough</div>
+              </div>
+              <input type="file" id="exclusion-csv-input" accept=".csv" style="display:none" onchange="handleExclusionFile(this.files[0])">
+              <div id="exclusion-preview" style="display:none;margin-top:12px;padding:12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <span id="exclusion-count" style="color:#e5e7eb;font-size:13px"></span>
+                  <button type="button" onclick="clearExclusionList()" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:12px;text-decoration:underline">Remove</button>
+                </div>
+                <div id="exclusion-sample" style="margin-top:8px;color:#6b7280;font-size:11px;font-family:'DM Mono',monospace;line-height:1.6"></div>
+              </div>
+            </div>
+
+            <!-- Priority List Selector -->
+            <div id="launch-priority-section" style="margin-bottom:20px">
+              <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">List Priority <span style="font-weight:400;font-size:11px;text-transform:none;letter-spacing:0">(optional)</span></h3>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Select which investor lists Roco searches first. Leave empty to search the full database.</p>
+              <div id="priority-list-container" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px"></div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <select id="add-list-select" style="flex:1;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px">
+                  <option value="">+ Add a list to prioritise&#8230;</option>
+                </select>
+                <button type="button" onclick="addPriorityList()" style="padding:8px 14px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-muted);border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap">Add</button>
+              </div>
+            </div>
+
+            <div class="form-submit-row">
+              <button type="submit" class="btn btn-launch" id="launch-btn">
+                &#128640;&nbsp; LAUNCH ROCO ON THIS DEAL
+              </button>
+            </div>
+
+          </form>
+          </div><!-- end step-2 -->
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ DATABASE ══════════════════════════════════ -->
+      <section id="view-database" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Investor Database</h1>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn btn-ghost btn-sm" onclick="loadDatabase()">&#8635; Refresh</button>
+            <button class="btn btn-sm" style="background:rgba(220,30,30,0.15);color:#e03030;border:1px solid rgba(220,30,30,0.3);font-size:12px" onclick="wipeEverything()">&#9888; Wipe Everything</button>
+          </div>
+        </div>
+
+        <!-- Stats Bar -->
+        <div class="stats-bar" id="db-stats-bar" style="margin-bottom:24px">
+          <div class="stat-card">
+            <div class="stat-label">Total Investors</div>
+            <div class="stat-value mono gold" id="db-stat-total">&#8212;</div>
+          </div>
+          <div class="stat-card" id="db-stats-categories" style="grid-column:span 3">
+            <div class="stat-label">By Category</div>
+            <div id="db-cat-breakdown" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;font-size:12px;font-family:var(--font-mono)"></div>
+          </div>
+        </div>
+
+        <!-- Named Lists -->
+        <div id="db-lists-panel" style="margin-bottom:24px"></div>
+
+        <!-- XLSX Upload Zone -->
+        <div class="card" style="margin-bottom:24px">
+          <div class="card-header">
+            <h2 class="card-title">Import from PitchBook XLSX</h2>
+            <span style="font-size:12px;color:var(--text-muted)">Drag and drop a PitchBook export file to import investors</span>
+          </div>
+          <div style="padding:0 24px 24px">
+            <div style="margin-bottom:12px">
+              <label style="color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px">List Name</label>
+              <input type="text" id="import-list-name" placeholder="e.g. Healthcare PE Q1 2026"
+                style="width:100%;padding:8px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;box-sizing:border-box">
+            </div>
+            <div class="file-drop-zone" id="db-drop-zone"
+                 onclick="document.getElementById('db-file-input').click()"
+                 ondragover="event.preventDefault(); this.classList.add('drag-over')"
+                 ondragleave="this.classList.remove('drag-over')"
+                 ondrop="onDbFileDrop(event)">
+              <input type="file" id="db-file-input" accept=".xlsx,.xls" style="display:none" onchange="onDbFileSelected(this)" />
+              <div class="file-drop-icon" id="db-drop-icon">&#128196;</div>
+              <div class="file-drop-text" id="db-drop-text">Drop XLSX here or click to browse</div>
+              <div class="file-drop-hint">PitchBook investor export — all columns mapped automatically</div>
+            </div>
+            <div id="db-import-progress" style="display:none;margin-top:12px">
+              <div style="display:flex;align-items:center;gap:10px">
+                <div class="spinner" style="width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></div>
+                <span id="db-import-msg" style="font-size:13px;color:var(--text-muted)">Importing&#8230;</span>
+              </div>
+            </div>
+            <div id="db-import-result" style="display:none;margin-top:12px;padding:10px 14px;border-radius:6px;font-size:13px;background:var(--surface-2)"></div>
+          </div>
+        </div>
+
+        <!-- Sub-tabs: Investors / Contacts / Lists -->
+        <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px">
+          <button id="db-subtab-investors" onclick="switchDbSubtab('investors')"
+            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid var(--gold);color:var(--gold);cursor:pointer;font-size:13px;font-family:var(--font-body)">
+            Investors
+          </button>
+          <button id="db-subtab-contacts" onclick="switchDbSubtab('contacts')"
+            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);cursor:pointer;font-size:13px;font-family:var(--font-body)">
+            Contacts
+          </button>
+          <button id="db-subtab-lists" onclick="switchDbSubtab('lists')"
+            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);cursor:pointer;font-size:13px;font-family:var(--font-body)">
+            Lists
+          </button>
+        </div>
+
+        <!-- INVESTORS VIEW -->
+        <div id="db-investors-view">
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Search Investors</h2>
+            </div>
+            <div style="padding:0 24px 16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+              <input type="text" id="db-search-input" class="form-input" placeholder="Search name, industry, description&#8230;"
+                style="flex:2;min-width:180px" oninput="dbSearchDebounce()" />
+              <select id="db-filter-type" onchange="loadDatabaseTable(1)"
+                style="padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;min-width:160px">
+                <option value="">All Types</option>
+                <optgroup label="── Categories ──">
+                  <option value="IndependentSponsor">Independent Sponsor</option>
+                  <option value="FundlessSponsor">Fundless Sponsor</option>
+                  <option value="VC_LP">VC / LP</option>
+                  <option value="General">General</option>
+                  <option value="Secondary">Secondary</option>
+                  <option value="Manufacturing">Manufacturing</option>
+                  <option value="LMM_Minority">LMM / Minority</option>
+                </optgroup>
+                <optgroup label="── Investor Types ──">
+                  <option value="Family Office">Family Office</option>
+                  <option value="PE/Buyout">PE / Buyout</option>
+                  <option value="Venture Capital">Venture Capital</option>
+                  <option value="Holding Company">Holding Company</option>
+                  <option value="Fund of Funds">Fund of Funds</option>
+                  <option value="Endowment">Endowment</option>
+                  <option value="Foundation">Foundation</option>
+                  <option value="Corporate Pension">Corporate Pension</option>
+                  <option value="High-net-worth investor">HNW Investor</option>
+                  <option value="Public Pension Fund">Public Pension</option>
+                  <option value="Limited Partner">Limited Partner</option>
+                  <option value="Angel">Angel</option>
+                  <option value="Sovereign Wealth Fund">Sovereign Wealth</option>
+                  <option value="Insurance Company">Insurance</option>
+                  <option value="Asset Manager">Asset Manager</option>
+                </optgroup>
+              </select>
+              <select id="db-filter-country" onchange="loadDatabaseTable(1)"
+                style="padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;min-width:140px">
+                <option value="">All Countries</option>
+                <option value="United States">United States</option>
+                <option value="United Kingdom">United Kingdom</option>
+                <option value="Canada">Canada</option>
+                <option value="Germany">Germany</option>
+                <option value="France">France</option>
+                <option value="Switzerland">Switzerland</option>
+                <option value="Netherlands">Netherlands</option>
+                <option value="Sweden">Sweden</option>
+                <option value="Australia">Australia</option>
+                <option value="Japan">Japan</option>
+                <option value="China">China</option>
+                <option value="Singapore">Singapore</option>
+                <option value="India">India</option>
+                <option value="Spain">Spain</option>
+                <option value="Italy">Italy</option>
+                <option value="Norway">Norway</option>
+                <option value="Denmark">Denmark</option>
+                <option value="Belgium">Belgium</option>
+                <option value="Luxembourg">Luxembourg</option>
+                <option value="United Arab Emirates">UAE</option>
+                <option value="Israel">Israel</option>
+                <option value="South Korea">South Korea</option>
+                <option value="Hong Kong">Hong Kong</option>
+                <option value="Ireland">Ireland</option>
+                <option value="South Africa">South Africa</option>
+                <option value="Brazil">Brazil</option>
+              </select>
+              <select id="db-filter-enrichment" onchange="loadDatabaseTable(1)"
+                style="padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;min-width:130px">
+                <option value="">All Enrichment</option>
+                <option value="Enriched">Enriched</option>
+                <option value="Partial">Partial</option>
+                <option value="Raw">Raw</option>
+              </select>
+              <select id="db-filter-contact-type" onchange="loadDatabaseTable(1)"
+                style="padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;min-width:140px">
+                <option value="">All Contact Types</option>
+                <option value="angel">Angel Investor</option>
+                <option value="individual_at_firm">Individual at Firm</option>
+                <option value="firm">Firm</option>
+              </select>
+              <button class="btn btn-ghost btn-sm" onclick="exportInvestorsCSV(this)" style="white-space:nowrap">&#8595; Export CSV</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Contact Type</th>
+                    <th>Sectors</th>
+                    <th>AUM</th>
+                    <th>Deal Size</th>
+                    <th>EBITDA Range</th>
+                    <th>Last Investment</th>
+                    <th>12m</th>
+                    <th>Email</th>
+                    <th>Deals</th>
+                  </tr>
+                </thead>
+                <tbody id="db-table-body">
+                  <tr><td colspan="11" class="table-empty">Load or search investors above</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="db-pagination"></div>
+          </div>
+        </div>
+
+        <!-- CONTACTS VIEW -->
+        <div id="db-contacts-view" style="display:none">
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Enriched Contacts</h2>
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="font-size:12px;color:var(--text-muted)">Individual decision makers found and enriched by Roco</span>
+                <button class="btn btn-ghost btn-sm" onclick="exportContactsCSV(this)" style="white-space:nowrap;flex-shrink:0">&#8595; Export CSV</button>
+              </div>
+            </div>
+            <div style="padding:0 24px 16px">
+              <input type="text" id="db-contacts-search" class="form-input" placeholder="Search name, email, firm&#8230;"
+                style="width:100%;max-width:400px" oninput="clearTimeout(dbSearchTimer);dbSearchTimer=setTimeout(()=>loadContactsTable(1),400)" />
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Firm</th>
+                    <th>Title</th>
+                    <th>Email</th>
+                    <th>LinkedIn</th>
+                    <th>Source</th>
+                    <th>Verified</th>
+                    <th>Updated</th>
+                  </tr>
+                </thead>
+                <tbody id="db-contacts-body">
+                  <tr><td colspan="8" class="table-empty">No enriched contacts yet</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="db-contacts-pagination"></div>
+          </div>
+        </div>
+
+        <!-- LISTS VIEW -->
+        <div id="db-lists-view" style="display:none">
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Investor Lists</h2>
+              <span style="font-size:12px;color:var(--text-muted)">Named groups of investors — select these when launching a deal to control search order</span>
+            </div>
+            <div id="lists-table-container" style="padding:0 24px 24px">
+              <div class="loading-placeholder">Loading lists&#8230;</div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ══════════════════════════════════ ACTIVE DEALS ══════════════════════════════════ -->
+      <section id="view-deals" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Active Deals</h1>
+          <button class="btn btn-gold btn-sm" onclick="navigate('#launch')">+ New Deal</button>
+        </div>
+
+        <!-- Deals Grid -->
+        <div class="deals-grid" id="deals-grid">
+          <div class="loading-placeholder">Loading deals&#8230;</div>
+        </div>
+
+        <!-- Deal Detail Panel (hidden until VIEW clicked) -->
+        <div class="deal-detail-panel hidden" id="deal-detail-panel">
+          <div class="deal-detail-header">
+            <div>
+              <h2 class="deal-detail-name" id="deal-detail-name"></h2>
+              <span class="status-badge" id="deal-detail-status-badge"></span>
+            </div>
+            <button class="btn btn-ghost" id="deal-detail-back-btn" onclick="closeDealDetail()">&#8592; Back to Deals</button>
+          </div>
+          <div class="deal-detail-tabs">
+            <button class="deal-tab active" data-tab="overview" onclick="switchDealTab('overview', this)">Overview</button>
+            <button class="deal-tab" data-tab="brief" onclick="switchDealTab('brief', this)">Deal Brief</button>
+            <button class="deal-tab" data-tab="pipeline" onclick="switchDealTab('pipeline', this)">Pipeline</button>
+            <button class="deal-tab" data-tab="rankings" onclick="switchDealTab('rankings', this)">Rankings</button>
+            <button class="deal-tab" data-tab="settings" onclick="switchDealTab('settings', this)">Settings</button>
+            <button class="deal-tab" data-tab="archived" onclick="switchDealTab('archived', this)">Archived</button>
+            <button class="deal-tab" data-tab="exclusions" onclick="switchDealTab('exclusions', this)">Exclusions</button>
+            <button class="deal-tab" data-tab="templates" onclick="switchDealTab('templates', this)">Templates</button>
+            <button class="deal-tab" data-tab="campaign" onclick="switchDealTab('campaign', this)" id="deal-tab-btn-campaign">Campaign</button>
+          </div>
+          <div id="deal-tab-overview" class="deal-tab-content"></div>
+          <div id="deal-tab-brief" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-pipeline" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-rankings" class="deal-tab-content hidden"></div>
+<div id="deal-tab-settings" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-archived" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-exclusions" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-templates" class="deal-tab-content hidden"></div>
+          <div id="deal-tab-campaign" class="deal-tab-content hidden"></div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ PIPELINE ══════════════════════════════════ -->
+      <section id="view-pipeline" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Pipeline</h1>
+          <div class="header-controls" style="display:flex;gap:8px;align-items:center">
+            <select class="form-input sm" id="pipeline-deal-filter" onchange="loadPipeline()">
+              <option value="">All Deals</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" onclick="exportGlobalPipelineCSV()">&#8595; Export CSV</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table class="data-table" id="pipeline-table">
+              <thead>
+                <tr>
+                  <th class="sortable-th" onclick="sortPipeline('name')">
+                    Investor <span class="sort-icon" data-col="name">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('firm')">
+                    Firm <span class="sort-icon" data-col="firm">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('deal_name')">
+                    Deal <span class="sort-icon" data-col="deal_name">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('score')">
+                    Score <span class="sort-icon" data-col="score">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('stage')">
+                    Stage <span class="sort-icon" data-col="stage">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('lastContact')">
+                    Last Contact <span class="sort-icon" data-col="lastContact">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('nextFollowup')">
+                    Next Follow-up <span class="sort-icon" data-col="nextFollowup">&#8597;</span>
+                  </th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="pipeline-tbody">
+                <tr><td colspan="8" class="table-empty">Loading pipeline&#8230;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ APPROVAL QUEUE ══════════════════════════════════ -->
+      <section id="view-queue" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Approval Queue</h1>
+        </div>
+        <div class="queue-tab-bar">
+          <button class="queue-tab active" id="qtab-email" onclick="switchQueueTab('email', this)">
+            Emails <span class="tab-count" id="queue-email-count">0</span>
+          </button>
+          <button class="queue-tab" id="qtab-linkedin" onclick="switchQueueTab('linkedin', this)">
+            LinkedIn <span class="tab-count" id="queue-linkedin-count">0</span>
+          </button>
+        </div>
+        <div id="qpanel-email" class="queue-panel">
+          <div id="queue-email-list">
+            <div class="queue-empty">&#10003;&nbsp; Queue is empty &#8212; no emails pending approval.</div>
+          </div>
+        </div>
+        <div id="qpanel-linkedin" class="queue-panel hidden">
+          <div id="queue-linkedin-list">
+            <div class="queue-empty">&#10003;&nbsp; No LinkedIn messages pending approval.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ LIVE ACTIVITY ══════════════════════════════════ -->
+      <section id="view-activity" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Live Activity</h1>
+          <span class="live-indicator"><span class="live-dot" id="activity-live-dot"></span>LIVE</span>
+        </div>
+        <div class="activity-filters mb-16">
+          <select class="form-input sm" id="activity-deal-filter" onchange="filterActivity()">
+            <option value="">All Deals</option>
+          </select>
+          <select class="form-input sm" id="activity-type-filter" onchange="filterActivity()">
+            <option value="">All Types</option>
+            <option value="email_sent">Email Sent</option>
+            <option value="email_reply">Reply</option>
+            <option value="research">Research</option>
+            <option value="enrichment">Enrichment</option>
+            <option value="approval">Approval</option>
+            <option value="system">System</option>
+          </select>
+        </div>
+        <div class="card">
+          <div class="activity-feed tall" id="activity-feed">
+            <div class="feed-empty">No activity yet &#8212; ROCO is watching&#8230;</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ ANALYTICS ══════════════════════════════════ -->
+      <section id="view-analytics" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Analytics</h1>
+          <button class="btn btn-ghost btn-sm" onclick="runAnalyticsNow(this)">&#9654; Run Analysis Now</button>
+        </div>
+
+        <!-- Sub-tabs -->
+        <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px">
+          <button id="analytics-tab-performance" onclick="switchAnalyticsTab('performance')"
+            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid var(--gold);color:var(--gold);cursor:pointer;font-size:13px;font-family:var(--font-body)">
+            Performance
+          </button>
+          <button id="analytics-tab-recommendations" onclick="switchAnalyticsTab('recommendations')"
+            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);cursor:pointer;font-size:13px;font-family:var(--font-body)">
+            Recommendations
+          </button>
+        </div>
+
+        <div id="analytics-panel-performance">
+          <div id="analytics-summary-table"><div class="loading-placeholder">Loading performance data&#8230;</div></div>
+        </div>
+
+        <div id="analytics-panel-recommendations" style="display:none">
+          <div id="analytics-recs-list"><div class="loading-placeholder">Loading recommendations&#8230;</div></div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ SOURCING CAMPAIGNS ══════════════════════════════════ -->
+      <section id="view-sourcing" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Sourcing Campaigns</h1>
+        </div>
+
+        <div style="display:flex;flex-direction:column;align-items:center;
+                    justify-content:center;padding:80px 40px;text-align:center">
+
+          <!-- Icon -->
+          <div style="width:64px;height:64px;border-radius:50%;
+                      background:rgba(212,168,71,0.1);border:1px solid rgba(212,168,71,0.2);
+                      display:flex;align-items:center;justify-content:center;
+                      margin-bottom:24px;font-size:28px">
+            🚀
+          </div>
+
+          <!-- Title -->
+          <div style="font-family:'Playfair Display',serif;font-size:32px;
+                      font-weight:600;color:#e5e7eb;margin-bottom:12px">
+            Coming Soon
+          </div>
+
+          <!-- Subtitle -->
+          <div style="font-family:'DM Mono',monospace;font-size:12px;
+                      letter-spacing:0.2em;text-transform:uppercase;
+                      color:#d4a847;margin-bottom:20px">
+            Sourcing Campaigns
+          </div>
+
+          <!-- Description -->
+          <p style="color:#6b7280;font-size:14px;max-width:480px;line-height:1.6;margin:0">
+            Automated outbound sourcing campaigns are being configured.
+            This will enable Roco to proactively source and contact
+            investment opportunities on your behalf.
+          </p>
+
+          <!-- Status indicator -->
+          <div style="margin-top:32px;padding:8px 20px;background:#1a1a1a;
+                      border:1px solid #2a2a2a;border-radius:6px;
+                      font-family:'DM Mono',monospace;font-size:11px;
+                      color:#374151;letter-spacing:0.1em">
+            IN DEVELOPMENT
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ LAUNCH SOURCING CAMPAIGN ══════════════════════════════════ -->
+      <section id="view-sourcing-launch" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Launch Sourcing Campaign</h1>
+          <button class="btn btn-ghost btn-sm" onclick="showView('sourcing')">&#8592; Back to Campaigns</button>
+        </div>
+        <div class="card" style="max-width:720px">
+          <form id="sourcing-launch-form" onsubmit="submitSourcingCampaign(event)">
+            <div class="form-section-title">Campaign Details</div>
+            <div class="form-group">
+              <label class="form-label">Campaign Name *</label>
+              <input type="text" class="form-input" name="name" placeholder="e.g. Manufacturing Buyout — Q2 2026" required />
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Firm Name *</label>
+                <input type="text" class="form-input" name="firm_name" placeholder="e.g. MJD Funding" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Firm Type *</label>
+                <select class="form-input" name="firm_type" required>
+                  <option value="">Select&#8230;</option>
+                  <option value="PE">PE</option>
+                  <option value="VC">VC</option>
+                  <option value="Family Office">Family Office</option>
+                  <option value="Strategic Acquirer">Strategic Acquirer</option>
+                  <option value="Angel">Angel</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-section-title" style="margin-top:20px">Target Company Criteria</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Target Sector *</label>
+                <input type="text" class="form-input" name="target_sector" placeholder="e.g. Manufacturing / B2B SaaS / Healthcare" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Geography *</label>
+                <input type="text" class="form-input" name="target_geography" placeholder="e.g. US / UK / Europe" required />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Business Model</label>
+                <select class="form-input" name="business_model">
+                  <option value="Any">Any</option>
+                  <option value="B2B SaaS">B2B SaaS</option>
+                  <option value="B2C">B2C</option>
+                  <option value="Marketplace">Marketplace</option>
+                  <option value="Manufacturing">Manufacturing</option>
+                  <option value="Professional Services">Professional Services</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Company Stage</label>
+                <select class="form-input" name="company_stage">
+                  <option value="Any">Any</option>
+                  <option value="Pre-seed">Pre-seed</option>
+                  <option value="Seed">Seed</option>
+                  <option value="Series A">Series A</option>
+                  <option value="Series B">Series B</option>
+                  <option value="Growth">Growth</option>
+                  <option value="Mature">Mature</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Ownership Type</label>
+                <select class="form-input" name="ownership_type">
+                  <option value="Any">Any</option>
+                  <option value="Bootstrapped">Bootstrapped</option>
+                  <option value="VC-backed">VC-backed</option>
+                  <option value="PE-backed">PE-backed</option>
+                  <option value="Family-owned">Family-owned</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Deal Type *</label>
+                <select class="form-input" name="deal_type" required>
+                  <option value="Any">Any</option>
+                  <option value="Equity">Equity</option>
+                  <option value="Acquisition">Acquisition</option>
+                  <option value="Minority Stake">Minority Stake</option>
+                  <option value="Growth Capital">Growth Capital</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Investment Size</label>
+              <input type="text" class="form-input" name="investment_size" placeholder="e.g. $1M-$5M or £750k-£5M" />
+            </div>
+
+            <div class="form-section-title" style="margin-top:20px">Financial Criteria</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Min Revenue</label>
+                <input type="text" class="form-input" name="min_revenue" placeholder="e.g. $500,000" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max Revenue</label>
+                <input type="text" class="form-input" name="max_revenue" placeholder="e.g. $10,000,000" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Min EBITDA</label>
+                <input type="text" class="form-input" name="min_ebitda" placeholder="e.g. $750,000" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max EBITDA</label>
+                <input type="text" class="form-input" name="max_ebitda" placeholder="e.g. $5,000,000" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Min Company Age (months)</label>
+                <input type="number" class="form-input" name="min_company_age_months" placeholder="e.g. 12" min="0" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max Company Age (months)</label>
+                <input type="number" class="form-input" name="max_company_age_months" placeholder="e.g. 120" min="0" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Min Headcount</label>
+                <input type="number" class="form-input" name="headcount_min" placeholder="e.g. 10" min="0" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max Headcount</label>
+                <input type="number" class="form-input" name="headcount_max" placeholder="e.g. 500" min="0" />
+              </div>
+            </div>
+
+            <div class="form-section-title" style="margin-top:20px">Search Signals</div>
+            <div class="form-group">
+              <label class="form-label">Intent Signals to Search For</label>
+              <textarea class="form-input" name="intent_signals" rows="2" placeholder="e.g. seeking investors, hiring CFO, expanding to new markets, product launch, revenue milestone announced"></textarea>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Keywords to Include</label>
+                <input type="text" class="form-input" name="keywords_include" placeholder="e.g. recurring revenue, SaaS, ARR" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Keywords to Exclude</label>
+                <input type="text" class="form-input" name="keywords_exclude" placeholder="e.g. Series C+, already acquired" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Investment Thesis</label>
+              <textarea class="form-input" name="investment_thesis" rows="3" placeholder="Describe exactly what the firm is looking for. e.g. We look for profitable manufacturing businesses with $750k-$5M EBITDA, owner-operated, open to partial or full exit, US-based, with strong recurring customer relationships"></textarea>
+            </div>
+
+            <div class="form-section-title" style="margin-top:20px">Sending Windows</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Email Window</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="time" class="form-input" name="email_start" value="09:00" style="width:110px" />
+                  <span>to</span>
+                  <input type="time" class="form-input" name="email_end" value="18:00" style="width:110px" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">LinkedIn DM Window</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="time" class="form-input" name="li_dm_start" value="20:00" style="width:110px" />
+                  <span>to</span>
+                  <input type="time" class="form-input" name="li_dm_end" value="23:00" style="width:110px" />
+                </div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">LinkedIn Connection Window</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="time" class="form-input" name="li_connect_start" value="09:00" style="width:110px" />
+                  <span>to</span>
+                  <input type="time" class="form-input" name="li_connect_end" value="18:00" style="width:110px" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Timezone</label>
+                <select class="form-input" name="timezone">
+                  <option value="America/New_York">New York (ET)</option>
+                  <option value="America/Chicago">Chicago (CT)</option>
+                  <option value="America/Denver">Denver (MT)</option>
+                  <option value="America/Los_Angeles">Los Angeles (PT)</option>
+                  <option value="Europe/London">London (GMT/BST)</option>
+                  <option value="Europe/Paris">Paris (CET)</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="display:flex;gap:12px;margin-top:24px">
+              <button type="submit" class="btn btn-primary">Launch Campaign</button>
+              <button type="button" class="btn btn-ghost" onclick="showView('sourcing')">Cancel</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ SOURCING CAMPAIGN DETAIL ══════════════════════════════════ -->
+      <section id="view-sourcing-detail" class="view-section hidden">
+        <div class="section-header">
+          <div style="display:flex;align-items:center;gap:12px">
+            <button class="btn btn-ghost btn-sm" onclick="showView('sourcing')">&#8592; All Campaigns</button>
+            <h1 class="section-title" id="sourcing-detail-title">Campaign</h1>
+            <span class="chip" id="sourcing-detail-status-chip"></span>
+          </div>
+          <div style="display:flex;gap:8px" id="sourcing-detail-actions">
+            <button class="btn btn-ghost btn-sm" id="sourcing-pause-btn" onclick="toggleSourcingCampaign()">Pause</button>
+            <button class="btn btn-danger btn-sm" id="sourcing-close-btn" onclick="closeSourcingCampaign()">Close</button>
+            <button class="btn btn-danger btn-sm" id="sourcing-delete-btn" onclick="deleteSourcingCampaign(currentSourcingCampaignId, document.getElementById('sourcing-detail-title').textContent)" style="display:none">Delete Permanently</button>
+          </div>
+        </div>
+
+        <!-- Stats bar -->
+        <div class="stats-bar" style="margin-bottom:20px">
+          <div class="stat-card">
+            <div class="stat-label">Companies Found</div>
+            <div class="stat-value mono" id="sc-stat-companies">&#8212;</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Hot Leads</div>
+            <div class="stat-value mono gold" id="sc-stat-hot">&#8212;</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Contacts Enriched</div>
+            <div class="stat-value mono" id="sc-stat-enriched">&#8212;</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Outreach Sent</div>
+            <div class="stat-value mono" id="sc-stat-outreach">&#8212;</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Meetings Booked</div>
+            <div class="stat-value mono green" id="sc-stat-meetings">&#8212;</div>
+          </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tab-bar" style="margin-bottom:16px">
+          <button class="tab-btn active" data-tab="sc-companies" onclick="switchSourcingTab('sc-companies', this)">Companies</button>
+          <button class="tab-btn" data-tab="sc-hot" onclick="switchSourcingTab('sc-hot', this)">Hot Leads</button>
+          <button class="tab-btn" data-tab="sc-contacts" onclick="switchSourcingTab('sc-contacts', this)">Contacts</button>
+          <button class="tab-btn" data-tab="sc-meetings" onclick="switchSourcingTab('sc-meetings', this)">Meetings</button>
+          <button class="tab-btn" data-tab="sc-archived" onclick="switchSourcingTab('sc-archived', this)">Archived</button>
+          <button class="tab-btn" data-tab="sc-settings" onclick="switchSourcingTab('sc-settings', this)">Settings</button>
+        </div>
+
+        <!-- Tab: Companies -->
+        <div id="tab-sc-companies" class="sourcing-tab">
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Revenue Est.</th>
+                    <th>Score</th>
+                    <th>Tier</th>
+                    <th>Intent Signals</th>
+                    <th>Research</th>
+                    <th>Outreach</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="sc-companies-tbody">
+                  <tr><td colspan="9" class="table-empty">Loading companies&#8230;</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Hot Leads -->
+        <div id="tab-sc-hot" class="sourcing-tab" style="display:none">
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Revenue Est.</th>
+                    <th>EBITDA Est.</th>
+                    <th>Score</th>
+                    <th>Tier</th>
+                    <th>Outreach</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="sc-hot-tbody">
+                  <tr><td colspan="8" class="table-empty">No hot leads yet&#8230;</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Contacts -->
+        <div id="tab-sc-contacts" class="sourcing-tab" style="display:none">
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Title</th>
+                    <th>Company</th>
+                    <th>Enrichment</th>
+                    <th>Stage</th>
+                    <th>Email</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="sc-contacts-tbody">
+                  <tr><td colspan="7" class="table-empty">Loading contacts&#8230;</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Meetings -->
+        <div id="tab-sc-meetings" class="sourcing-tab" style="display:none">
+          <div id="sc-meetings-list" class="card" style="padding:20px">
+            <div class="table-empty">No meetings booked yet</div>
+          </div>
+        </div>
+
+        <!-- Tab: Archived -->
+        <div id="tab-sc-archived" class="sourcing-tab" style="display:none">
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Score</th>
+                    <th>Why Archived</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="sc-archived-tbody">
+                  <tr><td colspan="5" class="table-empty">No archived companies</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Settings -->
+        <div id="tab-sc-settings" class="sourcing-tab" style="display:none">
+          <div class="card" style="max-width:600px;padding:24px">
+            <p class="form-label" style="margin-bottom:16px;opacity:0.6">Settings changes take effect on the next orchestrator cycle.</p>
+            <div id="sc-settings-form"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ DEAL ARCHIVE ══════════════════════════════════ -->
+      <section id="view-archive" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Deal Archive</h1>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table class="data-table" id="archive-table">
+              <thead>
+                <tr>
+                  <th>Deal Name</th>
+                  <th>Opened</th>
+                  <th>Closed</th>
+                  <th>Raised / Target</th>
+                  <th>Emails Sent</th>
+                  <th>LI Invites</th>
+                  <th>Response Rate</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="archive-tbody">
+                <tr><td colspan="8" class="table-empty">Loading archive&#8230;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════ CONTROLS ══════════════════════════════════ -->
+      <section id="view-controls" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Controls</h1>
+        </div>
+        <div class="controls-grid">
+
+          <!-- System Toggles -->
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">System Toggles</h2>
+            </div>
+            <div class="toggle-stack" id="toggle-list">
+              <div class="toggle-row-full">
+                <div class="toggle-info">
+                  <div class="toggle-name">Email Outreach</div>
+                  <div class="toggle-desc">Send outreach emails to new prospects</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" data-key="outreachEnabled" onchange="onSwitchChange('outreachEnabled', this.checked)" />
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+              <div class="toggle-row-full">
+                <div class="toggle-info">
+                  <div class="toggle-name">Follow-up</div>
+                  <div class="toggle-desc">Automated follow-up sequences</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" data-key="followUpEnabled" onchange="onSwitchChange('followUpEnabled', this.checked)" />
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+              <div class="toggle-row-full">
+                <div class="toggle-info">
+                  <div class="toggle-name">Enrichment</div>
+                  <div class="toggle-desc">Auto-enrich contact data via KASPR</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" data-key="enrichmentEnabled" onchange="onSwitchChange('enrichmentEnabled', this.checked)" />
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+              <div class="toggle-row-full">
+                <div class="toggle-info">
+                  <div class="toggle-name">Research</div>
+                  <div class="toggle-desc">AI-powered prospect research before outreach</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" data-key="researchEnabled" onchange="onSwitchChange('researchEnabled', this.checked)" />
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+              <div class="toggle-row-full">
+                <div class="toggle-info">
+                  <div class="toggle-name">LinkedIn</div>
+                  <div class="toggle-desc">LinkedIn outreach and connection requests</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" data-key="linkedinEnabled" onchange="onSwitchChange('linkedinEnabled', this.checked)" />
+                  <span class="toggle-track"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Manual Triggers -->
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Manual Triggers</h2>
+            </div>
+            <div class="trigger-stack">
+              <!-- Run Research -->
+              <div style="display:flex;gap:8px;align-items:center;width:100%">
+                <select class="form-input" id="research-deal-select" style="flex:1;font-size:13px">
+                  <option value="">Select deal&#8230;</option>
+                </select>
+                <button class="btn btn-ghost trigger-btn" style="white-space:nowrap" onclick="triggerAction('run-research')">
+                  &#128269;&nbsp; Run Research
+                </button>
+              </div>
+              <!-- Run Enrichment -->
+              <div style="display:flex;gap:8px;align-items:center;width:100%">
+                <select class="form-input" id="enrichment-deal-select" style="flex:1;font-size:13px">
+                  <option value="">Select deal&#8230;</option>
+                </select>
+                <button class="btn btn-ghost trigger-btn" style="white-space:nowrap" onclick="triggerAction('run-enrichment')">
+                  &#9881;&nbsp; Run Enrichment
+                </button>
+              </div>
+              <!-- Flush Approval Queue -->
+              <div style="display:flex;gap:8px;align-items:center;width:100%">
+                <div style="flex:1;font-size:12px;color:var(--text-muted)">Skip all pending approval items — clears the outreach queue</div>
+                <button class="btn btn-ghost trigger-btn" style="white-space:nowrap" onclick="triggerAction('flush-queue')">
+                  &#128228;&nbsp; Flush Approval Queue
+                </button>
+              </div>
+              <!-- Pause All -->
+              <button class="btn btn-danger trigger-btn" onclick="triggerAction('pause-all-24h')">
+                &#9646;&#9646;&nbsp; Pause All 24h
+              </button>
+            </div>
+          </div>
+
+          <!-- Global Outreach Pause -->
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Global Outreach Pause</h2>
+            </div>
+            <div class="global-pause-body">
+              <div class="pause-active-block" id="pause-active-block" style="display:none">
+                <div class="pause-active-label">Paused until</div>
+                <div class="pause-active-val mono" id="pause-until-display">&#8212;</div>
+                <div class="pause-countdown-timer mono" id="pause-countdown-timer">&#8212;</div>
+                <button class="btn btn-ghost btn-sm mt-8" onclick="clearGlobalPause()">Clear Pause</button>
+              </div>
+              <div id="pause-set-form">
+                <div class="form-group">
+                  <label class="form-label">Pause Until</label>
+                  <input type="datetime-local" id="pause-until-input" class="form-input" />
+                </div>
+                <button class="btn btn-amber" onclick="setGlobalPause()">PAUSE UNTIL</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Per-Deal Schedule (full width) -->
+          <div class="card card-full">
+            <div class="card-header">
+              <h2 class="card-title">Per-Deal Schedule</h2>
+            </div>
+            <div class="schedule-body">
+              <div class="form-group mb-16" style="max-width:320px">
+                <label class="form-label">Deal</label>
+                <select class="form-input" id="schedule-deal-select" onchange="loadDealSchedule(this.value)">
+                  <option value="">Select a deal&#8230;</option>
+                </select>
+              </div>
+              <div id="schedule-content" style="display:none">
+                <div class="schedule-viz" id="schedule-viz"></div>
+                <div class="schedule-cadence mt-16" id="schedule-cadence"></div>
+                <button class="btn btn-gold mt-16" onclick="saveDealSchedule()">Save Schedule</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- TRAIN YOUR AGENT VIEW -->
+      <section id="view-train" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Train Your Agent</h1>
+          <p style="color:var(--text-dim);font-size:13px;margin-top:4px">Guidance rules are injected into every LLM call in real time. Changes take effect on the next Roco cycle — no restart needed.</p>
+        </div>
+
+        <!-- Tab switcher -->
+        <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:28px;max-width:860px">
+          <button id="train-tab-investor" onclick="switchTrainTab('investor')"
+            style="padding:10px 24px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:600;color:var(--gold);border-bottom:2px solid var(--gold);letter-spacing:0.05em">
+            Investor Outreach
+          </button>
+          <button id="train-tab-sourcing" onclick="switchTrainTab('sourcing')"
+            style="padding:10px 24px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:600;color:var(--text-dim);border-bottom:2px solid transparent;letter-spacing:0.05em">
+            Company Sourcing
+          </button>
+        </div>
+
+        <!-- Investor Outreach form -->
+        <div id="train-form-investor" style="max-width:860px">
+          <div id="train-investor-updated" style="font-size:12px;color:var(--text-dim);margin-bottom:20px;display:none"></div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Identity &amp; Persona</label>
+            <textarea id="train-investor-identity" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Roco is acting as a representative of [firm name]. It approaches investors professionally and knowledgeably, positioning the deal as a compelling opportunity...&quot;"></textarea>
+            <div id="char-count-train-investor-identity" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 2000</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Voice &amp; Tone</label>
+            <textarea id="train-investor-voice" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Conversational and direct. No em-dashes. No corporate language. No 'I hope this finds you well.' Sound like a trusted colleague, not a pitch deck. Always use first name. Sign off as Dom.&quot;"></textarea>
+            <div id="char-count-train-investor-voice_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Search Guidance</label>
+            <textarea id="train-investor-search" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Prioritise investors who have made 2+ investments in this sector in the last 24 months. Look for signals of active deal flow. Avoid investors clearly focused on stages outside the raise target.&quot;"></textarea>
+            <div id="char-count-train-investor-search_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Research Guidance</label>
+            <textarea id="train-investor-research" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;For each investor, find their 3 most recent portfolio companies in this sector. Find their stated thesis from their website or public interviews. Look for any press coverage about their investment pace or deal preferences.&quot;"></textarea>
+            <div id="char-count-train-investor-research_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Scoring Guidance</label>
+            <textarea id="train-investor-scoring" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Sector fit: 30pts. Cheque size match: 25pts. Geography: 20pts. Portfolio overlap: 15pts. Activity recency: 10pts. If cheque size is clearly outside range — archive immediately regardless of other scores.&quot;"></textarea>
+            <div id="char-count-train-investor-scoring_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Outreach Guidance</label>
+            <textarea id="train-investor-outreach" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Always reference a specific past investment from their portfolio. Get to the deal in the first two sentences. Never send a generic opener. The reference must be real — pulled from actual research.&quot;"></textarea>
+            <div id="char-count-train-investor-outreach_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Reply &amp; Conversation Guidance</label>
+            <textarea id="train-investor-reply" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;When they reply with interest, ask one qualifying question per message. Do not ask multiple at once. For investors: confirm cheque size appetite, current deal flow timeline, and any sector concerns. Move toward a call as soon as interest is confirmed.&quot;"></textarea>
+            <div id="char-count-train-investor-reply_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:32px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Closing Guidance</label>
+            <textarea id="train-investor-closing" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Once qualifying questions are answered and interest is confirmed, push directly for a 20-minute call. If no response after two follow-ups, close the thread graciously and archive. Never ghost — always close cleanly.&quot;"></textarea>
+            <div id="char-count-train-investor-closing_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+            <button class="btn btn-gold" onclick="saveTrainGuidance('investor')">Save &amp; Apply</button>
+            <span id="train-investor-save-status" style="font-size:13px;color:var(--text-dim)"></span>
+          </div>
+          <p style="font-size:12px;color:var(--text-dim);margin-top:12px">Saving updates Roco immediately. All future outreach, replies and research will use these rules on the next cycle.</p>
+        </div>
+
+        <!-- Company Sourcing form -->
+        <div id="train-form-sourcing" style="max-width:860px;display:none">
+          <div id="train-sourcing-updated" style="font-size:12px;color:var(--text-dim);margin-bottom:20px;display:none"></div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Identity &amp; Persona</label>
+            <textarea id="train-sourcing-identity" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Roco is acting as a representative of the investment firm. It approaches company founders and executives as a firm that has already identified their business as a potential fit...&quot;"></textarea>
+            <div id="char-count-train-sourcing-identity" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 2000</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Voice &amp; Tone</label>
+            <textarea id="train-sourcing-voice" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Confident, peer-to-peer. Sound like an investor who already knows the market and has done their homework. No em-dashes. No pitch language. Reference their actual product and company specifically.&quot;"></textarea>
+            <div id="char-count-train-sourcing-voice_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Search Guidance</label>
+            <textarea id="train-sourcing-search" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Look for companies with active signals: hiring senior roles, announcing growth milestones, raising awareness through content, or expressing openness to capital...&quot;"></textarea>
+            <div id="char-count-train-sourcing-search_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Research Guidance</label>
+            <textarea id="train-sourcing-research" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;For each company, understand exactly what their product does and who their customers are. Find revenue estimates if available. Look for founding team background and any public press...&quot;"></textarea>
+            <div id="char-count-train-sourcing-research_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Scoring Guidance</label>
+            <textarea id="train-sourcing-scoring" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Sector and thesis fit: 30pts. Financial criteria match: 25pts. Geography: 20pts. Ownership and stage fit: 15pts. Intent signal strength: 10pts. If clearly outside financial criteria — archive without outreach.&quot;"></textarea>
+            <div id="char-count-train-sourcing-scoring_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Outreach Guidance</label>
+            <textarea id="train-sourcing-outreach" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Reference something specific about their product or a recent signal. Position the firm as an interested party that has identified them specifically. Be direct about what the firm does and why they reached out.&quot;"></textarea>
+            <div id="char-count-train-sourcing-outreach_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:24px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Reply &amp; Conversation Guidance</label>
+            <textarea id="train-sourcing-reply" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;When a founder replies, ask about current revenue run rate, ownership structure, and openness to exploring investment. One question per message. Move toward a call as soon as they confirm interest.&quot;"></textarea>
+            <div id="char-count-train-sourcing-reply_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom:32px">
+            <label class="form-label" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim)">Closing Guidance</label>
+            <textarea id="train-sourcing-closing" class="form-textarea train-auto-resize" rows="6"
+              placeholder="e.g. &quot;Once they've shown genuine interest and confirmed they're open to exploring, push for a 30-minute introductory call. If they go cold after two follow-ups, close politely and archive.&quot;"></textarea>
+            <div id="char-count-train-sourcing-closing_guidance" style="text-align:right;font-size:11px;color:#6b7280;margin-top:4px">0 / 1800</div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+            <button class="btn btn-gold" onclick="saveTrainGuidance('sourcing')">Save &amp; Apply</button>
+            <span id="train-sourcing-save-status" style="font-size:13px;color:var(--text-dim)"></span>
+          </div>
+          <p style="font-size:12px;color:var(--text-dim);margin-top:12px">Saving updates Roco immediately. All future outreach, replies and research will use these rules on the next cycle.</p>
+        </div>
+      </section>
+
+      <!-- ENV VARIABLES VIEW -->
+      <section id="view-env" class="view-section hidden">
+        <div class="section-header">
+          <h1 class="section-title">Environment Variables</h1>
+          <p style="color:var(--text-dim);font-size:13px;margin-top:4px">All API keys and configuration. Changes take effect immediately. AI client keys (Anthropic, OpenAI) require a Roco restart to reload.</p>
+        </div>
+        <div id="env-container" style="max-width:860px">
+          <div style="color:var(--text-dim);padding:16px">Loading&#8230;</div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Deal History Modal -->
+  <div id="deal-history-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)this.style.display='none'">
+    <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:28px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <h3 id="deal-history-title" style="margin:0;color:var(--text-bright)"></h3>
+        <button onclick="document.getElementById('deal-history-modal').style.display='none'" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:18px">&#10005;</button>
+      </div>
+      <div id="deal-history-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit / Instructions Modal -->
+<div class="modal-overlay hidden" id="edit-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 class="modal-title" id="modal-title">Edit</h3>
+      <button class="modal-close" onclick="closeModal()">&#215;</button>
+    </div>
+    <div class="modal-body" id="modal-body">
+      <div class="form-group">
+        <label class="form-label">Instructions / Edits</label>
+        <textarea id="modal-instructions" class="form-textarea" rows="5" placeholder="Describe what to change in this email&#8230;"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-gold" id="modal-confirm-btn" onclick="modalConfirm()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>

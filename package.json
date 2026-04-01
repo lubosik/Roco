@@ -1,0 +1,41 @@
+{
+  "name": "roco",
+  "version": "1.0.0",
+  "description": "Roco — Autonomous Fundraising AI Agent",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "seed": "node scripts/seedDeal.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "@cedrugs/pdf-parse": "^1.0.0",
+    "@google/genai": "^1.45.0",
+    "@google/generative-ai": "latest",
+    "@supabase/supabase-js": "^2.99.0",
+    "apify-client": "^2.22.2",
+    "better-sqlite3": "^12.6.2",
+    "chokidar": "latest",
+    "csv-parse": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "express-session": "^1.19.0",
+    "googleapis": "latest",
+    "luxon": "^3.7.2",
+    "mammoth": "^1.12.0",
+    "multer": "^2.1.1",
+    "node-cron": "latest",
+    "node-fetch": "latest",
+    "node-telegram-bot-api": "latest",
+    "openai": "latest",
+    "papaparse": "^5.5.3",
+    "unipile-node-sdk": "^1.9.3",
+    "winston": "latest",
+    "ws": "latest",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "pg": "^8.20.0"
+  }
+}
