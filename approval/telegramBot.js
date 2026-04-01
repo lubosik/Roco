@@ -10,6 +10,21 @@ import { aiComplete } from '../core/aiClient.js';
 let bot;
 let rocoState; // injected from orchestrator
 
+const CURRENCY_SYMBOLS = {
+  USD: '$',
+  GBP: '£',
+  EUR: '€',
+  CAD: 'CA$',
+  AUD: 'A$',
+  CHF: 'Fr',
+  SGD: 'S$',
+};
+
+function formatCurrencyAmount(amount, currency = 'USD') {
+  const symbol = CURRENCY_SYMBOLS[(currency || 'USD').toUpperCase()] || '$';
+  return `${symbol}${Number(amount || 0).toLocaleString()}`;
+}
+
 const pendingApprovals  = new Map(); // messageId -> { contactPage, emailDraft, resolve, ... }
 const editLoops         = new Map(); // contactPageId -> count
 const pendingEditReqs   = new Map(); // chatId -> msgId  (waiting for edit instructions after button press)
@@ -798,7 +813,7 @@ async function handleStatus(chatId) {
     }
 
     const dealLines = deals?.map(d =>
-      `• ${d.name} — £${(d.committed_amount || 0).toLocaleString()} / £${(d.target_amount || 0).toLocaleString()}`
+      `• ${d.name} — ${formatCurrencyAmount(d.committed_amount, d.currency)} / ${formatCurrencyAmount(d.target_amount, d.currency)}`
     ).join('\n') || '• No active deals';
 
     const isActive = (state.rocoStatus === 'ACTIVE') || (rocoState?.status === 'ACTIVE');

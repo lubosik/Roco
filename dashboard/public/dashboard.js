@@ -1241,8 +1241,8 @@ function renderDealCard(deal) {
     </div>
     <div class="deal-progress-wrap">
       <div class="deal-progress-label">
-        <span>${deal.capitalCommittedDisplay || formatMoney(committed)}</span>
-        <span>${deal.targetAmountDisplay || formatMoney(target)}</span>
+        <span>${deal.capitalCommittedDisplay || formatMoney(committed, deal.currency || 'USD')}</span>
+        <span>${deal.targetAmountDisplay || formatMoney(target, deal.currency || 'USD')}</span>
       </div>
       <div class="deal-progress-bar">
         <div class="deal-progress-fill" style="width:${pct_}%"></div>
@@ -1390,8 +1390,8 @@ async function loadDealTabOverview(id, deal) {
   el.innerHTML = `
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Fundraise</div>
     <div class="deal-stats" style="grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px">
-      ${stat(formatMoney(m.capitalCommitted || deal.committed_amount || 0), 'Capital Committed')}
-      ${stat(formatMoney(m.targetAmount || deal.target_amount || 0), 'Target')}
+      ${stat(formatMoney(m.capitalCommitted || deal.committed_amount || 0, deal.currency || 'USD'), 'Capital Committed')}
+      ${stat(formatMoney(m.targetAmount || deal.target_amount || 0, deal.currency || 'USD'), 'Target')}
       ${stat(fmt(m.activeProspects || 0), 'Active Prospects')}
       ${stat(fmt(m.totalContacts || 0), 'Total Contacts')}
     </div>
@@ -2673,7 +2673,7 @@ async function loadDealTabSettings(id) {
         </div>
         <div class="form-group">
           <label class="form-label">Currency</label>
-          <select class="form-input" id="ds-currency" onchange="document.getElementById('ds-target-label').textContent='Target Amount ('+(CURRENCY_SYMBOLS[this.value]||this.value)+')'">
+          <select class="form-input" id="ds-currency" onchange="updateDealCurrencyLabels(this.value)">
             ${['USD','GBP','EUR','CAD','AUD','CHF','SGD'].map(c => `<option value="${c}" ${(deal.currency || 'USD') === c ? 'selected' : ''}>${CURRENCY_SYMBOLS[c] || c} ${c}</option>`).join('')}
           </select>
         </div>
@@ -2792,7 +2792,7 @@ async function loadDealTabSettings(id) {
       <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 12px">Capital Committed</h3>
       <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:24px">
         <div class="form-group" style="flex:1;margin:0">
-          <label class="form-label">Amount Committed (£)</label>
+          <label class="form-label" id="ds-capital-label">Amount Committed (${CURRENCY_SYMBOLS[deal.currency || 'USD'] || '$'})</label>
           <input type="number" class="form-input" id="ds-capital-input" value="${deal.committed_amount || ''}" placeholder="e.g. 250000" />
         </div>
         <button class="btn btn-gold" style="white-space:nowrap" onclick="updateCapital('${id}')">Update Capital</button>
@@ -2880,7 +2880,8 @@ async function updateCapital(dealId) {
   if (!amount) return showToast('Enter an amount', 'error');
   try {
     await api(`/api/deals/${dealId}/capital`, 'POST', { amount: Number(amount) });
-    showToast(`Capital updated — £${Number(amount).toLocaleString()}`);
+    const currency = document.getElementById('ds-currency')?.value || window.__activeDealCurrency || 'USD';
+    showToast(`Capital updated — ${formatMoney(amount, currency)}`);
     await refreshStats();
   } catch (e) { showToast(`Failed: ${e.message}`, 'error'); }
 }
@@ -2921,9 +2922,18 @@ async function saveDealSettings(id) {
   const origText = btn?.textContent;
   if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
   try {
-    await api(`/api/deals/${id}`, 'PATCH', payload);
+    const res = await api(`/api/deals/${id}`, 'PATCH', payload);
+    const updatedDeal = res?.deal || null;
+    if (updatedDeal) {
+      allDeals = (allDeals || []).map(d => ((d.id || d._id) === id ? { ...d, ...updatedDeal } : d));
+    }
     // Update active currency context so formatMoney reflects change immediately
     if (payload.currency) window.__activeDealCurrency = payload.currency;
+    await loadDeals();
+    const activeTab = document.querySelector('.deal-tab.active')?.dataset.tab || 'overview';
+    if (selectedDealId === id) {
+      await switchDealTab(activeTab, document.querySelector(`.deal-tab[data-tab="${activeTab}"]`));
+    }
     await populateDealSelector();
     showToast('Settings saved');
   } catch (err) {
@@ -3626,7 +3636,7 @@ async function loadArchive() {
         <td><strong>${esc(name)}</strong></td>
         <td class="text-dim">${formatDate(openedAt)}</td>
         <td class="text-dim">${formatDate(closedAt)}</td>
-        <td class="mono">${formatMoney(committed)} / ${formatMoney(target)}</td>
+        <td class="mono">${formatMoney(committed, d.currency || 'USD')} / ${formatMoney(target, d.currency || 'USD')}</td>
         <td class="mono">${fmt(d.emails_sent || d.emailsSent || 0)}</td>
         <td class="mono">${fmt(d.invites_sent_week || d.invitesSentWeek || 0)}</td>
         <td class="mono">${d.response_rate != null ? pct(d.response_rate) : (d.responseRate != null ? pct(d.responseRate) : '—')}</td>
@@ -5066,6 +5076,14 @@ function pct(n) {
 }
 
 const CURRENCY_SYMBOLS = { USD: '$', GBP: '£', EUR: '€', CAD: 'CA$', AUD: 'A$', CHF: 'Fr', JPY: '¥', SGD: 'S$' };
+
+function updateDealCurrencyLabels(currency) {
+  const symbol = CURRENCY_SYMBOLS[currency || 'USD'] || '$';
+  const targetLabel = document.getElementById('ds-target-label');
+  const capitalLabel = document.getElementById('ds-capital-label');
+  if (targetLabel) targetLabel.textContent = `Target Amount (${symbol})`;
+  if (capitalLabel) capitalLabel.textContent = `Amount Committed (${symbol})`;
+}
 
 function formatMoney(v, currency) {
   if (!v) return '—';

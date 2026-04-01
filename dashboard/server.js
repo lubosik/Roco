@@ -100,6 +100,22 @@ function writeState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
+const CURRENCY_SYMBOLS = {
+  USD: '$',
+  GBP: '£',
+  EUR: '€',
+  CAD: 'CA$',
+  AUD: 'A$',
+  CHF: 'Fr',
+  SGD: 'S$',
+};
+
+function formatCurrencyAmount(amount, currency = 'USD') {
+  const value = Number(amount || 0);
+  const symbol = CURRENCY_SYMBOLS[(currency || 'USD').toUpperCase()] || '$';
+  return `${symbol}${value.toLocaleString()}`;
+}
+
 // ─────────────────────────────────────────────
 // LINKEDIN DM SEND HELPER (approval flow)
 // ─────────────────────────────────────────────
@@ -1655,15 +1671,14 @@ function registerRoutes(app) {
       }
       if (Array.isArray(geography)) geography = geography.join(', ');
 
-      const descriptionText  = req.body.description || '';
-      const keyMetricsText   = req.body.keyMetrics || req.body.key_metrics || '';
-      const investorText     = req.body.investorProfile || req.body.investor_profile || '';
-      const targetText       = req.body.targetAmount || req.body.target_amount || '';
-      const detectedCurrency = detectCurrency([descriptionText, keyMetricsText, investorText, targetText, name]);
+      const descriptionText = req.body.description || '';
+      const keyMetricsText = req.body.keyMetrics || req.body.key_metrics || '';
+      const investorText = req.body.investorProfile || req.body.investor_profile || '';
+      const dealCurrency = (req.body.currency || 'USD').toString().trim().toUpperCase() || 'USD';
 
       const deal = {
         name,
-        currency:              detectedCurrency,
+        currency:              dealCurrency,
         raise_type:            req.body.raiseType || req.body.raise_type || 'Equity',
         target_amount:         parseAmount(req.body.targetAmount || req.body.target_amount),
         min_cheque:            parseAmount(req.body.minCheque || req.body.min_cheque),
@@ -1695,7 +1710,7 @@ function registerRoutes(app) {
         active_prospects:      0,
         created_by:            'dashboard',
       };
-      console.log(`[DEAL LAUNCH] Detected currency: ${detectedCurrency} for "${name}"`);
+      console.log(`[DEAL LAUNCH] Using currency: ${dealCurrency} for "${name}"`);
 
       const supabase = getSupabase();
       const { data: savedDeal, error: supabaseError } = await supabase
@@ -1744,7 +1759,9 @@ function registerRoutes(app) {
 
       pushActivity({ type: 'SYSTEM', action: 'Deal Launched', note: name });
       await sbLogActivity({ dealId: savedDeal.id, eventType: 'DEAL_CREATED', summary: `Deal "${name}" created` }).catch(() => {});
-      const tgTarget = savedDeal.target_amount > 0 ? '£' + Number(savedDeal.target_amount).toLocaleString() : '—';
+      const tgTarget = savedDeal.target_amount > 0
+        ? formatCurrencyAmount(savedDeal.target_amount, savedDeal.currency)
+        : '—';
       await sendTelegram(`New deal launched: ${name}\nTarget: ${tgTarget}\nSector: ${savedDeal.sector || '—'}\nRaise Type: ${savedDeal.raise_type || '—'}\n\nRoco is on it.`).catch(() => {});
 
       // Auto-insert deck_url into deal_assets
@@ -2026,7 +2043,7 @@ function registerRoutes(app) {
 
       info(`[CLOSE] Deal "${deal.name}" closed — cleared ${clearedApprovals} approval(s) from queue`);
       await sbLogActivity({ dealId, eventType: 'DEAL_CLOSED', summary: `Deal "${deal.name}" closed` });
-      await sendTelegram(`Deal closed: ${deal.name}\nFinal committed: £${(deal.committed_amount || 0).toLocaleString()} of £${(deal.target_amount || 0).toLocaleString()} target\n\nAll outreach stopped. Deal archived.`).catch(() => {});
+      await sendTelegram(`Deal closed: ${deal.name}\nFinal committed: ${formatCurrencyAmount(deal.committed_amount, deal.currency)} of ${formatCurrencyAmount(deal.target_amount, deal.currency)} target\n\nAll outreach stopped. Deal archived.`).catch(() => {});
       pushActivity({ type: 'system', action: `Deal closed: ${deal.name}`, note: `All outreach stopped — ${clearedApprovals} pending approval(s) cleared`, dealId, deal_name: deal.name });
       broadcastToAll({ type: 'DEAL_UPDATED', deal });
       broadcastToAll({ type: 'DEAL_CLOSED', dealId });
@@ -2237,7 +2254,11 @@ function registerRoutes(app) {
     try {
       const deal = await updateDeal(req.params.id, { committed_amount: Number(amount) });
       broadcastToAll({ type: 'DEAL_UPDATED', deal });
-      pushActivity({ type: 'system', action: `Capital updated: ${deal.name}`, note: `£${Number(amount).toLocaleString()} committed` });
+      pushActivity({
+        type: 'system',
+        action: `Capital updated: ${deal.name}`,
+        note: `${formatCurrencyAmount(amount, deal.currency)} committed`,
+      });
       res.json({ success: true, committed_amount: Number(amount) });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
