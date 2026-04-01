@@ -30,7 +30,12 @@ import { sendEmailForApproval, sendLinkedInDMForApproval, sendTelegram } from '.
 import { draftEmail } from '../outreach/emailDrafter.js';
 import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
 import { isExcluded } from './exclusionCheck.js';
-import { researchPerson, isResearched } from '../research/personResearcher.js';
+import {
+  researchPerson,
+  isResearched,
+  hasCoreResearchFields,
+  hasFreshResearch,
+} from '../research/personResearcher.js';
 import { runFirmResearch } from '../research/firmResearcher.js';
 import { runDealResearch } from '../research/dealResearcher.js'; // legacy fallback
 import { queryInvestorDatabase, batchScoreInvestors as batchScoreInvestors } from './investorDatabaseQuery.js';
@@ -297,6 +302,73 @@ async function backfillContactsFromInvestorsDb() {
 /** How many ranked firms trigger a campaign review */
 const BATCH_FIRM_TARGET = 20;
 
+function classifyBatchEntity({ companyName, isAngel }) {
+  const companyLower = (companyName || '').toLowerCase().trim();
+  const contactType = (!companyName || GENERIC_FIRM_NAMES.has(companyLower) || isAngel)
+    ? 'individual'
+    : 'institutional';
+  return {
+    contactType,
+    entityKey: contactType === 'institutional' ? companyLower : null,
+  };
+}
+
+async function getBatchEntitySnapshot(dealId, batchStart) {
+  const sb = getSupabase();
+  if (!sb) return { entityCount: 0, firmKeys: new Set() };
+
+  const ACTIVE_STAGES = ['Ranked', 'ranked', 'Enriched', 'enriched', 'email_sent', 'dm_sent',
+    'invite_sent', 'invite_accepted', 'Replied', 'In Conversation'];
+
+  const { data: firmContacts } = await sb.from('contacts')
+    .select('company_name')
+    .eq('deal_id', dealId)
+    .in('contact_type', ['institutional', 'individual_at_firm'])
+    .gte('created_at', batchStart)
+    .in('pipeline_stage', ACTIVE_STAGES)
+    .not('pipeline_stage', 'eq', 'Archived');
+
+  const firmKeys = new Set(
+    (firmContacts || []).map(c => (c.company_name || '').toLowerCase().trim()).filter(Boolean)
+  );
+
+  const { count: individualCount } = await sb.from('contacts')
+    .select('id', { count: 'exact', head: true })
+    .eq('deal_id', dealId)
+    .eq('contact_type', 'individual')
+    .gte('created_at', batchStart)
+    .in('pipeline_stage', ACTIVE_STAGES)
+    .not('pipeline_stage', 'eq', 'Archived');
+
+  return {
+    entityCount: firmKeys.size + (individualCount || 0),
+    firmKeys,
+  };
+}
+
+async function backfillBatchContactTypes(deal, batch) {
+  if (!batch) return;
+  const sb = getSupabase();
+  if (!sb) return;
+
+  const { data: contacts } = await sb.from('contacts')
+    .select('id, company_name, is_angel')
+    .eq('deal_id', deal.id)
+    .gte('created_at', batch.created_at)
+    .is('contact_type', null)
+    .not('pipeline_stage', 'eq', 'Archived')
+    .limit(200);
+
+  for (const contact of contacts || []) {
+    const { contactType } = classifyBatchEntity({
+      companyName: contact.company_name,
+      isAngel: contact.is_angel,
+    });
+    await sb.from('contacts').update({ contact_type: contactType }).eq('id', contact.id);
+  }
+}
+
+
 async function getOrCreateBatch(deal) {
   const sb = getSupabase();
   if (!sb) return null;
@@ -377,37 +449,11 @@ async function updateBatchFirms(deal, batch) {
   if (!batch) return false;
   const sb = getSupabase();
   if (!sb) return false;
-
-  const ACTIVE_STAGES = ['Ranked', 'ranked', 'Enriched', 'enriched', 'email_sent', 'dm_sent',
-    'invite_sent', 'invite_accepted', 'Replied', 'In Conversation'];
-
-  // Only count contacts promoted after this batch started
   const batchStart = batch.created_at;
-
-  // Count unique institutional firms in this batch window
-  const { data: institutionalContacts } = await sb.from('contacts')
-    .select('company_name, contact_type')
-    .eq('deal_id', deal.id)
-    .eq('contact_type', 'institutional')
-    .gte('created_at', batchStart)
-    .in('pipeline_stage', ACTIVE_STAGES)
-    .not('pipeline_stage', 'eq', 'Archived');
-
-  const uniqueFirms = new Set(
-    (institutionalContacts || []).map(c => (c.company_name || '').toLowerCase().trim()).filter(Boolean)
-  );
-
-  // Count individual contacts in this batch window
-  const { count: individualCount } = await sb.from('contacts')
-    .select('id', { count: 'exact', head: true })
-    .eq('deal_id', deal.id)
-    .eq('contact_type', 'individual')
-    .gte('created_at', batchStart)
-    .in('pipeline_stage', ACTIVE_STAGES)
-    .not('pipeline_stage', 'eq', 'Archived');
-
-  const entityCount = uniqueFirms.size + (individualCount || 0);
-  console.log(`[BATCH] ${deal.name} batch #${batch.batch_number}: ${uniqueFirms.size} firms + ${individualCount || 0} individuals = ${entityCount}/${BATCH_FIRM_TARGET}`);
+  await backfillBatchContactTypes(deal, batch);
+  const snapshot = await getBatchEntitySnapshot(deal.id, batchStart);
+  const entityCount = Math.min(snapshot.entityCount, BATCH_FIRM_TARGET);
+  console.log(`[BATCH] ${deal.name} batch #${batch.batch_number}: ${snapshot.firmKeys.size} firms + ${Math.max(0, snapshot.entityCount - snapshot.firmKeys.size)} individuals = ${entityCount}/${BATCH_FIRM_TARGET}`);
 
   // Update batch with current entity count
   await sb.from('campaign_batches')
@@ -415,18 +461,18 @@ async function updateBatchFirms(deal, batch) {
     .eq('id', batch.id);
 
   if (entityCount >= BATCH_FIRM_TARGET && batch.status === 'researching') {
-    // Verify all contacts in this batch window are fully researched before sending for approval.
-    // Research must complete (past_investments, thesis, etc.) BEFORE Dom reviews the campaign.
+    // Verify that contacts actually queued for outreach (Ranked/Enriched) are fully researched.
+    // We only gate on active outreach candidates — not every contact ever created for this deal.
     const { count: unresearchedCount } = await sb.from('contacts')
       .select('id', { count: 'exact', head: true })
       .eq('deal_id', deal.id)
       .gte('created_at', batchStart)
-      .not('pipeline_stage', 'eq', 'Archived')
+      .in('pipeline_stage', ['Ranked', 'ranked', 'Enriched', 'enriched'])
       .eq('person_researched', false);
 
     if ((unresearchedCount || 0) > 0) {
-      console.log(`[BATCH] ${deal.name} batch #${batch.batch_number}: 20 firms ranked but ${unresearchedCount} still being researched — holding for approval`);
-      return false; // research continues — will trigger review once all done
+      console.log(`[BATCH] ${deal.name} batch #${batch.batch_number}: 20 firms ranked but ${unresearchedCount} outreach-ready contacts still need person research — holding`);
+      return false;
     }
 
     // Check if there's already an active batch (pending_approval or approved)
@@ -475,6 +521,44 @@ async function updateBatchFirms(deal, batch) {
     }
     return true;
   }
+  return false;
+}
+
+function deepResearchOnlyForBatch() {
+  const value = process.env.RESEARCH_DEEP_ONLY_FOR_BATCH;
+  if (value == null || value === '') return true;
+  return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
+}
+
+function isContactInsideBatch(contact, batch) {
+  if (!contact?.created_at || !batch?.created_at) return false;
+  return Date.parse(contact.created_at) >= Date.parse(batch.created_at);
+}
+
+function contactNeedsCoreResearch(contact) {
+  return !contact?.past_investments || !contact?.investment_thesis || !contact?.sector_focus;
+}
+
+function hasResearchFailureMarker(notes) {
+  if (typeof notes !== 'string') return false;
+  return notes.includes('[PERSON_RESEARCH_FAILED]') || notes.includes('Research failed');
+}
+
+function shouldResearchContact(contact, deal, batch) {
+  const scoreThreshold = Number(deal.min_investor_score || 60);
+  const score = Number(contact.investor_score || 0);
+  const inCurrentBatch = isContactInsideBatch(contact, batch);
+  const missingCore = contactNeedsCoreResearch(contact);
+  const freshResearch = hasFreshResearch(contact);
+  const existingResearch = !!contact.person_researched ||
+    hasCoreResearchFields(contact) ||
+    (isResearched(contact.notes) && !hasResearchFailureMarker(contact.notes));
+
+  if (freshResearch && !missingCore) return false;
+  if (!existingResearch) return true;
+  if (missingCore) return true;
+  if (inCurrentBatch) return true;
+  if (!deepResearchOnlyForBatch() && score >= scoreThreshold) return true;
   return false;
 }
 
@@ -645,8 +729,14 @@ async function runDealCycle(deal, state) {
 
   // All research/enrichment phases run 24/7
   if (state.research_enabled !== false) {
-    await phaseDatabaseQuery(deal);  // query investor DB, score with Haiku 4.5, promote shortlist
-    await phasePersonResearch(deal); // research person+firm FIRST so ranker has full data
+    // Skip DB promotion if the current researching batch already hit its firm target
+    const batchFull = batch?.status === 'researching' && (batch?.ranked_firms || 0) >= BATCH_FIRM_TARGET;
+    if (!batchFull) {
+      await phaseDatabaseQuery(deal, batch);      // query investor DB, score with Haiku 4.5, promote shortlist
+    } else {
+      info(`[${deal.name}] DB QUERY: batch at ${batch.ranked_firms}/${BATCH_FIRM_TARGET} — skipping promotion`);
+    }
+    await phasePersonResearch(deal, batch); // research person+firm FIRST so ranker has full data
     await phaseRank(deal, state);    // rank only contacts that have been researched
     await phaseArchive(deal, state);
     await phaseNotionSync(deal, state); // sync immediately after ranking
@@ -714,7 +804,7 @@ async function runDealCycle(deal, state) {
 // Only runs when pipeline is below 100 contacts
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function phaseDatabaseQuery(deal) {
+async function phaseDatabaseQuery(deal, batch) {
   const sb = getSupabase();
   if (!sb) return;
 
@@ -854,6 +944,17 @@ async function phaseDatabaseQuery(deal) {
       : `Database (${shortlisted[0]?.investor_category || 'General'})`;
 
     let promoted = 0;
+    const batchSnapshot = batch
+      ? await getBatchEntitySnapshot(deal.id, batch.created_at)
+      : { entityCount: 0, firmKeys: new Set() };
+    let remainingEntitySlots = Math.max(0, BATCH_FIRM_TARGET - batchSnapshot.entityCount);
+    const batchFirmKeys = new Set(batchSnapshot.firmKeys);
+
+    if (batch && remainingEntitySlots === 0) {
+      info(`[${deal.name}] DB QUERY: current batch already full (${BATCH_FIRM_TARGET}/${BATCH_FIRM_TARGET}) — skipping new entities`);
+      return;
+    }
+
     for (const investor of shortlisted) {
       // Final dup guard (by linkedin_url)
       if (investor.linkedin_url) {
@@ -892,7 +993,9 @@ async function phaseDatabaseQuery(deal) {
         if (activeElsewhere?.length) continue;
       }
 
-      const alreadyResearched = !!(investor.person_researched || investor.last_researched_at);
+      // Contacts from investors_db already have structured data (description, thesis, AUM, etc.)
+      // — mark as researched so the batch gate doesn't stall waiting for per-person Grok calls
+      const alreadyResearched = !!(investor.person_researched || investor.last_researched_at || investor.description || investor.investment_thesis);
       const existingEmail     = investor.email || investor.primary_contact_email || null;
       const existingLinkedin  = investor.decision_maker_linkedin || null;
       const existingName      = investor.decision_maker_name || investor.primary_contact_name || investor.name;
@@ -908,6 +1011,13 @@ async function phaseDatabaseQuery(deal) {
       const skipEnrichment = !!existingEmail;
       const promoteStage   = skipEnrichment ? 'Enriched' : 'Researched';
       const promoteEnrich  = skipEnrichment ? 'enriched'  : 'Pending';
+      const { contactType, entityKey } = classifyBatchEntity({
+        companyName: investor.name,
+        isAngel: investor.is_angel || false,
+      });
+      const consumesNewEntity = contactType === 'individual' || (entityKey && !batchFirmKeys.has(entityKey));
+
+      if (batch && consumesNewEntity && remainingEntitySlots <= 0) break;
 
       await sb.from('contacts').insert({
         deal_id:              deal.id,
@@ -924,6 +1034,7 @@ async function phaseDatabaseQuery(deal) {
           (investor.preferred_deal_size_min && investor.preferred_deal_size_max
             ? `$${investor.preferred_deal_size_min}M - $${investor.preferred_deal_size_max}M` : null),
         investor_score:       investor.score,
+        investment_thesis:    investor.investment_thesis || null,
         past_investments:     investor.past_investments || null,
         pipeline_stage:       promoteStage,
         enrichment_status:    promoteEnrich,
@@ -933,13 +1044,17 @@ async function phaseDatabaseQuery(deal) {
         person_researched:    alreadyResearched,
         is_warm_contact:      isWarmList,
         conversation_state:   isWarmList ? 'warm_not_started' : 'not_started',
-        // contact_type left null at promotion — phaseRank will classify from name/company heuristics
+        contact_type:         contactType,
         is_angel:             investor.is_angel || false,
         created_at:           new Date().toISOString(),
       });
 
       pushActivity({ type: 'research', action: `Promoted: ${investor.name} (score: ${investor.score})`, deal_name: deal.name, dealId: deal.id });
       promoted++;
+      if (batch && consumesNewEntity) {
+        remainingEntitySlots--;
+        if (entityKey) batchFirmKeys.add(entityKey);
+      }
 
       if (investor.id) {
         try {
@@ -1085,7 +1200,7 @@ async function phaseArchive(deal, state) {
 // Tracked via [PERSON_RESEARCHED] marker in notes — no extra DB column needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function phasePersonResearch(deal) {
+async function phasePersonResearch(deal, batch) {
   const sb = getSupabase();
   if (!sb) return;
 
@@ -1095,16 +1210,29 @@ async function phasePersonResearch(deal) {
   const { data: allCandidates } = await sb.from('contacts')
     .select('*')
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Researched', 'RESEARCHED', 'researched', 'Enriched', 'ENRICHED', 'enriched'])
-    .is('investor_score', null)
+    .in('pipeline_stage', ['Researched', 'RESEARCHED', 'researched', 'Enriched', 'ENRICHED', 'enriched', 'Ranked', 'RANKED', 'ranked'])
     .order('created_at', { ascending: true })
-    .limit(30);
+    .limit(80);
 
-  // Filter in JS so contacts with NULL notes (never researched) are included correctly.
-  // Also skip contacts already marked researched via the DB column (set at promotion time).
+  // Filter and prioritize in JS so we only spend live-search budget on contacts
+  // that are missing core fields, inside the current batch, or otherwise eligible.
   const candidates = (allCandidates || [])
-    .filter(c => !c.person_researched && (!c.notes || !c.notes.includes('[PERSON_RESEARCHED]')))
+    .filter(c => shouldResearchContact(c, deal, batch))
+    .sort((a, b) => {
+      const aBatch = isContactInsideBatch(a, batch) ? 1 : 0;
+      const bBatch = isContactInsideBatch(b, batch) ? 1 : 0;
+      if (aBatch !== bBatch) return bBatch - aBatch;
+      const aMissing = contactNeedsCoreResearch(a) ? 1 : 0;
+      const bMissing = contactNeedsCoreResearch(b) ? 1 : 0;
+      if (aMissing !== bMissing) return bMissing - aMissing;
+      return Number(b.investor_score || 0) - Number(a.investor_score || 0);
+    })
     .slice(0, 5);
+
+  if (!candidates.length) {
+    info(`[${deal.name}] phasePersonResearch: no eligible candidates`);
+    return;
+  }
 
   for (const contact of candidates) {
     pushActivity({
@@ -1126,7 +1254,7 @@ async function phasePersonResearch(deal) {
       pushActivity({ type: 'error', action: `Research failed: ${contact.name}`, note: msg, deal_name: deal.name, dealId: deal.id });
       warn(`[PERSON RESEARCH] Error for ${contact.name}: ${err.message}`);
       await sb.from('contacts').update({
-        notes: (contact.notes ? contact.notes + '\n' : '') + '[PERSON_RESEARCHED] Research failed — API error',
+        notes: (contact.notes ? contact.notes + '\n' : '') + '[PERSON_RESEARCH_FAILED] API error',
       }).eq('id', contact.id);
       continue; // move to next contact, don't abort the whole batch
     }
@@ -1141,10 +1269,11 @@ async function phasePersonResearch(deal) {
       if (result.sector_focus) updates.sector_focus = result.sector_focus;
       if (result.geography)    updates.geography    = result.geography;
       if (result.past_investments) updates.past_investments = result.past_investments;
+      if (result.investment_thesis) updates.investment_thesis = result.investment_thesis;
       if (result.linkedin_url && !contact.linkedin_url) updates.linkedin_url = result.linkedin_url;
       // Update contact_type if research confirms a different classification
       if (result.contact_type_confirmed) {
-        updates.contact_type = result.contact_type_confirmed;
+        updates.contact_type = result.contact_type_confirmed === 'angel' ? 'individual' : result.contact_type_confirmed;
         updates.is_angel     = result.contact_type_confirmed === 'angel';
       }
 
@@ -1179,7 +1308,11 @@ async function phasePersonResearch(deal) {
         if (result.typical_cheque)    dbUpdates.typical_cheque_size = result.typical_cheque;
         if (result.firm_aum)          dbUpdates.aum_millions = parseFloat(result.firm_aum.replace(/[^0-9.]/g, '')) || undefined;
         if (result.geography)         dbUpdates.preferred_geographies = result.geography;
-        if (result.contact_type_confirmed) dbUpdates.contact_type = result.contact_type_confirmed;
+        if (result.sector_focus)      dbUpdates.preferred_industries  = result.sector_focus;
+        if (result.contact_type_confirmed) {
+          dbUpdates.contact_type = result.contact_type_confirmed;
+          dbUpdates.is_angel = result.contact_type_confirmed === 'angel';
+        }
         const noteParts = [];
         if (result.firm_description)  noteParts.push(result.firm_description);
         if (result.investment_thesis) noteParts.push(`Thesis: ${result.investment_thesis}`);

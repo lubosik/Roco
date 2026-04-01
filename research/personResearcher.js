@@ -1,27 +1,91 @@
 /**
  * research/personResearcher.js
- * Deep-researches individual investors using Gemini (primary) or Grok (fallback).
- * Both use real-time web search grounding.
+ * Investor research router:
+ * - Reuse/canonicalize existing structured data first (zero-cost path)
+ * - Gemini grounded search is the default live-research provider
+ * - Grok is optional fallback
  * Tracks completion via a [PERSON_RESEARCHED] marker in the notes field.
  */
 
 import { getResearchContext } from '../core/agentContext.js';
 
-const GEMINI_MODELS = [
+const DEFAULT_GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-1.5-flash',
   'gemini-1.5-pro',
 ];
 
-const GROK_MODEL = 'grok-4-latest';
+const DEFAULT_GROK_MODEL = 'grok-4-latest';
+
+function boolFromEnv(value, fallback = false) {
+  if (value == null || value === '') return fallback;
+  return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
+}
+
+function getResearchConfig() {
+  return {
+    primaryProvider: (process.env.RESEARCH_PRIMARY_PROVIDER || 'gemini').toLowerCase(),
+    enableGrokFallback: boolFromEnv(process.env.RESEARCH_ENABLE_GROK_FALLBACK, true),
+    cacheTtlDays: Number(process.env.RESEARCH_CACHE_TTL_DAYS || 90),
+    geminiModels: (process.env.RESEARCH_GEMINI_MODELS || '')
+      .split(',')
+      .map(m => m.trim())
+      .filter(Boolean)
+      .slice(0, 5)
+      .concat(DEFAULT_GEMINI_MODELS)
+      .filter((model, index, all) => all.indexOf(model) === index),
+    grokModel: process.env.RESEARCH_GROK_MODEL || DEFAULT_GROK_MODEL,
+  };
+}
+
+function inferContactType(contact) {
+  if (contact.contact_type) return contact.contact_type;
+  const company = (contact.company_name || '').trim().toLowerCase();
+  if (contact.is_angel || !company) return 'individual';
+  return company.includes('angel investor') ? 'angel' : 'institutional';
+}
+
+export function hasCoreResearchFields(record) {
+  return !!(record?.past_investments && record?.investment_thesis && record?.sector_focus);
+}
+
+export function hasFreshResearch(record, ttlDays = getResearchConfig().cacheTtlDays) {
+  if (!record?.last_researched_at) return false;
+  const last = Date.parse(record.last_researched_at);
+  if (Number.isNaN(last)) return false;
+  return (Date.now() - last) < ttlDays * 24 * 60 * 60 * 1000;
+}
+
+export function normalizePersonResearch(record = {}) {
+  const notes = typeof record.notes === 'string' ? record.notes : '';
+  const type = inferContactType(record);
+  const description = record.firm_description || record.description || record.research_notes || notes || null;
+  return {
+    job_title: record.job_title || record.decision_maker_title || record.primary_contact_title || null,
+    company_name: record.company_name || record.firm_name || null,
+    firm_description: description ? String(description).substring(0, 600) : null,
+    firm_aum: record.firm_aum || record.aum_fund_size || (record.aum_millions ? `$${record.aum_millions}M` : null),
+    investment_stage: record.investment_stage || record.preferred_stage || null,
+    typical_cheque: record.typical_cheque || record.typical_cheque_size || null,
+    sector_focus: record.sector_focus || record.preferred_industries || null,
+    geography: record.geography || record.preferred_geographies || record.hq_country || record.hq_location || null,
+    past_investments: record.past_investments || null,
+    investment_thesis: record.investment_thesis || null,
+    linkedin_url: record.linkedin_url || record.decision_maker_linkedin || null,
+    recent_news: record.recent_news || null,
+    contact_type_confirmed: type,
+    confidence: hasCoreResearchFields(record) ? 'high' : 'medium',
+  };
+}
 
 function buildPrompt(contact, deal) {
   const firm    = contact.company_name || '';
   const isAngel = contact.is_angel || contact.contact_type === 'angel';
+  const isIndividual = contact.contact_type === 'individual';
 
-  const investorContext = isAngel
-    ? `${contact.name} is an ANGEL INVESTOR — an individual investing personal capital, not on behalf of a fund.
-Research their personal investment history, typical personal cheque sizes (usually $25K-$500K),
+  const investorContext = (isAngel || isIndividual)
+    ? `${contact.name} is an individual investor — investing personal or family capital, not on behalf of a fund.
+Research their personal investment history, typical personal cheque sizes,
 sectors they have backed personally, and any public statements about their investing.
 Do NOT look for a fund mandate or institutional AUM — they invest their own money.`
     : `${contact.name} is a ${contact.job_title || 'decision-maker'} at ${firm || 'an investment firm'}.
@@ -33,9 +97,9 @@ Also research ${contact.name}'s specific role and any public statements they hav
 
 INVESTOR:
 Name: ${contact.name}
-${firm ? `Firm: ${firm}` : 'No firm affiliation — independent/angel investor'}
+${firm ? `Firm: ${firm}` : 'No firm affiliation — independent investor'}
 Title: ${contact.job_title || 'Unknown'}
-Type: ${isAngel ? 'Angel Investor (personal capital)' : 'Institutional Investor'}
+Type: ${(isAngel || isIndividual) ? 'Individual Investor (personal capital)' : 'Institutional Investor'}
 ${contact.linkedin_url ? `LinkedIn: ${contact.linkedin_url}` : ''}
 
 DEAL CONTEXT:
@@ -48,20 +112,25 @@ ${investorContext}
 
 Using web search, find and return:
 1. Their exact current title and seniority
-2. ${isAngel ? 'Their personal investment activity and background' : 'The firm they work at and its investment focus'}
-3. ${isAngel ? 'Typical personal cheque size and sectors backed' : "The firm's investment focus, stage preference, typical cheque size, AUM"}
-4. 3-5 specific companies they have backed (personally for angels, via firm for institutional)
+2. ${(isAngel || isIndividual) ? 'Their personal investment activity and background' : 'The firm they work at and its investment focus'}
+3. ${(isAngel || isIndividual) ? 'Typical personal cheque size and sectors backed' : "The firm's investment focus, stage preference, typical cheque size, AUM"}
+4. 3-5 specific companies they have backed (personally for individuals/angels, via firm for institutional)
 5. Their investment thesis or stated focus
 6. Geographies they invest in
-7. Any recent news about them${isAngel ? '' : ' or their firm'} (last 12 months)
+7. Any recent news about them${(isAngel || isIndividual) ? '' : ' or their firm'} (last 12 months)
 8. Their LinkedIn URL if findable
+
+CONTACT TYPE CLASSIFICATION RULES (for contact_type_confirmed field):
+- "institutional" = operates a formal fund, VC, PE firm, family office, or invests on behalf of others/LPs
+- "angel" = explicitly self-identifies as an angel investor, backs early startups with personal capital, often listed on AngelList or similar
+- "individual" = high net worth individual or family wealth — invests personally but does not typically call themselves an angel (e.g. HNWI, family wealth, private investor, exec with personal portfolio)
 
 Return ONLY this JSON (no markdown, no other text):
 {
   "job_title": "<exact current title or null>",
-  "company_name": "<firm name — null if angel with no firm>",
-  "firm_description": "<2-3 sentence overview — firm for institutional, personal bio for angel>",
-  "firm_aum": "<AUM e.g. $500m or null — null for angels>",
+  "company_name": "<firm name — null if individual/angel with no firm>",
+  "firm_description": "<2-3 sentence overview — firm for institutional, personal bio for individual/angel>",
+  "firm_aum": "<AUM e.g. $500m or null — null for individuals/angels>",
   "investment_stage": "<e.g. Pre-seed, Seed, Series A>",
   "typical_cheque": "<e.g. £100k-£500k or null>",
   "sector_focus": "<their actual sectors, comma-separated>",
@@ -70,7 +139,7 @@ Return ONLY this JSON (no markdown, no other text):
   "investment_thesis": "<1-2 sentence thesis>",
   "linkedin_url": "<LinkedIn URL or null>",
   "recent_news": "<relevant recent news or null>",
-  "contact_type_confirmed": "<angel|individual_at_firm|firm — your assessment based on research>",
+  "contact_type_confirmed": "<institutional|angel|individual — your assessment based on research>",
   "confidence": "high|medium|low"
 }`;
 }
@@ -83,13 +152,12 @@ function parseJsonFromText(text) {
 
 /** Try Gemini with all models and both keys. Returns result or null. Pushes errors into `errors` array. */
 async function tryGemini(prompt, contactName, errors) {
-  const primaryKey = process.env.GEMINI_API_KEY;
-  if (!primaryKey) return null;
-
-  const keys = [primaryKey, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
+  const { geminiModels } = getResearchConfig();
+  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
+  if (!keys.length) return null;
 
   for (const key of keys) {
-    for (const model of GEMINI_MODELS) {
+    for (const model of geminiModels) {
       try {
         const body = {
           contents: [{ parts: [{ text: prompt }] }],
@@ -129,6 +197,7 @@ async function tryGemini(prompt, contactName, errors) {
 
 /** Try Grok with web search via Responses API. Returns result or null. Pushes errors into `errors` array. */
 async function tryGrok(prompt, contactName, errors) {
+  const { grokModel } = getResearchConfig();
   const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) return null;
 
@@ -140,7 +209,7 @@ async function tryGrok(prompt, contactName, errors) {
         'Authorization': `Bearer ${key}`,
       },
       body: JSON.stringify({
-        model: GROK_MODEL,
+        model: grokModel,
         input: [{ role: 'user', content: prompt }],
         tools: [{ type: 'web_search' }],
       }),
@@ -148,7 +217,7 @@ async function tryGrok(prompt, contactName, errors) {
 
     if (!res.ok) {
       const errText = await res.text();
-      const err = new Error(`Grok ${GROK_MODEL} ${res.status}: ${errText.substring(0, 150)}`);
+      const err = new Error(`Grok ${grokModel} ${res.status}: ${errText.substring(0, 150)}`);
       err.status = res.status;
       throw err;
     }
@@ -163,7 +232,7 @@ async function tryGrok(prompt, contactName, errors) {
     console.log(`[PERSON RESEARCH] ${contactName}: Grok success (${result.confidence || '?'} confidence)`);
     return result;
   } catch (err) {
-    errors.push({ api: 'grok', model: GROK_MODEL, status: err.status, message: err.message });
+    errors.push({ api: 'grok', model: grokModel, status: err.status, message: err.message });
     console.warn(`[PERSON RESEARCH] Grok failed for ${contactName}: ${err.message}`);
     return null;
   }
@@ -179,9 +248,17 @@ async function tryGrok(prompt, contactName, errors) {
  */
 export async function researchPerson({ contact, deal }) {
   if (!contact.name) return null;
+  const config = getResearchConfig();
+  const normalized = normalizePersonResearch(contact);
+  const canReuseStoredResearch = hasCoreResearchFields(contact) || hasFreshResearch(contact, config.cacheTtlDays);
 
-  const hasGemini = !!process.env.GEMINI_API_KEY;
+  const hasGemini = !!(process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_FALLBACK);
   const hasGrok = !!(process.env.XAI_API_KEY || process.env.GROK_API_KEY);
+
+  if (canReuseStoredResearch) {
+    console.log(`[PERSON RESEARCH] ${contact.name}: using cached/structured data`);
+    return normalized;
+  }
 
   if (!hasGemini && !hasGrok) {
     console.warn('[PERSON RESEARCH] No API keys configured (XAI_API_KEY, GROK_API_KEY, or GEMINI_API_KEY) — skipping');
@@ -195,18 +272,25 @@ export async function researchPerson({ contact, deal }) {
   const basePrompt = buildPrompt(contact, deal);
   const prompt = agentCtx ? `${agentCtx}${basePrompt}` : basePrompt;
   const errors = [];
+  const providers = config.primaryProvider === 'grok'
+    ? ['grok', 'gemini']
+    : ['gemini', 'grok'];
 
-  // 1. Try Grok (primary)
-  const grokResult = await tryGrok(prompt, contact.name, errors);
-  if (grokResult) return grokResult;
-
-  // 2. Grok failed — fall back to Gemini
-  if (errors.length > 0) {
-    console.warn(`[PERSON RESEARCH] Grok failed for ${contact.name} — falling back to Gemini`);
+  for (const provider of providers) {
+    if (provider === 'grok' && !config.enableGrokFallback && config.primaryProvider !== 'grok') continue;
+    const result = provider === 'gemini'
+      ? await tryGemini(prompt, contact.name, errors)
+      : await tryGrok(prompt, contact.name, errors);
+    if (result) return result;
+    if (errors.length > 0) {
+      console.warn(`[PERSON RESEARCH] ${provider} failed for ${contact.name}`);
+    }
   }
 
-  const geminiResult = await tryGemini(prompt, contact.name, errors);
-  if (geminiResult) return geminiResult;
+  if (hasCoreResearchFields(contact)) {
+    console.warn(`[PERSON RESEARCH] Live research failed for ${contact.name} — reusing stored fields`);
+    return normalized;
+  }
 
   // All APIs failed — classify the error type so orchestrator can surface it
   const quotaStatuses = [429, 503];

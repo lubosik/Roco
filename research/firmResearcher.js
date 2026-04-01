@@ -2,7 +2,7 @@
  * research/firmResearcher.js
  * Firms-first research pipeline.
  * Stream 1: CSV import → firms table
- * Stream 2: Grok/Gemini deep research → firms table
+ * Stream 2: Gemini/Grok grounded research → firms table
  * Stream 3: LinkedIn search → firms table
  * Then: firm enrichment loop → contacts table
  */
@@ -14,6 +14,26 @@ import path from 'path';
 import { parse } from 'csv-parse/sync';
 
 // Keys read lazily inside functions so dotenv is loaded first
+
+function boolFromEnv(value, fallback = false) {
+  if (value == null || value === '') return fallback;
+  return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
+}
+
+function getResearchConfig() {
+  return {
+    primaryProvider: (process.env.RESEARCH_PRIMARY_PROVIDER || 'gemini').toLowerCase(),
+    enableGrokFallback: boolFromEnv(process.env.RESEARCH_ENABLE_GROK_FALLBACK, true),
+    geminiModels: (process.env.RESEARCH_FIRM_GEMINI_MODELS || '')
+      .split(',')
+      .map(v => v.trim())
+      .filter(Boolean)
+      .slice(0, 5)
+      .concat(['gemini-2.5-flash', 'gemini-1.5-pro'])
+      .filter((model, index, all) => all.indexOf(model) === index),
+    grokModel: process.env.RESEARCH_FIRM_GROK_MODEL || 'grok-4',
+  };
+}
 
 // Labels that describe a role, not a real firm — don't persist as company_name
 const GENERIC_FIRM_NAMES = new Set([
@@ -41,20 +61,20 @@ export async function runFirmResearch(deal) {
   sb.from('activity_log').insert({ deal_id: deal.id, event_type: 'RESEARCH_STARTED', summary: `Firm research started for ${deal.name}`, created_at: new Date().toISOString() }).then(null, () => {});
 
   // Run all three streams in parallel
-  const [csvRes, grokRes, linkedinRes] = await Promise.allSettled([
+  const [csvRes, researchRes, linkedinRes] = await Promise.allSettled([
     importFirmsFromCSV(deal),
-    runGrokFirmResearch(deal),
+    runPrimaryFirmResearch(deal),
     runLinkedInFirmSearch(deal),
   ]);
 
   const csvFirms = csvRes.status === 'fulfilled' ? csvRes.value : [];
-  const grokFirms = grokRes.status === 'fulfilled' ? grokRes.value : [];
+  const researchedFirms = researchRes.status === 'fulfilled' ? researchRes.value : [];
   const linkedinFirms = linkedinRes.status === 'fulfilled' ? linkedinRes.value : [];
 
-  console.log(`[FIRM RESEARCH] CSV: ${csvFirms.length} | Grok/Gemini: ${grokFirms.length} | LinkedIn: ${linkedinFirms.length}`);
+  console.log(`[FIRM RESEARCH] CSV: ${csvFirms.length} | AI research: ${researchedFirms.length} | LinkedIn: ${linkedinFirms.length}`);
 
   // Upsert all firms
-  const savedFirms = await upsertFirms(deal, csvFirms, grokFirms, linkedinFirms);
+  const savedFirms = await upsertFirms(deal, csvFirms, researchedFirms, linkedinFirms);
   console.log(`[FIRM RESEARCH] ${savedFirms} firms saved to Supabase`);
 
   // Now run firm enrichment — find contacts at each firm
@@ -111,13 +131,27 @@ async function importFirmsFromCSV(deal) {
   return firms;
 }
 
-// ── STREAM 2: GROK/GEMINI DEEP RESEARCH ───────────────────────────────
+// ── STREAM 2: GEMINI/GROK DEEP RESEARCH ───────────────────────────────
+
+async function runPrimaryFirmResearch(deal) {
+  const config = getResearchConfig();
+  if (config.primaryProvider === 'grok') {
+    const grokFirst = await runGrokFirmResearch(deal);
+    if (grokFirst.length > 0 || !config.enableGrokFallback) return grokFirst;
+    return runGeminiFirmResearch(deal);
+  }
+
+  const geminiFirst = await runGeminiFirmResearch(deal);
+  if (geminiFirst.length > 0 || !config.enableGrokFallback) return geminiFirst;
+  return runGrokFirmResearch(deal);
+}
 
 async function runGrokFirmResearch(deal) {
-  const key = process.env.GROK_API_KEY;
+  const { grokModel } = getResearchConfig();
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) {
-    console.warn('[FIRM RESEARCH] GROK_API_KEY not set — trying Gemini');
-    return runGeminiFirmResearch(deal);
+    console.warn('[FIRM RESEARCH] No Grok key set — skipping Grok firm research');
+    return [];
   }
 
   console.log('[FIRM RESEARCH] Using Grok Responses API with web_search tool...');
@@ -129,7 +163,7 @@ async function runGrokFirmResearch(deal) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
       body: JSON.stringify({
-        model: 'grok-4',
+        model: grokModel,
         input: [{ role: 'user', content: prompt }],
         tools: [{ type: 'web_search' }],
       }),
@@ -137,25 +171,25 @@ async function runGrokFirmResearch(deal) {
 
     if (!res.ok) {
       const err = await res.text().catch(() => '');
-      console.warn(`[FIRM RESEARCH] Grok failed (${res.status}): ${err.substring(0, 150)} — falling back to Gemini`);
-      return runGeminiFirmResearch(deal);
+      console.warn(`[FIRM RESEARCH] Grok failed (${res.status}): ${err.substring(0, 150)}`);
+      return [];
     }
 
     const data = await res.json();
     // Responses API: output[] contains message objects with content[]
     const outputMsg = (data.output || []).find(o => o.type === 'message');
     const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-    const firms = parseFirmResearchResults(text, 'grok-4');
+    const firms = parseFirmResearchResults(text, grokModel);
     if (firms.length > 0) {
       console.log(`[FIRM RESEARCH] Grok returned ${firms.length} firms`);
       return firms;
     }
 
-    console.warn('[FIRM RESEARCH] Grok returned 0 firms — falling back to Gemini');
-    return runGeminiFirmResearch(deal);
+    console.warn('[FIRM RESEARCH] Grok returned 0 firms');
+    return [];
   } catch (err) {
-    console.warn('[FIRM RESEARCH] Grok error:', err.message, '— falling back to Gemini');
-    return runGeminiFirmResearch(deal);
+    console.warn('[FIRM RESEARCH] Grok error:', err.message);
+    return [];
   }
 }
 
@@ -167,14 +201,14 @@ async function runGeminiFirmResearch(deal) {
     return [];
   }
 
+  const { geminiModels } = getResearchConfig();
   console.log('[FIRM RESEARCH] Using Gemini with google_search...');
 
   const prompt = buildFirmResearchPrompt(deal);
-  const models = ['gemini-2.5-pro', 'gemini-1.5-pro'];
   const keys = [GEMINI_KEY, GEMINI_FALLBACK].filter(Boolean);
 
   for (const key of keys) {
-    for (const model of models) {
+    for (const model of geminiModels) {
       try {
         const res = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
@@ -184,7 +218,7 @@ async function runGeminiFirmResearch(deal) {
             body: JSON.stringify({
               contents: [{ parts: [{ text: prompt }] }],
               tools: [{ googleSearch: {} }],
-              generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
+              generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
             }),
           }
         );
