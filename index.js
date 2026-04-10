@@ -1,7 +1,11 @@
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig({ path: new URL('.env', import.meta.url).pathname });
 import { info, warn, error } from './core/logger.js';
-import { initTelegramBot, sendTelegram, startSupabaseApprovalPoller, reloadPendingSourcingApprovals } from './approval/telegramBot.js';
+import {
+  initTelegramBot,
+  sendTelegram,
+  startSupabaseApprovalPoller,
+} from './approval/telegramBot.js';
 import { initDashboard } from './dashboard/server.js';
 import { startFileWatcher } from './research/pitchbookIngestor.js';
 import { startOrchestrator, rocoState } from './core/orchestrator.js';
@@ -12,12 +16,19 @@ import { registerWebhooks } from './core/unipileSetup.js';
 const REQUIRED_VARS = [
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_CHAT_ID',
-  'NOTION_API_KEY',
-  'NOTION_CONTACTS_DB_ID',
-  'NOTION_COMPANIES_DB_ID',
   'DASHBOARD_USER',
   'DASHBOARD_PASS',
 ];
+
+function getServerBaseUrl(port) {
+  const explicit = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL;
+  if (explicit) return explicit.replace(/\/+$/, '');
+
+  const railwayDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
+  if (railwayDomain) return `https://${railwayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
+
+  return `http://76.13.44.185:${port}`;
+}
 
 async function validateEnv() {
   const missing = REQUIRED_VARS.filter(v => !process.env[v]);
@@ -30,29 +41,6 @@ async function validateEnv() {
   info('Environment variables validated');
 }
 
-async function verifyNotionAccess() {
-  const { NOTION_BASE, NOTION_VERSION } = await import('./config/constants.js');
-  const headers = {
-    Authorization: `Bearer ${process.env.NOTION_API_KEY}`,
-    'Notion-Version': NOTION_VERSION,
-  };
-
-  for (const [name, id] of [
-    ['Contacts DB', process.env.NOTION_CONTACTS_DB_ID],
-    ['Companies DB', process.env.NOTION_COMPANIES_DB_ID],
-  ]) {
-    try {
-      const res = await fetch(`${NOTION_BASE}/databases/${id}`, { headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      info(`Notion ${name} — connected`);
-    } catch (err) {
-      error(`Notion ${name} — connection failed: ${err.message}`);
-      console.error(`\nFailed to connect to Notion ${name}.\n`);
-      process.exit(1);
-    }
-  }
-}
-
 async function main() {
   console.log('\n' + '='.repeat(50));
   console.log('  ROCO — Autonomous Fundraising Agent');
@@ -62,10 +50,7 @@ async function main() {
   // 1. Validate env
   await validateEnv();
 
-  // 2. Verify Notion connectivity
-  await verifyNotionAccess();
-
-  // 3. Connect to Supabase
+  // 2. Connect to Supabase
   const supabaseOk = await verifySupabase();
   if (supabaseOk) {
     info('Supabase connected');
@@ -73,23 +58,22 @@ async function main() {
     warn('Supabase unavailable — running on local state cache');
   }
 
-  // 4. Load persisted session state from Supabase
+  // 3. Load persisted session state from Supabase
   const sessionState = await loadSessionState();
   Object.assign(rocoState, {
     status: sessionState.rocoStatus || 'ACTIVE',
   });
   info(`Roco status: ${rocoState.status}`);
 
-  // 5. Seed default templates if needed
+  // 4. Seed default templates if needed
   await seedDefaultTemplates();
 
-  // 6. Start Telegram bot
+  // 5. Start Telegram bot
   const bot = initTelegramBot(rocoState);
   startSupabaseApprovalPoller();
-  reloadPendingSourcingApprovals().catch(() => {});  // Reload pending sourcing approvals after restart
   info('Telegram bot initialised');
 
-  // 7. Start dashboard + webhook server
+  // 6. Start dashboard + webhook server
   initDashboard(rocoState);
 
   // Self-check: verify dashboard is reachable
@@ -109,7 +93,7 @@ async function main() {
   // 8. Register Unipile webhooks
   try {
     const port = process.env.PORT || 3000;
-    const baseUrl = process.env.PUBLIC_URL || `http://76.13.44.185:${port}`;
+    const baseUrl = getServerBaseUrl(port);
     await registerWebhooks(baseUrl);
   } catch (webhookErr) {
     warn(`Unipile webhook registration failed: ${webhookErr.message}`);

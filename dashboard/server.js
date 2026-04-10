@@ -7,11 +7,10 @@ import * as XLSX from 'xlsx';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { getPendingApprovals, resolveApprovalFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval } from '../approval/telegramBot.js';
+import { DateTime } from 'luxon';
+import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals } from '../approval/telegramBot.js';
 import { getInvestorGuidance, getSourcingGuidance, saveInvestorGuidance, saveSourcingGuidance, buildGuidanceBlock } from '../services/guidanceService.js';
 import { invalidateCache as invalidateAgentContext } from '../core/agentContext.js';
-import { getAllActiveContacts, getContactsByDeal, getContactProp, countActiveContacts, updateContact, archiveContact } from '../crm/notionContacts.js';
-import { getAllCompanies, getCompanyProp } from '../crm/notionCompanies.js';
 import { getSupabase } from '../core/supabase.js';
 import {
   getConversationHistory,
@@ -23,9 +22,7 @@ import {
   checkTempClosedContacts,
   draftTempCloseFollowUp,
 } from '../core/conversationManager.js';
-import { sendEmailReply, sendLinkedInReply } from '../integrations/unipileClient.js';
-import { sendLinkedInInvite } from '../integrations/unipileClient.js';
-import { logActivity } from '../crm/notionLogger.js';
+import { sendEmailReply, sendLinkedInReply, sendEmail, listEmails, listWebhooks, listSentInvitations } from '../integrations/unipileClient.js';
 import { getApiHealth, startHealthChecks } from '../core/apiFallback.js';
 import { info, error } from '../core/logger.js';
 import { aiComplete } from '../core/aiClient.js';
@@ -36,11 +33,13 @@ import {
   getActivityLog, logActivity as sbLogActivity,
   getBatches, deleteApprovalFromQueue,
 } from '../core/supabaseSync.js';
-import { getWindowStatus, getWindowVisualization } from '../core/scheduleChecker.js';
+import { getWindowStatus, getWindowVisualization, isWithinChannelWindow } from '../core/scheduleChecker.js';
 import { getBatchSummary } from '../core/batchManager.js';
-import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply } from '../core/unipile.js';
+import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply, getConnectedEmailAccounts, getExistingChatWithContact, getChatMessages, processLinkedInInvite } from '../core/unipile.js';
 import { handleLinkedInMessage as handleLiMsg, handleLinkedInRelation as handleLiRelation } from '../core/unipileWebhooks.js';
 import { startInboxMonitor } from '../core/inboxMonitor.js';
+import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
+import { listDailyActivityReports } from '../core/analyticsEngine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '../state.json');
@@ -51,6 +50,633 @@ let app;
 
 const activityFeed = [];
 const MAX_FEED = 200;
+const campaignFirmLinkCache = new Map();
+const CAMPAIGN_FIRM_LINK_TTL_MS = 6 * 60 * 60 * 1000;
+
+function getActivityTimestamp(entry) {
+  const raw = entry?.created_at || entry?.timestamp || entry?.createdAt || null;
+  const millis = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(millis) ? millis : 0;
+}
+
+function buildActivityFingerprint(entry) {
+  if (entry?.id) return `id:${entry.id}`;
+  const ts = entry?.created_at || entry?.timestamp || entry?.createdAt || '';
+  return [
+    entry?.deal_id || entry?.dealId || '',
+    entry?.type || entry?.event_type || '',
+    entry?.action || entry?.summary || '',
+    entry?.note || entry?.detail || '',
+    entry?.full_content || '',
+    String(ts).slice(0, 19),
+  ].join('|');
+}
+
+function mergeActivityEntries(dbEntries = [], liveEntries = []) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const entry of [...dbEntries, ...liveEntries]) {
+    const key = buildActivityFingerprint(entry);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+
+  return merged.sort((a, b) => getActivityTimestamp(b) - getActivityTimestamp(a));
+}
+
+function normalizeFirmLinkName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\b(inc|llc|ltd|lp|llp|plc|corp|corporation|partners|partner|capital|holdings|group|ventures|management|advisors)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isVerifiedCompanyProfileMatch(firmName, profile) {
+  const expected = normalizeFirmLinkName(firmName);
+  const actual = normalizeFirmLinkName(profile?.name || '');
+  if (!expected || !actual) return false;
+  if (expected === actual) return true;
+
+  const expectedTokens = expected.split(' ').filter(Boolean);
+  const actualTokens = actual.split(' ').filter(Boolean);
+  if (!expectedTokens.length || !actualTokens.length) return false;
+
+  const overlap = expectedTokens.filter(token => actualTokens.includes(token));
+  return overlap.length >= Math.min(expectedTokens.length, actualTokens.length)
+    && overlap.length >= 2;
+}
+
+async function resolveCampaignFirmLink(firmName) {
+  const cacheKey = normalizeFirmLinkName(firmName);
+  if (!cacheKey) return { url: null, type: null };
+
+  const cached = campaignFirmLinkCache.get(cacheKey);
+  if (cached && (Date.now() - cached.cachedAt) < CAMPAIGN_FIRM_LINK_TTL_MS) {
+    return cached.value;
+  }
+
+  let value = { url: null, type: null };
+  try {
+    const { getLinkedInCompanyProfile } = await import('../core/unipile.js');
+    const profile = await getLinkedInCompanyProfile(firmName, null, null).catch(() => null);
+    if (profile && isVerifiedCompanyProfileMatch(firmName, profile)) {
+      value = {
+        url: profile.profile_url || profile.website || null,
+        type: profile.profile_url ? 'linkedin' : (profile.website ? 'website' : null),
+      };
+    } else if (profile?.website) {
+      value = { url: profile.website, type: 'website' };
+    }
+  } catch {}
+
+  campaignFirmLinkCache.set(cacheKey, { cachedAt: Date.now(), value });
+  return value;
+}
+
+async function enrichCampaignFirmLinks(rows = []) {
+  const enriched = [];
+  const concurrency = 4;
+
+  for (let i = 0; i < rows.length; i += concurrency) {
+    const chunk = rows.slice(i, i + concurrency);
+    const resolved = await Promise.all(chunk.map(async row => {
+      const link = await resolveCampaignFirmLink(row.firm_name);
+      return {
+        ...row,
+        firm_link_url: link.url || null,
+        firm_link_type: link.type || null,
+      };
+    }));
+    enriched.push(...resolved);
+  }
+
+  return enriched;
+}
+
+function sanitizeApprovalText(text) {
+  return String(text || '')
+    .replace(/\u2014/g, '-')
+    .replace(/\u2013/g, '-')
+    .replace(/\u2018|\u2019/g, "'")
+    .replace(/\u201C|\u201D/g, '"')
+    .trim();
+}
+
+async function logWebhookReceipt(eventType, payload) {
+  await insertWebhookLogRecord({
+    event_type: eventType || 'unknown',
+    payload: payload || {},
+  });
+}
+
+async function insertWebhookLogRecord(record = {}) {
+  try {
+    const sb = getSupabase();
+    if (!sb) return false;
+    const payload = {
+      event_type: record.event_type || 'unknown',
+      payload: record.payload || {},
+      received_at: new Date().toISOString(),
+    };
+    const { error: insertErr } = await sb.from('webhook_logs').insert(payload);
+    if (!insertErr) return true;
+    if (!isMissingColumnError(insertErr, 'received_at')) return false;
+    const { error: fallbackErr } = await sb.from('webhook_logs').insert({
+      event_type: payload.event_type,
+      payload: payload.payload,
+    });
+    return !fallbackErr;
+  } catch {}
+  return false;
+}
+
+async function listRecentWebhookLogs(limit = 200) {
+  const sb = getSupabase();
+  if (!sb) return [];
+
+  try {
+    const { data, error: primaryErr } = await sb
+      .from('webhook_logs')
+      .select('event_type, payload, received_at')
+      .order('received_at', { ascending: false })
+      .limit(limit);
+    if (!primaryErr) return data || [];
+    if (!isMissingColumnError(primaryErr, 'received_at')) return [];
+  } catch {}
+
+  try {
+    const { data, error: fallbackErr } = await sb
+      .from('webhook_logs')
+      .select('event_type, payload, created_at')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (fallbackErr) return [];
+    return (data || []).map(row => ({
+      ...row,
+      received_at: row.received_at || row.created_at || null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function isEmptyWebhookPayload(event) {
+  if (event == null) return true;
+  if (typeof event === 'string') return !event.trim();
+  if (Array.isArray(event)) return event.length === 0;
+  if (typeof event === 'object') return Object.keys(event).length === 0;
+  return false;
+}
+
+function getDefaultSequenceStepsForChannel(channel) {
+  if (channel === 'linkedin_dm') {
+    return [
+      { step: 1, type: 'linkedin_dm', label: 'linkedin_dm_1', delay_days: 0 },
+      { step: 2, type: 'linkedin_dm', label: 'linkedin_dm_2', delay_days: 7 },
+    ];
+  }
+  return [
+    { step: 1, type: 'email', label: 'email_intro', delay_days: 0 },
+    { step: 2, type: 'email', label: 'email_followup_1', delay_days: 7 },
+    { step: 3, type: 'email', label: 'email_followup_2', delay_days: 14 },
+  ];
+}
+
+function normaliseSequenceDelay(step, fallback = null) {
+  const candidates = [
+    step?.delay_days,
+    step?.delayDays,
+    step?.wait_days,
+    step?.waitDays,
+    step?.days,
+  ];
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isFinite(value)) return value;
+  }
+  return fallback;
+}
+
+function getChannelSequenceSteps(sequence, channel) {
+  const fallback = getDefaultSequenceStepsForChannel(channel);
+  const typeMatches = channel === 'linkedin_dm'
+    ? new Set(['linkedin_dm'])
+    : new Set(['email']);
+  const steps = (sequence?.steps || [])
+    .filter(step => typeMatches.has(String(step?.type || '').toLowerCase()))
+    .sort((a, b) => Number(a?.step || 0) - Number(b?.step || 0));
+  return steps.length ? steps : fallback;
+}
+
+async function getSequenceForDealFromServer(sb, dealId) {
+  if (!sb) return null;
+
+  if (dealId) {
+    try {
+      const { data } = await sb.from('deal_sequence').select('steps').eq('deal_id', dealId).limit(1).single();
+      if (data?.steps?.length) return data;
+    } catch {}
+  }
+
+  try {
+    const { data } = await sb.from('outreach_sequence').select('steps').limit(1).single();
+    return data || null;
+  } catch {
+    return null;
+  }
+}
+
+function getNextFollowUpPlanForChannel(sequence, deal, channel, sentFollowUpNumber) {
+  const steps = getChannelSequenceSteps(sequence, channel);
+  const currentStep = steps[sentFollowUpNumber] || null;
+  const nextStep = steps[sentFollowUpNumber + 1] || null;
+  const defaultGap = channel === 'linkedin_dm'
+    ? (Number(deal?.followup_days_li) || 7)
+    : (Number(deal?.followup_days_email) || 7);
+
+  if (!nextStep) return { delayDays: null, nextStep: null };
+
+  const currentDelay = normaliseSequenceDelay(currentStep, 0);
+  const nextDelay = normaliseSequenceDelay(nextStep, defaultGap);
+  const delta = Number(nextDelay) - Number(currentDelay);
+  return {
+    delayDays: Number.isFinite(delta) && delta > 0 ? delta : defaultGap,
+    nextStep,
+  };
+}
+
+function computeBackfilledScheduledFollowUpAt(contact, deal, sequence) {
+  if (contact?.response_received === true || contact?.last_reply_at) return null;
+
+  const stage = String(contact?.pipeline_stage || '').trim().toLowerCase().replace(/\s+/g, '_');
+  const isEmailSent = stage === 'email_sent';
+  const isDmSent = stage === 'dm_sent';
+  if (!isEmailSent && !isDmSent) return null;
+
+  const sentAt = isDmSent
+    ? (contact?.dm_sent_at || contact?.last_outreach_at)
+    : (contact?.last_email_sent_at || contact?.last_outreach_at);
+  if (!sentAt) return null;
+
+  const dueAt = new Date(new Date(sentAt).getTime() + 7 * 24 * 60 * 60 * 1000);
+  if (Number.isNaN(dueAt.getTime())) return null;
+  return dueAt.toISOString();
+}
+
+async function processUnipileMessageEvent(event) {
+  insertWebhookLogRecord({
+    event_type: event?.type || event?.event_type || 'unknown',
+    payload: event,
+  }).catch(() => {});
+
+  const payload = event?.data || event || {};
+  let eventType = (event?.type || event?.event_type || '').toLowerCase();
+
+  if (!eventType) {
+    const hasRelationShape = Boolean(
+      payload?.user_provider_id ||
+      payload?.user_public_identifier ||
+      payload?.user_profile_url ||
+      payload?.relation?.provider_id ||
+      payload?.attendee?.provider_id
+    );
+    const hasMessageShape = Boolean(
+      payload?.chat_id ||
+      payload?.conversation_id ||
+      payload?.message ||
+      payload?.text ||
+      payload?.sender?.attendee_provider_id
+    );
+
+    if (hasRelationShape) eventType = 'new_relation';
+    else if (hasMessageShape) eventType = 'message_received';
+  }
+
+  console.log('[WEBHOOKS/UNIPILE] Received event:', eventType);
+
+  if (['message_received', 'message.created'].includes(eventType)) {
+    await handleLiMsg(event, pushActivity, { draftContextualReply });
+    return;
+  }
+
+  if (['new_relation', 'connection_request_accepted'].includes(eventType)) {
+    const queueForApproval = async ({ contact, reason }) => {
+      if (!contact?.id) return null;
+      return queueLinkedInDmApproval(contact.id, { reason });
+    };
+    await handleLiRelation(event, pushActivity, queueForApproval);
+    return;
+  }
+
+  if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
+    return 'email';
+  }
+
+  console.log('[WEBHOOKS/UNIPILE] Unhandled event type:', eventType);
+  return null;
+}
+
+function getConfiguredServerBaseUrl() {
+  const explicit = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL;
+  if (explicit) return explicit.replace(/\/+$/, '');
+
+  const railwayDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
+  if (railwayDomain) return `https://${railwayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
+
+  return '';
+}
+
+function requireAuth(req, res, next) {
+  const publicPaths = ['/login', '/welcome.html', '/favicon.ico', '/audio/'];
+  if (publicPaths.some(p => req.path.startsWith(p))) return next();
+  if (req.session?.authenticated) return next();
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Unauthorized' });
+  return res.redirect('/welcome.html');
+}
+
+function isMissingColumnError(err, columnName) {
+  const msg = String(err?.message || err || '');
+  return msg.includes(`Could not find the '${columnName}' column`) ||
+    msg.includes(`column ${columnName} does not exist`);
+}
+
+function normalizeMetadataArray(value) {
+  if (Array.isArray(value)) return value.map(v => String(v || '').trim()).filter(Boolean);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map(v => String(v || '').trim()).filter(Boolean);
+    } catch {}
+    return trimmed.split(',').map(v => v.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function mergeDealSettings(currentSettings, patch) {
+  return {
+    ...((currentSettings && typeof currentSettings === 'object') ? currentSettings : {}),
+    ...patch,
+  };
+}
+
+function mergeParsedDealInfo(currentParsed, patch) {
+  return {
+    ...((currentParsed && typeof currentParsed === 'object') ? currentParsed : {}),
+    ...patch,
+  };
+}
+
+function buildInvestorListPayload(body = {}, { requireName = false } = {}) {
+  const payload = {};
+  if (requireName || body.name != null) {
+    const name = String(body.name || '').trim();
+    if (!name && requireName) throw new Error('name is required');
+    if (name) payload.name = name;
+  }
+  if (body.list_type != null) payload.list_type = String(body.list_type || '').trim() || null;
+  if (body.description != null) payload.description = String(body.description || '').trim() || null;
+  if (body.priority_order != null && body.priority_order !== '') payload.priority_order = Number(body.priority_order);
+  if (body.source != null) payload.source = String(body.source || '').trim() || null;
+  if (body.list_source != null) payload.source = String(body.list_source || '').trim() || null;
+  if (body.deal_types != null) payload.deal_types = normalizeMetadataArray(body.deal_types);
+  if (body.sectors != null) payload.sectors = normalizeMetadataArray(body.sectors);
+  return payload;
+}
+
+function normalizeSheetRows(rows) {
+  return (rows || []).map(row => {
+    const normalized = {};
+    for (const [key, value] of Object.entries(row || {})) {
+      const cleanKey = String(key || '')
+        .replace(/\uFEFF/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      normalized[cleanKey] = value;
+    }
+    return normalized;
+  });
+}
+
+function extractUnipileMessageText(message) {
+  return String(message?.text || message?.message || message?.body || '').trim();
+}
+
+function extractUnipileEmailBody(message) {
+  return String(
+    message?.body_text
+    || message?.text
+    || message?.message
+    || message?.body
+    || message?.snippet
+    || ''
+  ).trim();
+}
+
+function getUnipileMessageTimestamp(message) {
+  return message?.created_at
+    || message?.timestamp
+    || message?.sent_at
+    || message?.received_at
+    || null;
+}
+
+function buildConversationDedupeKey(message) {
+  const body = String(message?.body || '').trim();
+  const direction = String(message?.direction || '').trim();
+  const unipileId = String(message?.unipile_message_id || '').trim();
+  return unipileId || `${direction}|${body}`;
+}
+
+async function hydrateLinkedInConversationHistory(sb, contact, dealId = null) {
+  if (!sb || !contact?.id) return [];
+
+  let existingMessages = [];
+  {
+    let query = sb.from('conversation_messages')
+      .select('*')
+      .eq('contact_id', contact.id)
+      .order('sent_at', { ascending: true });
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    existingMessages = data || [];
+  }
+
+  const chatId = String(contact.unipile_chat_id || '').trim();
+  if (!chatId) return existingMessages;
+
+  const remoteMessages = await getChatMessages(chatId, 100).catch(() => []);
+  if (!Array.isArray(remoteMessages) || remoteMessages.length === 0) return existingMessages;
+
+  const existingKeys = new Set(existingMessages.map(buildConversationDedupeKey));
+  const inserts = [];
+
+  for (const remote of remoteMessages) {
+    const body = extractUnipileMessageText(remote);
+    if (!body) continue;
+
+    const unipileMessageId = remote?.message_id || remote?.id || null;
+    const timestamp = getUnipileMessageTimestamp(remote);
+    const direction = (remote?.is_sender || remote?.is_self) ? 'outbound' : 'inbound';
+    const mapped = {
+      contact_id: contact.id,
+      deal_id: dealId || contact.deal_id || null,
+      direction,
+      channel: 'linkedin_dm',
+      body,
+      unipile_message_id: unipileMessageId,
+      unipile_chat_id: chatId,
+      sent_at: direction === 'outbound' ? (timestamp || new Date().toISOString()) : null,
+      received_at: direction === 'inbound' ? (timestamp || new Date().toISOString()) : null,
+    };
+    const dedupeKey = buildConversationDedupeKey(mapped);
+    if (existingKeys.has(dedupeKey)) continue;
+    existingKeys.add(dedupeKey);
+    inserts.push(mapped);
+  }
+
+  if (inserts.length > 0) {
+    await sb.from('conversation_messages').insert(inserts).catch(() => {});
+    let query = sb.from('conversation_messages')
+      .select('*')
+      .eq('contact_id', contact.id)
+      .order('sent_at', { ascending: true });
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    existingMessages = data || existingMessages;
+  }
+
+  return existingMessages;
+}
+
+function normalizeEmailAddress(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function collectEmailAddresses(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.flatMap(collectEmailAddresses);
+  if (typeof value === 'string') {
+    const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig);
+    return match ? match.map(normalizeEmailAddress).filter(Boolean) : [];
+  }
+  if (typeof value === 'object') {
+    return [
+      value.email,
+      value.address,
+      value.value,
+      value.name,
+    ].flatMap(collectEmailAddresses);
+  }
+  return [];
+}
+
+function detectRemoteEmailDirection(message, contactEmail) {
+  if (message?.is_sender || message?.is_self) return 'outbound';
+  const normalizedContactEmail = normalizeEmailAddress(contactEmail);
+  const fromEmails = collectEmailAddresses(message?.from || message?.from_attendee || message?.sender || message?.sender_info);
+  const toEmails = collectEmailAddresses(message?.to || message?.to_attendees || message?.recipients);
+  if (normalizedContactEmail && fromEmails.includes(normalizedContactEmail)) return 'inbound';
+  if (normalizedContactEmail && toEmails.includes(normalizedContactEmail)) return 'outbound';
+  return 'inbound';
+}
+
+async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
+  if (!sb || !contact?.id) return [];
+
+  let existingMessages = [];
+  {
+    let query = sb.from('conversation_messages')
+      .select('*')
+      .eq('contact_id', contact.id)
+      .order('sent_at', { ascending: true });
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    existingMessages = data || [];
+  }
+
+  const threadIds = new Set();
+  try {
+    let query = sb.from('emails')
+      .select('gmail_thread_id')
+      .eq('contact_id', contact.id)
+      .not('gmail_thread_id', 'is', null);
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    for (const row of data || []) {
+      if (row?.gmail_thread_id) threadIds.add(String(row.gmail_thread_id));
+    }
+  } catch {}
+
+  try {
+    let query = sb.from('replies')
+      .select('thread_id')
+      .eq('contact_id', contact.id)
+      .not('thread_id', 'is', null);
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    for (const row of data || []) {
+      if (row?.thread_id) threadIds.add(String(row.thread_id));
+    }
+  } catch {}
+
+  if (!threadIds.size) return existingMessages;
+
+  const existingKeys = new Set(existingMessages.map(buildConversationDedupeKey));
+  const inserts = [];
+
+  for (const threadId of threadIds) {
+    let remoteMessages = [];
+    try {
+      remoteMessages = await listEmails({ threadId, limit: 100 });
+    } catch {
+      remoteMessages = [];
+    }
+
+    for (const remote of remoteMessages || []) {
+      const body = extractUnipileEmailBody(remote);
+      if (!body) continue;
+
+      const direction = detectRemoteEmailDirection(remote, contact.email);
+      const unipileMessageId = remote?.message_id || remote?.id || remote?.provider_id || null;
+      const timestamp = getUnipileMessageTimestamp(remote);
+      const mapped = {
+        contact_id: contact.id,
+        deal_id: dealId || contact.deal_id || null,
+        direction,
+        channel: 'email',
+        subject: remote?.subject || null,
+        body,
+        unipile_message_id: unipileMessageId,
+        sent_at: direction === 'outbound' ? (timestamp || new Date().toISOString()) : null,
+        received_at: direction === 'inbound' ? (timestamp || new Date().toISOString()) : null,
+      };
+      const dedupeKey = buildConversationDedupeKey(mapped);
+      if (existingKeys.has(dedupeKey)) continue;
+      existingKeys.add(dedupeKey);
+      inserts.push(mapped);
+    }
+  }
+
+  if (inserts.length > 0) {
+    await sb.from('conversation_messages').insert(inserts).catch(() => {});
+    let query = sb.from('conversation_messages')
+      .select('*')
+      .eq('contact_id', contact.id)
+      .order('sent_at', { ascending: true });
+    if (dealId) query = query.eq('deal_id', dealId);
+    const { data } = await query;
+    existingMessages = data || existingMessages;
+  }
+
+  return existingMessages;
+}
 
 // ─────────────────────────────────────────────
 // REPLY DEBOUNCE BATCHER
@@ -116,18 +742,405 @@ function formatCurrencyAmount(amount, currency = 'USD') {
   return `${symbol}${value.toLocaleString()}`;
 }
 
+async function getDealNameMap(sb, dealIds = []) {
+  const ids = [...new Set((dealIds || []).filter(Boolean).map(String))];
+  if (!sb || ids.length === 0) return {};
+  const { data } = await sb.from('deals').select('id, name').in('id', ids);
+  return Object.fromEntries((data || []).map(deal => [String(deal.id), deal.name || 'Unknown Project']));
+}
+
+function normalizeContactIdentityValue(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/+$/, '');
+}
+
+function getContactIdentityKeys(contact) {
+  const keys = [];
+  const email = normalizeContactIdentityValue(contact?.email);
+  const linkedin = normalizeContactIdentityValue(contact?.linkedin_url);
+  const name = normalizeContactIdentityValue(contact?.name);
+  const company = normalizeContactIdentityValue(contact?.company_name);
+  if (email) keys.push(`email:${email}`);
+  if (linkedin) keys.push(`linkedin:${linkedin}`);
+  if (name && company) keys.push(`name_company:${name}|${company}`);
+  return [...new Set(keys)];
+}
+
+function normalizeFirmLookupName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+const LINKEDIN_INVITE_STAGES = new Set([
+  'invite_sent',
+  'invite_accepted',
+  'DM Approved',
+  'DM Sent',
+  'dm_sent',
+  'Replied',
+  'In Conversation',
+  'Meeting Booked',
+  'Meeting Scheduled',
+]);
+const LINKEDIN_ACCEPTED_STAGES = new Set([
+  'invite_accepted',
+  'DM Approved',
+  'DM Sent',
+  'dm_sent',
+  'Replied',
+  'In Conversation',
+  'Meeting Booked',
+  'Meeting Scheduled',
+]);
+const CLOSED_CONTACT_STAGES = new Set([
+  'Archived',
+  'Skipped',
+  'Inactive',
+  'Suppressed — Opt Out',
+  'Deleted — Do Not Contact',
+]);
+
+function hasLinkedInInviteHistory(contact) {
+  return Boolean(
+    contact?.invite_sent_at ||
+    contact?.invite_accepted_at ||
+    contact?.outreach_channel === 'linkedin_invite' ||
+    LINKEDIN_INVITE_STAGES.has(contact?.pipeline_stage)
+  );
+}
+
+function hasLinkedInAccepted(contact) {
+  return Boolean(
+    contact?.invite_accepted_at ||
+    LINKEDIN_ACCEPTED_STAGES.has(contact?.pipeline_stage)
+  );
+}
+
+function hasActivePendingLinkedInInvite(contact) {
+  if (!hasLinkedInInviteHistory(contact)) return false;
+  if (hasLinkedInAccepted(contact)) return false;
+  if (CLOSED_CONTACT_STAGES.has(contact?.pipeline_stage)) return false;
+  return true;
+}
+
+function buildFirmCampaignSummary(contacts = [], enrichmentStatus = 'pending') {
+  const archivedStages = new Set(['Archived', 'Deleted — Do Not Contact', 'Suppressed — Opt Out', 'Inactive']);
+  const repliedStages = new Set(['Replied', 'In Conversation', 'Meeting Booked']);
+  const totalContacts = contacts.length;
+  const contactedCount = contacts.filter(contact =>
+    contact?.invite_sent_at ||
+    contact?.last_email_sent_at ||
+    contact?.last_outreach_at ||
+    ['invite_sent', 'invite_accepted', 'DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'dm_sent', 'email_sent', 'Replied', 'In Conversation', 'Meeting Booked'].includes(contact?.pipeline_stage)
+  ).length;
+  const inviteSentCount = contacts.filter(hasLinkedInInviteHistory).length;
+  const activePendingInviteCount = contacts.filter(hasActivePendingLinkedInInvite).length;
+  const inviteAcceptedCount = contacts.filter(contact =>
+    contact?.invite_accepted_at || ['invite_accepted', 'DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked'].includes(contact?.pipeline_stage)
+  ).length;
+  const emailSentCount = contacts.filter(contact =>
+    contact?.last_email_sent_at || ['Email Approved', 'Email Sent', 'email_sent', 'Replied', 'In Conversation', 'Meeting Booked'].includes(contact?.pipeline_stage)
+  ).length;
+  const repliedCount = contacts.filter(contact =>
+    contact?.response_received === true ||
+    contact?.last_reply_at ||
+    repliedStages.has(contact?.pipeline_stage)
+  ).length;
+  const meetingBookedCount = contacts.filter(contact => contact?.pipeline_stage === 'Meeting Booked').length;
+  const closedCount = totalContacts > 0 && contacts.every(contact => archivedStages.has(contact?.pipeline_stage)) ? totalContacts : 0;
+
+  let firmStage = 'pending_enrichment';
+  let firmStageLabel = 'Pending enrichment';
+
+  if (closedCount === totalContacts && totalContacts > 0) {
+    firmStage = 'closed';
+    firmStageLabel = 'Closed';
+  } else if (meetingBookedCount > 0) {
+    firmStage = 'meeting_booked';
+    firmStageLabel = 'Meeting booked';
+  } else if (repliedCount > 0) {
+    firmStage = 'replied';
+    firmStageLabel = 'Replied';
+  } else if (inviteAcceptedCount > 0) {
+    firmStage = 'invite_accepted';
+    firmStageLabel = 'Connection accepted';
+  } else if (contactedCount > 0) {
+    firmStage = 'outreach_started';
+    firmStageLabel = 'Outreach in progress';
+  } else if (enrichmentStatus === 'complete') {
+    firmStage = 'ready_for_outreach';
+    firmStageLabel = 'Ready for outreach';
+  } else if (enrichmentStatus === 'in_progress') {
+    firmStage = 'enriching';
+    firmStageLabel = 'Finding decision makers';
+  }
+
+  return {
+    total_contacts: totalContacts,
+    contacted_count: contactedCount,
+    invite_sent_count: inviteSentCount,
+    active_pending_invite_count: activePendingInviteCount,
+    invite_accepted_count: inviteAcceptedCount,
+    email_sent_count: emailSentCount,
+    replied_count: repliedCount,
+    meeting_booked_count: meetingBookedCount,
+    closed_count: closedCount,
+    firm_stage: firmStage,
+    firm_stage_label: firmStageLabel,
+  };
+}
+
+async function buildContactDealContextMap(sb) {
+  if (!sb) return new Map();
+  const { data: allContacts } = await sb.from('contacts')
+    .select('id, name, company_name, email, linkedin_url, deal_id, updated_at')
+    .limit(5000);
+  const contacts = allContacts || [];
+  const dealIds = [...new Set(contacts.map(c => c.deal_id).filter(Boolean).map(String))];
+  const { data: dealRows } = dealIds.length
+    ? await sb.from('deals').select('id, name, status').in('id', dealIds)
+    : { data: [] };
+  const dealsById = new Map((dealRows || []).map(deal => [String(deal.id), deal]));
+
+  const idsByKey = new Map();
+  for (const contact of contacts) {
+    for (const key of getContactIdentityKeys(contact)) {
+      if (!idsByKey.has(key)) idsByKey.set(key, new Set());
+      idsByKey.get(key).add(contact.id);
+    }
+  }
+
+  const contactById = new Map(contacts.map(contact => [contact.id, contact]));
+  const contextMap = new Map();
+
+  for (const contact of contacts) {
+    const relatedIds = new Set([contact.id]);
+    for (const key of getContactIdentityKeys(contact)) {
+      for (const relatedId of (idsByKey.get(key) || [])) relatedIds.add(relatedId);
+    }
+
+    const relatedContacts = [...relatedIds]
+      .map(id => contactById.get(id))
+      .filter(Boolean);
+
+    const relatedDeals = [...new Map(
+      relatedContacts
+        .filter(row => row.deal_id)
+        .map(row => {
+          const deal = dealsById.get(String(row.deal_id));
+          return [String(row.deal_id), {
+            dealId: row.deal_id,
+            dealName: deal?.name || 'Unknown Project',
+            status: deal?.status || '',
+          }];
+        })
+    ).values()];
+
+    const currentDeal = contact.deal_id ? dealsById.get(String(contact.deal_id)) : null;
+    const activeDeal = (currentDeal?.status === 'ACTIVE'
+      ? { dealId: contact.deal_id, dealName: currentDeal.name || 'Unknown Project', status: currentDeal.status }
+      : relatedDeals.find(deal => deal.status === 'ACTIVE')) || null;
+
+    contextMap.set(contact.id, {
+      projectName: currentDeal?.name || (relatedDeals[0]?.dealName || ''),
+      currentDealStatus: currentDeal?.status || '',
+      activeDealName: activeDeal?.dealName || '',
+      activeDealId: activeDeal?.dealId || null,
+      deals: relatedDeals,
+      dealNamesText: relatedDeals.map(deal => deal.dealName).join(', '),
+    });
+  }
+
+  return contextMap;
+}
+
+function formatConversationHistoryForProject(messages, contact, dealName = null) {
+  const projectLabel = dealName || 'Unknown Project';
+  const projectHeader = `Project: ${projectLabel}`;
+  const history = (messages || []).map(message => {
+    const role = message.direction === 'outbound' ? 'ROCO' : (contact?.name || 'INVESTOR');
+    const channel = message.channel ? ` via ${message.channel}` : '';
+    const timestamp = message.sent_at || message.received_at;
+    const dateLabel = timestamp ? ` on ${new Date(timestamp).toLocaleDateString('en-GB')}` : '';
+    return `[${projectLabel}] ${role}${channel}${dateLabel}\n${message.body || ''}`;
+  }).join('\n\n---\n\n');
+  return history ? `${projectHeader}\n${history}` : projectHeader;
+}
+
 // ─────────────────────────────────────────────
 // LINKEDIN DM SEND HELPER (approval flow)
 // ─────────────────────────────────────────────
 
-async function sendApprovedLinkedInDM({ contactId, text }) {
+function buildLinkedInDraftContactPage(contact) {
+  const whyThisFirm = contact.why_this_firm
+    || contact.match_rationale
+    || contact.justification
+    || '';
+  return {
+    id: contact.id,
+    properties: {
+      'Name':                   { type: 'title',     title:     [{ plain_text: contact.name || '' }] },
+      'Email':                  { type: 'email',     email:     contact.email || null },
+      'Company Name':           { type: 'rich_text', rich_text: [{ plain_text: contact.company_name || '' }] },
+      'LinkedIn URL':           { type: 'url',       url:       contact.linkedin_url || null },
+      'Job Title':              { type: 'rich_text', rich_text: [{ plain_text: contact.job_title || '' }] },
+      'Investor Score (0-100)': { type: 'number',    number:    contact.investor_score || null },
+      'Notes':                  { type: 'rich_text', rich_text: [{ plain_text: contact.notes || '' }] },
+      'Sector Focus':           { type: 'rich_text', rich_text: [{ plain_text: contact.sector_focus || '' }] },
+      'Geography':              { type: 'rich_text', rich_text: [{ plain_text: contact.geography || '' }] },
+      'Typical Cheque Size':    { type: 'rich_text', rich_text: [{ plain_text: contact.typical_cheque_size || '' }] },
+      'Past Investments':       { type: 'rich_text', rich_text: [{ plain_text: contact.past_investments || '' }] },
+      'AUM':                    { type: 'rich_text', rich_text: [{ plain_text: contact.aum_fund_size || '' }] },
+      'Investment Thesis':      { type: 'rich_text', rich_text: [{ plain_text: contact.investment_thesis || '' }] },
+      'Why This Firm':          { type: 'rich_text', rich_text: [{ plain_text: whyThisFirm }] },
+    },
+    name: contact.name,
+    email: contact.email,
+    company_name: contact.company_name,
+    linkedin_url: contact.linkedin_url,
+    investor_score: contact.investor_score,
+    why_this_firm: whyThisFirm,
+  };
+}
+
+async function loadLinkedInConversationContext(contact) {
+  if (!contact?.linkedin_provider_id && !contact?.unipile_chat_id) return [];
+  try {
+    const chatId = contact.unipile_chat_id
+      || (await getExistingChatWithContact(contact.linkedin_provider_id, process.env.UNIPILE_LINKEDIN_ACCOUNT_ID))?.id
+      || null;
+    if (!chatId) return [];
+    const messages = await getChatMessages(chatId, 25).catch(() => []);
+    return Array.isArray(messages) ? messages : [];
+  } catch {
+    return [];
+  }
+}
+
+function truncateInline(value, max = 140) {
+  const text = String(value || '').trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
+  const sb = getSupabase();
+  if (!sb || !contactId) return null;
+
+  const { data: contact } = await sb.from('contacts')
+    .select('*, deals!contacts_deal_id_fkey(*)')
+    .eq('id', contactId)
+    .single();
+  if (!contact || !contact.linkedin_provider_id) return null;
+
+  let firmResearch = null;
+  if (contact.firm_id) {
+    const { data } = await sb.from('firms')
+      .select('aum, past_investments, investment_thesis, thesis, match_rationale, justification')
+      .eq('id', contact.firm_id)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    firmResearch = data || null;
+  }
+
+  const enrichedContact = {
+    ...contact,
+    past_investments: contact.past_investments || firmResearch?.past_investments || '',
+    investment_thesis: contact.investment_thesis || firmResearch?.investment_thesis || firmResearch?.thesis || '',
+    aum_fund_size: contact.aum_fund_size || firmResearch?.aum || '',
+    why_this_firm: firmResearch?.match_rationale || firmResearch?.justification || '',
+    match_rationale: firmResearch?.match_rationale || '',
+    justification: firmResearch?.justification || '',
+  };
+
+  const { data: existingRows } = await sb.from('approval_queue')
+    .select('id, status')
+    .eq('contact_id', contact.id)
+    .eq('stage', 'LinkedIn DM')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (existingRows?.length) {
+    await reloadPendingInvestorApprovals().catch(() => {});
+    return existingRows[0];
+  }
+
+  const conversationHistory = await loadLinkedInConversationContext(contact);
+
+  const draft = body
+    ? { body }
+    : await draftLinkedInDM(buildLinkedInDraftContactPage(enrichedContact), null, 'intro', {
+        deal: contact.deals || null,
+        conversationHistory,
+      });
+  const messageBody = String(draft?.body || '').trim();
+  if (!messageBody) return null;
+
+  const researchSummary = [
+    conversationHistory.length ? `${conversationHistory.length} prior LinkedIn message(s) loaded` : null,
+    contact.notes ? truncateInline(contact.notes, 140) : null,
+    enrichedContact.why_this_firm ? truncateInline(enrichedContact.why_this_firm, 180) : null,
+  ].filter(Boolean).join(' · ') || null;
+
+  const { data: row, error } = await sb.from('approval_queue').insert([{
+    contact_id:        contact.id,
+    contact_name:      contact.name || '',
+    contact_email:     contact.email || null,
+    firm:              contact.company_name || '',
+    deal_id:           contact.deal_id || null,
+    deal_name:         contact.deals?.name || null,
+    stage:             'LinkedIn DM',
+    body:              messageBody,
+    score:             contact.investor_score || null,
+    status:            'pending',
+    outreach_mode:     'investor_outreach',
+    research_summary:  researchSummary,
+    created_at:        new Date().toISOString(),
+  }]).select().single();
+  if (error) throw error;
+
+  await sb.from('contacts').update({ pending_linkedin_dm: false }).eq('id', contact.id);
+  await reloadPendingInvestorApprovals().catch(() => {});
+  pushActivity({
+    type: 'linkedin',
+    action: `LinkedIn DM drafted for approval: ${contact.name || ''}`,
+    note: `${contact.company_name || ''}${reason ? ` · ${reason}` : ''}`,
+    deal_name: contact.deals?.name || null,
+    dealId: contact.deal_id || null,
+  });
+  notifyQueueUpdated();
+  return row;
+}
+
+export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, queueItem = null }) {
   const sb = getSupabase();
   if (!sb) throw new Error('Database unavailable');
+
+  if (queueId) {
+    let claimed = null;
+    try {
+      ({ data: claimed } = await sb.from('approval_queue').update({
+        status: 'sending',
+        resolved_at: new Date().toISOString(),
+      }).eq('id', queueId)
+        .in('status', ['approved', 'approved_waiting_for_window'])
+        .select('id,status')
+        .maybeSingle());
+    } catch {}
+
+    if (!claimed?.id) {
+      return { skipped: true, reason: 'queue_not_claimed' };
+    }
+  }
 
   let contact = null;
   try {
     const { data } = await sb.from('contacts')
-      .select('id, name, deal_id, linkedin_provider_id, unipile_chat_id')
+      .select('id, name, company_name, deal_id, linkedin_provider_id, unipile_chat_id, pipeline_stage, dm_sent_at')
       .eq('id', contactId).single();
     contact = data;
   } catch { /* not found */ }
@@ -136,29 +1149,182 @@ async function sendApprovedLinkedInDM({ contactId, text }) {
     throw new Error('No LinkedIn provider ID or chat ID on contact ' + contactId);
   }
 
-  let result;
-  if (contact.unipile_chat_id) {
-    result = await sendLinkedInDMReply(contact.unipile_chat_id, text);
-  } else {
-    result = await startLinkedInDM(contact.linkedin_provider_id, text);
+  let deal = null;
+  if (contact.deal_id) {
+    try {
+      const { data } = await sb.from('deals').select('*').eq('id', contact.deal_id).single();
+      deal = data || null;
+    } catch {}
   }
 
-  const newChatId = result?.chat_id;
-  if (newChatId && !contact.unipile_chat_id) {
+  let existingOutbound = null;
+  try {
+    ({ data: existingOutbound } = await sb.from('conversation_messages')
+      .select('id, sent_at, body')
+      .eq('contact_id', contact.id)
+      .eq('direction', 'outbound')
+      .eq('channel', 'linkedin_dm')
+      .order('sent_at', { ascending: false })
+      .limit(1)
+      .maybeSingle());
+  } catch {}
+
+  if (contact.dm_sent_at || contact.pipeline_stage === 'DM Sent' || existingOutbound?.id) {
+    const sentAt = contact.dm_sent_at || existingOutbound?.sent_at || new Date().toISOString();
     await sb.from('contacts').update({
-      unipile_chat_id: newChatId,
-      pipeline_stage:  'dm_sent',
-    }).eq('id', contact.id).catch(() => {});
+      pipeline_stage: 'DM Sent',
+      outreach_channel: 'linkedin_dm',
+      dm_sent_at: sentAt,
+      last_outreach_at: sentAt,
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id);
+    if (queueId) {
+      await sb.from('approval_queue').update({
+        status: 'sent',
+        sent_at: sentAt,
+      }).eq('id', queueId);
+    }
+    pushActivity({
+      type: 'warning',
+      action: `Duplicate LinkedIn DM suppressed: ${contact.name || 'contact'}`,
+      note: 'Existing outbound LinkedIn DM already recorded',
+      deal_name: deal?.name || null,
+      dealId: contact.deal_id || null,
+    });
+    notifyQueueUpdated();
+    return { skipped: true, duplicate: true, sentAt };
   }
+
+  if (deal && !isWithinChannelWindow(deal, 'linkedin_dm')) {
+    const deferredBody = sanitizeApprovalText(text || queueItem?.edited_body || queueItem?.body || '') || null;
+    await sb.from('contacts').update({
+      pipeline_stage: 'DM Approved',
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id);
+    if (queueId) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        edited_body: deferredBody,
+        resolved_at: new Date().toISOString(),
+      }).eq('id', queueId);
+    }
+    pushActivity({
+      type: 'linkedin',
+      action: `LinkedIn DM approved: ${contact.name || 'contact'}`,
+      note: deal?.name
+        ? `${contact.company_name || queueItem?.firm || ''} · Waiting for DM window${getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : ''}`
+        : `Waiting for DM window${getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : ''}`,
+      deal_name: deal?.name || queueItem?.deal_name || null,
+      dealId: contact.deal_id || queueItem?.deal_id || null,
+    });
+    notifyQueueUpdated();
+    return { deferred: true, nextOpen: getWindowStatus(deal).nextOpen || null };
+  }
+
+  const bodyToSend = sanitizeApprovalText(text || queueItem?.edited_body || queueItem?.body || '');
+  if (!bodyToSend) {
+    throw new Error('LinkedIn DM body is empty');
+  }
+
+  let result;
+  const sentAt = new Date().toISOString();
+  try {
+    if (contact.unipile_chat_id) {
+      result = await sendLinkedInDMReply(contact.unipile_chat_id, bodyToSend);
+    } else {
+      result = await startLinkedInDM(contact.linkedin_provider_id, bodyToSend);
+    }
+  } catch (err) {
+    if (queueId) {
+      await sb.from('approval_queue').update({
+        status: 'failed',
+        resolved_at: new Date().toISOString(),
+        edit_instructions: String(err.message || 'LinkedIn DM send failed').slice(0, 300),
+      }).eq('id', queueId);
+    }
+    pushActivity({
+      type: 'error',
+      action: `LinkedIn DM failed: ${contact.name || 'contact'}`,
+      note: String(err.message || 'Unknown send failure').slice(0, 200),
+      deal_name: deal?.name || null,
+      dealId: contact.deal_id || null,
+    });
+    if (contact.deal_id) {
+      await sb.from('activity_log').insert({
+        deal_id: contact.deal_id,
+        event_type: 'LINKEDIN_DM_FAILED',
+        summary: `LinkedIn DM failed for ${contact.name || 'contact'}`,
+        detail: { error: String(err.message || 'Unknown send failure').slice(0, 500) },
+        created_at: new Date().toISOString(),
+      }).catch(() => {});
+    }
+    notifyQueueUpdated();
+    throw err;
+  }
+
+  const stageLabel = String(queueItem?.stage || '').toLowerCase();
+  const followUpMatch = stageLabel.match(/follow[- ]up\s*(\d+)/i);
+  const followUpNumber = followUpMatch ? Number(followUpMatch[1] || 1) : 0;
+  const nextFollowUpDueAt = followUpNumber >= 1
+    ? null
+    : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const updates = {
+    pipeline_stage: 'DM Sent',
+    outreach_channel: 'linkedin_dm',
+    last_outreach_at: sentAt,
+    dm_sent_at: sentAt,
+    follow_up_count: followUpNumber,
+    follow_up_due_at: nextFollowUpDueAt,
+  };
+  if (result?.chat_id && !contact.unipile_chat_id) updates.unipile_chat_id = result.chat_id;
+  await sb.from('contacts').update(updates).eq('id', contact.id);
 
   await sb.from('conversation_messages').insert({
     contact_id: contact.id,
     deal_id:    contact.deal_id || null,
     direction:  'outbound',
     channel:    'linkedin_dm',
-    body:       text,
-    sent_at:    new Date().toISOString(),
+    body:       bodyToSend,
+    sent_at:    sentAt,
   }).catch(err => console.warn('[LI DM] log error:', err.message));
+
+  if (contact.deal_id) {
+    await sb.from('activity_log').insert({
+      deal_id:    contact.deal_id,
+      event_type: 'LINKEDIN_DM_SENT',
+      summary:    `LinkedIn DM sent to ${contact.name || 'contact'}`,
+      detail:     {
+        channel: 'linkedin_dm',
+        chat_id: result?.chat_id || contact.unipile_chat_id || null,
+        message_id: result?.message_id || null,
+        queue_id: queueId || queueItem?.id || null,
+        firm: contact.company_name || queueItem?.firm || null,
+      },
+      created_at: sentAt,
+    }).catch(() => {});
+  }
+
+  pushActivity({
+    type: 'linkedin',
+    action: `LinkedIn DM sent: ${contact.name || 'contact'}`,
+    note: `${contact.company_name || queueItem?.firm || ''}${result?.chat_id || contact.unipile_chat_id ? ` · chat ${result?.chat_id || contact.unipile_chat_id}` : ''}`,
+    deal_name: deal?.name || queueItem?.deal_name || null,
+    dealId: contact.deal_id || queueItem?.deal_id || null,
+  });
+
+  if (queueId) {
+    await sb.from('approval_queue').update({
+      status: 'sent',
+      sent_at: sentAt,
+      edited_body: bodyToSend !== queueItem?.body ? bodyToSend : (queueItem?.edited_body || null),
+    }).eq('id', queueId);
+  }
+
+  notifyQueueUpdated();
+  await sendTelegram(
+    `💬 LinkedIn DM sent to ${contact.name || 'contact'}${contact.company_name ? ` (${contact.company_name})` : ''}`
+  ).catch(() => {});
 
   return result;
 }
@@ -191,6 +1357,51 @@ export function initDashboard(state) {
     res.json({ ok: true, status: 'running', ts: new Date().toISOString() });
   });
 
+  // Session middleware
+  app.use(session({
+    secret: process.env.SESSION_SECRET || 'roco-mission-control-2026',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 },
+  }));
+
+  app.get('/api/admin/webhook-status', requireAuth, async (req, res) => {
+    try {
+      const hooks = await listWebhooks(100).catch(() => []);
+      const recentLogs = await listRecentWebhookLogs(200);
+
+      const gmailId = process.env.UNIPILE_GMAIL_ACCOUNT_ID || null;
+      const outlookId = process.env.UNIPILE_OUTLOOK_ACCOUNT_ID || null;
+
+      const latestFor = (predicate) => (recentLogs || []).find(predicate) || null;
+
+      const gmailLog = latestFor(log => {
+        const payload = log.payload || {};
+        return ['mail_received', 'email.received', 'email_received'].includes(String(log.event_type || '').toLowerCase())
+          && String(payload.account_id || payload.data?.account_id || '') === String(gmailId || '');
+      });
+      const outlookLog = latestFor(log => {
+        const payload = log.payload || {};
+        return ['mail_received', 'email.received', 'email_received'].includes(String(log.event_type || '').toLowerCase())
+          && String(payload.account_id || payload.data?.account_id || '') === String(outlookId || '');
+      });
+      const liAcceptLog = latestFor(log => ['new_relation', 'connection_request_accepted'].includes(String(log.event_type || '').toLowerCase()));
+      const liMsgLog = latestFor(log => ['message_received', 'message.created'].includes(String(log.event_type || '').toLowerCase()));
+
+      res.json({
+        hooks,
+        latest: {
+          gmail: gmailLog ? { received_at: gmailLog.received_at, event_type: gmailLog.event_type } : null,
+          outlook: outlookLog ? { received_at: outlookLog.received_at, event_type: outlookLog.event_type } : null,
+          linkedin_acceptance: liAcceptLog ? { received_at: liAcceptLog.received_at, event_type: liAcceptLog.event_type } : null,
+          linkedin_dm: liMsgLog ? { received_at: liMsgLog.received_at, event_type: liMsgLog.event_type } : null,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ─── Unipile webhooks — no Basic Auth (Unipile calls these from their servers) ───
 
   // POST /webhook/unipile/gmail — inbound Gmail replies via Unipile
@@ -198,6 +1409,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
+      await logWebhookReceipt(event?.type || 'mail_received', event);
       console.log('[WEBHOOK/GMAIL] Received event:', event?.type || 'unknown');
 
       // Unipile sends a wrapper with type + payload
@@ -224,6 +1436,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
+      await logWebhookReceipt(event?.event || event?.type || 'mail_received', event);
       console.log('[WEBHOOK/OUTLOOK] Received event:', event?.event || event?.type || 'unknown');
 
       const payload   = event?.data || event;
@@ -261,6 +1474,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
+      await logWebhookReceipt(event?.type || 'message_received', event);
       console.log('[WEBHOOK/LINKEDIN] Received event:', event?.type || 'unknown');
 
       const payload   = event?.data || event;
@@ -285,6 +1499,7 @@ export function initDashboard(state) {
     res.json({ ok: true });
     try {
       const event   = req.body;
+      await logWebhookReceipt(event?.type || 'message_received', event);
       const payload = event?.data || event;
 
       // Unipile message_received payload: sender.attendee_provider_id, sender.attendee_name, message (top-level)
@@ -326,6 +1541,11 @@ export function initDashboard(state) {
     res.json({ ok: true });
     try {
       const event   = req.body;
+      if (isEmptyWebhookPayload(event)) {
+        console.warn('[WEBHOOK/LINKEDIN/REL] Empty request body — likely provider validation ping');
+        return;
+      }
+      await logWebhookReceipt(event?.type || 'new_relation', event);
       // Log full raw payload to confirm Unipile field structure
       console.log('[WEBHOOK/LINKEDIN/REL] Raw payload:', JSON.stringify(event));
 
@@ -335,11 +1555,17 @@ export function initDashboard(state) {
       const name       = payload?.user_full_name || payload?.display_name || payload?.attendee?.display_name || '';
       const publicId   = payload?.user_public_identifier || '';
       const profileUrl = payload?.user_profile_url || '';
+      const contactLabel = name || publicId || providerId || 'Unknown contact';
 
       console.log(`[WEBHOOK/LINKEDIN/REL] Connection accepted: ${name} (${providerId})`);
 
       if (!providerId && !name) {
         console.warn('[WEBHOOK/LINKEDIN/REL] Empty payload — cannot identify person, skipping');
+        pushActivity({
+          type: 'error',
+          action: 'LinkedIn acceptance received',
+          note: 'Payload was empty, so no contact or deal could be matched',
+        });
         return;
       }
 
@@ -349,7 +1575,7 @@ export function initDashboard(state) {
       // Look up the contact in our pipeline — include paused deals so we still record the accepted connection.
       // We check paused state later and hold the DM until resume, but always update the stage.
       let contactQuery = sb.from('contacts')
-        .select('id, name, deal_id, notion_page_id, deals!inner(id, status, paused)')
+        .select('id, name, deal_id, pipeline_stage, response_received, deals!inner(id, name, status, paused)')
         .eq('deals.status', 'ACTIVE');
 
       // Match by provider_id first (most reliable), then URL slug, then name as last resort.
@@ -387,11 +1613,6 @@ export function initDashboard(state) {
         // The stage update ensures the orchestrator picks it up on resume.
         if (!alreadyResponded) {
           await sb.from('contacts').update({ pipeline_stage: 'invite_accepted' }).eq('id', contact.id);
-          if (contact.notion_page_id) {
-            await updateContact(contact.notion_page_id, {
-              pipelineStage: 'invite_accepted',
-            }).catch(e => console.warn(`[WEBHOOK/LINKEDIN/REL] Notion update failed for ${contact.name}: ${e.message}`));
-          }
         } else {
           console.log(`[WEBHOOK/LINKEDIN/REL] ${contact.name} already responded (${contact.pipeline_stage}) — not overwriting stage`);
         }
@@ -399,10 +1620,13 @@ export function initDashboard(state) {
         const pausedNote = dealPaused ? ' (deal paused — DM will be queued on resume)' : '';
         pushActivity({
           type: 'linkedin',
+          activity_badge: 'accepted',
           action: `${contact.name} accepted your connection request`,
           note: alreadyResponded
-            ? `Already in conversation — LinkedIn connected, no DM will be sent.`
-            : `Pipeline stage → invite_accepted.${pausedNote}`,
+            ? `Matched to deal ${contact.deals?.name || 'Unknown deal'} · already in conversation, no DM will be sent.`
+            : `Matched to deal ${contact.deals?.name || 'Unknown deal'} · pipeline stage -> invite_accepted.${pausedNote}`,
+          dealId: contact.deal_id,
+          deal_name: contact.deals?.name || null,
         });
         await sbLogActivity({
           dealId: contact.deal_id,
@@ -411,6 +1635,12 @@ export function initDashboard(state) {
           summary: `${contact.name} accepted connection request${dealPaused ? ' (deal paused)' : ''}`,
         }).catch(() => {});
         console.log(`[WEBHOOK/LINKEDIN/REL] ${contact.name} advanced to invite_accepted (investor pipeline)${dealPaused ? ' — deal paused, DM held for resume' : ''}`);
+
+        if (!alreadyResponded) {
+          queueLinkedInDmApproval(contact.id, {
+            reason: dealPaused ? 'accepted_while_paused' : 'accepted_via_legacy_route',
+          }).catch(err => console.warn('[WEBHOOK/LINKEDIN/REL] LinkedIn DM draft queue failed:', err.message));
+        }
 
       } else {
         // ── Sourcing pipeline — check company_contacts ─────────────────────────
@@ -438,6 +1668,11 @@ export function initDashboard(state) {
 
         if (!sc) {
           console.log(`[WEBHOOK/LINKEDIN/REL] ${name || providerId} not in any active pipeline — ignoring`);
+          pushActivity({
+            type: 'excluded',
+            action: `LinkedIn acceptance received: ${contactLabel}`,
+            note: 'Did not match any active deals or sourcing campaigns',
+          });
           return;
         }
 
@@ -451,6 +1686,7 @@ export function initDashboard(state) {
         console.log(`[WEBHOOK/LINKEDIN/REL] Sourcing contact ${sc.name} accepted invite — queuing LinkedIn DM`);
         pushActivity({
           type: 'linkedin',
+          activity_badge: 'accepted',
           action: `${sc.name} accepted connection request (sourcing)`,
           note: `Campaign: ${sc.sourcing_campaigns?.name || 'Unknown'} — queuing LinkedIn DM draft`,
         });
@@ -509,45 +1745,19 @@ export function initDashboard(state) {
 
   // POST /webhooks/unipile/messages — consolidated LinkedIn events (messages + relation accepted)
   // No auth — Unipile calls this from their servers. Always 200 immediately.
-  app.post('/webhooks/unipile/messages', express.json(), async (req, res) => {
+  const unipileMessageWebhookHandler = async (req, res) => {
     res.status(200).json({ ok: true });
 
     const event = req.body;
 
-    // Forensic trail — raw payload logged synchronously before anything else
-    const sb = getSupabase();
-    if (sb) {
-      sb.from('webhook_logs').insert({
-        event_type:  event?.type || event?.event_type || 'unknown',
-        payload:     event,
-        received_at: new Date().toISOString(),
-      }).then(null, () => {});
-    }
-
-    const eventType = (event?.type || event?.event_type || '').toLowerCase();
-    console.log('[WEBHOOKS/UNIPILE] Received event:', eventType);
-
     try {
-      if (['message_received', 'message.created'].includes(eventType)) {
-        await handleLiMsg(event, pushActivity, { draftContextualReply });
-      } else if (['new_relation', 'connection_request_accepted'].includes(eventType)) {
-        // queueForApproval callback: create approval_queue entry + log
-        const queueForApproval = async ({ contact, template, channel, action }) => {
-          if (!sb) return;
-          const body = (template.body || template.body_a || '').replace(/{{firstName}}/g, contact.name?.split(' ')[0] || contact.name || '');
-          await sb.from('approval_queue').insert([{
-            contact_id:   contact.id,
-            contact_name: contact.name,
-            firm:         contact.company_name || '',
-            stage:        'LinkedIn DM',
-            body,
-            status:       'pending',
-            outreach_mode: 'investor_outreach',
-            created_at:   new Date().toISOString(),
-          }]).then(null, err => console.warn('[APPROVAL] Queue insert error:', err.message));
-        };
-        await handleLiRelation(event, pushActivity, queueForApproval);
-      } else if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
+      if (isEmptyWebhookPayload(event)) {
+        console.warn('[WEBHOOKS/UNIPILE] Empty request body — likely provider validation ping');
+        return;
+      }
+      const mode = await processUnipileMessageEvent(event);
+      if (mode === 'email') {
+        const sb = getSupabase();
         // Inbound email reply from investor — mark contact as replied + notify
         const fromEmail = event?.from?.email || event?.from_email || event?.from || '';
         const subject   = event?.subject || '';
@@ -558,63 +1768,67 @@ export function initDashboard(state) {
         if (sb && fromEmail) {
           // Find contact by email
           const { data: contact } = await sb.from('contacts')
-            .select('id, name, company_name, deal_id')
+            .select('id, name, company_name, deal_id, deals!contacts_deal_id_fkey(name, status)')
             .ilike('email', fromEmail)
             .limit(1)
             .single();
 
-          if (contact) {
+          if (contact && String(contact.deals?.status || 'ACTIVE').toUpperCase() === 'ACTIVE') {
             // Mark as replied
             await sb.from('contacts').update({
               response_received: true,
-              pipeline_stage: 'Replied',
-              last_contacted_at: new Date().toISOString(),
+              pipeline_stage: 'In Conversation',
+              follow_up_due_at: null,
             }).eq('id', contact.id);
+
+            const dealName = contact.deals?.name || 'Unknown deal';
+            pushActivity({
+              type: 'reply',
+              activity_badge: 'replied',
+              action: `Email replied: ${contact.name}`,
+              note: `Matched to deal ${dealName}${contact.company_name ? ` · ${contact.company_name}` : ''}${subject ? ` · "${subject}"` : ''}`,
+              dealId: contact.deal_id,
+              deal_name: dealName,
+            });
 
             // Queue with debounce for contextual reply drafting
             queueInboundWithDebounce({ fromEmail, fromName: contact.name, bodyText: body, threadId, channel: 'email' }).catch(() => {});
 
             pushActivity({
-              type: 'reply',
-              action: 'Email reply received',
-              note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} — "${subject}"`,
+              type: 'approval',
+              action: `Next action: draft email reply for ${contact.name}`,
+              note: `Matched to deal ${dealName} · contextual reply workflow queued`,
               dealId: contact.deal_id,
+              deal_name: dealName,
             });
 
             const { sendTelegram } = await import('../approval/telegramBot.js');
             await sendTelegram(`📧 *Email reply* from *${contact.name}* (${contact.company_name || 'unknown'})\nSubject: _${subject}_`).catch(() => {});
           } else {
             console.log(`[WEBHOOKS/UNIPILE] mail_received — no contact found for ${fromEmail}`);
+            pushActivity({
+              type: contact ? 'system' : 'excluded',
+              action: `Email reply received: ${fromEmail}`,
+              note: contact
+                ? `${contact.name} matched a non-active deal, so no active deal workflow was triggered`
+                : 'Email address did not match any active deals',
+            });
           }
         }
-      } else {
-        console.log('[WEBHOOKS/UNIPILE] Unhandled event type:', eventType);
       }
     } catch (err) {
       console.error('[WEBHOOKS/UNIPILE] Handler error:', err.message);
     }
-  });
-
-  // Session middleware
-  app.use(session({
-    secret: process.env.SESSION_SECRET || 'roco-mission-control-2026',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 },
-  }));
+  };
+  app.post('/webhooks/unipile/messages', express.json(), unipileMessageWebhookHandler);
+  // Backward-compatibility aliases for older Unipile webhook registrations.
+  app.post('/webhook/unipile/linkedin/messages', express.json(), unipileMessageWebhookHandler);
+  app.post('/webhook/unipile/linkedin/relations', express.json(), unipileMessageWebhookHandler);
 
   // Auth middleware
   const dashboardUser = (process.env.DASHBOARD_USER || 'admin').trim();
   const dashboardPass = (process.env.DASHBOARD_PASS || 'roco2026').trim();
   const dashboardDisplayName = (process.env.DASHBOARD_DISPLAY_NAME || dashboardUser).trim();
-
-  function requireAuth(req, res, next) {
-    const publicPaths = ['/login', '/welcome.html', '/favicon.ico', '/audio/'];
-    if (publicPaths.some(p => req.path.startsWith(p))) return next();
-    if (req.session?.authenticated) return next();
-    if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Unauthorized' });
-    return res.redirect('/welcome.html');
-  }
 
   app.use(requireAuth);
 
@@ -661,6 +1875,7 @@ export function initDashboard(state) {
   });
 
   app.use(express.json());
+  app.use(express.static(path.join(__dirname, '../public')));
   app.use(express.static(path.join(__dirname, 'public')));
   registerRoutes(app);
 
@@ -681,7 +1896,7 @@ export function initDashboard(state) {
 
   // Recreate LinkedIn webhooks — auto-discover Cloudflare tunnel URL if running
   (async () => {
-    let serverBaseUrl = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL || '';
+    let serverBaseUrl = getConfiguredServerBaseUrl();
     if (!serverBaseUrl) {
       try {
         const r = await fetch('http://localhost:20241/quicktunnel');
@@ -700,6 +1915,9 @@ export function initDashboard(state) {
 
   // Start inbox polling fallback (60-second interval, catches missed webhooks)
   startInboxMonitor(handleLiMsg, pushActivity, { draftContextualReply });
+
+  // Register Telegram webhook for inline button callbacks
+  import('../core/telegram.js').then(m => m.registerTelegramWebhook()).catch(e => console.warn('[TELEGRAM] Webhook reg error:', e.message));
 
   // Pre-generate ElevenLabs welcome audio for the configured display name
   generateWelcomeAudio(dashboardDisplayName).catch(console.error);
@@ -903,9 +2121,73 @@ function registerRoutes(app) {
     });
   });
 
-  // GET /api/activity — last 100 events
-  app.get('/api/activity', (req, res) => {
-    res.json(activityFeed.slice(-100));
+  // GET /api/activity — paginated, persistent activity from DB
+  app.get('/api/activity', requireAuth, async (req, res) => {
+    try {
+      const sb     = getSupabase();
+      const page   = Math.max(1, parseInt(req.query.page || '1'));
+      const limit  = 50;
+      const offset = (page - 1) * limit;
+      const dealId = req.query.deal_id || req.query.dealId || null;
+
+      if (!sb) {
+        // Fallback to in-memory feed
+        const items = activityFeed.slice().reverse();
+        return res.json({ events: items.slice(offset, offset + limit), total: items.length, page, pages: Math.ceil(items.length / limit), has_more: offset + limit < items.length });
+      }
+
+      let query = sb.from('activity_log')
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
+      if (dealId) query = query.eq('deal_id', dealId);
+
+      const { data, count, error: dbErr } = await query;
+      if (dbErr) {
+        // DB error — fall back to in-memory feed
+        const items = activityFeed.slice().reverse();
+        return res.json({ events: items.slice(offset, offset + limit), total: items.length, page, pages: Math.ceil(items.length / limit) || 1, has_more: offset + limit < items.length });
+      }
+
+      const liveItems = activityFeed
+        .filter(item => !dealId || String(item.deal_id || item.dealId || '') === String(dealId))
+        .slice()
+        .reverse();
+      const merged = offset === 0
+        ? mergeActivityEntries(data || [], liveItems)
+        : (data || []);
+      const mergedTotal = offset === 0
+        ? Math.max(Number(count || 0), merged.length)
+        : Number(count || 0);
+
+      res.json({
+        events:   merged.slice(0, limit),
+        total:    mergedTotal,
+        page,
+        pages:    Math.ceil(mergedTotal / limit) || 1,
+        has_more: offset + limit < mergedTotal,
+      });
+    } catch (err) {
+      // Any error — return in-memory feed
+      const items = activityFeed.slice().reverse();
+      res.json({ events: items.slice(0, 50), total: items.length, page: 1, pages: 1, has_more: false });
+    }
+  });
+
+  // GET /api/activity/recent — last 20 events, no pagination (for overview widget)
+  app.get('/api/activity/recent', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.json(activityFeed.slice(-20).reverse());
+      const { data } = await sb.from('activity_log')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(20);
+      const merged = mergeActivityEntries(data || [], activityFeed.slice().reverse());
+      res.json(merged.slice(0, 20));
+    } catch {
+      res.json(activityFeed.slice(-20).reverse());
+    }
   });
 
   // GET /api/pipeline — active pipeline contacts from Supabase, filtered by deal
@@ -915,43 +2197,184 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
 
-      const EXCLUDED = ['Archived', 'Skipped', 'Inactive', 'Deleted — Do Not Contact', 'Suppressed — Opt Out'];
+      const EXCLUDED = dealId
+        ? ['Deleted — Do Not Contact', 'Suppressed — Opt Out']
+        : ['Archived', 'Skipped', 'Deleted — Do Not Contact', 'Suppressed — Opt Out'];
 
-      let query = sb.from('contacts')
-        .select('id, name, company_name, job_title, linkedin_url, investor_score, pipeline_stage, enrichment_status, email, notes, updated_at, invite_sent_at, deal_id')
-        .not('pipeline_stage', 'in', `(${EXCLUDED.map(s => `"${s}"`).join(',')})`)
-        .order('investor_score', { ascending: false })
-        .limit(500);
+      const baseSelect = 'id, name, company_name, job_title, linkedin_url, investor_score, pipeline_stage, enrichment_status, email, phone, notes, updated_at, invite_sent_at, last_email_sent_at, dm_sent_at, last_outreach_at, last_reply_at, deal_id, conversation_state, intent_history, follow_up_due_at, follow_up_count, response_received';
+      const richSelect = baseSelect + ', last_intent, last_intent_label';
 
-      if (dealId) query = query.eq('deal_id', dealId);
+      const buildQuery = (select) => {
+        let q = sb.from('contacts')
+          .select(select)
+          .not('pipeline_stage', 'in', `(${EXCLUDED.map(s => `"${s}"`).join(',')})`)
+          .order('investor_score', { ascending: false })
+          .limit(500);
+        if (dealId) q = q.eq('deal_id', dealId);
+        return q;
+      };
 
-      const { data, error: dbErr } = await query;
+      let { data, error: dbErr } = await buildQuery(richSelect);
+      // Fall back if sentiment columns not yet added via SQL migration
+      if (dbErr?.code === '42703') {
+        ({ data, error: dbErr } = await buildQuery(baseSelect));
+      }
       if (dbErr) throw new Error(dbErr.message);
 
       // Build deal name lookup
       const dealIds = [...new Set((data || []).map(c => c.deal_id).filter(Boolean))];
       const dealNames = {};
+      const dealRowsById = {};
       if (dealIds.length) {
-        const { data: dealRows } = await sb.from('deals').select('id, name').in('id', dealIds);
-        (dealRows || []).forEach(d => { dealNames[d.id] = d.name; });
+        const { data: dealRows } = await sb.from('deals').select('id, name, followup_days_li, followup_days_email').in('id', dealIds);
+        (dealRows || []).forEach(d => {
+          dealNames[d.id] = d.name;
+          dealRowsById[d.id] = d;
+        });
       }
 
-      const mapped = (data || []).map(c => ({
+      let globalSequence = null;
+      try {
+        const { data } = await sb.from('outreach_sequence').select('steps').limit(1).single();
+        globalSequence = data || null;
+      } catch {}
+
+      const dealSequences = {};
+      if (dealIds.length) {
+        const { data: seqRows } = await sb.from('deal_sequence').select('deal_id, steps').in('deal_id', dealIds);
+        (seqRows || []).forEach(row => { dealSequences[row.deal_id] = row; });
+      }
+
+      const backfills = [];
+
+      const contactDealContext = await buildContactDealContextMap(sb);
+      const mapped = (data || []).map(c => {
+        const dealContext = contactDealContext.get(c.id) || {};
+        const dealRow = dealRowsById[c.deal_id] || null;
+        const sequence = dealSequences[c.deal_id] || globalSequence;
+        const scheduledFollowUpAt = computeBackfilledScheduledFollowUpAt(c, dealRow, sequence);
+        if (scheduledFollowUpAt && c.follow_up_due_at !== scheduledFollowUpAt) {
+          backfills.push({ id: c.id, follow_up_due_at: scheduledFollowUpAt });
+        }
+        return {
         id: c.id,
         name: c.name,
         firm: c.company_name || '',
         jobTitle: c.job_title || '',
         score: c.investor_score,
-        stage: c.pipeline_stage,
-        lastContacted: c.invite_sent_at || c.updated_at,
+        stage: (c.pipeline_stage === 'Inactive' && String(c.conversation_state || '').startsWith('conversation_ended'))
+          ? 'Closed'
+          : c.pipeline_stage,
+        lastContacted: c.last_outreach_at || c.last_email_sent_at || c.invite_sent_at || c.updated_at,
+        lastReplyAt: c.last_reply_at,
+        scheduledFollowUpAt,
+        followUpCount: c.follow_up_count || 0,
         enrichmentStatus: c.enrichment_status,
         email: c.email,
+        phone: c.phone,
         linkedinUrl: c.linkedin_url,
         notes: c.notes,
         deal_id: c.deal_id,
         dealName: dealNames[c.deal_id] || '',
-      }));
+        projectName: dealContext.projectName || dealNames[c.deal_id] || '',
+        activeDealName: dealContext.activeDealName || '',
+        activeDealId: dealContext.activeDealId || null,
+        deals: dealContext.deals || [],
+        dealNamesText: dealContext.dealNamesText || '',
+        conversationState: c.conversation_state,
+        lastIntent: c.last_intent,
+        lastIntentLabel: c.last_intent_label,
+        intentHistory: c.intent_history || [],
+      };
+      });
+
+      for (const backfill of backfills.slice(0, 100)) {
+        await sb.from('contacts').update({ follow_up_due_at: backfill.follow_up_due_at }).eq('id', backfill.id);
+      }
       res.json(mapped);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/contacts/:id/conversation — messages + intent history for a contact
+  app.get('/api/contacts/:id/conversation', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { id } = req.params;
+      const requestedDealId = String(req.query.dealId || '').trim() || null;
+
+      const { data: contact } = await sb.from('contacts')
+        .select('id, name, company_name, job_title, email, phone, linkedin_url, pipeline_stage, conversation_state, last_intent, last_intent_label, intent_history, last_outreach_at, last_reply_at, investor_score, notes, deal_id, batch_id')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (contact) {
+        await hydrateLinkedInConversationHistory(sb, contact, requestedDealId);
+        await hydrateEmailConversationHistory(sb, contact, requestedDealId);
+      }
+
+      let query = sb.from('conversation_messages')
+        .select('id, deal_id, direction, channel, body, subject, sent_at, received_at, intent, intent_confidence, action_taken')
+        .eq('contact_id', id)
+        .limit(250);
+      if (requestedDealId) query = query.eq('deal_id', requestedDealId);
+      const { data: rawMessages } = await query;
+      const messages = (rawMessages || []).slice().sort((a, b) => {
+        const aTs = new Date(a.sent_at || a.received_at || 0).getTime();
+        const bTs = new Date(b.sent_at || b.received_at || 0).getTime();
+        return aTs - bTs;
+      });
+
+      const selectedDealId = requestedDealId || (messages?.length === 1 ? messages[0]?.deal_id : null) || contact?.deal_id || null;
+      const contactDealContext = await buildContactDealContextMap(sb);
+      const dealNameMap = await getDealNameMap(sb, [
+        requestedDealId,
+        selectedDealId,
+        contact?.deal_id,
+        ...(messages || []).map(m => m.deal_id),
+      ]);
+      const selectedDealName = selectedDealId ? (dealNameMap[selectedDealId] || 'Unknown Project') : null;
+
+      // Fetch firm research from batch_firms (AUM, thesis, justification, past investments)
+      let firmResearch = null;
+      if (contact?.batch_id && contact?.company_name) {
+        try {
+          const { data: firmRow } = await sb.from('batch_firms')
+            .select('firm_name, score, aum, thesis, justification, past_investments, contacts_found, enrichment_status')
+            .eq('batch_id', contact.batch_id)
+            .eq('firm_name', contact.company_name)
+            .maybeSingle();
+          firmResearch = firmRow || null;
+        } catch {
+          firmResearch = null;
+        }
+      }
+
+      res.json({
+        contact: contact || null,
+        firmResearch,
+        messages: (messages || []).map(m => ({
+          id: m.id,
+          dealId: m.deal_id || null,
+          dealName: m.deal_id ? (dealNameMap[String(m.deal_id)] || 'Unknown Project') : null,
+          direction: m.direction,
+          channel: m.channel,
+          body: m.body,
+          subject: m.subject,
+          timestamp: m.sent_at || m.received_at,
+          intent: m.intent,
+          intentConfidence: m.intent_confidence,
+          actionTaken: m.action_taken,
+        })),
+        selectedDealId,
+        selectedDealName,
+        deals: contactDealContext.get(id)?.deals || [],
+        activeDealName: contactDealContext.get(id)?.activeDealName || '',
+        dealNamesText: contactDealContext.get(id)?.dealNamesText || '',
+        intentHistory: contact?.intent_history || [],
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -963,23 +2386,84 @@ function registerRoutes(app) {
     try {
       const sb = getSupabase();
       if (sb) {
-        const { data: sbItems } = await sb.from('approval_queue')
-          .select('id, contact_id, contact_name, firm, stage, body, created_at')
-          .eq('stage', 'LinkedIn DM')
-          .eq('status', 'pending')
-          .order('created_at', { ascending: true })
-          .catch(() => ({ data: [] }));
-        const sbMapped = (sbItems || []).map(r => ({
-          id:       r.id,
-          name:     r.contact_name || '',
-          firm:     r.firm || '',
-          stage:    r.stage,
-          body:     r.body || '',
-          channel:  'linkedin',
-          queuedAt: r.created_at,
-          _supabaseOnly: true,
-        }));
-        return res.json([...inMemory, ...sbMapped]);
+        const { data: sbItems, error: sbErr } = await sb.from('approval_queue')
+          .select('id, contact_id, contact_name, contact_email, firm, stage, body, message_type, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode')
+          .in('status', ['pending'])
+          .order('created_at', { ascending: true });
+        if (sbErr) console.warn('[/api/queue] Supabase query error:', sbErr.message);
+        const LINKEDIN_STAGES = ['LinkedIn DM', 'prior_chat_review'];
+        const looksLikeEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+        const missingEmailIds = [];
+        const contactIdsToHydrate = [...new Set((sbItems || [])
+          .filter(r => r.contact_id)
+          .map(r => r.contact_id))];
+        const contactEmailMap = {};
+        const contactScoreMap = {};
+        if (contactIdsToHydrate.length) {
+          try {
+            const { data: contactRows } = await sb.from('contacts').select('id, email, investor_score').in('id', contactIdsToHydrate);
+            for (const row of contactRows || []) {
+              contactEmailMap[row.id] = row.email || null;
+              contactScoreMap[row.id] = row.investor_score ?? null;
+            }
+          } catch {}
+        }
+
+        const sbMapped = (sbItems || []).flatMap(r => {
+          const isLinkedIn = LINKEDIN_STAGES.includes(r.stage) || r.message_type === 'prior_chat_review';
+          const resolvedEmail = r.contact_email || contactEmailMap[r.contact_id] || null;
+          if (!isLinkedIn && !looksLikeEmail(resolvedEmail)) {
+            missingEmailIds.push(r.id);
+            return [];
+          }
+          return {
+            id:              r.id,
+            name:            r.contact_name || '',
+            firm:            r.firm || '',
+            stage:           r.stage,
+            body:            r.edited_body || r.body || '',
+            message_type:    r.message_type || null,
+            channel:         isLinkedIn ? 'linkedin' : 'email',
+            queuedAt:        r.created_at,
+            contact_id:      r.contact_id,
+            subjectA:        r.subject_a || null,
+            subjectB:        r.subject_b || null,
+            score:           r.score ?? contactScoreMap[r.contact_id] ?? null,
+            researchSummary: r.research_summary || null,
+            contactEmail:    resolvedEmail,
+            dealName:        r.deal_name || null,
+            editInstructions: r.edit_instructions || null,
+            _supabaseOnly:   true,
+          };
+        });
+        if (missingEmailIds.length) {
+          sb.from('approval_queue').update({
+            status: 'skipped',
+            resolved_at: new Date().toISOString(),
+            edit_instructions: 'Auto-skipped: missing usable email address',
+          }).in('id', missingEmailIds).catch(() => {});
+        }
+        const merged = [];
+        const seenQueueIds = new Set();
+        const seenLocalIds = new Set();
+
+        for (const item of inMemory) {
+          const queueKey = item.queueId ? `q:${item.queueId}` : null;
+          const localKey = item.id ? `i:${item.id}` : null;
+          if (queueKey) seenQueueIds.add(queueKey);
+          if (localKey) seenLocalIds.add(localKey);
+          merged.push(item);
+        }
+
+        for (const item of sbMapped) {
+          const queueKey = item.id ? `q:${item.id}` : null;
+          if (queueKey && seenQueueIds.has(queueKey)) continue;
+          const localKey = item.telegramMsgId ? `i:${item.telegramMsgId}` : null;
+          if (localKey && seenLocalIds.has(localKey)) continue;
+          merged.push(item);
+        }
+
+        return res.json(merged);
       }
     } catch {}
     res.json(inMemory);
@@ -988,6 +2472,57 @@ function registerRoutes(app) {
   // Alias for backward compat
   app.get('/api/approvals', (req, res) => {
     res.json(getPendingApprovals());
+  });
+
+  // POST /api/approvals/:id/prior-chat — dashboard decision on prior-chat review items
+  app.post('/api/approvals/:id/prior-chat', async (req, res) => {
+    const { id }       = req.params;
+    const { decision } = req.body; // 'proceed' or 'skip'
+    if (!decision || !['proceed', 'skip'].includes(decision)) {
+      return res.status(400).json({ error: 'decision must be proceed or skip' });
+    }
+    const sb = getSupabase();
+    if (!sb) return res.status(500).json({ error: 'DB unavailable' });
+    try {
+      const { data: row } = await sb.from('approval_queue')
+        .select('id, contact_id, contact_name, firm, deal_id').eq('id', id).single();
+      if (!row) return res.status(404).json({ error: 'Queue item not found' });
+
+      const contactPatch = decision === 'proceed'
+        ? {
+            pipeline_stage: 'invite_accepted',
+            updated_at: new Date().toISOString(),
+          }
+        : {
+            pipeline_stage: 'Inactive',
+            conversation_state: 'do_not_contact',
+            conversation_ended_at: new Date().toISOString(),
+            conversation_ended_reason: 'Prior LinkedIn chat declined via dashboard',
+            updated_at: new Date().toISOString(),
+          };
+      await sb.from('contacts').update(contactPatch).eq('id', row.contact_id);
+      await sb.from('approval_queue').update({
+        status:       decision === 'proceed' ? 'approved' : 'skipped',
+        resolved_at:  new Date().toISOString(),
+      }).eq('id', id);
+
+      if (decision === 'proceed') {
+        await queueLinkedInDmApproval(row.contact_id, { reason: 'prior_chat_approved_dashboard' }).catch(() => {});
+      }
+
+      pushActivity({
+        type:   'linkedin',
+        action: decision === 'proceed'
+          ? `Prior chat approved — DM approval queued: ${row.contact_name || ''}`
+          : `Prior chat skipped: ${row.contact_name || ''}`,
+        note: row.firm || '',
+        dealId: row.deal_id || null,
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[/api/approvals/prior-chat]', err.message);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // POST /api/approve — approve an email from dashboard
@@ -1013,7 +2548,7 @@ function registerRoutes(app) {
         let sbItem = null;
         try {
           const { data } = await sb.from('approval_queue')
-            .select('id, contact_id, contact_name, firm, body, stage')
+            .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject')
             .eq('id', id)
             .eq('status', 'pending')
             .single();
@@ -1022,20 +2557,146 @@ function registerRoutes(app) {
 
         if (sbItem?.contact_id && sbItem?.stage === 'LinkedIn DM') {
           try {
-            const text = editedBody || sbItem.body || '';
-            await sendApprovedLinkedInDM({ contactId: sbItem.contact_id, text });
-            await sb.from('approval_queue').update({
-              status:  'sent',
-              sent_at: new Date().toISOString(),
-            }).eq('id', sbItem.id).catch(() => {});
-            pushActivity({
-              type:   'linkedin',
-              action: `LinkedIn DM sent: ${sbItem.contact_name || ''}`,
-              note:   sbItem.firm || '',
+            const text = sanitizeApprovalText(editedBody || sbItem.edited_body || sbItem.body || '');
+            await sb.from('contacts').update({
+              pipeline_stage: 'DM Approved',
+              updated_at: new Date().toISOString(),
+            }).eq('id', sbItem.contact_id);
+            const sendResult = await sendApprovedLinkedInDM({
+              contactId: sbItem.contact_id,
+              text,
+              queueId: sbItem.id,
+              queueItem: sbItem,
             });
+            if (sendResult?.deferred) {
+              return res.json({
+                success: true,
+                deferred: true,
+                message: sendResult.nextOpen
+                  ? `LinkedIn DM approved and waiting for the DM window (${sendResult.nextOpen})`
+                  : 'LinkedIn DM approved and waiting for the DM window',
+              });
+            }
             return res.json({ success: true, message: 'LinkedIn DM sent' });
           } catch (err) {
             console.error('[/api/approve] LinkedIn DM send error:', err.message);
+            return res.status(500).json({ error: 'Send failed: ' + err.message });
+          }
+        }
+
+        // Email approval (INTRO or other email stages) — send via Unipile Gmail
+        if (sbItem?.contact_id) {
+          try {
+            // Look up contact email if not stored directly on the queue item
+            let toEmail = sbItem.contact_email;
+            if (!toEmail) {
+              let contactRow = null;
+              try {
+                const result = await sb.from('contacts').select('email, name').eq('id', sbItem.contact_id).single();
+                contactRow = result?.data || null;
+              } catch {
+                contactRow = null;
+              }
+              toEmail = contactRow?.email;
+            }
+            if (!toEmail) {
+              return res.status(400).json({ error: 'No email address found for this contact — cannot send' });
+            }
+
+            const chosenSubject = subjectChoice === 'b' ? sbItem.subject_b : (sbItem.subject_a || sbItem.subject || '');
+            const finalSubject  = editedBody ? chosenSubject : (chosenSubject || '');
+            const bodyToSend    = sanitizeApprovalText(editedBody || sbItem.edited_body || sbItem.body || '');
+            await sb.from('contacts').update({
+              pipeline_stage: 'Email Approved',
+              updated_at: new Date().toISOString(),
+            }).eq('id', sbItem.contact_id);
+
+            const sendResult = await sendEmail({ to: toEmail, toName: sbItem.contact_name || '', subject: finalSubject, body: bodyToSend });
+
+            try {
+              await sb.from('approval_queue').update({
+                status:           'sent',
+                sent_at:          new Date().toISOString(),
+                approved_subject: finalSubject,
+              }).eq('id', sbItem.id);
+            } catch {}
+
+            try {
+              await sb.from('contacts').update({
+                pipeline_stage:     'Email Sent',
+                last_email_sent_at: new Date().toISOString(),
+              }).eq('id', sbItem.contact_id);
+            } catch {}
+
+            try {
+              await sb.from('conversation_messages').insert({
+                contact_id:  sbItem.contact_id,
+                direction:   'outbound',
+                channel:     'email',
+                body:        bodyToSend,
+                subject:     finalSubject,
+                sent_at:     new Date().toISOString(),
+              });
+            } catch {}
+
+            // Log to activity_log so email sent metrics increment
+            let contactForLog = null;
+            try {
+              const result = await sb.from('contacts').select('deal_id').eq('id', sbItem.contact_id).single();
+              contactForLog = result?.data || null;
+            } catch {
+              contactForLog = null;
+            }
+            if (contactForLog?.deal_id) {
+              try {
+                const { data: dealRow } = await sb.from('deals')
+                  .select('id, followup_days_li, followup_days_email')
+                  .eq('id', contactForLog.deal_id)
+                  .maybeSingle();
+                const sequence = await getSequenceForDealFromServer(sb, contactForLog.deal_id);
+                const stageLabel = String(sbItem?.stage || '').toLowerCase();
+                const followUpMatch = stageLabel.match(/follow[- ]up\s*(\d+)/i);
+                const followUpNumber = followUpMatch ? Number(followUpMatch[1] || 1) : 0;
+                const nextFollowUpPlan = getNextFollowUpPlanForChannel(sequence, dealRow || null, 'email', followUpNumber);
+                const sentAt = new Date().toISOString();
+                const nextFollowUpDueAt = nextFollowUpPlan?.delayDays
+                  ? new Date(Date.now() + nextFollowUpPlan.delayDays * 24 * 60 * 60 * 1000).toISOString()
+                  : null;
+
+                await sb.from('contacts').update({
+                  pipeline_stage:     'Email Sent',
+                  outreach_channel:   'email',
+                  last_email_sent_at: sentAt,
+                  last_outreach_at:   sentAt,
+                  follow_up_count:    followUpNumber,
+                  follow_up_due_at:   nextFollowUpDueAt,
+                }).eq('id', sbItem.contact_id);
+
+                await sb.from('activity_log').insert({
+                  deal_id:    contactForLog.deal_id,
+                  event_type: 'EMAIL_SENT',
+                  summary:    `Email sent to ${sbItem.contact_name || ''} at ${sbItem.firm || ''}`,
+                  detail:     {
+                    channel: 'email',
+                    account_id: sendResult?.accountId || null,
+                    provider_id: sendResult?.providerId || null,
+                    message_id: sendResult?.emailId || null,
+                    thread_id: sendResult?.threadId || null,
+                    to: toEmail,
+                  },
+                  created_at: new Date().toISOString(),
+                });
+              } catch {}
+            }
+
+            pushActivity({
+              type:   'email',
+              action: `Email sent: ${sbItem.contact_name || ''}`,
+              note:   `${sbItem.firm || ''} · ${finalSubject}`,
+            });
+            return res.json({ success: true, message: 'Email sent' });
+          } catch (err) {
+            console.error('[/api/approve] Email send error:', err.message);
             return res.status(500).json({ error: 'Send failed: ' + err.message });
           }
         }
@@ -1049,7 +2710,13 @@ function registerRoutes(app) {
       note: item ? `${item.name} @ ${item.firm}` : 'Unknown contact',
     });
 
-    res.json({ success: true, message: 'Approval sent — orchestrator will fire the email' });
+    const isLinkedIn = String(item?.stage || '').toLowerCase().includes('linkedin');
+    res.json({
+      success: true,
+      message: isLinkedIn
+        ? 'LinkedIn DM approved'
+        : 'Approval sent — orchestrator will fire the email',
+    });
   });
 
   // POST /api/skip-approval — skip an approval from dashboard (hard delete)
@@ -1063,20 +2730,57 @@ function registerRoutes(app) {
     // Hard delete from Supabase approval_queue by id (handles both telegram_msg_id and UUID items)
     await deleteApprovalFromQueue(id).catch(() => {});
     const sb = getSupabase();
-    if (sb) await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', id).catch(() => {});
+    if (sb) {
+      try {
+        await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', id);
+      } catch {
+        // best effort
+      }
+    }
 
     res.json({ success: true });
   });
 
   // POST /api/edit-approval — send edit instructions
-  app.post('/api/edit-approval', (req, res) => {
-    const { id, instructions } = req.body;
-    if (!id || !instructions) return res.status(400).json({ error: 'id and instructions required' });
+  app.post('/api/edit-approval', async (req, res) => {
+    const { id, body, subject } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
 
-    const resolved = resolveApprovalFromDashboard(id, 'edit', null, instructions);
-    if (!resolved) return res.status(404).json({ error: 'Approval not found' });
+    const sanitizedBody = body == null ? null : sanitizeApprovalText(body);
+    const sanitizedSubject = subject == null ? null : sanitizeApprovalText(subject);
+    if (sanitizedBody !== null && !sanitizedBody) {
+      return res.status(400).json({ error: 'Edited body cannot be empty' });
+    }
 
-    res.json({ success: true, message: 'Edit instructions sent — orchestrator will redraft' });
+    const updatedMemory = await updateApprovalDraftFromDashboard(id, {
+      body: sanitizedBody,
+      subject: sanitizedSubject,
+    }).catch(() => false);
+
+    const sb = getSupabase();
+    let updatedDb = false;
+    if (sb) {
+      try {
+        const patch = {};
+        if (sanitizedBody !== null) patch.edited_body = sanitizedBody;
+        if (sanitizedSubject !== null) patch.approved_subject = sanitizedSubject;
+        if (Object.keys(patch).length) {
+          const { data } = await sb.from('approval_queue').update(patch)
+            .eq('id', id)
+            .eq('status', 'pending')
+            .select('id')
+            .maybeSingle();
+          updatedDb = !!data?.id;
+        }
+      } catch {}
+    }
+
+    if (!updatedMemory && !updatedDb) {
+      return res.status(404).json({ error: 'Approval not found' });
+    }
+
+    notifyQueueUpdated();
+    res.json({ success: true, message: 'Draft updated' });
   });
 
   // GET /api/health — API health status + process diagnostics
@@ -1104,7 +2808,7 @@ function registerRoutes(app) {
     }
   });
 
-  // GET /api/stats — stats summary (Supabase-based, never calls Notion)
+  // GET /api/stats — stats summary from Supabase
   app.get('/api/stats', async (req, res) => {
     const stats = {
       emails_sent: 0,
@@ -1138,26 +2842,22 @@ function registerRoutes(app) {
         const safeActiveIds    = activeDealIds.length > 0    ? activeDealIds    : ['00000000-0000-0000-0000-000000000000'];
         const safeAllActiveIds = allActiveDealIds.length > 0 ? allActiveDealIds : ['00000000-0000-0000-0000-000000000000'];
 
-        // Emails sent — count from activity_log (EMAIL_SENT events) — include paused deals
+        // Email sent / response stats — use contacts table so Overview matches deal cards.
         try {
-          const { count } = await sb.from('activity_log').select('id', { count: 'exact', head: true })
-            .eq('event_type', 'EMAIL_SENT')
+          const { data: contactStats } = await sb.from('contacts')
+            .select('pipeline_stage, last_email_sent_at, response_received')
             .in('deal_id', safeAllActiveIds);
-          stats.emails_sent = count || 0;
-          stats.emailsSent  = count || 0;
-        } catch (e) { console.warn('/api/stats emails_sent:', e.message); }
-
-        // Email replies — counted from replies table (webhook-driven), active deals only
-        // Response rate = replies / emails sent
-        try {
-          const { count: replied } = await sb.from('replies').select('id', { count: 'exact', head: true })
-            .in('deal_id', safeAllActiveIds);
-          stats.emails_replied  = replied || 0;
-          stats.response_rate   = stats.emails_sent > 0
-            ? Math.round(((replied || 0) / stats.emails_sent) * 100)
+          const contacts = contactStats || [];
+          const emailsSent = contacts.filter(c => c.last_email_sent_at || ['Email Sent', 'email_sent'].includes(c.pipeline_stage)).length;
+          const emailReplies = contacts.filter(c => c.response_received === true).length;
+          stats.emails_sent = emailsSent;
+          stats.emailsSent = emailsSent;
+          stats.emails_replied = emailReplies;
+          stats.response_rate = emailsSent > 0
+            ? Math.round((emailReplies / emailsSent) * 100)
             : 0;
-          stats.responseRate    = stats.response_rate;
-        } catch (e) { console.warn('/api/stats response_rate:', e.message); }
+          stats.responseRate = stats.response_rate;
+        } catch (e) { console.warn('/api/stats email metrics:', e.message); }
 
         // Pending approvals
         try {
@@ -1194,30 +2894,28 @@ function registerRoutes(app) {
 
         // LinkedIn metrics — all active deals incl. paused
         try {
-          const { count: liInvites } = await sb.from('contacts').select('id', { count: 'exact', head: true })
-            .in('deal_id', safeAllActiveIds)
-            .not('invite_sent_at', 'is', null);
-          stats.li_invites_sent = liInvites || 0;
-
-          const { count: liAccepted } = await sb.from('contacts').select('id', { count: 'exact', head: true })
-            .in('deal_id', safeAllActiveIds)
-            .in('pipeline_stage', ['invite_accepted', 'dm_sent', 'Replied', 'Meeting Booked', 'Meeting Scheduled']);
+          const { data: linkedinContacts } = await sb.from('contacts')
+            .select('pipeline_stage, invite_sent_at, invite_accepted_at, outreach_channel')
+            .in('deal_id', safeAllActiveIds);
+          const contacts = linkedinContacts || [];
+          stats.li_invites_sent = contacts.filter(hasLinkedInInviteHistory).length;
+          stats.li_active_pending = contacts.filter(hasActivePendingLinkedInInvite).length;
+          const liAccepted = contacts.filter(hasLinkedInAccepted).length;
           stats.li_acceptance_rate = stats.li_invites_sent > 0
-            ? Math.round(((liAccepted || 0) / stats.li_invites_sent) * 100)
+            ? Math.round((liAccepted / stats.li_invites_sent) * 100)
             : 0;
 
-          const { count: liDms } = await sb.from('contacts').select('id', { count: 'exact', head: true })
-            .in('deal_id', safeAllActiveIds)
-            .in('pipeline_stage', ['dm_sent', 'Replied', 'Meeting Booked', 'Meeting Scheduled'])
-            .eq('outreach_channel', 'linkedin');
-          stats.li_dms_sent = liDms || 0;
+          stats.li_dms_sent = contacts.filter(c =>
+            ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(c.pipeline_stage) &&
+            ['linkedin', 'linkedin_dm'].includes(c.outreach_channel)
+          ).length;
 
-          const { count: liReplied } = await sb.from('contacts').select('id', { count: 'exact', head: true })
-            .in('deal_id', safeAllActiveIds)
-            .in('pipeline_stage', ['Replied', 'Meeting Booked', 'Meeting Scheduled'])
-            .eq('outreach_channel', 'linkedin');
+          const liReplied = contacts.filter(c =>
+            ['In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'].includes(c.pipeline_stage) &&
+            ['linkedin', 'linkedin_dm'].includes(c.outreach_channel)
+          ).length;
           stats.li_dm_response_rate = stats.li_dms_sent > 0
-            ? Math.round(((liReplied || 0) / stats.li_dms_sent) * 100)
+            ? Math.round((liReplied / stats.li_dms_sent) * 100)
             : 0;
         } catch (e) { console.warn('/api/stats linkedin metrics:', e.message); }
       }
@@ -1332,19 +3030,6 @@ function registerRoutes(app) {
         }
       }
 
-      case 'run_analytics': {
-        try {
-          const { runWeeklyAnalytics } = await import('../core/analyticsEngine.js');
-          runWeeklyAnalytics().catch(err =>
-            console.error('[ANALYTICS] Manual run failed:', err.message)
-          );
-          pushActivity({ type: 'SYSTEM', action: 'Analytics Started', note: 'Weekly analytics running — recommendations will appear shortly' });
-          return res.json({ success: true, message: 'Analytics queued — check the Analytics tab in a minute' });
-        } catch (e) {
-          return res.status(500).json({ error: e.message });
-        }
-      }
-
       default:
         return res.status(400).json({ error: `Unknown action: ${req.body?.action}` });
     }
@@ -1380,7 +3065,10 @@ function registerRoutes(app) {
     const { stage } = req.body;
     if (!stage) return res.status(400).json({ error: 'stage required' });
     try {
-      await updateContact(id, { pipelineStage: stage });
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { error: updateErr } = await sb.from('contacts').update({ pipeline_stage: stage }).eq('id', id);
+      if (updateErr) throw updateErr;
       res.json({ success: true });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -1423,13 +3111,16 @@ function registerRoutes(app) {
     try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { data, error: dbErr } = await sb
-        .from('conversation_messages')
-        .select('*')
-        .eq('contact_id', req.params.id)
-        .order('sent_at', { ascending: true });
-      if (dbErr) throw new Error(dbErr.message);
-      res.json({ messages: data || [] });
+      const requestedDealId = String(req.query.dealId || '').trim() || null;
+
+      const { data: contact, error: contactErr } = await sb.from('contacts')
+        .select('id, deal_id, name, unipile_chat_id')
+        .eq('id', req.params.id)
+        .single();
+      if (contactErr) throw new Error(contactErr.message);
+
+      const messages = await hydrateLinkedInConversationHistory(sb, contact, requestedDealId);
+      res.json({ messages: messages || [] });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
@@ -1451,20 +3142,7 @@ function registerRoutes(app) {
         .eq('contact_id', id)
         .in('status', ['draft', 'pending_approval']);
 
-      // 4. Remove from Notion — set Inactive (guaranteed valid) AND archive
-      //    Either one alone is enough to hide the contact from all pipeline queries
-      try {
-        await updateContact(id, { pipelineStage: 'Inactive' });
-      } catch (notionErr) {
-        error('Notion stage update failed on delete', { id, err: notionErr.message });
-      }
-      try {
-        await archiveContact(id);
-      } catch (archiveErr) {
-        error('Notion archive failed on delete (contact may still be hidden via Inactive stage)', { id, err: archiveErr.message });
-      }
-
-      // 5. Log
+      // 4. Log
       pushActivity({ type: 'SYSTEM', action: 'Contact Deleted', note: `Contact ${id} removed from pipeline` });
       await sbLogActivity({
         contactId: id,
@@ -1516,7 +3194,7 @@ function registerRoutes(app) {
       }
 
       const ARCHIVED_STAGES = ['Archived','ARCHIVED','archived','Skipped','skipped_no_name','skipped_no_linkedin','Inactive','Suppressed — Opt Out','Deleted — Do Not Contact'];
-      const OUTREACHED_STAGES = ['email_sent','dm_sent','invite_sent','invite_accepted','Replied','In Conversation','Meeting Booked','Meeting Scheduled'];
+      const OUTREACHED_STAGES = ['Email Approved','DM Approved','Email Sent','DM Sent','email_sent','dm_sent','invite_sent','invite_accepted','Replied','In Conversation','Meeting Booked','Meeting Scheduled'];
 
       // Fetch current campaign batch status for all deals
       const { data: campaignBatches } = await sb.from('campaign_batches')
@@ -1531,19 +3209,33 @@ function registerRoutes(app) {
         if (!batchByDeal[b.deal_id]) batchByDeal[b.deal_id] = b;
       }
 
+      const batchIds = Object.values(batchByDeal).map(b => b.id).filter(Boolean);
+      const firmCountByBatch = {};
+      if (batchIds.length) {
+        const { data: batchFirmRows } = await sb.from('batch_firms')
+          .select('batch_id')
+          .in('batch_id', batchIds);
+        for (const row of (batchFirmRows || [])) {
+          firmCountByBatch[row.batch_id] = (firmCountByBatch[row.batch_id] || 0) + 1;
+        }
+      }
+
       const enriched = deals.map(deal => {
         const contacts = byDeal[deal.id] || [];
         const totalContacts = contacts.length; // all scraped
-        const emailsSentCount = contacts.filter(c => c.last_email_sent_at || c.pipeline_stage === 'email_sent').length;
+        const emailsSentCount = contacts.filter(c => c.last_email_sent_at || ['Email Sent', 'email_sent'].includes(c.pipeline_stage)).length;
         const totalOutreached = contacts.filter(c => OUTREACHED_STAGES.includes(c.pipeline_stage)).length;
         const responses = contacts.filter(c => c.response_received === true).length;
         const responseRate = totalOutreached > 0 ? Math.round((responses / totalOutreached) * 100) : 0;
         const activeProspects = contacts.filter(c => !ARCHIVED_STAGES.includes(c.pipeline_stage)).length;
         const batch = batchByDeal[deal.id] || null;
+        const liveFirmCount = batch?.id ? (firmCountByBatch[batch.id] || 0) : 0;
 
         return {
           ...deal,
           contacts: totalContacts,
+          live_firms: liveFirmCount,
+          firms: liveFirmCount,
           active_prospects: activeProspects,
           emails_sent: emailsSentCount,
           response_rate: responseRate,
@@ -1555,8 +3247,8 @@ function registerRoutes(app) {
           current_batch_status: batch?.status || null,
           current_batch_number: batch?.batch_number || null,
           current_batch_id: batch?.id || null,
-          current_batch_ranked_firms: batch?.ranked_firms || 0,
-          current_batch_target_firms: batch?.target_firms || 20,
+          current_batch_ranked_firms: liveFirmCount,
+          current_batch_target_firms: batch?.target_firms || 100,
         };
       });
 
@@ -1583,22 +3275,55 @@ function registerRoutes(app) {
         Promise.resolve(getWindowVisualization(deal)),
       ]);
 
-      // Fetch parsed_deal_info from linked document if available
+      // Fetch parsed_deal_info and saved PitchBook metadata if available
       let parsed_deal_info = null;
+      let pitchbook = {
+        investor_universe_lists: [],
+        comparable_deals_count: 0,
+        priority_lists: [],
+      };
       try {
         const sb = getSupabase();
         if (sb) {
-          const { data: doc } = await sb.from('deal_documents')
-            .select('parsed_deal_info')
-            .eq('deal_id', deal.id)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
+          const [
+            { data: doc },
+            { data: linkedLists },
+            { count: comparablesCount },
+          ] = await Promise.all([
+            sb.from('deal_documents')
+              .select('parsed_deal_info')
+              .eq('deal_id', deal.id)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle(),
+            sb.from('deal_list_priorities')
+              .select('list_id, list_name, priority_order, source, status')
+              .eq('deal_id', deal.id)
+              .order('priority_order', { ascending: true }),
+            sb.from('deal_intelligence')
+              .select('id', { count: 'exact', head: true })
+              .eq('deal_id', deal.id),
+          ]);
           parsed_deal_info = doc?.parsed_deal_info || null;
+          const kbListId   = deal.knowledge_base_list_id   || deal.settings?.knowledge_base_list_id   || null;
+          const kbListName = deal.knowledge_base_list_name || deal.settings?.knowledge_base_list_name || null;
+          // Fetch KB list record for live count
+          let kbList = null;
+          if (kbListId && sb) {
+            const { data: kbRec } = await sb.from('investor_lists').select('id, name, list_type').eq('id', kbListId).maybeSingle();
+            const { count: kbCount } = await sb.from('investors_db').select('*', { count: 'exact', head: true }).eq('list_id', kbListId);
+            if (kbRec) kbList = { ...kbRec, investor_count: kbCount || 0 };
+          }
+          pitchbook = {
+            investor_universe_lists: (linkedLists || []).filter(list => list.source === 'pitchbook'),
+            comparable_deals_count: comparablesCount || 0,
+            priority_lists: linkedLists || [],
+            kb_list: kbList || (kbListId ? { id: kbListId, name: kbListName, investor_count: 0 } : null),
+          };
         }
       } catch {}
 
-      res.json({ ...deal, batches, windowStatus, windowVisualization: windowViz, parsed_deal_info });
+      res.json({ ...deal, batches, windowStatus, windowVisualization: windowViz, parsed_deal_info, pitchbook });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
@@ -1675,6 +3400,13 @@ function registerRoutes(app) {
       const keyMetricsText = req.body.keyMetrics || req.body.key_metrics || '';
       const investorText = req.body.investorProfile || req.body.investor_profile || '';
       const dealCurrency = (req.body.currency || 'USD').toString().trim().toUpperCase() || 'USD';
+      const priorityLists = (() => {
+        try { return JSON.parse(req.body.priority_lists || '[]'); } catch { return []; }
+      })();
+      const primaryPriorityList = [...priorityLists]
+        .sort((a, b) => Number(a.priority_order || 999) - Number(b.priority_order || 999))[0] || null;
+      const knowledgeBaseListId   = req.body.knowledge_base_list_id   || null;
+      const knowledgeBaseListName = req.body.knowledge_base_list_name || null;
 
       const deal = {
         name,
@@ -1685,6 +3417,7 @@ function registerRoutes(app) {
         max_cheque:            parseAmount(req.body.maxCheque || req.body.max_cheque),
         sector:                req.body.sector || '',
         geography,
+        target_geography:      req.body.target_geography || (Array.isArray(geography) ? geography.join(', ') : geography) || 'Global',
         description:           descriptionText,
         key_metrics:           keyMetricsText,
         investor_profile:      investorText,
@@ -1709,15 +3442,53 @@ function registerRoutes(app) {
         response_rate:         0,
         active_prospects:      0,
         created_by:            'dashboard',
+        sending_account_id:    req.body.sending_account_id || null,
+        sending_email:         req.body.sending_email || null,
+        priority_list_id:        primaryPriorityList?.list_id || null,
+        priority_list_name:      primaryPriorityList?.list_name || null,
+        knowledge_base_list_id:  knowledgeBaseListId,
+        knowledge_base_list_name: knowledgeBaseListName,
       };
       console.log(`[DEAL LAUNCH] Using currency: ${dealCurrency} for "${name}"`);
 
       const supabase = getSupabase();
-      const { data: savedDeal, error: supabaseError } = await supabase
+      let insertResult = await supabase
         .from('deals')
         .insert(deal)
         .select()
         .single();
+
+      if (insertResult.error && isMissingColumnError(insertResult.error, 'target_geography')) {
+        const fallbackDeal = { ...deal };
+        delete fallbackDeal.target_geography;
+        insertResult = await supabase
+          .from('deals')
+          .insert(fallbackDeal)
+          .select()
+          .single();
+      }
+
+      // KB columns may not exist in all deployments — store in settings JSONB as fallback
+      if (insertResult.error && (
+        isMissingColumnError(insertResult.error, 'knowledge_base_list_id') ||
+        isMissingColumnError(insertResult.error, 'knowledge_base_list_name')
+      )) {
+        const kbId   = deal.knowledge_base_list_id;
+        const kbName = deal.knowledge_base_list_name;
+        const fallbackDeal = { ...deal };
+        delete fallbackDeal.knowledge_base_list_id;
+        delete fallbackDeal.knowledge_base_list_name;
+        if (kbId || kbName) {
+          fallbackDeal.settings = {
+            ...(fallbackDeal.settings || {}),
+            knowledge_base_list_id:   kbId,
+            knowledge_base_list_name: kbName,
+          };
+        }
+        insertResult = await supabase.from('deals').insert(fallbackDeal).select().single();
+      }
+
+      const { data: savedDeal, error: supabaseError } = insertResult;
 
       if (supabaseError) {
         error('Supabase deal insert error: ' + supabaseError.message);
@@ -1725,19 +3496,20 @@ function registerRoutes(app) {
       }
 
       // Save priority lists if provided
-      const priorityLists = (() => {
-        try { return JSON.parse(req.body.priority_lists || '[]'); } catch { return []; }
-      })();
       if (priorityLists.length) {
-        await supabase.from('deal_list_priorities').insert(
-          priorityLists.map(l => ({
-            deal_id: savedDeal.id,
-            list_id: l.list_id,
-            list_name: l.list_name,
-            priority_order: l.priority_order,
-            status: 'pending',
-          }))
-        ).catch(e => console.warn('[DEAL] priority lists insert:', e.message));
+        try {
+          await supabase.from('deal_list_priorities').insert(
+            priorityLists.map(l => ({
+              deal_id: savedDeal.id,
+              list_id: l.list_id,
+              list_name: l.list_name,
+              priority_order: l.priority_order,
+              status: 'pending',
+            }))
+          );
+        } catch (e) {
+          console.warn('[DEAL] priority lists insert:', e.message);
+        }
       }
 
       // Save exclusion list if provided
@@ -1752,8 +3524,11 @@ function registerRoutes(app) {
           email:       e.email       ? e.email.toLowerCase().trim()       : null,
           added_by:    req.session?.displayName || 'Dom',
         }));
-        await getSupabase().from('deal_exclusions').insert(exclusionRows)
-          .catch(e => console.warn('[DEAL] exclusions insert:', e.message));
+        try {
+          await getSupabase().from('deal_exclusions').insert(exclusionRows);
+        } catch (e) {
+          console.warn('[DEAL] exclusions insert:', e.message);
+        }
         pushActivity({ type: 'system', action: `Exclusion list loaded: ${exclusions.length} entries`, note: name });
       }
 
@@ -1798,7 +3573,11 @@ function registerRoutes(app) {
       info(`Deal created: ${name} (id: ${savedDeal.id})`);
       res.json({ success: true, deal: savedDeal });
 
-      // Fire full research sequence immediately — non-blocking
+      const pendingIntelligenceUploads = String(req.body.pending_intelligence_uploads || '').toLowerCase() === 'true';
+
+      // Fire post-launch setup immediately — non-blocking.
+      // Templates and sequence should always be generated on launch.
+      // Only research waits for PitchBook uploads to finish.
       setImmediate(async () => {
         const broadcast = (msg, type = 'research') => pushActivity({
           type, action: msg, note: '', dealId: savedDeal.id, deal_name: savedDeal.name,
@@ -1807,14 +3586,18 @@ function registerRoutes(app) {
         try {
           broadcast(`Deal launched: ${savedDeal.name}`, 'system');
 
-          // Auto-generate deal-specific templates
-          try {
-            const { generateDealTemplates } = await import('../core/templateGenerator.js');
-            await generateDealTemplates(savedDeal, req.session?.displayName || 'Dom');
-            broadcast('Templates generated', 'system');
-          } catch (e) {
-            console.warn('[DEAL LAUNCH] Template generation failed:', e.message);
-          }
+          // Auto-generate deal-specific templates — fire in background, never block launch
+          (async () => {
+            try {
+              const { generateDealTemplates } = await import('../core/templateGenerator.js');
+              await generateDealTemplates(savedDeal, req.session?.displayName || 'Dom');
+              broadcast('Templates generated for ' + savedDeal.name, 'system');
+              pushActivity({ type: 'system', action: `Templates ready: ${savedDeal.name}`, note: 'AI email + LinkedIn templates generated', dealId: savedDeal.id });
+            } catch (e) {
+              console.warn('[DEAL LAUNCH] Template generation failed:', e.message);
+              pushActivity({ type: 'error', action: `Template generation failed: ${savedDeal.name}`, note: e.message?.slice(0, 80), dealId: savedDeal.id });
+            }
+          })();
 
           // Seed default outreach sequence for this deal
           try {
@@ -1836,6 +3619,11 @@ function registerRoutes(app) {
             }
           } catch (e) {
             console.warn('[DEAL LAUNCH] Sequence seed failed:', e.message);
+          }
+
+          if (pendingIntelligenceUploads) {
+            broadcast('PitchBook uploads pending — research will start after imports complete', 'system');
+            return;
           }
 
           // Step 1: CSV ingest if file was uploaded
@@ -1902,6 +3690,7 @@ function registerRoutes(app) {
       const allowed = [
         // Core
         'name', 'status', 'sector', 'geography', 'description', 'raise_type', 'currency',
+        'target_geography',
         'target_amount', 'committed_amount', 'emails_sent', 'response_rate', 'active_prospects',
         'key_metrics', 'deck_url', 'investor_profile', 'linkedin_seeds', 'notes',
         // Cheque sizes — new column names
@@ -1918,12 +3707,15 @@ function registerRoutes(app) {
         'max_emails_per_day', 'max_emails_per_hour', 'batch_size',
         'followup_cadence_days', 'max_contacts_per_firm', 'max_total_outreach',
         'min_investor_score', 'prioritise_hot_leads', 'include_unscored',
-        'linkedin_daily_limit', 'followup_days_li', 'followup_days_email',
+        'linkedin_daily_limit', 'followup_days_li', 'followup_days_email', 'no_follow_ups',
         // Pipeline cap
         'pipeline_max', 'pipeline_refill_threshold',
         // Pause / archive
         'paused', 'paused_at', 'outreach_paused_until',
         'archived_at', 'archived_reason',
+        // Email account + priority list
+        'sending_account_id', 'sending_email',
+        'priority_list_id', 'priority_list_name',
       ];
       for (const key of allowed) {
         if (req.body[key] !== undefined) {
@@ -1932,7 +3724,28 @@ function registerRoutes(app) {
           updates[key] = req.body[key];
         }
       }
-      const deal = await updateDeal(req.params.id, updates);
+      let deal;
+      try {
+        deal = await updateDeal(req.params.id, updates);
+      } catch (err) {
+        const fallbackUpdates = { ...updates };
+        const existingDeal = await getDeal(req.params.id);
+
+        if (fallbackUpdates.target_geography && isMissingColumnError(err, 'target_geography')) {
+          delete fallbackUpdates.target_geography;
+        }
+        if (fallbackUpdates.no_follow_ups !== undefined && (
+          isMissingColumnError(err, 'no_follow_ups')
+          || isMissingColumnError(err, 'settings')
+        )) {
+          fallbackUpdates.parsed_deal_info = mergeParsedDealInfo(existingDeal?.parsed_deal_info, {
+            no_follow_ups: !!fallbackUpdates.no_follow_ups,
+          });
+          delete fallbackUpdates.no_follow_ups;
+        }
+
+        deal = await updateDeal(req.params.id, fallbackUpdates);
+      }
       broadcastToAll({ type: 'DEAL_UPDATED', deal });
       res.json({ success: true, deal });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1986,6 +3799,8 @@ function registerRoutes(app) {
       });
       broadcastToAll({ type: 'DEAL_UPDATED', deal });
       pushActivity({ type: 'system', action: 'Deal Resumed', note: `${deal.name} — resumed by user`, dealId: deal.id, deal_name: deal.name });
+      const { sendTelegram } = await import('../approval/telegramBot.js');
+      await sendTelegram(`▶️ *Deal Resumed: ${deal.name}*\n\nRoco is back online for this deal.\nWebhooks active. Outreach resuming on next cycle.`).catch(() => {});
       res.json({ success: true, deal });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -2098,20 +3913,26 @@ function registerRoutes(app) {
 
       if (!contacts?.length) return res.json({ sent: 0, message: 'No contacts ready for invites' });
 
+      let pendingInvites = [];
+      try {
+        pendingInvites = await listSentInvitations(100);
+      } catch {}
+
       let sent = 0;
       const results = [];
       for (const contact of contacts) {
         try {
-          let providerId = contact.linkedin_provider_id || null;
-          if (!providerId && contact.linkedin_url) {
-            const urnMatch = contact.linkedin_url.match(/miniProfileUrn=urn%3Ali%3A[^&]+%3A([A-Za-z0-9_-]+)/);
-            if (urnMatch) providerId = urnMatch[1];
-          }
-          await sendLinkedInInvite({ providerId, linkedinUrl: providerId ? null : contact.linkedin_url, message: `Hi ${(contact.name || '').split(' ')[0]}, I came across your profile — we're building Roco, an autonomous fundraising AI, and I'd love to connect.` });
-          await sb.from('contacts').update({ pipeline_stage: 'invite_sent', invite_sent_at: new Date().toISOString() }).eq('id', contact.id);
-          sent++;
-          results.push({ name: contact.name, status: 'sent' });
-          await sbLogActivity({ dealId: req.params.id, contactId: contact.id, eventType: 'LINKEDIN_INVITE_SENT', summary: `Manual invite sent to ${contact.name}`, apiUsed: 'unipile' });
+          const outcome = await processLinkedInInvite({
+            sb,
+            deal,
+            contact,
+            pushActivity,
+            logActivity: sbLogActivity,
+            pendingInvites,
+            source: 'dashboard_manual_trigger',
+          });
+          if (['sent', 'already_pending', 'already_connected'].includes(outcome.status)) sent++;
+          results.push({ name: contact.name, status: outcome.status });
           await new Promise(r => setTimeout(r, 2000));
         } catch (e) {
           results.push({ name: contact.name, status: 'failed', error: e.message });
@@ -2122,41 +3943,50 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // DELETE /api/deals/:id — permanently delete a deal and all its contacts
-  app.delete('/api/deals/:id', async (req, res) => {
+  app.delete('/api/deals/:id', requireAuth, async (req, res) => {
     try {
       const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const deal = await getDeal(req.params.id);
-      if (!deal) return res.status(404).json({ error: 'Deal not found' });
-      // Delete all related data — hard wipe, nothing referencing this deal survives
-      const did = req.params.id;
-      await sb.from('contacts').delete().eq('deal_id', did);
-      const relatedTables = [
-        'emails', 'replies', 'linkedin_messages', 'firms', 'deal_assets',
-        'activity_log', 'batches', 'firm_suppressions', 'firm_responses',
-        'schedule_log', 'deal_contacts',
+      const id = req.params.id;
+
+      const childTables = [
+        'activity_log',
+        'conversation_messages',
+        'approval_queue',
+        'contacts',
+        'batch_firms',
+        'campaign_batches',
+        'deal_intelligence',
+        'deal_investor_scores',
+        'deal_templates',
+        'deal_sequence',
+        'deal_exclusions',
+        'deal_assets',
+        'deal_documents',
+        'emails',
+        'replies',
+        'linkedin_messages',
+        'deal_contacts',
+        'schedule_log',
+        'weekly_reports',
+        'investor_deal_history',
       ];
-      for (const t of relatedTables) {
-        try { await sb.from(t).delete().eq('deal_id', did); } catch {}
-      }
-      // Delete the deal itself
-      await sb.from('deals').delete().eq('id', did);
-      // Clear deal.json on disk if it still references this deal
-      try {
-        const { readFileSync, writeFileSync, existsSync } = await import('fs');
-        const dealJsonPath = new URL('../deal.json', import.meta.url).pathname;
-        if (existsSync(dealJsonPath)) {
-          const stored = JSON.parse(readFileSync(dealJsonPath, 'utf8'));
-          if (String(stored?.id) === String(req.params.id)) {
-            writeFileSync(dealJsonPath, JSON.stringify({}));
-          }
+
+      for (const table of childTables) {
+        try {
+          await sb.from(table).delete().eq('deal_id', id);
+        } catch (err) {
+          console.warn(`[DELETE DEAL] ${table}:`, err.message);
         }
-      } catch { /* non-fatal */ }
-      pushActivity({ type: 'SYSTEM', action: 'Deal Deleted', note: `Deal "${deal.name}" permanently deleted` });
-      broadcastToAll({ type: 'DEAL_DELETED', dealId: req.params.id });
+      }
+
+      const { error: deleteError } = await sb.from('deals').delete().eq('id', id);
+      if (deleteError) throw deleteError;
+
+      broadcastToAll({ type: 'DEAL_DELETED', dealId: id });
       res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to delete deal: ' + err.message });
+    }
   });
 
   // POST /api/deals/:id/clear-pipeline — delete ALL contacts for this deal
@@ -2167,20 +3997,11 @@ function registerRoutes(app) {
       const deal = await getDeal(req.params.id);
       if (!deal) return res.status(404).json({ error: 'Deal not found' });
 
-      // Fetch all contacts so we can archive their Notion pages
       const { data: contacts } = await sb.from('contacts')
-        .select('id, name, notion_page_id')
+        .select('id, name')
         .eq('deal_id', req.params.id);
 
       const count = contacts?.length || 0;
-
-      // Archive in Notion — best-effort, non-blocking
-      if (contacts?.length) {
-        const { archiveContact } = await import('../crm/notionContacts.js');
-        for (const c of contacts) {
-          if (c.notion_page_id) archiveContact(c.notion_page_id).catch(() => {});
-        }
-      }
 
       const did = req.params.id;
       // Full memory wipe — contacts + all pipeline state for this deal
@@ -2277,25 +4098,29 @@ function registerRoutes(app) {
         { data: contacts },
         { count: emailsSentCount },
         { count: emailRepliesCount },
+        { count: firmsCount },
       ] = await Promise.all([
         sb.from('contacts').select('pipeline_stage, invite_sent_at, outreach_channel').eq('deal_id', req.params.id),
         sb.from('emails').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id).eq('status', 'sent'),
         sb.from('replies').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
+        sb.from('batch_firms').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
       ]);
       const all = contacts || [];
 
       const emailsSent      = emailsSentCount || 0;
       const emailReplies    = emailRepliesCount || 0;
-      const invitesSent     = all.filter(c => c.invite_sent_at).length;
-      const invitesAccepted = all.filter(c => ['invite_accepted','dm_sent','Replied','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage)).length;
-      const dmsSent         = all.filter(c => ['dm_sent','Replied','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
-      const dmResponses     = all.filter(c => ['Replied','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
+      const invitesSent     = all.filter(hasLinkedInInviteHistory).length;
+      const activePendingInvites = all.filter(hasActivePendingLinkedInInvite).length;
+      const invitesAccepted = all.filter(hasLinkedInAccepted).length;
+      const dmsSent         = all.filter(c => ['DM Approved','DM Sent','dm_sent','Replied','In Conversation','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
+      const dmResponses     = all.filter(c => ['In Conversation','Replied','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
       const activeProspects = all.filter(c => !['Archived','Skipped','Inactive','Suppressed — Opt Out','Deleted — Do Not Contact'].includes(c.pipeline_stage)).length;
 
       res.json({
         totalContacts:      all.length,
         activeProspects,
         invitesSent,
+        activePendingInvites,
         invitesAccepted,
         acceptanceRate:     invitesSent > 0 ? Math.round((invitesAccepted / invitesSent) * 100) : 0,
         dmsSent,
@@ -2305,6 +4130,7 @@ function registerRoutes(app) {
         emailReplies,
         emailResponseRate:  emailsSent > 0 ? Math.round((emailReplies / emailsSent) * 100) : 0,
         totalResponses:     emailReplies + dmResponses,
+        firms:              firmsCount || 0,
         capitalCommitted:   deal.committed_amount || 0,
         targetAmount:       deal.target_amount || 0,
       });
@@ -2366,193 +4192,441 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // GET /api/deals/:id/batches — batch summary for a deal
+  // GET /api/deals/:id/batches — campaign batch list for a deal
   app.get('/api/deals/:id/batches', async (req, res) => {
     try {
-      const batches = await getBatchSummary(req.params.id);
-      res.json(batches);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // ─── CAMPAIGN BATCHES (firm approval flow) ────────────────────────────────
-
-  // GET /api/deals/:id/campaign/current — get current campaign batch with firms + contacts + research
-  app.get('/api/deals/:id/campaign/current', async (req, res) => {
-    try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      const dealId = req.params.id;
-
-      // Show the most relevant batch: pending_approval first, then approved, then researching
-      const { data: batches } = await sb.from('campaign_batches')
-        .select('*')
-        .eq('deal_id', dealId)
-        .in('status', ['pending_approval', 'approved', 'researching'])
-        .order('created_at', { ascending: false })
-        .limit(5);
-
-      if (!batches?.length) return res.json(null);
-      // Prioritise pending_approval > approved > researching
-      const batch = batches.find(b => b.status === 'pending_approval')
-        || batches.find(b => b.status === 'approved')
-        || batches[0];
-
-      const { data: firms } = await sb.from('campaign_batch_firms')
-        .select('*, firm_outreach_state(rank_score, status, firms(id, name, sector, hq_location, website, description))')
-        .eq('batch_id', batch.id)
-        .order('created_at', { ascending: true });
-
-      // For each firm, fetch contacts in this deal that match the firm name (decision makers)
-      const firmsWithContacts = await Promise.all((firms || []).map(async (f) => {
-        const firmName = f.firm_outreach_state?.firms?.name || f.firm_name;
-        if (!firmName) return { ...f, contacts: [] };
-
-        const { data: contacts } = await sb.from('contacts')
-          .select('id, name, job_title, email, linkedin_url, pipeline_stage, enrichment_status, investor_score, person_researched, past_investments, investment_thesis, sector_focus, geography, contact_type, is_angel')
-          .eq('deal_id', dealId)
-          .ilike('company_name', `%${firmName}%`)
-          .not('pipeline_stage', 'eq', 'Archived')
-          .order('investor_score', { ascending: false });
-
-        // Also pull research from investors_db for any contact that links there
-        return { ...f, contacts: contacts || [] };
-      }));
-
-      res.json({ ...batch, firms: firmsWithContacts });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // GET /api/deals/:id/campaign/history — all past completed batches
-  app.get('/api/deals/:id/campaign/history', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      const { data: batches } = await sb.from('campaign_batches')
+      const { data } = await sb.from('campaign_batches')
         .select('*')
         .eq('deal_id', req.params.id)
-        .order('created_at', { ascending: false });
-      res.json(batches || []);
+        .order('batch_number', { ascending: true });
+      res.json(data || []);
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // POST /api/deals/:id/campaign/:batchId/approve — approve a campaign batch
-  app.post('/api/deals/:id/campaign/:batchId/approve', async (req, res) => {
+  // ─── CAMPAIGN BATCHES (single batch firm-first flow) ──────────────────────
+
+  app.get('/api/deals/:id/batch/current', requireAuth, async (req, res) => {
     try {
       const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      const { data: batch } = await sb.from('campaign_batches')
-        .update({ status: 'approved', approved_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-        .eq('id', req.params.batchId)
+      const { data } = await sb.from('campaign_batches')
+        .select('*')
         .eq('deal_id', req.params.id)
-        .select()
-        .single();
-      if (!batch) return res.status(404).json({ error: 'Batch not found' });
-
-      const deal = await getDeal(req.params.id);
-      pushActivity({ type: 'system', action: 'Campaign batch approved', note: `${deal?.name} — Batch #${batch.batch_number} approved. Outreach begins next window.`, deal_name: deal?.name, dealId: deal?.id });
-      const { sendTelegram } = await import('../approval/telegramBot.js');
-      await sendTelegram(`✅ *Campaign Approved* — ${deal?.name}\n\nBatch #${batch.batch_number} approved. Outreach will begin at the next EST sending window.`).catch(() => {});
-
-      res.json({ success: true, batch });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // POST /api/deals/:id/campaign/:batchId/reject — reject a batch (resets to researching)
-  app.post('/api/deals/:id/campaign/:batchId/reject', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      const { reason } = req.body || {};
-      await sb.from('campaign_batches')
-        .update({ status: 'rejected', rejection_reason: reason || null, updated_at: new Date().toISOString() })
-        .eq('id', req.params.batchId)
-        .eq('deal_id', req.params.id);
-      res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // DELETE /api/campaign-firms/:firmId — remove a firm from a batch
-  app.delete('/api/campaign-firms/:firmId', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      await sb.from('campaign_batch_firms').delete().eq('id', req.params.firmId);
-      res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // GET /api/campaign-firms/:firmId/contacts — get contacts for a firm in this deal
-  app.get('/api/campaign-firms/:batchFirmId/contacts', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      // Get the batch firm record to find firm_outreach_state → deal_id
-      const { data: bf } = await sb.from('campaign_batch_firms')
-        .select('*, firm_outreach_state(deal_id, firms(id, name))')
-        .eq('id', req.params.batchFirmId)
-        .single();
-      if (!bf) return res.status(404).json({ error: 'Not found' });
-      const dealId = bf.firm_outreach_state?.deal_id;
-      const firmName = bf.firm_outreach_state?.firms?.name || bf.firm_name;
-      if (!dealId) return res.json([]);
-      const { data: contacts } = await sb.from('contacts')
-        .select('id, name, job_title, email, linkedin_url, pipeline_stage, investor_score, enrichment_status')
-        .eq('deal_id', dealId)
-        .ilike('company_name', `%${firmName}%`)
-        .order('investor_score', { ascending: false });
-      res.json(contacts || []);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  // POST /api/deals/:id/campaign/close — close approved batch, promote next ready batch
-  app.post('/api/deals/:id/campaign/close', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
-      const dealId = req.params.id;
-      const { data: deal } = await sb.from('deals').select('name').eq('id', dealId).single();
-
-      // Mark approved batch as completed
-      const { data: approvedBatch } = await sb.from('campaign_batches')
-        .select('id, batch_number')
-        .eq('deal_id', dealId).eq('status', 'approved')
-        .limit(1).single();
-      if (approvedBatch) {
-        await sb.from('campaign_batches')
-          .update({ status: 'completed', updated_at: new Date().toISOString() })
-          .eq('id', approvedBatch.id);
-      }
-
-      // Promote next ready batch to pending_approval
-      const { data: readyBatch } = await sb.from('campaign_batches')
-        .select('id, batch_number')
-        .eq('deal_id', dealId).eq('status', 'ready')
-        .order('batch_number', { ascending: true })
-        .limit(1).single();
-      if (readyBatch) {
-        await sb.from('campaign_batches')
-          .update({ status: 'pending_approval', updated_at: new Date().toISOString() })
-          .eq('id', readyBatch.id);
-        const msg = `📋 *Campaign Review Ready* — ${deal?.name || 'Deal'}\n\nBatch #${readyBatch.batch_number} is up for review. Open the dashboard → Campaign tab.`;
-        sendTelegram(msg).catch(() => {});
-        pushActivity({ type: 'system', action: 'Next batch ready for review',
-          note: `${deal?.name || ''} — Batch #${readyBatch.batch_number} promoted after batch #${approvedBatch?.batch_number || '?'} closed.`,
-          deal_name: deal?.name, dealId });
-        return res.json({ closed: approvedBatch?.batch_number || null, promoted: readyBatch.batch_number });
-      }
-
-      // No ready batch — find if one is still building
-      const { data: buildingBatch } = await sb.from('campaign_batches')
-        .select('batch_number, ranked_firms, target_firms')
-        .eq('deal_id', dealId).eq('status', 'researching')
-        .limit(1).single();
+        .not('status', 'in', '("completed","skipped")')
+        .order('batch_number', { ascending: false })
+        .limit(1).maybeSingle();
+      if (!data) return res.json(null);
+      const { data: firmRows, count } = await sb.from('batch_firms')
+        .select('id', { count: 'exact' })
+        .eq('batch_id', data.id);
+      const liveFirmCount = count ?? firmRows?.length ?? 0;
       res.json({
-        closed: approvedBatch?.batch_number || null,
-        promoted: null,
-        building: buildingBatch?.batch_number || null,
-        buildingProgress: buildingBatch ? `${buildingBatch.ranked_firms || 0}/${buildingBatch.target_firms || 20}` : null,
+        ...data,
+        firms_target: data.firms_target || data.target_firms || 100,
+        firms_researched: liveFirmCount,
+        ranked_firms: liveFirmCount,
       });
     } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.get('/api/deals/:id/batch/:batchId/firms', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      const wantsPagination = req.query.page != null || req.query.limit != null;
+      const page = Math.max(1, parseInt(req.query.page || '1', 10));
+      const limit = Math.min(20, Math.max(1, parseInt(req.query.limit || '20', 10)));
+      const offset = (page - 1) * limit;
+
+      let firmQuery = sb.from('batch_firms')
+        .select('*', wantsPagination ? { count: 'exact' } : undefined)
+        .eq('batch_id', req.params.batchId)
+        .order('score', { ascending: false });
+
+      if (wantsPagination) {
+        firmQuery = firmQuery.range(offset, offset + limit - 1);
+      }
+
+      const { data, error, count } = await firmQuery;
+      if (error) return res.status(500).json({ error: error.message });
+
+      const { data: contacts, error: contactsError } = await sb.from('contacts')
+        .select('id, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at')
+        .eq('deal_id', req.params.id)
+        .eq('batch_id', req.params.batchId);
+      if (contactsError) return res.status(500).json({ error: contactsError.message });
+
+      const contactsByFirm = new Map();
+      for (const contact of (contacts || [])) {
+        const key = normalizeFirmLookupName(contact.company_name);
+        if (!key) continue;
+        if (!contactsByFirm.has(key)) contactsByFirm.set(key, []);
+        contactsByFirm.get(key).push(contact);
+      }
+
+      const rows = [...(data || [])].sort((a, b) => {
+        const rankDiff = Number(a.rank || 9999) - Number(b.rank || 9999);
+        if (rankDiff !== 0) return rankDiff;
+        return Number(b.score || 0) - Number(a.score || 0);
+      });
+      const baseSummarized = rows.map(row => ({
+        ...buildFirmCampaignSummary(
+          contactsByFirm.get(normalizeFirmLookupName(row.firm_name)) || [],
+          row.enrichment_status || 'pending'
+        ),
+        id: row.id,
+        firm_name: row.firm_name,
+        score: row.score || 0,
+        rank: row.rank || null,
+        justification: row.justification || null,
+        thesis: row.thesis || null,
+        past_investments: Array.isArray(row.past_investments) ? row.past_investments : [],
+        aum: row.aum || null,
+        contact_type: row.contact_type || 'individual_at_firm',
+        status: row.status || 'pending',
+        enrichment_status: row.enrichment_status || 'pending',
+        contacts_found: row.contacts_found || 0,
+      }));
+      const summarized = await enrichCampaignFirmLinks(baseSummarized);
+
+      if (!wantsPagination) {
+        return res.json(summarized);
+      }
+
+      return res.json({
+        firms: summarized,
+        total: count || 0,
+        page,
+        pages: Math.ceil((count || 0) / limit) || 1,
+        per_page: limit,
+      });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/api/deals/:id/batch/:batchId/approve', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+
+      const { data: activeBatch } = await sb.from('campaign_batches')
+        .select('id, batch_number')
+        .eq('deal_id', req.params.id)
+        .in('status', ['approved'])
+        .neq('id', req.params.batchId)
+        .limit(1).maybeSingle();
+
+      if (activeBatch) {
+        return res.status(400).json({
+          error: `Batch ${activeBatch.batch_number} is already active. Close it first.`
+        });
+      }
+
+      await sb.from('campaign_batches').update({
+        status: 'approved',
+        approved_at: new Date().toISOString(),
+        approved_by: req.session?.displayName || 'Dom',
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.batchId);
+
+      // Normalize legacy/mis-cased firm states so the approved batch can enter enrichment.
+      await sb.from('batch_firms')
+        .update({ enrichment_status: 'pending' })
+        .eq('batch_id', req.params.batchId)
+        .in('enrichment_status', ['Pending', 'PENDING']);
+      await sb.from('batch_firms')
+        .update({ enrichment_status: 'pending' })
+        .eq('batch_id', req.params.batchId)
+        .is('enrichment_status', null);
+
+      pushActivity({
+        type: 'system',
+        action: `Campaign approved — batch ${req.params.batchId.slice(0, 6)}`,
+        note: 'Contact enrichment starting now, in rank order',
+        dealId: req.params.id,
+      });
+
+      res.json({ success: true });
+
+      setImmediate(async () => {
+        try {
+          const { triggerImmediateRun } = await import('../core/orchestrator.js');
+          await triggerImmediateRun(req.params.id);
+        } catch (err) {
+          console.error('[CAMPAIGN APPROVAL] Immediate run failed:', err.message);
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/campaign-reviews — all batches awaiting approval, with their firms
+  app.get('/api/campaign-reviews', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { data: batches } = await sb.from('campaign_batches')
+        .select('id, deal_id, batch_number, status, ranked_firms, created_at, updated_at')
+        .eq('status', 'pending_approval')
+        .order('updated_at', { ascending: false });
+      if (!batches?.length) return res.json([]);
+      // Enrich each batch with deal name and top firms
+      const dealIds = [...new Set(batches.map(b => b.deal_id))];
+      const { data: deals } = await sb.from('deals').select('id, name, sector, raise_type').in('id', dealIds);
+      const dealMap = Object.fromEntries((deals || []).map(d => [d.id, d]));
+      const reviews = await Promise.all(batches.map(async (batch) => {
+        const { data: firms } = await sb.from('batch_firms')
+          .select('id, firm_name, score, justification, contact_type')
+          .eq('batch_id', batch.id)
+          .order('score', { ascending: false })
+          .limit(20);
+        return {
+          ...batch,
+          deal_name: dealMap[batch.deal_id]?.name || 'Unknown Deal',
+          deal_sector: dealMap[batch.deal_id]?.sector || '',
+          deal_raise_type: dealMap[batch.deal_id]?.raise_type || '',
+          firms: firms || [],
+        };
+      }));
+      res.json(reviews);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/api/deals/:id/campaign/:batchId/firms', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      const { firm_name, investors_db_id } = req.body || {};
+      if (!firm_name?.trim()) return res.status(400).json({ error: 'firm_name required' });
+
+      const { data: batch } = await sb.from('campaign_batches')
+        .select('id, status')
+        .eq('id', req.params.batchId)
+        .eq('deal_id', req.params.id)
+        .maybeSingle();
+      if (!batch || batch.status !== 'pending_approval') {
+        return res.status(400).json({ error: 'Batch is not pending approval' });
+      }
+
+      const { data: investor } = investors_db_id
+        ? await sb.from('investors_db').select('*').eq('id', investors_db_id).maybeSingle()
+        : { data: null };
+
+      const score = Number(investor?.score || 50);
+      const contactType = investor?.is_angel ? 'angel' : (investor?.contact_type || 'individual_at_firm');
+      const insertPayload = {
+        batch_id: req.params.batchId,
+        deal_id: req.params.id,
+        investor_id: investor?.id || null,
+        firm_name: firm_name.trim(),
+        contact_type: contactType,
+        score,
+        thesis: investor?.description?.slice(0, 500) || null,
+        past_investments: [],
+        aum: investor?.aum_millions ? `$${investor.aum_millions}M` : null,
+        justification: 'Manually added by reviewer',
+        firm_researched: !!investor,
+        enrichment_status: 'pending',
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      };
+
+      const { data: inserted, error } = await sb.from('batch_firms')
+        .insert(insertPayload)
+        .select('id')
+        .single();
+      if (error) throw error;
+
+      const { count } = await sb.from('batch_firms')
+        .select('id', { count: 'exact', head: true })
+        .eq('batch_id', req.params.batchId);
+      await sb.from('campaign_batches')
+        .update({ ranked_firms: count || 0, updated_at: new Date().toISOString() })
+        .eq('id', req.params.batchId);
+
+      res.json({ success: true, id: inserted?.id, researched: !!investor });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/deals/:id/batch/:batchId/firms/:firmId', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
+      await sb.from('batch_firms')
+        .delete()
+        .eq('id', req.params.firmId)
+        .eq('batch_id', req.params.batchId);
+      const { count } = await sb.from('batch_firms')
+        .select('id', { count: 'exact', head: true })
+        .eq('batch_id', req.params.batchId);
+      await sb.from('campaign_batches')
+        .update({ ranked_firms: count || 0, updated_at: new Date().toISOString() })
+        .eq('id', req.params.batchId);
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // GET /api/deals/:id/batch/:batchId/firms/:firmId/contacts — contacts found for a specific firm
+  app.get('/api/deals/:id/batch/:batchId/firms/:firmId/contacts', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
+      const { data: firm } = await sb.from('batch_firms')
+        .select('firm_name')
+        .eq('id', req.params.firmId)
+        .maybeSingle();
+      if (!firm) return res.json([]);
+      const { data, error } = await sb.from('contacts')
+        .select('id, name, job_title, email, linkedin_url, pipeline_stage, enrichment_status, investor_score, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at')
+        .eq('deal_id', req.params.id)
+        .eq('batch_id', req.params.batchId)
+        .ilike('company_name', firm.firm_name)
+        .order('investor_score', { ascending: false });
+      if (error) throw error;
+      res.json(data || []);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/api/deals/:id/batch/:batchId/close', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+
+      await sb.from('campaign_batches').update({
+        status: 'completed',
+        closed_at: new Date().toISOString(),
+        closed_by: req.session?.displayName || 'Dom',
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.batchId).eq('deal_id', req.params.id);
+
+      await sb.from('batch_firms')
+        .update({ status: 'completed' })
+        .eq('batch_id', req.params.batchId);
+
+      pushActivity({
+        type: 'system',
+        action: 'Batch closed — next batch will begin on next cycle',
+        note: 'Research will start for the next 20 firms automatically',
+        dealId: req.params.id,
+      });
+
+      await sendTelegram(
+        `✅ *Batch Closed*\n\nNext batch will begin researching automatically.\nRoco will exclude all firms from previous batches.`
+      ).catch(() => {});
+
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/deals/:id/batch/:batchId/skip — skip a batch that hasn't started outreach
+  app.post('/api/deals/:id/batch/:batchId/skip', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
+
+      const { data: batch } = await sb.from('campaign_batches')
+        .select('status, batch_number').eq('id', req.params.batchId).single();
+      if (!batch) return res.status(404).json({ error: 'Batch not found' });
+
+      if (batch.status === 'active') {
+        return res.status(400).json({ error: 'Cannot skip an active batch. Close it first.' });
+      }
+
+      await sb.from('campaign_batches').update({
+        status: 'skipped',
+        closed_at: new Date().toISOString(),
+        closed_by: req.session?.displayName || 'Dom',
+        skip_reason: req.body?.reason || 'Manually skipped',
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.batchId);
+
+      await sb.from('batch_firms')
+        .update({ status: 'skipped' })
+        .eq('batch_id', req.params.batchId);
+
+      pushActivity({
+        type: 'system',
+        action: `Batch ${batch.batch_number} skipped`,
+        note: req.body?.reason || 'Manually skipped by user',
+        dealId: req.params.id,
+      });
+
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/api/deals/:id/trigger-research', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
+      const { data: deal } = await sb.from('deals').select('*').eq('id', req.params.id).maybeSingle();
+      if (!deal) return res.status(404).json({ error: 'Deal not found' });
+      const { triggerImmediateRun } = await import('../core/orchestrator.js');
+      await triggerImmediateRun(deal.id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/email-accounts — list connected email accounts via Unipile
+  app.get('/api/email-accounts', async (req, res) => {
+    try {
+      const accounts = await getConnectedEmailAccounts();
+      res.json(accounts);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  const intelligenceUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 },
+  });
+
+  // POST /api/deals/:id/import-intelligence — import PitchBook XLSX (investor list or deal comparables)
+  app.post('/api/deals/:id/import-intelligence', requireAuth, intelligenceUpload.single('file'), async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'DB unavailable' });
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+      const buffer = req.file.buffer;
+      const filename = req.file.originalname;
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      let rows = XLSX.utils.sheet_to_json(ws, { range: 7, defval: null });
+      if (!rows.length) rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+      rows = normalizeSheetRows(rows);
+      if (!rows.length) return res.status(400).json({ error: 'No data rows found in file' });
+
+      const firstRowKeys = Object.keys(rows[0] || {});
+      const isInvestorFile = firstRowKeys.includes('Investor ID') && firstRowKeys.includes('Investors');
+      const isDealFile = firstRowKeys.includes('Deal ID') && firstRowKeys.includes('Companies');
+
+      const clientHint = String(req.body?.fileType || '').toLowerCase().trim();
+      const useInvestorParser = clientHint === 'investors' || (!clientHint && isInvestorFile);
+      const useDealParser = clientHint === 'intelligence' || clientHint === 'deals' || (!clientHint && isDealFile);
+
+      if (!useInvestorParser && !useDealParser) {
+        return res.status(400).json({
+          error: 'Cannot detect file type. Expected PitchBook investor export (has "Investor ID") or deals export (has "Deal ID").',
+          detected_columns: firstRowKeys.slice(0, 10),
+        });
+      }
+
+      if (useInvestorParser) {
+        const result = await importInvestorUniverse(sb, rows, req.params.id, filename);
+        return res.json({ success: true, type: 'investors', ...result });
+      }
+
+      if (useDealParser) {
+        const result = await importComparableDeals(sb, rows, req.params.id);
+        return res.json({ success: true, type: 'intelligence', ...result });
+      }
+    } catch (err) {
+      console.error('[IMPORT INTELLIGENCE]', err.message);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // GET /api/investors/search — search investors DB for manual firm add
@@ -2748,6 +4822,66 @@ function registerRoutes(app) {
     });
   });
 
+  // ─── DEAL PRIORITY LISTS & KB ─────────────────────────────────────────────
+
+  // POST /api/deals/:id/priority-lists — attach an existing investor list to this deal
+  app.post('/api/deals/:id/priority-lists', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { list_id, list_name, priority_order } = req.body;
+      if (!list_id) return res.status(400).json({ error: 'list_id required' });
+      // Get current max priority_order for this deal
+      const { data: existing } = await sb.from('deal_list_priorities')
+        .select('priority_order').eq('deal_id', req.params.id).order('priority_order', { ascending: false }).limit(1);
+      const nextOrder = ((existing?.[0]?.priority_order ?? -1)) + 1;
+      const { error } = await sb.from('deal_list_priorities').upsert({
+        deal_id: req.params.id,
+        list_id,
+        list_name: list_name || list_id,
+        priority_order: priority_order ?? nextOrder,
+        status: 'pending',
+      }, { onConflict: 'deal_id,list_id' });
+      if (error) return res.status(500).json({ error: error.message });
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // DELETE /api/deals/:id/priority-lists/:listId — detach a priority list from this deal
+  app.delete('/api/deals/:id/priority-lists/:listId', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      await sb.from('deal_list_priorities').delete().eq('deal_id', req.params.id).eq('list_id', req.params.listId);
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // PATCH /api/deals/:id/kb — update the knowledge base for this deal
+  app.patch('/api/deals/:id/kb', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { kb_list_id, kb_list_name } = req.body;
+      const updates = { updated_at: new Date().toISOString() };
+      // Try dedicated columns first; fall back to settings JSONB if columns don't exist
+      try {
+        await sb.from('deals').update({
+          ...updates,
+          knowledge_base_list_id:   kb_list_id   || null,
+          knowledge_base_list_name: kb_list_name || null,
+        }).eq('id', req.params.id);
+      } catch {
+        const { data: current } = await sb.from('deals').select('settings').eq('id', req.params.id).single();
+        await sb.from('deals').update({
+          ...updates,
+          settings: { ...(current?.settings || {}), knowledge_base_list_id: kb_list_id || null, knowledge_base_list_name: kb_list_name || null },
+        }).eq('id', req.params.id);
+      }
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
   // ─── DEAL TEMPLATES ────────────────────────────────────────────────────────
 
   // GET /api/deals/:id/templates
@@ -2814,6 +4948,21 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  // POST /api/deals/:id/templates/regenerate — regenerate AI templates using latest deal data
+  app.post('/api/deals/:id/templates/regenerate', requireAuth, async (req, res) => {
+    try {
+      const deal = await getDeal(req.params.id);
+      if (!deal) return res.status(404).json({ error: 'Deal not found' });
+      const { generateDealTemplates } = await import('../core/templateGenerator.js');
+      const rows = await generateDealTemplates(deal, req.session?.displayName || 'Dom');
+      pushActivity({ type: 'system', action: `Templates regenerated for ${deal.name}`, note: `${rows.length} templates updated with latest deal data`, dealId: deal.id });
+      res.json({ success: true, count: rows.length });
+    } catch (err) {
+      console.error('[TEMPLATE REGEN]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/deals/:id/sequence
   app.get('/api/deals/:id/sequence', async (req, res) => {
     try {
@@ -2848,6 +4997,65 @@ function registerRoutes(app) {
       pushActivity({ type: 'system', action: 'Deal sequence updated', note: '' });
       res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // GET /api/deals/:id/archive — firms that have been exhausted for this deal
+  app.get('/api/deals/:id/archive', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { data } = await sb.from('deal_archive')
+        .select('*')
+        .eq('deal_id', req.params.id)
+        .order('archived_at', { ascending: false });
+      res.json(data || []);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // ─── TELEGRAM WEBHOOK (inline button callbacks) ────────────────────────────
+
+  app.post('/api/telegram/webhook', async (req, res) => {
+    try {
+      const cb = req.body?.callback_query;
+      if (!cb) return res.json({ ok: true });
+
+      const [action, approvalId] = (cb.data || '').split(':');
+      const sb = getSupabase();
+      if (!sb || !approvalId) return res.json({ ok: true });
+
+      const { data: item } = await sb.from('approval_queue')
+        .select('*').eq('id', approvalId).maybeSingle();
+
+      if (!item) return res.json({ ok: true });
+      const meta = (() => { try { return JSON.parse(item.metadata || '{}'); } catch { return {}; } })();
+
+      const { editTelegramMessage, answerCallbackQuery } = await import('../core/telegram.js');
+      const chatId    = cb.message?.chat?.id;
+      const messageId = cb.message?.message_id;
+
+      if (action === 'proceed') {
+        await sb.from('approval_queue').update({ status: 'prior_chat_proceed', resolved_at: new Date().toISOString() }).eq('id', approvalId);
+        pushActivity({ type: 'linkedin', action: `Prior chat: proceeding with ${meta.contact_name || 'contact'}`, note: meta.firm_name || '', deal_id: item.deal_id });
+        await editTelegramMessage(chatId, messageId, `✅ *Proceeding with ${meta.contact_name || 'contact'}*\nDM queued for your approval.`);
+      } else if (action === 'find_other') {
+        await sb.from('approval_queue').update({ status: 'prior_chat_skip', resolved_at: new Date().toISOString() }).eq('id', approvalId);
+        pushActivity({ type: 'linkedin', action: `Prior chat: skipping ${meta.contact_name || 'contact'}, finding next`, note: meta.firm_name || '', deal_id: item.deal_id });
+        await editTelegramMessage(chatId, messageId, `↩️ *Skipping ${meta.contact_name || 'contact'}*\nMoving to next contact at ${meta.firm_name || 'firm'}.`);
+      } else if (action === 'suppress') {
+        if (meta.firm_name) {
+          await sb.from('contacts').update({ pipeline_stage: 'Archived' }).ilike('company_name', `%${meta.firm_name}%`);
+        }
+        await sb.from('approval_queue').update({ status: 'prior_chat_suppress', resolved_at: new Date().toISOString() }).eq('id', approvalId);
+        pushActivity({ type: 'system', action: `Firm suppressed via Telegram: ${meta.firm_name || 'firm'}`, deal_id: item.deal_id });
+        await editTelegramMessage(chatId, messageId, `🚫 *${meta.firm_name || 'Firm'} suppressed*\nAll outreach paused.`);
+      }
+
+      await answerCallbackQuery(cb.id, 'Done');
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[TG WEBHOOK]', err.message);
+      res.json({ ok: true });
+    }
   });
 
   // ─── ENV VARS ─────────────────────────────────────────────────────────────
@@ -3571,8 +5779,9 @@ function registerRoutes(app) {
 
       // Create or find the named list record
       const listName = (req.body.list_name || req.file.originalname.replace(/\.[^/.]+$/, '')).trim();
-      const listType = req.body.list_type || 'standard';
+      const listType = req.body.list_type || 'standing';
       const listSource = req.body.list_source || 'pitchbook';
+      const listPayload = buildInvestorListPayload(req.body);
       let listId = null;
       const sbList = getSupabase();
       if (sbList) {
@@ -3582,7 +5791,7 @@ function registerRoutes(app) {
           listId = existingList.id;
         } else {
           const { data: newList } = await sbList.from('investor_lists').insert({
-            name: listName, list_type: listType, source: listSource,
+            name: listName, list_type: listType, source: listSource, ...listPayload,
           }).select().single();
           listId = newList?.id;
         }
@@ -3594,6 +5803,7 @@ function registerRoutes(app) {
         filename: req.file.originalname,
         listId,
         listName,
+        listType,
         broadcastFn: (msg) => pushActivity({ type: 'research', action: msg, note: '' }),
       });
       fs.unlinkSync(req.file.path);
@@ -3603,36 +5813,46 @@ function registerRoutes(app) {
     }
   });
 
-  // PUT /api/investor-lists/:id — rename a list and update all investor rows
-  app.put('/api/investor-lists/:id', async (req, res) => {
+  const updateInvestorListHandler = async (req, res) => {
     try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { name, list_type } = req.body;
-      if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
-      const cleanName = name.trim();
-      const updates = { name: cleanName, updated_at: new Date().toISOString() };
-      if (list_type) updates.list_type = list_type;
+      const { data: existing, error: existingError } = await sb.from('investor_lists')
+        .select('*')
+        .eq('id', req.params.id)
+        .single();
+      if (existingError || !existing) return res.status(404).json({ error: 'List not found' });
+      const updates = buildInvestorListPayload(req.body, { requireName: false });
+      if (req.body.name != null && !updates.name) return res.status(400).json({ error: 'name is required' });
+      updates.updated_at = new Date().toISOString();
       const { data, error } = await sb.from('investor_lists').update(updates).eq('id', req.params.id).select().single();
       if (error) return res.status(500).json({ error: error.message });
       // Keep investors_db rows in sync
-      await sb.from('investors_db').update({ list_name: cleanName }).eq('list_id', req.params.id);
+      if (updates.name && updates.name !== existing.name) {
+        await sb.from('investors_db').update({ list_name: updates.name }).eq('list_id', req.params.id);
+      }
       pushActivity({
         type: 'system',
-        action: `List renamed: "${cleanName}"`,
+        action: `List updated: "${data?.name || existing.name}"`,
         note: `${data?.investor_count || ''} investors updated`,
       });
       res.json({ success: true, list: data });
     } catch (err) { res.status(500).json({ error: err.message }); }
-  });
+  };
+  app.put('/api/investor-lists/:id', updateInvestorListHandler);
+  app.put('/api/lists/:id', updateInvestorListHandler);
 
-  // GET /api/investor-lists — all named investor lists with counts
-  app.get('/api/investor-lists', async (req, res) => {
+  const getInvestorListsHandler = async (req, res) => {
     try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { data: lists } = await sb.from('investor_lists')
-        .select('*').order('created_at', { ascending: false });
+      let query = sb.from('investor_lists').select('*').order('created_at', { ascending: false });
+      if (req.query.type === 'knowledge_base') {
+        query = query.eq('list_type', 'knowledge_base');
+      } else if (req.query.type === 'investors') {
+        query = query.neq('list_type', 'knowledge_base');
+      }
+      const { data: lists } = await query;
       const listsWithCounts = await Promise.all((lists || []).map(async list => {
         const { count } = await sb.from('investors_db')
           .select('*', { count: 'exact', head: true }).eq('list_id', list.id);
@@ -3640,7 +5860,9 @@ function registerRoutes(app) {
       }));
       res.json(listsWithCounts);
     } catch (err) { res.status(500).json({ error: err.message }); }
-  });
+  };
+  app.get('/api/investor-lists', getInvestorListsHandler);
+  app.get('/api/lists', getInvestorListsHandler);
 
   // GET /api/investors-db/search
   app.get('/api/investors-db/search', async (req, res) => {
@@ -3702,7 +5924,7 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // GET /api/contacts-db/researched — contacts that have been individually researched and not archived
+  // GET /api/contacts-db/researched — deal-linked contacts with relationship context
   app.get('/api/contacts-db/researched', async (req, res) => {
     try {
       const sb = getSupabase();
@@ -3715,20 +5937,10 @@ function registerRoutes(app) {
           'id, name, company_name, job_title, email, phone, linkedin_url, ' +
           'sector_focus, geography, typical_cheque_size, aum_fund_size, ' +
           'past_investments, notes, source, enrichment_status, pipeline_stage, ' +
-          'person_researched, investor_score, created_at, updated_at',
+          'person_researched, investor_score, created_at, updated_at, deal_id, conversation_state, last_intent, last_intent_label',
           { count: 'exact' }
         )
-        // Show contacts that have been personally researched and queued for outreach
-        // Threshold: Enriched stage and beyond (post phasePersonResearch + phaseEnrich)
-        .in('pipeline_stage', [
-          'Enriched', 'enriched',
-          'linkedin_only', 'email_invalid_linkedin_only',
-          'invite_sent', 'invite_accepted',
-          'email_sent', 'dm_sent',
-          'Replied', 'In Conversation',
-          'Meeting Booked', 'Meeting Scheduled',
-          'Archived', 'archived', 'ARCHIVED',
-        ]);
+        .not('pipeline_stage', 'in', `("Deleted — Do Not Contact","Suppressed — Opt Out")`);
 
       if (search) query = query.or(
         `name.ilike.%${search}%,company_name.ilike.%${search}%,email.ilike.%${search}%`
@@ -3739,8 +5951,21 @@ function registerRoutes(app) {
 
       const { data, error: dbErr, count } = await query;
       if (dbErr) throw new Error(dbErr.message);
+      const dealNameMap = await getDealNameMap(sb, (data || []).map(row => row.deal_id));
+      const contactDealContext = await buildContactDealContextMap(sb);
       res.json({
-        contacts: data || [],
+        contacts: (data || []).map(row => {
+          const dealContext = contactDealContext.get(row.id) || {};
+          return {
+            ...row,
+            dealName: dealNameMap[row.deal_id] || '',
+            projectName: dealContext.projectName || dealNameMap[row.deal_id] || '',
+            activeDealName: dealContext.activeDealName || '',
+            activeDealId: dealContext.activeDealId || null,
+            deals: dealContext.deals || [],
+            dealNamesText: dealContext.dealNamesText || '',
+          };
+        }),
         total: count || 0,
         page: Number(page),
         pages: Math.ceil((count || 0) / Number(limit)),
@@ -3887,43 +6112,24 @@ function registerRoutes(app) {
 
   // ─── ANALYTICS ────────────────────────────────────────────────────────────
 
-  app.get('/api/analytics/summary', async (req, res) => {
+  app.get('/api/analytics/weeks', requireAuth, async (req, res) => {
     try {
       const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { data } = await sb.from('deal_analytics')
-        .select('*, deals(name)')
-        .order('week_starting', { ascending: false })
-        .limit(50);
+      const { data } = await sb.from('weekly_intelligence').select('*')
+        .order('week_start', { ascending: false });
       res.json(data || []);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.get('/api/analytics/recommendations', async (req, res) => {
+  app.get('/api/analytics/daily-logs', requireAuth, async (req, res) => {
     try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { data } = await sb.from('roco_recommendations')
-        .select('*').order('generated_at', { ascending: false }).limit(20);
-      res.json(data || []);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  app.post('/api/analytics/recommendations/:id/apply', async (req, res) => {
-    try {
-      const { applyRecommendation } = await import('../core/analyticsEngine.js');
-      await applyRecommendation(req.params.id);
-      res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-  });
-
-  app.post('/api/analytics/recommendations/:id/dismiss', async (req, res) => {
-    try {
-      const sb = getSupabase();
-      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      await sb.from('roco_recommendations').update({ status: 'rejected' }).eq('id', req.params.id);
-      res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+      const rows = await listDailyActivityReports();
+      res.json(rows || []);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // 404 handler — JSON for API/webhook paths, index.html for everything else
@@ -3939,25 +6145,223 @@ function registerRoutes(app) {
 // ACTIVITY PUSH
 // ─────────────────────────────────────────────
 
-export function pushActivity(entry) {
-  // Normalise: ensure a human-readable `message` field is always present
-  const message = entry.message || entry.note || entry.action || entry.summary || 'System event';
-  const enriched = { ...entry, message, timestamp: new Date().toISOString() };
+export function pushActivity(entry, legacyType) {
+  // Support legacy string call: pushActivity('message', 'type')
+  if (typeof entry === 'string') {
+    entry = { action: entry, type: legacyType || 'system' };
+  }
+
+  // Normalise: preserve the full human-readable activity line when both action and note exist.
+  const action = String(entry.action || '').trim();
+  const note = String(entry.note || '').trim();
+  const summary = String(entry.summary || '').trim();
+  const type = String(entry.type || 'system').toLowerCase();
+  const full_content = entry.full_content || null;
+  const message = entry.message
+    || (action && note ? `${action} · ${note}` : '')
+    || action
+    || note
+    || summary
+    || 'System event';
+  const deal_id = entry.deal_id || entry.dealId || null;
+  const enriched = { ...entry, type, action, note, message, deal_id, timestamp: new Date().toISOString() };
   activityFeed.push(enriched);
   if (activityFeed.length > MAX_FEED) activityFeed.shift();
 
   // Broadcast to all WebSocket clients
   if (wss) broadcastToAll({ type: 'activity', entry: enriched, feed: activityFeed.slice(-100) });
 
-  // Persist to Supabase activity_log (best-effort, non-blocking)
+  // Console log for PM2 visibility
+  console.log(`[${type.toUpperCase()}] ${action}${note ? ' — ' + note : ''}`);
+
+  // Persist to Supabase activity_log — try new schema, fall back to old
   const sb = getSupabase();
   if (sb) {
     sb.from('activity_log').insert({
-      event_type: (entry.type || 'system').toUpperCase(),
-      summary:    message,
-      deal_id:    entry.dealId || null,
-    }).then(() => {}).catch(() => {});
+      deal_id,
+      type,
+      action:       action || message,
+      note:         note || null,
+      full_content: full_content,
+    }).then(() => {}).catch(() => {
+      // Fall back to old schema (event_type, summary, detail)
+      sb.from('activity_log').insert({
+        deal_id,
+        event_type: type.toUpperCase(),
+        summary:    message,
+        detail:     note || null,
+      }).then(() => {}).catch(() => {});
+    });
   }
+}
+
+export function notifyQueueUpdated(count = null) {
+  if (wss) broadcastToAll({ type: 'QUEUE_UPDATED', count });
+}
+
+// ─────────────────────────────────────────────
+// PITCHBOOK IMPORT HELPERS
+// ─────────────────────────────────────────────
+
+async function importInvestorUniverse(sb, rows, dealId, filename) {
+  const listName = filename.replace(/\.xlsx?$/i, '').replace(/_/g, ' ').trim();
+
+  const { data: existingList } = await sb.from('investor_lists')
+    .select('id')
+    .eq('name', listName)
+    .limit(1)
+    .maybeSingle();
+
+  let listId;
+  if (existingList?.id) {
+    listId = existingList.id;
+  } else {
+    const { data: newList, error: newListError } = await sb.from('investor_lists').insert({
+      name: listName,
+    }).select('id').single();
+    if (newListError) throw new Error(newListError.message);
+    listId = newList.id;
+  }
+
+  const investors = rows
+    .filter(r => (r['Investor ID'] || r['Limited Partner ID']) && (r['Investors'] || r['Limited Partners']))
+    .map(r => ({
+      pitchbook_id:                    String(r['Investor ID'] || r['Limited Partner ID'] || '').trim(),
+      name:                            String(r['Investors'] || r['Limited Partners'] || '').trim(),
+      legal_name:                      String(r['Investor Legal Name'] || '').trim() || null,
+      description:                     String(r['Description'] || '').slice(0, 2000) || null,
+      investor_type:                   String(r['Primary Investor Type'] || r['Limited Partner Type'] || '').trim() || null,
+      aum_millions:                    r['AUM'] != null ? parseFloat(String(r['AUM']).replace(/[^0-9.-]/g, '')) || null : null,
+      dry_powder_millions:             r['Dry Powder'] != null ? parseFloat(String(r['Dry Powder']).replace(/[^0-9.-]/g, '')) || null : null,
+      hq_city:                         String(r['HQ City'] || '').trim() || null,
+      hq_state:                        String(r['HQ State/Province'] || '').trim() || null,
+      hq_country:                      String(r['HQ Country/Territory/Region'] || '').trim() || null,
+      hq_region:                       String(r['HQ Global Region'] || '').trim() || null,
+      hq_email:                        String(r['HQ Email'] || '').trim().toLowerCase() || null,
+      website:                         String(r['Website'] || '').trim() || null,
+      preferred_industries:            String(r['Preferred Industry'] || '').trim() || null,
+      preferred_geographies:           String(r['Preferred Geography'] || '').trim() || null,
+      preferred_investment_types:      String(r['Preferred Investment Types'] || '').trim() || null,
+      preferred_investment_amount_min: r['Preferred Investment Amount Min'] ? String(r['Preferred Investment Amount Min']).trim() || null : null,
+      preferred_investment_amount_max: r['Preferred Investment Amount Max'] ? String(r['Preferred Investment Amount Max']).trim() || null : null,
+      preferred_deal_size_min:         r['Preferred Deal Size Min'] ? String(r['Preferred Deal Size Min']).trim() || null : null,
+      preferred_deal_size_max:         r['Preferred Deal Size Max'] ? String(r['Preferred Deal Size Max']).trim() || null : null,
+      preferred_ebitda_min:            r['Preferred EBITDA Min'] ? String(r['Preferred EBITDA Min']).trim() || null : null,
+      preferred_ebitda_max:            r['Preferred EBITDA Max'] ? String(r['Preferred EBITDA Max']).trim() || null : null,
+      investments_last_12m:            r['Investments in the last 12 months'] ? Number(r['Investments in the last 12 months']) || null : null,
+      last_investment_date:            r['Last Investment Date'] != null ? String(r['Last Investment Date']) : null,
+      last_investment_company:         String(r['Last Investment Company'] || '').trim() || null,
+      list_id:                         listId,
+      list_name:                       listName,
+    }))
+    .filter(i => i.name && i.name.length > 1 && i.pitchbook_id);
+
+  if (!investors.length) {
+    throw new Error(`Investor universe parser found 0 investors in "${filename}". Expected "Investor ID" and "Investors" columns on the PitchBook header row.`);
+  }
+
+  let imported = 0;
+  for (let i = 0; i < investors.length; i += 100) {
+    const batch = investors.slice(i, i + 100);
+    const { error } = await sb.from('investors_db').upsert(batch, {
+      onConflict: 'pitchbook_id',
+      ignoreDuplicates: false,
+    });
+    if (!error) imported += batch.length;
+    else console.warn('[IMPORT INVESTOR] Batch error:', error.message);
+  }
+
+  await sb.from('investor_lists').update({ investor_count: imported }).eq('id', listId);
+  await sb.from('deals').update({
+    priority_list_id: listId,
+    priority_list_name: listName,
+    updated_at: new Date().toISOString(),
+  }).eq('id', dealId);
+  // Insert into deal_list_priorities — try with optional columns first, fall back to minimal row
+  const listPriorityRowFull = { deal_id: dealId, list_id: listId, list_name: listName, priority_order: -1, status: 'pending', source: 'pitchbook' };
+  const listPriorityRowMin  = { deal_id: dealId, list_id: listId, list_name: listName, priority_order: -1 };
+  const { error: lpErr } = await sb.from('deal_list_priorities')
+    .upsert(listPriorityRowFull, { onConflict: 'deal_id,list_id', ignoreDuplicates: false });
+  if (lpErr) {
+    await sb.from('deal_list_priorities').delete().eq('deal_id', dealId).eq('list_id', listId);
+    const { error: lpInsertErr } = await sb.from('deal_list_priorities').insert(listPriorityRowFull);
+    if (lpInsertErr) {
+      // source/status columns may not exist — try minimal row
+      await sb.from('deal_list_priorities').delete().eq('deal_id', dealId).eq('list_id', listId);
+      const { error: lpMinErr } = await sb.from('deal_list_priorities').insert(listPriorityRowMin);
+      if (lpMinErr) console.warn('[IMPORT INVESTOR] deal_list_priorities insert error:', lpMinErr.message);
+    }
+  }
+
+  pushActivity({
+    type: 'research',
+    action: `Investor universe imported: ${imported} investors added to database`,
+    note: `${listName} — set as priority source for this deal`,
+    dealId,
+  });
+
+  return { imported, listId, listName };
+}
+
+async function importComparableDeals(sb, rows, dealId) {
+  const records = rows
+    .filter(r => r['Deal ID'] && (r['Description'] || r['Financing Status Note']))
+    .map(r => ({
+      deal_id: dealId,
+      source_deal_id: String(r['Deal ID'] || '').trim(),
+      source_company: String(r['Companies'] || '').trim(),
+      description: String(r['Description'] || '').slice(0, 3000) || null,
+      financing_note: String(r['Financing Status Note'] || '').slice(0, 2000) || null,
+      deal_date: r['Deal Date'] ? String(r['Deal Date']) : null,
+      deal_size: r['Deal Size'] ? String(r['Deal Size']) : null,
+      deal_type: String(r['Deal Type'] || '').trim() || null,
+      primary_sector: String(r['Primary Industry Sector'] || '').trim() || null,
+      all_industries: String(r['All Industries'] || '').trim() || null,
+      hq_country: String(r['Company Country/Territory/Region'] || '').trim() || null,
+      hq_region: String(r['HQ Global Region'] || '').trim() || null,
+      ebitda: r['EBITDA'] ? String(r['EBITDA']) : null,
+      investors_raw: String(r['Investors'] || '').trim() || null,
+      lead_investors: String(r['Lead/Sole Investors'] || '').trim() || null,
+      sponsor: String(r['Sponsor'] || '').trim() || null,
+    }))
+    .filter(r => r.source_company && r.source_deal_id);
+
+  if (!records.length) {
+    throw new Error('Comparable deals parser found 0 records. Expected "Deal ID", "Companies", and "Description" or "Financing Status Note" columns.');
+  }
+
+  const seen = new Set();
+  const unique = records.filter(r => {
+    if (seen.has(r.source_deal_id)) return false;
+    seen.add(r.source_deal_id);
+    return true;
+  });
+
+  let imported = 0;
+  for (let i = 0; i < unique.length; i += 100) {
+    const batch = unique.slice(i, i + 100);
+    const { error } = await sb.from('deal_intelligence').upsert(batch, {
+      onConflict: 'deal_id,source_deal_id',
+      ignoreDuplicates: true,
+    });
+    if (!error) imported += batch.length;
+    else console.warn('[IMPORT DEALS] Batch error:', error.message);
+  }
+
+  pushActivity({
+    type: 'research',
+    action: `Comparable deals imported: ${imported} records`,
+    note: 'AI similarity analysis will run in background',
+    dealId,
+  });
+
+  import('../core/dealIntelligence.js').then(({ analyzeDealIntelligence }) => {
+    analyzeDealIntelligence(dealId, pushActivity).catch(err =>
+      console.error('[DEAL INTEL ANALYSIS]', err.message)
+    );
+  }).catch(() => {});
+
+  return { imported };
 }
 
 // ─────────────────────────────────────────────
@@ -3976,10 +6380,35 @@ function broadcastToAll(data) {
 // DEBOUNCE BATCHER — 90-second multi-reply handler
 // ─────────────────────────────────────────────
 
+function normalizeInboundEmail(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  const bracketMatch = raw.match(/<([^>]+)>/);
+  const candidate = bracketMatch?.[1] || raw;
+  return candidate.replace(/^mailto:/, '').trim();
+}
+
+async function fetchInvestorContactById(contactId) {
+  const sb = getSupabase();
+  if (!sb || !contactId) return null;
+  const { data } = await sb.from('contacts').select('*, deals(*)').eq('id', contactId).limit(1).maybeSingle();
+  return data || null;
+}
+
+async function fetchSourcingContactById(contactId) {
+  const sb = getSupabase();
+  if (!sb || !contactId) return null;
+  const { data } = await sb.from('company_contacts').select('*, sourcing_campaigns(*), target_companies(*)').eq('id', contactId).limit(1).maybeSingle();
+  return data || null;
+}
+
 async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText, threadId, chatId, messageId, channel, emailAccountId, raw }) {
   if (!bodyText?.trim()) return;
 
-  const contactKey = channel === 'linkedin' ? (fromUrn || fromName) : fromEmail;
+  const normalizedEmail = normalizeInboundEmail(fromEmail);
+  const contactKey = channel === 'linkedin'
+    ? (chatId || fromUrn || fromName)
+    : (normalizedEmail || threadId || fromName);
   if (!contactKey) return;
 
   const batchKey  = `${channel}_${contactKey}`;
@@ -3994,7 +6423,15 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText
     console.log(`[REPLY] Batched message ${existing.messages.length} from ${contactKey}`);
   } else {
     // Resolve contact + context before batching
-    const ctx = await resolveContactAndContext(contactKey, channel);
+    const ctx = await resolveContactAndContext({
+      channel,
+      contactKey,
+      fromEmail: normalizedEmail,
+      fromUrn,
+      fromName,
+      threadId,
+      chatId,
+    });
 
     if (!ctx.contact) {
       // Unknown contact — fall back to legacy handler
@@ -4032,29 +6469,72 @@ async function flushReplyBatch(batchKey) {
   });
 }
 
-async function resolveContactAndContext(contactKey, channel) {
+async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUrn, threadId, chatId }) {
   const sb = getSupabase();
   if (!sb) return { contact: null, deal: null, campaign: null, mode: null };
 
   // Investor outreach — check contacts table
   try {
-    let q = sb.from('contacts').select('*, deals(*)').limit(1);
-    q = channel === 'linkedin' ? q.eq('linkedin_provider_id', contactKey) : q.eq('email', contactKey);
-    const { data: contacts } = await q;
-    if (contacts?.length > 0) {
-      const c = contacts[0];
-      return { contact: c, deal: c.deals || null, campaign: null, mode: 'investor_outreach' };
+    if (channel === 'linkedin' && chatId) {
+      const { data } = await sb.from('contacts').select('*, deals(*)').eq('unipile_chat_id', chatId).limit(1).maybeSingle();
+      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+    }
+    if (channel === 'linkedin' && (fromUrn || contactKey)) {
+      const { data } = await sb.from('contacts').select('*, deals(*)').eq('linkedin_provider_id', fromUrn || contactKey).limit(1).maybeSingle();
+      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+    }
+    if (channel === 'email' && fromEmail) {
+      const { data } = await sb.from('contacts').select('*, deals(*)').ilike('email', fromEmail).limit(1).maybeSingle();
+      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+    }
+    if (channel === 'email' && threadId) {
+      const { data: emailThread } = await sb.from('emails')
+        .select('contact_id')
+        .eq('gmail_thread_id', threadId)
+        .not('contact_id', 'is', null)
+        .order('sent_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (emailThread?.contact_id) {
+        const contact = await fetchInvestorContactById(emailThread.contact_id);
+        if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
+      }
+      const { data: priorReply } = await sb.from('replies')
+        .select('contact_id')
+        .eq('thread_id', threadId)
+        .not('contact_id', 'is', null)
+        .order('received_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (priorReply?.contact_id) {
+        const contact = await fetchInvestorContactById(priorReply.contact_id);
+        if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
+      }
     }
   } catch {}
 
   // Company sourcing — check company_contacts table
   try {
-    let sq = sb.from('company_contacts').select('*, sourcing_campaigns(*), target_companies(*)').limit(1);
-    sq = channel === 'linkedin' ? sq.eq('linkedin_provider_id', contactKey) : sq.eq('email', contactKey);
-    const { data: sContacts } = await sq;
-    if (sContacts?.length > 0) {
-      const c = sContacts[0];
-      return { contact: c, deal: null, campaign: c.sourcing_campaigns || null, mode: 'company_sourcing' };
+    if (channel === 'linkedin' && (fromUrn || contactKey)) {
+      const { data } = await sb.from('company_contacts').select('*, sourcing_campaigns(*), target_companies(*)').eq('linkedin_provider_id', fromUrn || contactKey).limit(1).maybeSingle();
+      if (data) return { contact: data, deal: null, campaign: data.sourcing_campaigns || null, mode: 'company_sourcing' };
+    }
+    if (channel === 'email' && fromEmail) {
+      const { data } = await sb.from('company_contacts').select('*, sourcing_campaigns(*), target_companies(*)').ilike('email', fromEmail).limit(1).maybeSingle();
+      if (data) return { contact: data, deal: null, campaign: data.sourcing_campaigns || null, mode: 'company_sourcing' };
+    }
+    if (channel === 'email' && threadId) {
+      const { data: priorReply } = await sb.from('replies')
+        .select('contact_id')
+        .eq('thread_id', threadId)
+        .not('contact_id', 'is', null)
+        .order('received_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (priorReply?.contact_id) {
+        const contact = await fetchSourcingContactById(priorReply.contact_id);
+        if (contact) return { contact, deal: null, campaign: contact.sourcing_campaigns || null, mode: 'company_sourcing' };
+      }
     }
   } catch {}
 
@@ -4086,11 +6566,12 @@ async function processRocoBatchedReply(batch) {
     response_received: true,
     last_reply_at:     new Date().toISOString(),
     response_summary:  combinedContent.slice(0, 200),
-  }).eq('id', contact.id).catch(() => {});
+    ...(contactTable === 'contacts' ? { follow_up_due_at: null } : {}),
+  }).eq('id', contact.id);
 
   // Record which channel the reply came in on (for channel loyalty in responses)
   await sb?.from(contactTable).update({ reply_channel: channel })
-    .eq('id', contact.id).catch(() => {});
+    .eq('id', contact.id);
 
   // Log to conversation_messages table (investor outreach only)
   if (mode === 'investor_outreach' && contact?.id) {
@@ -4109,7 +6590,20 @@ async function processRocoBatchedReply(batch) {
   // Load conversation history — prefer conversation_messages table, fall back to activity_log
   let convMessages = [];
   if (mode === 'investor_outreach' && contact?.id) {
-    convMessages = await getConversationHistory(contact.id).catch(() => []);
+    convMessages = await getConversationHistory(contact.id, deal?.id || contact?.deal_id || null).catch(() => []);
+  }
+
+  let emailThreadHistory = [];
+  if (channel === 'email' && threadId) {
+    try {
+      emailThreadHistory = await listEmails({
+        threadId,
+        accountId: emailAccountId || process.env.UNIPILE_OUTLOOK_ACCOUNT_ID || process.env.UNIPILE_GMAIL_ACCOUNT_ID,
+        limit: 50,
+      });
+    } catch (err) {
+      console.warn('[REPLY] Unipile email thread fetch failed:', err.message);
+    }
   }
 
   // Build plain-text history for existing classifyAndDraftRocoReply prompt format
@@ -4119,10 +6613,23 @@ async function processRocoBatchedReply(batch) {
     .in('event_type', ['REPLY_RECEIVED', 'EMAIL_SENT', 'LINKEDIN_DM_SENT', 'MESSAGE_SENT', 'OUTREACH_SENT'])
     .order('created_at', { ascending: true }) || { data: [] };
 
-  const conversationHistory = (history || []).map(h => {
-    const isInbound = h.event_type === 'REPLY_RECEIVED';
-    return `${isInbound ? contact.name : 'Roco'}: ${h.detail?.content || h.summary}`;
-  }).join('\n');
+  const conversationHistory = convMessages.length > 0
+    ? formatConversationHistoryForProject(convMessages, contact, deal?.name || null)
+    : (history || []).map(h => {
+      const isInbound = h.event_type === 'REPLY_RECEIVED';
+      const prefix = deal?.name ? `[${deal.name}] ` : '';
+      return `${prefix}${isInbound ? contact.name : 'Roco'}: ${h.detail?.content || h.summary}`;
+    }).join('\n');
+
+  const remoteEmailThread = (emailThreadHistory || []).map(mail => {
+    const isInboundMail = !mail.is_sender;
+    const fromName = mail.from_attendee?.display_name || mail.from?.display_name || mail.from?.identifier || contact.name;
+    const body = mail.body_plain || mail.body || mail.snippet || '';
+    const prefix = deal?.name ? `[${deal.name}] ` : '';
+    return `${prefix}${isInboundMail ? fromName : 'Roco'}: ${String(body).replace(/<[^>]+>/g, ' ').trim()}`;
+  }).filter(Boolean).join('\n');
+
+  const effectiveConversationHistory = [conversationHistory, remoteEmailThread].filter(Boolean).join('\n');
 
   // Mid-conversation research if triggered
   let researchContext = '';
@@ -4135,7 +6642,7 @@ async function processRocoBatchedReply(batch) {
 
   // Classify and draft
   const classification = await classifyAndDraftRocoReply(
-    contact, combinedContent, conversationHistory,
+    contact, combinedContent, effectiveConversationHistory,
     deal, campaign, mode, contextName,
     researchContext, guidanceBlock, messages.length
   );
@@ -4167,6 +6674,14 @@ async function processRocoBatchedReply(batch) {
           intent_category:  intent.category,
           action_taken:     intent.suggested_action,
         }).catch(() => {});
+
+        // Stamp last_intent on contact for pipeline sentiment display
+        if (sb) {
+          await sb.from('contacts').update({
+            last_intent:       intent.intent_key,
+            last_intent_label: intent.category,
+          }).eq('id', contact.id);
+        }
 
         // Update intent on the conversation_messages record just inserted
         if (sb) {
@@ -4234,7 +6749,8 @@ async function processRocoBatchedReply(batch) {
       pipeline_stage:    'Archived',
       response_received: true,
       response_summary:  'Conversation ended',
-    }).eq('id', contact.id).catch(() => {});
+      follow_up_due_at:  null,
+    }).eq('id', contact.id);
     await sb?.from('activity_log').insert({
       deal_id:    deal?.id || null,
       contact_id: contact.id,
@@ -4423,10 +6939,14 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
   const table = mode === 'investor_outreach' ? 'contacts' : 'company_contacts';
   const sb = getSupabase();
   await sb?.from(table).update({
-    pipeline_stage:   'declined',
+    pipeline_stage:   mode === 'investor_outreach' ? 'Inactive' : 'declined',
+    conversation_state: mode === 'investor_outreach' ? 'conversation_ended_negative' : undefined,
+    conversation_ended_at: mode === 'investor_outreach' ? new Date().toISOString() : undefined,
+    conversation_ended_reason: mode === 'investor_outreach' ? 'Not interested' : undefined,
     response_received: true,
     response_summary:  'Not interested',
-  }).eq('id', contact.id).catch(() => {});
+    ...(table === 'contacts' ? { follow_up_due_at: null } : {}),
+  }).eq('id', contact.id);
 
   const isAngel = contact.is_angel || contact.contact_type === 'angel';
 
@@ -4453,7 +6973,20 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
     await sb?.from('target_companies').update({
       firm_responded:  true,
       outreach_status: 'declined',
-    }).eq('id', contact.company_id).catch(() => {});
+    }).eq('id', contact.company_id);
+  }
+
+  if (mode === 'investor_outreach' && deal?.id && contact.company_name) {
+    await sb?.from('contacts').update({
+      pipeline_stage: 'Inactive',
+      response_received: true,
+      follow_up_due_at: null,
+    }).eq('deal_id', deal.id)
+      .eq('company_name', contact.company_name)
+      .neq('id', contact.id);
+    await sb?.from('batch_firms').update({ status: 'suppressed' })
+      .eq('deal_id', deal.id)
+      .ilike('firm_name', contact.company_name);
   }
 
   const suppressionScope = (mode === 'investor_outreach' && isAngel)
@@ -4514,7 +7047,7 @@ async function classifyWithGpt({ body, fromEmail, fromName, dealName, dealDescri
   }
 }
 
-// Close a conversation: update stage in Supabase + Notion, generate summary, notify Dom
+// Close a conversation: update stage in Supabase, generate summary, notify Dom
 async function closeConversation({ contact, sb, outcome, newStage, summary }) {
   if (!contact) return;
 
@@ -4539,15 +7072,6 @@ async function closeConversation({ contact, sb, outcome, newStage, summary }) {
     }
   } catch { /* use fallback summary */ }
 
-  // Write summary to Notion notes
-  if (contact.notion_page_id) {
-    const timestamp = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-    await updateContact(contact.notion_page_id, {
-      pipelineStage: newStage,
-      notes: `[${timestamp} — Outcome: ${outcome}]\n${conversationSummary}`,
-    }).catch(e => console.warn('[CLOSE] Notion notes update failed:', e.message));
-  }
-
   // Notify Dom
   await sendTelegram(
     `🔚 *Conversation Closed — ${outcome}*\n\n` +
@@ -4562,7 +7086,21 @@ async function closeConversation({ contact, sb, outcome, newStage, summary }) {
     note: conversationSummary.substring(0, 150),
   });
 
-  console.log(`[CLOSE] ${contact.name} → ${newStage}. Summary logged to Notion.`);
+  if (contact.deal_id && contact.company_name && ['Not Interested', 'Suppressed — Opt Out'].includes(newStage)) {
+    try {
+      await sb.from('contacts')
+        .update({ pipeline_stage: 'Inactive', response_received: true, follow_up_due_at: null })
+        .eq('deal_id', contact.deal_id)
+        .eq('company_name', contact.company_name)
+        .neq('id', contact.id);
+      await sb.from('batch_firms')
+        .update({ status: 'suppressed' })
+        .eq('deal_id', contact.deal_id)
+        .ilike('firm_name', contact.company_name);
+    } catch {}
+  }
+
+  console.log(`[CLOSE] ${contact.name} → ${newStage}. Summary logged to Supabase activity.`);
 }
 
 async function fetchDealAssets(dealId) {
@@ -4709,25 +7247,25 @@ async function draftInstantReply({ contact, originalEmail, inboundBody, classifi
 
 async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyText, threadId, messageId, channel, threadField, emailAccountId }) {
   if (!bodyText && !fromEmail && !fromUrn) return;
-  console.log(`[INBOUND/${channel.toUpperCase()}] Reply from ${fromEmail || fromName} on thread ${threadId}`);
+  const normalizedEmail = normalizeInboundEmail(fromEmail);
+  console.log(`[INBOUND/${channel.toUpperCase()}] Reply from ${normalizedEmail || fromName} on thread ${threadId}`);
 
   const sb = getSupabase();
 
   // Find contact — try email first, then LinkedIn chat_id, then provider_id
   let contact = null;
   if (sb) {
-    if (fromEmail) {
-      const { data } = await sb.from('contacts').select('*').eq('email', fromEmail).limit(1).single();
+    if (normalizedEmail) {
+      const { data } = await sb.from('contacts').select('*').ilike('email', normalizedEmail).limit(1).maybeSingle();
       contact = data || null;
     }
     if (!contact && threadId) {
-      // LinkedIn: match by the chat_id stored when we sent the original DM
-      const { data } = await sb.from('contacts').select('*').eq('linkedin_chat_id', threadId).limit(1).single();
+      const { data } = await sb.from('contacts').select('*').eq('unipile_chat_id', threadId).limit(1).maybeSingle();
       contact = data || null;
     }
     if (!contact && fromUrn) {
       // Fall back to LinkedIn provider_id
-      const { data } = await sb.from('contacts').select('*').eq('linkedin_provider_id', fromUrn).limit(1).single();
+      const { data } = await sb.from('contacts').select('*').eq('linkedin_provider_id', fromUrn).limit(1).maybeSingle();
       contact = data || null;
     }
   }
@@ -4763,18 +7301,11 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
   if (contact && sb) {
     await sb.from('contacts').update({
       pipeline_stage:    'In Conversation',
-      last_contacted:    new Date().toISOString().split('T')[0],
+      response_received: true,
+      last_reply_at:     new Date().toISOString(),
       last_contact_type: channel === 'linkedin' ? 'LinkedIn' : 'Email',
+      follow_up_due_at:  null,
     }).eq('id', contact.id);
-
-    if (contact.notion_page_id) {
-      await updateContact(contact.notion_page_id, {
-        pipelineStage:     'In Conversation',
-        responseReceived:  'Yes',
-        lastContactType:   channel === 'linkedin' ? 'LinkedIn' : 'Email',
-        lastContactNotes:  `Reply received: ${bodyText.substring(0, 200)}`,
-      }).catch(e => console.warn('[INBOUND] Notion update failed:', e.message));
-    }
   }
 
   const deal = originalEmail?.deals;

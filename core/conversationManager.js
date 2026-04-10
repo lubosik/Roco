@@ -15,14 +15,16 @@ function getAnthropic() {
 
 // ── CONVERSATION HISTORY ──────────────────────────────────────────────────────
 
-export async function getConversationHistory(contactId) {
+export async function getConversationHistory(contactId, dealId = null) {
   const sb = getSupabase();
   if (!sb) return [];
-  const { data } = await sb
+  let query = sb
     .from('conversation_messages')
     .select('*')
     .eq('contact_id', contactId)
     .order('sent_at', { ascending: true });
+  if (dealId) query = query.eq('deal_id', dealId);
+  const { data } = await query;
   return data || [];
 }
 
@@ -45,9 +47,9 @@ export async function logConversationMessage({ contactId, dealId, direction, cha
 
   // Mirror timestamps on contacts row
   if (direction === 'outbound') {
-    await sb.from('contacts').update({ last_outreach_at: new Date().toISOString() }).eq('id', contactId).catch(() => {});
+    try { await sb.from('contacts').update({ last_outreach_at: new Date().toISOString() }).eq('id', contactId); } catch {}
   } else {
-    await sb.from('contacts').update({ last_reply_at: new Date().toISOString() }).eq('id', contactId).catch(() => {});
+    try { await sb.from('contacts').update({ last_reply_at: new Date().toISOString() }).eq('id', contactId); } catch {}
   }
 
   return data;
@@ -130,10 +132,11 @@ Return ONLY valid JSON:
     await registerNewIntent(result, inboundMessage, contact, sb);
   } else if (!result.is_new_intent && sb) {
     // Update last_seen_at on known intent
-    await sb.from('conversation_intents')
-      .update({ last_seen_at: new Date().toISOString() })
-      .eq('intent_key', result.intent_key)
-      .catch(() => {});
+    try {
+      await sb.from('conversation_intents')
+        .update({ last_seen_at: new Date().toISOString() })
+        .eq('intent_key', result.intent_key);
+    } catch {}
   }
 
   return result;
@@ -222,10 +225,16 @@ export async function setConversationState(contactId, state, extras = {}) {
   if (state === 'temp_closed') {
     updates.temp_closed_at      = new Date().toISOString();
     updates.next_follow_up_due  = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    updates.follow_up_due_at    = null;
+  }
+
+  if (['awaiting_response', 'needs_reply'].includes(state)) {
+    updates.follow_up_due_at = null;
   }
 
   if (['conversation_ended_positive', 'conversation_ended_negative', 'meeting_booked', 'do_not_contact'].includes(state)) {
     updates.conversation_ended_at = new Date().toISOString();
+    updates.follow_up_due_at = null;
   }
 
   await sb.from('contacts').update(updates).eq('id', contactId);

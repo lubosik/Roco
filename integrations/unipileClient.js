@@ -9,6 +9,7 @@ function getKey()        { return process.env.UNIPILE_API_KEY; }
 function getLiAcct()     { return process.env.UNIPILE_LINKEDIN_ACCOUNT_ID; }
 function getGmAcct()     { return process.env.UNIPILE_GMAIL_ACCOUNT_ID; }
 function getOutlookAcct(){ return process.env.UNIPILE_OUTLOOK_ACCOUNT_ID; }
+function getEmailAcct()  { return getOutlookAcct() || getGmAcct(); }
 
 async function api(method, path, body, isFormData = false) {
   const url = `${getDSN()}/api/v1${path}`;
@@ -29,28 +30,79 @@ async function api(method, path, body, isFormData = false) {
   const res = await fetch(url, { method, headers, body: fetchBody });
   if (!res.ok) {
     const err = await res.text().catch(() => res.statusText);
-    throw new Error(`Unipile ${method} ${path} → ${res.status}: ${err.substring(0, 300)}`);
+    const error = new Error(`Unipile ${method} ${path} → ${res.status}: ${err.substring(0, 300)}`);
+    error.status = res.status;
+    error.path = path;
+    error.method = method;
+    error.responseText = err.substring(0, 1000);
+    throw error;
   }
   return res.json();
 }
 
 // ── LINKEDIN INVITATIONS ──────────────────────────────────────────────
 
+function isValidLinkedInProviderId(value) {
+  return /^(ACo|ACw|AE)[A-Za-z0-9_-]+$/.test(String(value || '').trim());
+}
+
+function getLinkedInIdentifier(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (isValidLinkedInProviderId(raw)) return raw;
+  const slug = extractSlug(raw);
+  return slug || raw;
+}
+
 /**
  * Send a LinkedIn connection request.
- * providerId = LinkedIn member URN  e.g. ACoAAAcDMMQBODyLw...
- * OR pass linkedinUrl and we resolve the slug to use as identifier.
+ * Unipile requires the real LinkedIn provider_id (ACo / ACw / AE...), not a public profile slug.
  */
-export async function sendLinkedInInvite({ providerId, linkedinUrl, message }) {
-  const id = providerId || extractSlug(linkedinUrl);
-  if (!id) throw new Error('sendLinkedInInvite: need providerId or linkedinUrl');
+export async function sendLinkedInInvite({ providerId, message, userEmail }) {
+  const id = String(providerId || '').trim();
+  if (!isValidLinkedInProviderId(id)) {
+    throw new Error(`sendLinkedInInvite: invalid LinkedIn providerId "${id || 'missing'}"`);
+  }
 
   const result = await api('POST', '/users/invite', {
     account_id: getLiAcct(),
     provider_id: id,
+    user_email: userEmail || undefined,
     message: (message || '').substring(0, 300),
   });
-  return { success: true, invitationId: result.invitation_id || result.id };
+  return {
+    success: true,
+    accountId: getLiAcct(),
+    providerId: id,
+    invitationId: result.invitation_id || result.id || null,
+    usage: result.usage || null,
+    raw: result,
+  };
+}
+
+export async function resolveLinkedInProfile(identifier) {
+  const id = getLinkedInIdentifier(identifier);
+  if (!id) return null;
+
+  const result = await api('GET', `/users/${encodeURIComponent(id)}?account_id=${encodeURIComponent(getLiAcct())}`);
+  const profile = result?.profile || result?.user || result || {};
+  const providerId = profile.provider_id || profile.id || profile.providerId || null;
+  const canonicalUrl = canonicalizeLinkedInProfileUrl(profile.profile_url || profile.linkedin_url || identifier);
+  const publicId = profile.public_id || profile.provider_public_id || profile.username || extractSlug(canonicalUrl || identifier);
+
+  return {
+    providerId: isValidLinkedInProviderId(providerId) ? providerId : null,
+    publicId: publicId || null,
+    name: profile.name || profile.full_name || [profile.first_name, profile.last_name].filter(Boolean).join(' ').trim() || null,
+    headline: profile.headline || null,
+    linkedinUrl: canonicalUrl,
+    raw: profile,
+  };
+}
+
+export async function listSentInvitations(limit = 100) {
+  const result = await api('GET', `/users/invite/sent?account_id=${encodeURIComponent(getLiAcct())}&limit=${Math.min(Math.max(limit, 1), 100)}`);
+  return result?.items || [];
 }
 
 // ── LINKEDIN MESSAGES ─────────────────────────────────────────────────
@@ -60,21 +112,34 @@ export async function sendLinkedInInvite({ providerId, linkedinUrl, message }) {
  * attendeeProviderId = LinkedIn member URN (must be a 1st-degree connection).
  */
 export async function sendLinkedInDM({ attendeeProviderId, message }) {
+  const id = String(attendeeProviderId || '').trim();
+  if (!isValidLinkedInProviderId(id)) {
+    throw new Error(`sendLinkedInDM: invalid attendeeProviderId "${id || 'missing'}"`);
+  }
   const result = await api('POST', '/chats', {
     account_id: getLiAcct(),
-    attendees_ids: attendeeProviderId,
+    attendees_ids: [id],
     text: message,
-    'linkedin[api]': 'classic',
-  }, true);
-  return { success: true, chatId: result.chat_id || result.id, messageId: result.message_id };
+  });
+  return {
+    success: true,
+    accountId: getLiAcct(),
+    attendeeProviderId: id,
+    chatId: result.chat_id || result.id || null,
+    messageId: result.message_id || null,
+    raw: result,
+  };
 }
 
 /**
  * Send a message in an existing chat.
  */
 export async function sendLinkedInReply({ chatId, message }) {
-  const result = await api('POST', `/chats/${chatId}/messages`, { text: message }, true);
-  return { success: true, messageId: result.id };
+  const result = await api('POST', `/chats/${chatId}/messages`, {
+    account_id: getLiAcct(),
+    text: message,
+  });
+  return { success: true, accountId: getLiAcct(), chatId, messageId: result.message_id || result.id || null, raw: result };
 }
 
 /**
@@ -96,46 +161,98 @@ export async function getChatHistory({ chatId, limit = 20 }) {
 /**
  * LinkedIn People Search — up to 50 results per call.
  */
-export async function searchLinkedInPeople({ keywords, limit = 50 }) {
-  const result = await api('POST',
+export async function searchLinkedInPeople({ keywords, companyIds = [], networkDistance = [], limit = 50 }) {
+  const body = { api: 'classic', category: 'people' };
+  if (keywords) body.keywords = keywords;
+  if (Array.isArray(companyIds) && companyIds.length) body.company = companyIds.map(String);
+  if (Array.isArray(networkDistance) && networkDistance.length) body.network_distance = networkDistance;
+  const result = await api(
+    'POST',
     `/linkedin/search?account_id=${getLiAcct()}&limit=${Math.min(limit, 50)}`,
-    { api: 'classic', category: 'people', keywords }
+    body,
   );
+  return result.items || [];
+}
+
+/**
+ * LinkedIn People Search via Sales Navigator when available.
+ * Falls back at call-site if the account is not subscribed for this API.
+ */
+export async function searchLinkedInPeopleSalesNavigator({ firstName, lastName, keywords, companyIds = [], networkDistance = [], limit = 10 }) {
+  const body = { api: 'sales_navigator', category: 'people' };
+  if (firstName) body.first_name = firstName;
+  if (lastName) body.last_name = lastName;
+  if (keywords) body.keywords = keywords;
+  if (Array.isArray(companyIds) && companyIds.length) body.company = { include: companyIds.map(String) };
+  if (Array.isArray(networkDistance) && networkDistance.length) body.network_distance = networkDistance;
+
+  const result = await api(
+    'POST',
+    `/linkedin/search?account_id=${getLiAcct()}&limit=${Math.min(Math.max(limit, 1), 10)}`,
+    body,
+  );
+  return result.items || [];
+}
+
+export async function getLinkedInSearchParameters({ type, keywords, service = 'CLASSIC', limit = 10 }) {
+  const query = new URLSearchParams({
+    account_id: getLiAcct(),
+    type,
+    service,
+    limit: String(Math.min(Math.max(limit, 1), 100)),
+  });
+  if (keywords) query.set('keywords', keywords);
+  const result = await api('GET', `/linkedin/search/parameters?${query.toString()}`);
   return result.items || [];
 }
 
 // ── GMAIL ─────────────────────────────────────────────────────────────
 
 /**
- * Send a new email via Gmail through Unipile.
+ * Send a new email via Unipile using the explicitly selected mailbox when provided.
  */
-export async function sendEmail({ to, toName, subject, body, fromName }) {
-  const toPayload = JSON.stringify([{ display_name: toName || '', identifier: to }]);
+export async function sendEmail({ to, toName, subject, body, fromName, accountId }) {
+  const resolvedAccount = accountId || getEmailAcct();
   const result = await api('POST', '/emails', {
-    account_id: getGmAcct(),
+    account_id: resolvedAccount,
     subject,
     body: formatEmailHtml(body),
-    to: toPayload,
-    from: JSON.stringify({ display_name: fromName || 'Dom' }),
-  }, true);
-  return { success: true, emailId: result.id, threadId: result.thread_id };
+    to: [{ display_name: toName || '', identifier: to }],
+    from: { display_name: fromName || 'Dom' },
+  });
+  return {
+    success: true,
+    accountId: resolvedAccount,
+    emailId: result.id || result.provider_id || null,
+    providerId: result.provider_id || null,
+    threadId: result.thread_id || null,
+    to,
+    raw: result,
+  };
 }
 
 /**
  * Reply on an existing Gmail thread.
  */
 export async function sendEmailReply({ to, toName, subject, body, replyToProviderId, accountId }) {
-  // accountId can be explicitly passed so Outlook replies go via the Outlook account
-  const resolvedAccount = accountId || getGmAcct();
-  const toPayload = JSON.stringify([{ display_name: toName || '', identifier: to }]);
+  // accountId can be explicitly passed so replies stay on the same mailbox the inbound came from.
+  const resolvedAccount = accountId || getEmailAcct();
   const result = await api('POST', '/emails', {
     account_id: resolvedAccount,
     subject: subject?.startsWith('Re:') ? subject : `Re: ${subject}`,
     body: formatEmailHtml(body),
-    to: toPayload,
+    to: [{ display_name: toName || '', identifier: to }],
     reply_to: replyToProviderId,
-  }, true);
-  return { success: true, emailId: result.id, threadId: result.thread_id };
+  });
+  return {
+    success: true,
+    accountId: resolvedAccount,
+    emailId: result.id || result.provider_id || null,
+    providerId: result.provider_id || null,
+    threadId: result.thread_id || null,
+    to,
+    raw: result,
+  };
 }
 
 // ── ACCOUNT STATUS ────────────────────────────────────────────────────
@@ -146,12 +263,15 @@ export async function checkUnipileStatus() {
     const accounts = result.items || [];
     const li = accounts.find(a => a.id === getLiAcct());
     const gm = accounts.find(a => a.id === getGmAcct());
+    const outlook = accounts.find(a => a.id === getOutlookAcct());
     return {
       linkedin: li?.connection_status === 'OK' ? 'connected' : 'disconnected',
       gmail: gm?.connection_status === 'OK' ? 'connected' : 'disconnected',
+      outlook: outlook?.connection_status === 'OK' ? 'connected' : 'disconnected',
+      email_default: getOutlookAcct() ? 'outlook' : 'gmail',
     };
   } catch {
-    return { linkedin: 'error', gmail: 'error' };
+    return { linkedin: 'error', gmail: 'error', outlook: 'error', email_default: getOutlookAcct() ? 'outlook' : 'gmail' };
   }
 }
 
@@ -160,6 +280,14 @@ export async function checkUnipileStatus() {
 export function extractSlug(url) {
   const match = url?.match(/linkedin\.com\/in\/([^/?#\s]+)/i);
   return match ? match[1].replace(/\/$/, '') : null;
+}
+
+export function canonicalizeLinkedInProfileUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return null;
+  const match = value.match(/^https?:\/\/([a-z]{2,3}\.)?linkedin\.com\/in\/([^?#\s]+)/i);
+  if (!match) return value.replace(/[?#].*$/, '').replace(/\/+$/, '') || null;
+  return `https://${match[1] || 'www.'}linkedin.com/in/${match[2].replace(/\/+$/, '')}`;
 }
 
 function formatEmailHtml(text) {
@@ -175,19 +303,18 @@ function formatEmailHtml(text) {
  * Retrieve a LinkedIn profile by URL to get richer data for message construction.
  */
 export async function retrieveLinkedInProfile(linkedinUrl) {
-  if (!linkedinUrl) return null;
-
-  const slug = extractSlug(linkedinUrl);
-  if (!slug) return null;
-
   try {
-    const result = await api('GET', `/linkedin/profiles/${slug}?account_id=${getLiAcct()}`);
+    const resolved = await resolveLinkedInProfile(linkedinUrl);
+    if (!resolved) return null;
+    const result = resolved.raw || {};
     return {
+      provider_id: resolved.providerId,
+      public_id: resolved.publicId,
       headline: result.headline || null,
       summary: result.summary || null,
       current_company: result.positions?.[0]?.company_name || null,
       current_title: result.positions?.[0]?.title || null,
-      location: result.location || null,
+      location: result.location || result.geo || null,
       connections: result.connections_count || null,
     };
   } catch (err) {
@@ -200,6 +327,25 @@ export async function retrieveLinkedInProfile(linkedinUrl) {
  * Retrieve full email details by ID.
  */
 export async function retrieveEmail(emailId, accountId) {
-  const acct = accountId || getGmAcct();
+  const acct = accountId || getEmailAcct();
   return api('GET', `/emails/${emailId}?account_id=${acct}`);
+}
+
+export async function listEmails({ threadId, messageId, anyEmail, from, to, accountId, limit = 50, metaOnly = false, includeHeaders = false } = {}) {
+  const acct = accountId || getEmailAcct();
+  const params = new URLSearchParams({ account_id: acct, limit: String(Math.min(Math.max(limit, 1), 250)) });
+  if (threadId) params.set('thread_id', threadId);
+  if (messageId) params.set('message_id', messageId);
+  if (anyEmail) params.set('any_email', anyEmail);
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  if (metaOnly) params.set('meta_only', 'true');
+  if (includeHeaders) params.set('include_headers', 'true');
+  const result = await api('GET', `/emails?${params.toString()}`);
+  return result?.items || [];
+}
+
+export async function listWebhooks(limit = 100) {
+  const result = await api('GET', `/webhooks?limit=${Math.min(Math.max(limit, 1), 250)}`);
+  return result?.items || [];
 }

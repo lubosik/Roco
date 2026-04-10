@@ -89,6 +89,172 @@ const INT_FIELDS = [
   'investments_last_6m', 'investments_last_7d', 'exits', 'num_funds_open', 'num_funds_closed',
 ];
 
+// Enrichment fields that a KB upload is allowed to update on existing rows
+const KB_ENRICH_FIELDS = [
+  'description', 'investor_type', 'other_types', 'preferred_industries', 'preferred_verticals',
+  'other_preferences', 'preferred_geographies', 'preferred_investment_types',
+  'preferred_investment_amount_min', 'preferred_investment_amount_max',
+  'preferred_deal_size_min', 'preferred_deal_size_max',
+  'preferred_ebitda_min', 'preferred_ebitda_max',
+  'aum_millions', 'dry_powder_millions', 'last_closed_fund_vintage', 'num_funds_open',
+  'investments_last_12m', 'investments_last_6m', 'investments_last_7d', 'investments_last_2y',
+  'last_investment_date', 'last_investment_company',
+  'year_founded', 'hq_city', 'hq_state', 'hq_country',
+];
+
+async function flushBatch(supabase, dedupedBatch, isKB, listId, listName) {
+  if (!isKB) {
+    // Standard investor list upload: upsert everything including list_id
+    const { error } = await supabase.from('investors_db')
+      .upsert(dedupedBatch, { onConflict: 'pitchbook_id' });
+    if (error) { console.warn('[DB IMPORT] Batch error:', error.message); return 0; }
+    return dedupedBatch.length;
+  }
+
+  // KB upload — 2-pass to preserve priority list assignments on existing investors:
+  // Pass 1: tag only NEW rows with this KB list_id (ignoreDuplicates skips existing)
+  const taggedBatch = dedupedBatch.map(r => ({ ...r, list_id: listId, list_name: listName }));
+  const { error: insertErr } = await supabase.from('investors_db')
+    .upsert(taggedBatch, { onConflict: 'pitchbook_id', ignoreDuplicates: true });
+  if (insertErr) console.warn('[DB IMPORT] KB new-rows insert error:', insertErr.message);
+
+  // Pass 2: update enrichment fields on ALL rows (existing rows get richer data, list_id untouched)
+  for (const rec of dedupedBatch) {
+    const patch = {};
+    for (const f of KB_ENRICH_FIELDS) {
+      if (rec[f] != null && rec[f] !== '') patch[f] = rec[f];
+    }
+    if (Object.keys(patch).length > 0) {
+      await supabase.from('investors_db').update(patch).eq('pitchbook_id', rec.pitchbook_id);
+    }
+  }
+  return dedupedBatch.length;
+}
+
+function dealTypeToInvestorType(dealType) {
+  const d = String(dealType || '').toLowerCase();
+  if (/buyout|lbo|mbo|mbi/.test(d))         return 'Private Equity';
+  if (/growth equity|growth capital/.test(d)) return 'Growth Equity';
+  if (/venture|series|seed|angel/.test(d))   return 'Venture Capital';
+  if (/independent sponsor/.test(d))         return 'Independent Sponsor';
+  if (/family office/.test(d))               return 'Family Office';
+  if (/mezz|mezzanine|debt/.test(d))         return 'Mezzanine/Debt';
+  if (/real estate/.test(d))                 return 'Real Estate';
+  if (/recapitali/.test(d))                  return 'Private Equity';
+  return null;
+}
+
+function col(headers, row, ...candidates) {
+  for (const name of candidates) {
+    const idx = headers.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+    if (idx !== -1 && row[idx] != null && String(row[idx]).trim()) return String(row[idx]).trim();
+  }
+  return '';
+}
+
+async function importDealsExport({ supabase, headers, dataRows, filename, listId, listName, broadcastFn }) {
+  console.log(`[DB IMPORT] Deals format detected in "${filename}" — extracting investors from comparable deals`);
+  broadcastFn?.(`Parsing comparable deals from ${filename}...`);
+
+  // Build a map: normalised investor name → aggregated KB record
+  const investorMap = new Map();
+
+  for (const row of dataRows) {
+    if (!row || row.every(c => !c)) continue;
+
+    const company    = col(headers, row, 'Companies', 'Company Name', 'Company');
+    const dealType   = col(headers, row, 'Deal Type', 'Deal Class', 'Transaction Type');
+    const industry   = col(headers, row, 'Primary Industry Group', 'Primary Industry Sector', 'Primary Industry', 'Industry Vertical', 'Industry');
+    const geography  = col(headers, row, 'Company Country/Territory/Region', 'Company Country', 'Company State/Province', 'HQ Location', 'Geography');
+    const dealDate   = col(headers, row, 'Deal Date', 'Announced Date', 'Close Date');
+    const inferredType = dealTypeToInvestorType(dealType);
+
+    // Collect all investor name strings — covers PitchBook deals export column variants
+    const rawInvestors = [
+      col(headers, row, 'Lead/Sole Investors', 'Lead Investors', 'Lead Investor'),
+      col(headers, row, 'New Investors'),
+      col(headers, row, 'Follow-on Investors'),
+      col(headers, row, 'Investors'),
+      col(headers, row, 'All Investors'),
+      col(headers, row, 'Add-on Sponsors', 'Sponsor'),
+    ].filter(Boolean).join(';');
+
+    // Split by common delimiters, clean up
+    const names = rawInvestors
+      .split(/[;,\n]/)
+      .map(n => n.trim().replace(/^\[|\]$/g, ''))
+      .filter(n => n.length > 2 && !/^(unknown|undisclosed|n\/a)$/i.test(n));
+
+    for (const name of names) {
+      const key = name.toLowerCase().replace(/\s+/g, ' ');
+      if (!investorMap.has(key)) {
+        investorMap.set(key, {
+          name,
+          pitchbook_id: `DEALS-KB-${key.replace(/[^a-z0-9]/g, '-').slice(0, 60)}`,
+          investor_type: inferredType,
+          preferred_industries: industry || null,
+          preferred_geographies: geography || null,
+          source_file: filename,
+          investor_category: 'KnowledgeBase',
+          _deals: [],
+        });
+      }
+      const rec = investorMap.get(key);
+      // Aggregate: industries (unique), deal history
+      if (industry && rec.preferred_industries && !rec.preferred_industries.includes(industry)) {
+        rec.preferred_industries += `, ${industry}`;
+      }
+      if (company) rec._deals.push(company);
+      // Take the most recent date seen
+      if (dealDate && (!rec.last_investment_date || dealDate > rec.last_investment_date)) {
+        rec.last_investment_date = dealDate;
+      }
+    }
+  }
+
+  if (investorMap.size === 0) {
+    console.warn(`[DB IMPORT] Deals export "${filename}" — no investor names found. Headers: ${headers.join(' | ')}`);
+    return { imported: 0, updated: 0, skipped: 0 };
+  }
+
+  broadcastFn?.(`Found ${investorMap.size} unique investors in comparable deals — importing...`);
+
+  // Snapshot before
+  const { count: countBefore } = await supabase
+    .from('investors_db').select('*', { count: 'exact', head: true });
+
+  let processed = 0;
+  const records = [...investorMap.values()].map(rec => {
+    const { _deals, ...rest } = rec;
+    // Store the list of comparable companies in past_investments
+    const pastInv = [...new Set(_deals)].slice(0, 20);
+    const description = pastInv.length
+      ? `Backed comparable deals including: ${pastInv.slice(0, 5).join(', ')}${pastInv.length > 5 ? ` and ${pastInv.length - 5} more` : ''}.`
+      : null;
+    return {
+      ...rest,
+      past_investments: pastInv,
+      description:      rest.description || description,
+    };
+  });
+
+  // Upsert in batches of 100 using the same KB-safe two-pass logic
+  for (let i = 0; i < records.length; i += 100) {
+    const batch = records.slice(i, i + 100);
+    processed += await flushBatch(supabase, batch, true, listId, listName);
+    broadcastFn?.(`Processing comparable deals KB: ${Math.min(i + 100, records.length)}/${records.length} investors`);
+  }
+
+  const { count: countAfter } = await supabase
+    .from('investors_db').select('*', { count: 'exact', head: true });
+  const newInserts = (countAfter || 0) - (countBefore || 0);
+  const updated    = processed - newInserts;
+
+  console.log(`[DB IMPORT] Deals KB done: ${newInserts} new, ${updated} enriched existing, from ${dataRows.length} comparable deals`);
+  broadcastFn?.(`Deals KB import complete: ${investorMap.size} investors from comparable deals processed`);
+  return { imported: newInserts, updated, skipped: 0, total: countAfter };
+}
+
 function inferCategory(filename) {
   const f = filename.toLowerCase();
   if (f.includes('buyout')) return 'Buyout';
@@ -101,7 +267,9 @@ function inferCategory(filename) {
   return 'General';
 }
 
-export async function importXLSXToDatabase({ filePath, filename, listId, listName, broadcastFn }) {
+export async function importXLSXToDatabase({ filePath, filename, listId, listName, listType, broadcastFn }) {
+  // For knowledge_base uploads: tag rows but don't overwrite existing list_id assignments
+  const isKB = listType === 'knowledge_base';
   console.log(`[DB IMPORT] Starting: ${filename}`);
   broadcastFn?.(`Importing ${filename}...`);
 
@@ -113,12 +281,19 @@ export async function importXLSXToDatabase({ filePath, filename, listId, listNam
   const ws = workbook.Sheets[workbook.SheetNames[0]];
   const rawData = xlsx.utils.sheet_to_json(ws, { header: 1, defval: '' });
 
-  // Find actual header row (PitchBook exports have 7-8 metadata rows)
+  // Find actual header row (PitchBook exports have 7-8 metadata rows before the real header)
   let headerRowIdx = -1;
+  let isDealsFormat = false;
   for (let i = 0; i < Math.min(15, rawData.length); i++) {
     const row = rawData[i].map(c => String(c));
     if (row.some(c => c.includes('Investor ID') || c.includes('Limited Partner ID') || c === 'Investor Name')) {
       headerRowIdx = i;
+      break;
+    }
+    // PitchBook deals export: look for deal-level columns
+    if (row.some(c => c === 'Company Name' || c === 'Companies' || c === 'Deal Date' || c === 'Announced Date' || c === 'Lead Investors' || c === 'Lead/Sole Investors' || c === 'All Investors' || c === 'Investors')) {
+      headerRowIdx = i;
+      isDealsFormat = true;
       break;
     }
   }
@@ -130,6 +305,11 @@ export async function importXLSXToDatabase({ filePath, filename, listId, listNam
 
   const headers = rawData[headerRowIdx].map(h => String(h).trim());
   const dataRows = rawData.slice(headerRowIdx + 1);
+
+  // Route deals-format exports through a separate parser
+  if (isDealsFormat) {
+    return importDealsExport({ supabase, headers, dataRows, filename, listId, listName, broadcastFn });
+  }
 
   // Snapshot count before import so we can report true new inserts
   const { count: countBefore } = await supabase
@@ -143,8 +323,8 @@ export async function importXLSXToDatabase({ filePath, filename, listId, listNam
     if (!row || row.every(c => !c)) continue;
 
     const record = { source_file: filename, investor_category: category };
-    if (listId) record.list_id = listId;
-    if (listName) record.list_name = listName;
+    // KB uploads: list_id is set in a separate pass (new-only insert) — don't set here
+    if (listId && !isKB) { record.list_id = listId; record.list_name = listName; }
 
     headers.forEach((header, idx) => {
       const dbField = COLUMN_MAP[header];
@@ -186,24 +366,18 @@ export async function importXLSXToDatabase({ filePath, filename, listId, listNam
     batch.push(record);
 
     if (batch.length >= 100) {
-      // Dedup batch by pitchbook_id (last write wins within a file)
       const dedupedBatch = [...batch.reduce((m, r) => m.set(r.pitchbook_id, r), new Map()).values()];
-      const { error } = await supabase.from('investors_db')
-        .upsert(dedupedBatch, { onConflict: 'pitchbook_id' });
-      if (error) console.warn('[DB IMPORT] Batch error:', error.message);
-      else processed += dedupedBatch.length;
+      processed += await flushBatch(supabase, dedupedBatch, isKB, listId, listName);
       batch.length = 0;
       broadcastFn?.(`Processing ${filename}: ${processed} rows done…`);
     }
   }
 
   if (batch.length > 0) {
-    // Dedup batch by pitchbook_id (last write wins within a file)
     const dedupedBatch = [...batch.reduce((m, r) => m.set(r.pitchbook_id, r), new Map()).values()];
-    const { error } = await supabase.from('investors_db')
-      .upsert(dedupedBatch, { onConflict: 'pitchbook_id' });
-    if (!error) processed += dedupedBatch.length;
-    else skipped += dedupedBatch.length;
+    const n = await flushBatch(supabase, dedupedBatch, isKB, listId, listName);
+    processed += n;
+    if (n === 0) skipped += dedupedBatch.length;
   }
 
   // True new inserts = count delta

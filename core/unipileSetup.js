@@ -43,6 +43,9 @@ export async function registerWebhooks(baseUrl) {
       source: 'email',
       events: ['mail_received'],
       account_ids: [getGmailAcct()].filter(Boolean),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
     },
     {
       name: 'roco_outlook_inbound',
@@ -50,19 +53,29 @@ export async function registerWebhooks(baseUrl) {
       source: 'email',
       events: ['mail_received'],
       account_ids: [getOutlookAcct()].filter(Boolean),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
     },
     {
       name: 'roco_linkedin_messages',
-      request_url: `${baseUrl}/webhook/unipile/linkedin/messages`,
+      request_url: `${baseUrl}/webhooks/unipile/messages`,
       source: 'messaging',
       events: ['message_received'],
-      account_ids: [getLiAcct()].filter(Boolean),
+      account_id: getLiAcct(),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
     },
     {
       name: 'roco_linkedin_relations',
-      request_url: `${baseUrl}/webhook/unipile/linkedin/relations`,
+      request_url: `${baseUrl}/webhooks/unipile/messages`,
       source: 'users',
-      account_ids: [getLiAcct()].filter(Boolean),
+      events: ['new_relation'],
+      account_id: getLiAcct(),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
     },
   ];
 

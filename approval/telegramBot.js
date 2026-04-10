@@ -2,13 +2,41 @@ import TelegramBot from 'node-telegram-bot-api';
 import { info, warn, error } from '../core/logger.js';
 import {
   addApprovalToQueue, getResolvedApprovals, markApprovalProcessing, updateApprovalStatus,
-  loadSessionState, saveSessionState, getActiveDeals, createDeal, logActivity as sbLogActivity,
+  loadSessionState, saveSessionState, getActiveDeals, getAllDeals, updateDeal, createDeal, logActivity as sbLogActivity,
 } from '../core/supabaseSync.js';
 import { getSupabase } from '../core/supabase.js';
 import { aiComplete } from '../core/aiClient.js';
 
 let bot;
 let rocoState; // injected from orchestrator
+
+async function clearTelegramApprovalControls(messageId) {
+  if (!bot || !messageId) return;
+  try {
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+      chat_id: process.env.TELEGRAM_CHAT_ID,
+      message_id: Number(messageId),
+    });
+  } catch {}
+}
+
+function sanitizeApprovalText(text) {
+  return String(text || '')
+    .replace(/\u2014/g, '-')
+    .replace(/\u2013/g, '-')
+    .replace(/\u2018|\u2019/g, "'")
+    .replace(/\u201C|\u201D/g, '"')
+    .trim();
+}
+
+function isLinkedInStageLabel(stage) {
+  const value = String(stage || '').trim().toLowerCase();
+  return value === 'linkedin dm'
+    || value === 'linkedin_dm'
+    || value === 'linkedin_follow_up'
+    || value.startsWith('linkedin follow-up')
+    || value.startsWith('linkedin follow up');
+}
 
 const CURRENCY_SYMBOLS = {
   USD: '$',
@@ -23,6 +51,82 @@ const CURRENCY_SYMBOLS = {
 function formatCurrencyAmount(amount, currency = 'USD') {
   const symbol = CURRENCY_SYMBOLS[(currency || 'USD').toUpperCase()] || '$';
   return `${symbol}${Number(amount || 0).toLocaleString()}`;
+}
+
+function truncatePreview(value, max = 180) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '—';
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+async function resolveDealArgument(args, statuses = null) {
+  const deals = await getAllDeals().catch(() => []);
+  const pool = Array.isArray(statuses) && statuses.length
+    ? deals.filter(deal => statuses.includes(deal.status))
+    : deals;
+  const needle = String(args || '').trim().toLowerCase();
+
+  if (!needle) return { pool, deal: null, matches: [] };
+
+  const exact = pool.find(deal =>
+    String(deal.id || '').toLowerCase() === needle ||
+    String(deal.name || '').trim().toLowerCase() === needle
+  );
+  if (exact) return { pool, deal: exact, matches: [exact] };
+
+  const matches = pool.filter(deal =>
+    String(deal.name || '').trim().toLowerCase().includes(needle)
+  );
+  if (matches.length === 1) return { pool, deal: matches[0], matches };
+  return { pool, deal: null, matches };
+}
+
+function formatDealChoices(deals = []) {
+  if (!deals.length) return 'No matching deals.';
+  return deals.map(deal => `- ${deal.name} (${deal.status || 'UNKNOWN'})`).join('\n');
+}
+
+function buildCommandGuide() {
+  return [
+    '*Telegram Command Guide*',
+    '',
+    'Use the project name after the command when you want to target one deal.',
+    '',
+    '*Examples:*',
+    '`/status Project Electrify`',
+    '`/pipeline Project Electrify`',
+    '`/campaignstatus Project Electrify`',
+    '`/emails Project Electrify`',
+    '`/linkedindms Project Electrify`',
+    '`/queue Project Electrify`',
+    '`/pause Project Electrify`',
+    '`/resume Project Electrify`',
+    '`/close Project Electrify`',
+    '',
+    '*Global controls:*',
+    '`/pause all`',
+    '`/resume all`',
+    '`/stop`',
+    '',
+    'If the deal name is missing or matches more than one project, Roco will ask you to specify it.',
+  ].join('\n');
+}
+
+async function resolveRequiredDeal(chatId, args, {
+  statuses = ['ACTIVE', 'PAUSED', 'CLOSED'],
+  actionLabel = 'use',
+  commandExample = '/status [deal name]',
+} = {}) {
+  const input = String(args || '').trim();
+  const { pool, deal, matches } = await resolveDealArgument(input, statuses);
+  if (deal) return deal;
+
+  const scopedPool = pool.filter(row => statuses.includes(row.status));
+  const choices = input ? (matches.length ? matches : scopedPool) : scopedPool;
+  await bot.sendMessage(chatId,
+    `Specify which deal to ${actionLabel}.\n\nUse: ${commandExample}\n\nExample: ${commandExample.replace('[deal name]', 'Project Electrify')}\n\n${formatDealChoices(choices.slice(0, 12))}`
+  );
+  return null;
 }
 
 const pendingApprovals  = new Map(); // messageId -> { contactPage, emailDraft, resolve, ... }
@@ -50,7 +154,28 @@ export async function sendTelegram(text) {
   try {
     return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch (err) {
+    if (String(err?.message || '').includes("can't parse entities")) {
+      try {
+        const plainText = String(text || '')
+          .replace(/```/g, '')
+          .replace(/[_*`]/g, '')
+          .replace(/\[(.*?)\]\((.*?)\)/g, '$1 ($2)');
+        return await bot.sendMessage(chatId, plainText);
+      } catch {}
+    }
     error('Telegram send failed', { err: err.message });
+    return null;
+  }
+}
+
+export async function sendTelegramVoiceNote(voiceInput, options = {}) {
+  if (!bot || !voiceInput) return null;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!chatId) return null;
+  try {
+    return await bot.sendVoice(chatId, voiceInput, options);
+  } catch (err) {
+    error('Telegram voice note send failed', { err: err.message });
     return null;
   }
 }
@@ -59,6 +184,8 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
   const { getContactProp } = await import('../crm/notionContacts.js');
   const name = getContactProp(contactPage, 'Name');
   const firm = getContactProp(contactPage, 'Company Name') || 'Unknown Firm';
+  const rawEmail = getContactProp(contactPage, 'Email') || null;
+  const contactEmail = String(rawEmail || '').trim() || null;
 
   // GATE: never send to Telegram if name is null/invalid
   if (!name || name.trim() === '' || name.toLowerCase() === 'null') {
@@ -66,9 +193,18 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
     return { action: 'skip' };
   }
 
-  const isLinkedIn = stage === 'LinkedIn DM' || stage === 'linkedin_dm' || stage === 'linkedin_follow_up';
+  if (!isLinkedInStageLabel(stage) && !contactEmail) {
+    warn(`[TELEGRAM] Refusing to queue email approval for ${name} — no usable email address`);
+    return { action: 'missing_email' };
+  }
+
+  const isLinkedIn = isLinkedInStageLabel(stage);
   const stageLabel = isLinkedIn ? 'LINKEDIN DM' : stage?.includes('FOLLOW') ? 'FOLLOW-UP EMAIL' : 'EMAIL';
   const researchBasis = (researchSummary || '').substring(0, 200) || 'No specific research basis';
+
+  emailDraft.body = sanitizeApprovalText(emailDraft.body);
+  emailDraft.subject = sanitizeApprovalText(emailDraft.subject);
+  emailDraft.alternativeSubject = sanitizeApprovalText(emailDraft.alternativeSubject);
 
   const hasSubjects = !!emailDraft.subject;
   const subjectBlock = hasSubjects
@@ -101,8 +237,15 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
     try {
       const chatId = process.env.TELEGRAM_CHAT_ID;
       const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-      const entry = { contactPage, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: null };
+      const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: null };
       pendingApprovals.set(sent.message_id, entry);
+      // TTL: auto-expire after 4 hours to prevent unbounded memory growth from abandoned approvals
+      setTimeout(() => {
+        if (pendingApprovals.has(sent.message_id)) {
+          pendingApprovals.delete(sent.message_id);
+          resolve({ action: 'skip', reason: 'timeout' });
+        }
+      }, 4 * 60 * 60 * 1000);
       info(`Email draft sent to Telegram for approval: ${name}`);
 
       // Attach action buttons (done after send so we have the message_id)
@@ -116,6 +259,7 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
         telegramMsgId: sent.message_id,
         contactId: contactPage?.id,
         contactName: name,
+        contactEmail,
         firm,
         stage,
         score,
@@ -140,13 +284,17 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
  * Send a LinkedIn DM draft to Telegram for approval.
  * Returns a Promise resolving to { action: 'approve'|'skip'|'error', body }.
  */
-export async function sendLinkedInDMForApproval(contact, body, dealId = null) {
+export async function sendLinkedInDMForApproval(contact, body, dealId = null, options = {}) {
   if (!bot) return { action: 'error' };
   const name = contact.name || 'Contact';
   const firm = contact.company_name || 'Unknown Firm';
   const score = contact.investor_score || 0;
+  const stage = options.stage || 'LinkedIn DM';
+  const researchSummary = options.researchSummary || null;
+  let queueId = options.queueId || null;
 
   const contactType = contact.contact_type === 'individual' ? '👤 Individual' : '🏢 Firm';
+  body = sanitizeApprovalText(body);
   const bodyPreview = (body || '').length > 600 ? body.substring(0, 600) + '…' : body;
 
   const msg = [
@@ -154,26 +302,66 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null) {
     ``,
     `👤 *${name}* · ${firm}`,
     `📊 Score: ${score}/100  |  ${contactType}  |  LinkedIn DM`,
+    researchSummary ? `🔍 _${String(researchSummary).substring(0, 220)}_` : null,
     ``,
     '```',
     bodyPreview,
     '```',
     ``,
-    `Reply: *APPROVE* | *EDIT [instructions]* | *SKIP*`,
-  ].join('\n');
+    `Reply: *APPROVE* | *EDIT [instructions]* | *MANUAL* | *CLOSE*`,
+  ].filter(Boolean).join('\n');
 
   return new Promise(async (resolve) => {
     try {
+      if (!queueId && contact?.id) {
+        const sb = getSupabase();
+        if (sb) {
+          try {
+            const { data: existingRow } = await sb.from('approval_queue')
+              .select('id')
+              .eq('contact_id', contact.id)
+              .eq('stage', stage)
+              .eq('status', 'pending')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            queueId = existingRow?.id || null;
+
+            if (!queueId) {
+              const { data: inserted } = await sb.from('approval_queue').insert([{
+                contact_id: contact.id,
+                contact_name: name,
+                contact_email: contact.email || null,
+                firm,
+                deal_id: dealId || null,
+                stage,
+                body: body || '',
+                score,
+                status: 'pending',
+                outreach_mode: 'investor_outreach',
+                research_summary: researchSummary,
+                created_at: new Date().toISOString(),
+              }]).select('id').single();
+              queueId = inserted?.id || null;
+            }
+          } catch (err) {
+            warn('Could not create LinkedIn approval queue row', { err: err.message, contactId: contact.id });
+          }
+        }
+      }
+
       const chatId = process.env.TELEGRAM_CHAT_ID;
       const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
       pendingApprovals.set(sent.message_id, {
         name, firm, score, dealId,
         isLinkedInDM: true,
+        contactId: contact.id || null,
+        stage,
         emailDraft: { body, subject: null, alternativeSubject: null },
         resolve,
         contactPage: null,
         queuedAt: new Date().toISOString(),
-        queueId: null,
+        queueId,
       });
       bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(sent.message_id), {
         chat_id: chatId,
@@ -185,6 +373,53 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null) {
       resolve({ action: 'error' });
     }
   });
+}
+
+function buildPriorChatKeyboard(approvalId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✓ Proceed — Send DM', callback_data: `prior_chat:proceed:${approvalId}` },
+        { text: '✗ Skip Contact',       callback_data: `prior_chat:skip:${approvalId}` },
+      ],
+    ],
+  };
+}
+
+/**
+ * Notify Telegram about a prior LinkedIn chat found during connection acceptance.
+ * Decision is stored in DB; no Promise needed — handled via callback or dashboard.
+ */
+export async function sendPriorChatForApproval({ contactName, firm, dealName, summary, messageCount, approvalId }) {
+  if (!bot) return;
+  const msg = [
+    `🔁 *Prior LinkedIn Chat Found*`,
+    ``,
+    `👤 *${contactName}* · ${firm}`,
+    `📁 Deal: ${dealName}`,
+    `💬 ${messageCount} prior message(s) found`,
+    ``,
+    `_${summary}_`,
+    ``,
+    `Proceed with new DM, or skip this contact?`,
+  ].join('\n');
+
+  try {
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    const sb = getSupabase();
+    if (sb && approvalId) {
+      await sb.from('approval_queue').update({
+        telegram_msg_id: sent.message_id,
+      }).eq('id', approvalId).catch(() => {});
+    }
+    await bot.editMessageReplyMarkup(buildPriorChatKeyboard(approvalId), {
+      chat_id: chatId, message_id: sent.message_id,
+    }).catch(() => {});
+    info(`Prior chat review sent to Telegram for ${contactName} (approvalId: ${approvalId})`);
+  } catch (err) {
+    error('sendPriorChatForApproval failed', { err: err.message });
+  }
 }
 
 function buildKeyboard(msgId) {
@@ -208,9 +443,30 @@ function buildLinkedInDMKeyboard(msgId) {
       [{ text: '✓ Approve & Send', callback_data: `sa:${msgId}` }],
       [
         { text: '✏ Edit', callback_data: `ed:${msgId}` },
-        { text: '✗ Skip', callback_data: `sk:${msgId}` },
+        { text: 'Manual', callback_data: `lm:${msgId}` },
+        { text: 'Close',  callback_data: `lc:${msgId}` },
       ],
     ],
+  };
+}
+
+function buildReloadedApprovalKeyboard(msgId, hasSubjects = false) {
+  return {
+    inline_keyboard: hasSubjects
+      ? [
+          [
+            { text: '✓ Send A', callback_data: `aa:${msgId}` },
+            { text: '✓ Send B', callback_data: `ab:${msgId}` },
+          ],
+          [{ text: '✗ Skip', callback_data: `sk:${msgId}` }],
+        ]
+      : [
+          [{ text: '✓ Approve & Send', callback_data: `sa:${msgId}` }],
+          [
+            { text: 'Manual', callback_data: `lm:${msgId}` },
+            { text: 'Close',  callback_data: `lc:${msgId}` },
+          ],
+        ],
   };
 }
 
@@ -241,7 +497,9 @@ function buildReplyKeyboard(msgId) {
         { text: '✏ Edit',           callback_data: `re:${msgId}` },
       ],
       [
-        { text: '✗ Skip', callback_data: `rs:${msgId}` },
+        { text: '✗ Skip',    callback_data: `rs:${msgId}` },
+        { text: 'Manual',    callback_data: `rm:${msgId}` },
+        { text: 'Close',     callback_data: `rc:${msgId}` },
       ],
     ],
   };
@@ -312,7 +570,7 @@ async function handleReplyEdit(chatId, oldMsgId, approval, instructions) {
 
     const sb = getSupabase();
     if (sb && ra.queueItemId) {
-      await sb.from('approval_queue').update({ message_text: ra.replyBody }).eq('id', ra.queueItemId).catch(() => {});
+      await sb.from('approval_queue').update({ message_text: ra.replyBody }).eq('id', ra.queueItemId);
     }
 
     const channelLbl = ra.channel === 'linkedin' ? 'LinkedIn' : 'Email';
@@ -350,7 +608,7 @@ async function handleLinkedInDMEdit(chatId, oldMsgId, approval, instructions) {
       { maxTokens: 600, task: 'linkedin_dm_edit' }
     );
     if (!revised?.trim()) throw new Error('Empty revision from AI');
-    approval.emailDraft.body = revised.trim();
+    approval.emailDraft.body = sanitizeApprovalText(revised);
     pendingApprovals.delete(oldMsgId);
     const msg = [
       `*ROCO — LINKEDIN DM Revised*`,
@@ -380,6 +638,9 @@ async function handleLinkedInDMEdit(chatId, oldMsgId, approval, instructions) {
 async function resendUpdatedApproval(chatId, oldMsgId, approval) {
   pendingApprovals.delete(oldMsgId);
   const draft = approval.emailDraft;
+  draft.body = sanitizeApprovalText(draft.body);
+  draft.subject = sanitizeApprovalText(draft.subject);
+  draft.alternativeSubject = sanitizeApprovalText(draft.alternativeSubject);
   const isLinkedIn = approval.isLinkedInDM;
   const stageLabel = isLinkedIn ? 'LINKEDIN DM' : 'EMAIL (Edited)';
   const subjectBlock = (!isLinkedIn && draft.subject)
@@ -439,6 +700,16 @@ async function handleCallbackQuery(query) {
   await bot.answerCallbackQuery(query.id).catch(() => {});
 
   const data   = query.data || '';
+
+  // prior_chat decisions — format: prior_chat:proceed:<approvalId> or prior_chat:skip:<approvalId>
+  if (data.startsWith('prior_chat:')) {
+    const parts     = data.split(':');
+    const decision  = parts[1]; // 'proceed' or 'skip'
+    const approvalId = parts[2];
+    await handlePriorChatCallback(chatId, decision, approvalId);
+    return;
+  }
+
   const colon  = data.indexOf(':');
   if (colon === -1) return;
   const action = data.slice(0, colon);
@@ -460,6 +731,55 @@ async function handleCallbackQuery(query) {
     // Sourcing LinkedIn DM — single approve button
     resolveApproval(msgId, approval, 'approve', { variant: 'A', subject: approval.emailDraft.subject });
     await bot.sendMessage(chatId, `✅ LinkedIn DM approved for *${approval.name}*...`, { parse_mode: 'Markdown' });
+
+  } else if (action === 'lm') {
+    const sb = getSupabase();
+    if (sb && approval.contactId) {
+      await sb.from('contacts').update({
+        conversation_state: 'manual',
+        follow_up_due_at: null,
+        pending_linkedin_dm: false,
+        updated_at: new Date().toISOString(),
+      }).eq('id', approval.contactId);
+    }
+    if (sb && approval.queueId) {
+      await sb.from('approval_queue').update({
+        status: 'manual',
+        resolved_at: new Date().toISOString(),
+        edit_instructions: 'Manual takeover by Dom',
+      }).eq('id', approval.queueId);
+    }
+    await clearTelegramApprovalControls(msgId);
+    pendingApprovals.delete(msgId);
+    editLoops.delete(approval.contactPage?.id);
+    try { approval.resolve?.({ action: 'skip' }); } catch {}
+    await bot.sendMessage(chatId, `📝 *Manual* — *${approval.name}* will be ignored for this step. If they reply later, Roco can still pick that up.`, { parse_mode: 'Markdown' });
+
+  } else if (action === 'lc') {
+    const sb = getSupabase();
+    if (sb && approval.contactId) {
+      await sb.from('contacts').update({
+        pipeline_stage: 'Inactive',
+        conversation_state: 'do_not_contact',
+        conversation_ended_at: new Date().toISOString(),
+        conversation_ended_reason: 'Closed by Dom via Telegram',
+        follow_up_due_at: null,
+        pending_linkedin_dm: false,
+        updated_at: new Date().toISOString(),
+      }).eq('id', approval.contactId);
+    }
+    if (sb && approval.queueId) {
+      await sb.from('approval_queue').update({
+        status: 'closed',
+        resolved_at: new Date().toISOString(),
+        edit_instructions: 'Contact permanently closed by Dom',
+      }).eq('id', approval.queueId);
+    }
+    await clearTelegramApprovalControls(msgId);
+    pendingApprovals.delete(msgId);
+    editLoops.delete(approval.contactPage?.id);
+    try { approval.resolve?.({ action: 'skip' }); } catch {}
+    await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* will not be picked up by Roco again.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'sk') {
     resolveApproval(msgId, approval, 'skip');
@@ -512,8 +832,9 @@ async function handleCallbackQuery(query) {
         await sb.from('approval_queue').update({
           status:  'sent',
           sent_at: new Date().toISOString(),
-        }).eq('id', ra.queueItemId).catch(() => {});
+        }).eq('id', ra.queueItemId);
       }
+      await clearTelegramApprovalControls(msgId);
       pendingApprovals.delete(msgId);
       const ch = ra.channel === 'linkedin' ? 'LinkedIn' : 'Email';
       await bot.sendMessage(chatId, `✅ Reply sent to *${approval.name}* via ${ch}${sent ? '' : ' (send may have failed — check logs)'}`, { parse_mode: 'Markdown' });
@@ -534,10 +855,58 @@ async function handleCallbackQuery(query) {
     const ra = approval.replyApproval;
     const sb = getSupabase();
     if (sb && ra?.queueItemId) {
-      await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', ra.queueItemId).catch(() => {});
+      await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', ra.queueItemId);
     }
+    await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `✗ Reply to *${approval.name}* skipped.`, { parse_mode: 'Markdown' });
+
+  } else if (action === 'rm') {
+    // Manual takeover — dismiss the queued auto-reply but keep the contact live for future inbound tracking
+    const ra = approval.replyApproval;
+    const sb = getSupabase();
+    if (sb && ra?.queueItemId) {
+      await sb.from('approval_queue').update({
+        status: 'manual',
+        resolved_at: new Date().toISOString(),
+        edit_instructions: 'Manual takeover by Dom',
+      }).eq('id', ra.queueItemId);
+    }
+    await clearTelegramApprovalControls(msgId);
+    pendingApprovals.delete(msgId);
+    await bot.sendMessage(chatId, `📝 *Manual mode* — auto-reply dismissed for *${approval.name}*. Future replies will still be tracked and re-queued.`, { parse_mode: 'Markdown' });
+
+  } else if (action === 'rc') {
+    // Manual close-out — end the conversation and stop further outreach
+    const ra = approval.replyApproval;
+    const sb = getSupabase();
+    if (sb && ra?.contactId) {
+      await sb.from('contacts').update({
+        pipeline_stage: 'Inactive',
+        conversation_state: 'conversation_ended_negative',
+        conversation_ended_at: new Date().toISOString(),
+        conversation_ended_reason: 'Manually closed by Dom',
+        follow_up_due_at: null,
+      }).eq('id', ra.contactId);
+
+      await sb.from('activity_log').insert({
+        contact_id: ra.contactId,
+        event_type: 'CONVERSATION_CLOSED',
+        summary: `Conversation manually closed for ${approval.name}`,
+        detail: { channel: ra.channel, source: 'telegram_reply_approval' },
+        created_at: new Date().toISOString(),
+      }).catch(() => {});
+    }
+    if (sb && ra?.queueItemId) {
+      await sb.from('approval_queue').update({
+        status: 'closed',
+        resolved_at: new Date().toISOString(),
+        edit_instructions: 'Conversation manually closed by Dom',
+      }).eq('id', ra.queueItemId);
+    }
+    await clearTelegramApprovalControls(msgId);
+    pendingApprovals.delete(msgId);
+    await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* moved to Inactive and this conversation is finished.`, { parse_mode: 'Markdown' });
   }
 }
 
@@ -546,15 +915,34 @@ async function handleCallbackQuery(query) {
 // ─────────────────────────────────────────────
 
 function resolveApproval(msgId, approval, action, extra = {}) {
+  clearTelegramApprovalControls(msgId).catch(() => {});
   pendingApprovals.delete(msgId);
   editLoops.delete(approval.contactPage?.id);
   if (approval.queueId) {
-    const status = action === 'approve' ? 'telegram_approved' : 'telegram_skipped';
+    const status = action === 'approve' ? 'approved' : 'telegram_skipped';
     const subject = action === 'approve' ? (extra.subject || null) : null;
     updateApprovalStatus(approval.queueId, status, subject).catch(() => {});
   }
+  import('../dashboard/server.js').then(({ pushActivity, notifyQueueUpdated }) => {
+    pushActivity({
+      type: 'APPROVAL',
+      action: action === 'approve' ? 'Approved via Telegram' : action === 'edit' ? 'Edited via Telegram' : 'Skipped via Telegram',
+      note: approval?.name && approval?.firm ? `${approval.name} @ ${approval.firm}` : (approval?.name || approval?.firm || ''),
+      dealId: approval?.dealId || null,
+    });
+    notifyQueueUpdated();
+  }).catch(() => {});
   if (action === 'approve') {
-    approval.resolve({ action: 'approve', variant: extra.variant, subject: extra.subject, body: extra.body || approval.emailDraft?.body });
+    const sb = getSupabase();
+    const contactId = approval.contactId || approval.contactPage?.id || null;
+    const approvedStage = approval.isLinkedInDM ? 'DM Approved' : 'Email Approved';
+    if (sb && contactId) {
+      sb.from('contacts').update({
+        pipeline_stage: approvedStage,
+        updated_at: new Date().toISOString(),
+      }).eq('id', contactId);
+    }
+    approval.resolve({ action: 'approve', queueId: approval.queueId || null, variant: extra.variant, subject: extra.subject, body: extra.body || approval.emailDraft?.body });
   } else if (action === 'edit') {
     approval.resolve({ action: 'edit', instructions: extra.instructions });
   } else {
@@ -585,7 +973,7 @@ async function handleApprovalResponse(text, chatId) {
     }
     // Direct body edit — "BODY: <text>" replaces body without AI redraft
     if (text.toUpperCase().startsWith('BODY:')) {
-      const newBody = text.slice(5).trim();
+      const newBody = sanitizeApprovalText(text.slice(5));
       if (newBody) {
         approval.emailDraft.body = newBody;
         await resendUpdatedApproval(chatId, editMsgId, approval);
@@ -594,7 +982,7 @@ async function handleApprovalResponse(text, chatId) {
     }
     // Direct subject edit — "SUBJECT: <text>" replaces subject without AI redraft (emails only)
     if (text.toUpperCase().startsWith('SUBJECT:') && !approval.isLinkedInDM) {
-      const newSubject = text.slice(8).trim();
+      const newSubject = sanitizeApprovalText(text.slice(8));
       if (newSubject) {
         approval.emailDraft.subject = newSubject;
         await resendUpdatedApproval(chatId, editMsgId, approval);
@@ -745,25 +1133,37 @@ async function handleCommand(text, chatId) {
 
   switch (command) {
     case '/status':
-      await handleStatus(chatId);
+      await handleStatus(chatId, args);
+      break;
+    case '/help':
+      await handleHelp(chatId);
       break;
     case '/pause':
-      await handlePause(chatId);
+      await handlePause(chatId, args);
       break;
     case '/resume':
-      await handleResume(chatId);
+      await handleResume(chatId, args);
       break;
     case '/pipeline':
-      await handlePipeline(chatId);
+      await handlePipeline(chatId, args);
+      break;
+    case '/campaignstatus':
+      await handleCampaignStatus(chatId, args);
+      break;
+    case '/emails':
+      await handleOutboundMessages(chatId, 'email', args);
+      break;
+    case '/linkedindms':
+      await handleOutboundMessages(chatId, 'linkedin_dm', args);
       break;
     case '/queue':
-      await handleQueue(chatId);
+      await handleQueue(chatId, args);
       break;
     case '/newdeal':
       await handleNewDeal(chatId, args);
       break;
     case '/stop':
-      await handlePause(chatId);
+      await handlePause(chatId, 'all');
       break;
     case '/sourcing':
       await handleSourcingStatus(chatId);
@@ -774,49 +1174,128 @@ async function handleCommand(text, chatId) {
     case '/resumecampaigns':
       await handleResumeCampaigns(chatId);
       break;
+    case '/close':
+      await handleCloseDeal(chatId, args);
+      break;
     default:
       await bot.sendMessage(chatId,
         'Commands available:\n\n' +
-        '/status — Roco status and stats\n' +
-        '/pause — Pause all outreach\n' +
-        '/resume — Resume outreach\n' +
-        '/pipeline — Top 10 active prospects\n' +
-        '/queue — Emails waiting for approval\n' +
+        '/help — How to target a specific deal\n' +
+        '/status [deal] — Roco status and deal stats\n' +
+        '/pause [deal|all] — Pause a deal or all outreach\n' +
+        '/resume [deal|all] — Resume a deal or all outreach\n' +
+        '/pipeline [deal] — Top prospects for a deal\n' +
+        '/campaignstatus [deal] — Current outreach by deal\n' +
+        '/emails [deal] — Recent sent emails\n' +
+        '/linkedindms [deal] — Recent sent LinkedIn DMs\n' +
+        '/queue [deal] — Approval queue for a deal\n' +
+        '/close [deal] — Close a deal\n' +
         '/newdeal [name] — Start a new deal\n' +
         '/sourcing — Sourcing campaigns status\n' +
         '/pausecampaigns — Pause all sourcing campaigns\n' +
         '/resumecampaigns — Resume all sourcing campaigns\n' +
-        '/stop — Emergency stop'
+        '/stop — Emergency stop\n\n' +
+        buildCommandGuide(),
+        { parse_mode: 'Markdown' }
       );
   }
 }
 
-async function handleStatus(chatId) {
+async function handleHelp(chatId) {
+  await bot.sendMessage(chatId, buildCommandGuide(), { parse_mode: 'Markdown' });
+}
+
+async function handleStatus(chatId, args = '') {
   try {
     const state = await loadSessionState();
-    const deals = await getActiveDeals().catch(() => []);
+    const deals = await getAllDeals().catch(() => []);
     const sb = getSupabase();
 
     let emailsSent = 0;
     let queueCount = 0;
     if (sb) {
       const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const { count: sent } = await sb.from('emails').select('id', { count: 'exact', head: true })
-        .eq('status', 'sent').gte('sent_at', since).catch(() => ({ count: 0 }));
+      let sent = 0;
+      try {
+        ({ count: sent } = await sb.from('emails').select('id', { count: 'exact', head: true })
+          .eq('status', 'sent').gte('sent_at', since));
+      } catch {}
       emailsSent = sent || 0;
 
-      const { count: q } = await sb.from('emails').select('id', { count: 'exact', head: true })
-        .eq('status', 'pending_approval').catch(() => ({ count: 0 }));
+      let q = 0;
+      try {
+        ({ count: q } = await sb.from('emails').select('id', { count: 'exact', head: true })
+          .eq('status', 'pending_approval'));
+      } catch {}
       queueCount = q || pendingApprovals.size;
     } else {
       queueCount = pendingApprovals.size;
     }
 
-    const dealLines = deals?.map(d =>
-      `• ${d.name} — ${formatCurrencyAmount(d.committed_amount, d.currency)} / ${formatCurrencyAmount(d.target_amount, d.currency)}`
-    ).join('\n') || '• No active deals';
-
     const isActive = (state.rocoStatus === 'ACTIVE') || (rocoState?.status === 'ACTIVE');
+
+    const input = String(args || '').trim();
+    if (input) {
+      const deal = await resolveRequiredDeal(chatId, input, {
+        statuses: ['ACTIVE', 'PAUSED', 'CLOSED'],
+        actionLabel: 'view',
+        commandExample: '/status [deal name]',
+      });
+      if (!deal) return;
+
+      let prospectCount = 0;
+      let contactedCount = 0;
+      let repliedCount = 0;
+      if (sb) {
+        let prospects = 0;
+        try {
+          ({ count: prospects } = await sb.from('contacts').select('id', { count: 'exact', head: true })
+            .eq('deal_id', deal.id)
+            .not('pipeline_stage', 'in', '("Inactive","Archived","archived")'));
+        } catch {}
+        prospectCount = prospects || 0;
+
+        let contactedRows = [];
+        try {
+          ({ data: contactedRows } = await sb.from('contacts')
+            .select('id, invite_sent_at, invite_accepted_at, last_email_sent_at, last_outreach_at, pipeline_stage')
+            .eq('deal_id', deal.id)
+            .limit(1000));
+        } catch {}
+        const contacted = (contactedRows || []).filter(contact =>
+          contact.invite_sent_at || contact.invite_accepted_at || contact.last_email_sent_at || contact.last_outreach_at ||
+          ['DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'In Conversation', 'Meeting Booked', 'invite_sent', 'invite_accepted'].includes(contact.pipeline_stage)
+        );
+        contactedCount = contacted.length;
+
+        let replied = 0;
+        try {
+          ({ count: replied } = await sb.from('contacts').select('id', { count: 'exact', head: true })
+            .eq('deal_id', deal.id)
+            .or('response_received.eq.true,pipeline_stage.eq.In Conversation,pipeline_stage.eq.Meeting Booked'));
+        } catch {}
+        repliedCount = replied || 0;
+      }
+
+      await bot.sendMessage(chatId,
+        `*DEAL STATUS — ${deal.name}*\n\n` +
+        `System: ${isActive ? '🟢 ACTIVE' : '🔴 PAUSED'}\n` +
+        `Deal: ${deal.status}${deal.paused ? ' (paused)' : ''}\n` +
+        `Progress: ${formatCurrencyAmount(deal.committed_amount, deal.currency)} / ${formatCurrencyAmount(deal.target_amount, deal.currency)}\n` +
+        `Prospects: ${prospectCount}\n` +
+        `Contacted: ${contactedCount}\n` +
+        `Replies: ${repliedCount}\n` +
+        `Sector: ${deal.sector || '—'}`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    const dealLines = deals
+      ?.filter(d => ['ACTIVE', 'PAUSED'].includes(d.status))
+      .map(d =>
+        `• ${d.name} [${d.status}] — ${formatCurrencyAmount(d.committed_amount, d.currency)} / ${formatCurrencyAmount(d.target_amount, d.currency)}`
+    ).join('\n') || '• No active deals';
 
     await bot.sendMessage(chatId,
       `*ROCO STATUS*\n\n` +
@@ -834,7 +1313,33 @@ async function handleStatus(chatId) {
   }
 }
 
-async function handlePause(chatId) {
+async function handlePause(chatId, args = '') {
+  const input = String(args || '').trim();
+  if (input && input.toLowerCase() !== 'all') {
+    try {
+      const { pool, deal, matches } = await resolveDealArgument(input, ['ACTIVE']);
+      if (!deal) {
+        const choices = matches.length ? matches : pool;
+        await bot.sendMessage(chatId,
+          `Specify which active deal to pause.\n\nUse: /pause [deal name]\n\n${formatDealChoices(choices.slice(0, 12))}`
+        );
+        return;
+      }
+
+      const updated = await updateDeal(deal.id, {
+        status: 'PAUSED',
+        paused: true,
+        paused_at: new Date().toISOString(),
+      });
+      await sbLogActivity({ dealId: updated.id, eventType: 'DEAL_PAUSED', summary: `Deal "${updated.name}" paused from Telegram` });
+      await bot.sendMessage(chatId, `Deal paused: ${updated.name}\nAll outreach for this deal is now paused in the database.`);
+      return;
+    } catch (err) {
+      await bot.sendMessage(chatId, `Could not pause deal: ${err.message}`);
+      return;
+    }
+  }
+
   if (rocoState) rocoState.status = 'PAUSED';
   try {
     const state = await loadSessionState();
@@ -848,7 +1353,33 @@ async function handlePause(chatId) {
   );
 }
 
-async function handleResume(chatId) {
+async function handleResume(chatId, args = '') {
+  const input = String(args || '').trim();
+  if (input && input.toLowerCase() !== 'all') {
+    try {
+      const { pool, deal, matches } = await resolveDealArgument(input, ['PAUSED', 'ACTIVE']);
+      if (!deal) {
+        const choices = matches.length ? matches : pool.filter(d => ['PAUSED', 'ACTIVE'].includes(d.status));
+        await bot.sendMessage(chatId,
+          `Specify which deal to resume.\n\nUse: /resume [deal name]\n\n${formatDealChoices(choices.slice(0, 12))}`
+        );
+        return;
+      }
+
+      const updated = await updateDeal(deal.id, {
+        status: 'ACTIVE',
+        paused: false,
+        paused_at: null,
+      });
+      await sbLogActivity({ dealId: updated.id, eventType: 'DEAL_RESUMED', summary: `Deal "${updated.name}" resumed from Telegram` });
+      await bot.sendMessage(chatId, `Deal resumed: ${updated.name}\nRoco will pick it up again on the next cycle.`);
+      return;
+    } catch (err) {
+      await bot.sendMessage(chatId, `Could not resume deal: ${err.message}`);
+      return;
+    }
+  }
+
   if (rocoState) rocoState.status = 'ACTIVE';
   try {
     const state = await loadSessionState();
@@ -862,35 +1393,153 @@ async function handleResume(chatId) {
   );
 }
 
-async function handlePipeline(chatId) {
-  const { getAllActiveContacts, getContactProp } = await import('../crm/notionContacts.js');
+async function handlePipeline(chatId, args = '') {
   try {
-    const contacts = await getAllActiveContacts();
+    const sb = getSupabase();
+    const deal = await resolveRequiredDeal(chatId, args, {
+      statuses: ['ACTIVE', 'PAUSED'],
+      actionLabel: 'inspect in pipeline',
+      commandExample: '/pipeline [deal name]',
+    });
+    if (!deal) return;
+
+    const { data: contacts, error: dbErr } = await sb.from('contacts')
+      .select('name, company_name, investor_score, pipeline_stage, tier')
+      .eq('deal_id', deal.id)
+      .not('pipeline_stage', 'in', '("Inactive","Archived","archived")')
+      .order('investor_score', { ascending: false })
+      .limit(10);
+
+    if (dbErr) throw dbErr;
     if (!contacts?.length) {
       await bot.sendMessage(chatId, 'No active prospects in pipeline yet.');
       return;
     }
-    const top10 = contacts
-      .sort((a, b) => (getContactProp(b, 'Investor Score (0-100)') || 0) - (getContactProp(a, 'Investor Score (0-100)') || 0))
-      .slice(0, 10);
-    const lines = top10.map((c, i) =>
-      `${i + 1}. *${getContactProp(c, 'Name')}* (${getContactProp(c, 'Company Name') || 'Unknown'})\n` +
-      `   Score: ${getContactProp(c, 'Investor Score (0-100)') || '—'} | Stage: ${getContactProp(c, 'Pipeline Stage') || '—'}`
+    const lines = contacts.map((c, i) =>
+      `${i + 1}. *${c.name || 'Unknown'}* (${c.company_name || 'Unknown'})\n` +
+      `   Score: ${c.investor_score ?? '—'} | Stage: ${c.pipeline_stage || '—'} | Tier: ${c.tier || '—'}`
     ).join('\n\n');
-    await bot.sendMessage(chatId, `*TOP PIPELINE PROSPECTS*\n\n${lines}`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `*TOP PIPELINE PROSPECTS — ${deal.name}*\n\n${lines}`, { parse_mode: 'Markdown' });
   } catch (err) {
     error('handlePipeline failed', { err: err.message });
     await bot.sendMessage(chatId, 'Could not fetch pipeline.');
   }
 }
 
-async function handleQueue(chatId) {
+async function handleCampaignStatus(chatId, args) {
+  try {
+    const sb = getSupabase();
+    if (!sb) {
+      await bot.sendMessage(chatId, 'Database unavailable.');
+      return;
+    }
+
+    const deal = await resolveRequiredDeal(chatId, args, {
+      statuses: ['ACTIVE', 'PAUSED'],
+      actionLabel: 'inspect for campaign status',
+      commandExample: '/campaignstatus [deal name]',
+    });
+    if (!deal) return;
+
+    const { data: contacts } = await sb.from('contacts')
+      .select('deal_id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, last_outreach_at, updated_at')
+      .eq('deal_id', deal.id)
+      .order('updated_at', { ascending: false })
+      .limit(250);
+
+    const activeContacts = (contacts || []).filter(contact => !['Inactive', 'Archived', 'archived'].includes(contact.pipeline_stage));
+    const contacted = activeContacts.filter(contact =>
+      contact.invite_sent_at || contact.invite_accepted_at || contact.last_email_sent_at || contact.last_outreach_at ||
+      ['DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'In Conversation', 'Meeting Booked', 'invite_sent', 'invite_accepted'].includes(contact.pipeline_stage)
+    );
+    const firms = new Set(contacted.map(contact => String(contact.company_name || '').trim()).filter(Boolean));
+    const recent = contacted.slice(0, 6).map(contact =>
+      `${contact.name || 'Unknown'} @ ${contact.company_name || 'Unknown'} — ${contact.pipeline_stage || '—'}`
+    );
+
+    await bot.sendMessage(chatId,
+      `${deal.name} [${deal.status}]\n` +
+      `Prospects in play: ${activeContacts.length} | Firms in outreach: ${firms.size} | Contacted: ${contacted.length}\n` +
+      `${recent.length ? `Recent: ${recent.join(' | ')}` : 'Recent: none yet'}`
+    );
+  } catch (err) {
+    error('handleCampaignStatus failed', { err: err.message });
+    await bot.sendMessage(chatId, `Could not fetch campaign status: ${err.message}`);
+  }
+}
+
+async function handleOutboundMessages(chatId, channel, args) {
+  try {
+    const sb = getSupabase();
+    if (!sb) {
+      await bot.sendMessage(chatId, 'Database unavailable.');
+      return;
+    }
+
+    const deal = await resolveRequiredDeal(chatId, args, {
+      statuses: ['ACTIVE', 'PAUSED', 'CLOSED'],
+      actionLabel: `view ${channel === 'email' ? 'emails' : 'LinkedIn DMs'} for`,
+      commandExample: `${channel === 'email' ? '/emails' : '/linkedindms'} [deal name]`,
+    });
+    if (!deal) return;
+
+    let query = sb.from('conversation_messages')
+      .select('contact_id, deal_id, subject, body, created_at')
+      .eq('direction', 'outbound')
+      .eq('channel', channel)
+      .order('created_at', { ascending: false })
+      .limit(12);
+    query = query.eq('deal_id', deal.id);
+
+    const { data: messages, error: msgErr } = await query;
+    if (msgErr) throw new Error(msgErr.message);
+    if (!messages?.length) {
+      await bot.sendMessage(chatId, channel === 'email' ? 'No sent emails found.' : 'No sent LinkedIn DMs found.');
+      return;
+    }
+
+    const contactIds = [...new Set(messages.map(message => message.contact_id).filter(Boolean))];
+    const { data: contacts } = contactIds.length
+      ? await sb.from('contacts').select('id, name, company_name').in('id', contactIds)
+      : { data: [] };
+    const contactMap = Object.fromEntries((contacts || []).map(contact => [String(contact.id), contact]));
+
+    const title = `${channel === 'email' ? 'Recent Sent Emails' : 'Recent Sent LinkedIn DMs'} — ${deal.name}`;
+    const lines = messages.map((message, index) => {
+      const contact = contactMap[String(message.contact_id)] || {};
+      const sentAt = new Date(message.created_at).toLocaleString('en-GB', { timeZone: 'UTC' });
+      const subject = channel === 'email' ? `\nSubject: ${truncatePreview(message.subject || '—', 90)}` : '';
+      return `${index + 1}. ${contact.name || 'Unknown'} @ ${contact.company_name || 'Unknown'}\nSent: ${sentAt} UTC${subject}\n${truncatePreview(message.body, 240)}`;
+    });
+
+    await bot.sendMessage(chatId, `${title}\n\n${lines.join('\n\n')}`);
+  } catch (err) {
+    error('handleOutboundMessages failed', { err: err.message, channel });
+    await bot.sendMessage(chatId, `Could not fetch ${channel === 'email' ? 'emails' : 'LinkedIn DMs'}: ${err.message}`);
+  }
+}
+
+async function handleQueue(chatId, args = '') {
   if (pendingApprovals.size === 0) {
     await bot.sendMessage(chatId, 'No emails waiting for approval. ✅');
     return;
   }
 
-  const entries = [...pendingApprovals.entries()];
+  let entries = [...pendingApprovals.entries()];
+  const input = String(args || '').trim();
+  if (input) {
+    const deal = await resolveRequiredDeal(chatId, input, {
+      statuses: ['ACTIVE', 'PAUSED', 'CLOSED'],
+      actionLabel: 'view the queue for',
+      commandExample: '/queue [deal name]',
+    });
+    if (!deal) return;
+    entries = entries.filter(([, approval]) => String(approval.dealId || '') === String(deal.id));
+    if (!entries.length) {
+      await bot.sendMessage(chatId, `No approval items waiting for ${deal.name}.`);
+      return;
+    }
+  }
 
   await bot.sendMessage(chatId,
     `*APPROVAL QUEUE — ${entries.length} waiting*\n\n` +
@@ -1002,14 +1651,62 @@ async function handleResumeCampaigns(chatId) {
   }
 }
 
+async function handleCloseDeal(chatId, args) {
+  try {
+    const input = String(args || '').trim();
+    const { pool, deal, matches } = await resolveDealArgument(input, ['ACTIVE', 'PAUSED']);
+    if (!deal) {
+      const choices = matches.length ? matches : pool;
+      await bot.sendMessage(chatId,
+        `Specify which deal to close.\n\nUse: /close [deal name]\n\n${formatDealChoices(choices.slice(0, 12))}`
+      );
+      return;
+    }
+
+    const closedAt = new Date().toISOString();
+    const updated = await updateDeal(deal.id, {
+      status: 'CLOSED',
+      paused: false,
+      closed_at: closedAt,
+      archived_at: closedAt,
+      archived_reason: 'closed',
+    });
+
+    const sb = getSupabase();
+    if (sb) {
+      await sb.from('contacts').update({ pipeline_stage: 'Inactive' }).eq('deal_id', deal.id);
+      let dealContacts = [];
+      try {
+        ({ data: dealContacts } = await sb.from('contacts').select('id').eq('deal_id', deal.id));
+      } catch {}
+      const contactIds = (dealContacts || []).map(contact => contact.id).filter(Boolean);
+      if (contactIds.length) {
+        await sb.from('approval_queue').delete().in('contact_id', contactIds).eq('status', 'pending');
+      }
+    }
+
+    clearApprovalsForDeal(deal.id);
+    await sbLogActivity({ dealId: updated.id, eventType: 'DEAL_CLOSED', summary: `Deal "${updated.name}" closed from Telegram` });
+    await bot.sendMessage(chatId, `Deal closed: ${updated.name}\nAll outreach has been stopped and the deal is now closed in the database.`);
+  } catch (err) {
+    error('handleCloseDeal failed', { err: err.message });
+    await bot.sendMessage(chatId, `Could not close deal: ${err.message}`);
+  }
+}
+
 function registerCommands() {
   if (!bot) return;
   bot.setMyCommands([
+    { command: 'help', description: 'How to target a specific deal' },
     { command: 'status', description: 'Roco status and stats' },
     { command: 'pipeline', description: 'Top 10 active prospects' },
+    { command: 'campaignstatus', description: 'Current outreach by deal' },
+    { command: 'emails', description: 'Recent sent emails' },
+    { command: 'linkedindms', description: 'Recent sent LinkedIn DMs' },
     { command: 'queue', description: 'Emails waiting for approval' },
-    { command: 'pause', description: 'Pause all outreach' },
-    { command: 'resume', description: 'Resume outreach' },
+    { command: 'pause', description: 'Pause a deal or all outreach' },
+    { command: 'resume', description: 'Resume a deal or all outreach' },
+    { command: 'close', description: 'Close a deal' },
     { command: 'newdeal', description: 'Create a new deal' },
     { command: 'sourcing', description: 'Sourcing campaigns status' },
     { command: 'pausecampaigns', description: 'Pause all sourcing campaigns' },
@@ -1098,18 +1795,243 @@ export async function sendSourcingDraftToTelegram(contact, company, campaign, dr
 }
 
 export function getPendingApprovals() {
-  return [...pendingApprovals.entries()].map(([id, a]) => ({
-    id,
-    name: a.name,
-    firm: a.firm,
-    score: a.score,
-    stage: a.stage,
-    subject: a.emailDraft?.subject,
-    alternativeSubject: a.emailDraft?.alternativeSubject,
-    body: a.emailDraft?.body,
-    contactPageId: a.contactPage?.id,
-    queuedAt: a.queuedAt || new Date().toISOString(),
-  }));
+  const looksLikeEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+  return [...pendingApprovals.entries()].flatMap(([id, a]) => {
+    const isLinkedIn = a.isLinkedInDM || isLinkedInStageLabel(a.stage);
+    const contactEmail = a.contactPage?.properties?.Email?.email
+      || a.contactPage?.email
+      || a.contactEmail
+      || null;
+    if (!isLinkedIn && !looksLikeEmail(contactEmail)) return [];
+    return [{
+      id,
+      queueId: a.queueId || null,
+      name: a.name,
+      firm: a.firm,
+      score: a.score,
+      stage: a.stage,
+      channel: isLinkedIn ? 'linkedin' : 'email',
+      subject: a.emailDraft?.subject,
+      alternativeSubject: a.emailDraft?.alternativeSubject,
+      body: a.emailDraft?.body,
+      contactPageId: a.contactPage?.id,
+      contactEmail,
+      queuedAt: a.queuedAt || new Date().toISOString(),
+    }];
+  });
+}
+
+export async function updateApprovalDraftFromDashboard(id, { body = null, subject = null } = {}) {
+  const numId = Number(id);
+  const approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
+  if (!approval) return false;
+
+  if (body !== null) approval.emailDraft.body = sanitizeApprovalText(body);
+  if (subject !== null && !approval.isLinkedInDM) approval.emailDraft.subject = sanitizeApprovalText(subject);
+  return true;
+}
+
+async function executeReloadedApproval(item, decision) {
+  const sb = getSupabase();
+  if (!sb) throw new Error('Supabase unavailable');
+
+  if (decision.action === 'skip') {
+    await sb.from('approval_queue').update({
+      status: 'skipped',
+      resolved_at: new Date().toISOString(),
+    }).eq('id', item.id);
+    return;
+  }
+
+  if (isLinkedInStageLabel(item.stage) && item.contact_id) {
+    const { sendApprovedLinkedInDM } = await import('../dashboard/server.js');
+    const { notifyQueueUpdated } = await import('../dashboard/server.js');
+    const text = decision.body || item.body || '';
+    await sb.from('contacts').update({
+      pipeline_stage: 'DM Approved',
+      updated_at: new Date().toISOString(),
+    }).eq('id', item.contact_id);
+    const dmResult = await sendApprovedLinkedInDM({
+      contactId: item.contact_id,
+      text,
+      queueId: item.id,
+      queueItem: item,
+    });
+    if (dmResult?.deferred) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        edited_body: text || null,
+        resolved_at: new Date().toISOString(),
+      }).eq('id', item.id);
+      notifyQueueUpdated();
+      return;
+    }
+
+    notifyQueueUpdated();
+    return;
+  }
+
+  const { sendEmail } = await import('../integrations/unipileClient.js');
+  const { pushActivity, notifyQueueUpdated } = await import('../dashboard/server.js');
+  let toEmail = item.contact_email || null;
+  let dealId = null;
+  if (item.contact_id) {
+    try {
+      const { data: contact } = await sb.from('contacts').select('email, deal_id').eq('id', item.contact_id).single();
+      toEmail = toEmail || contact?.email || null;
+      dealId = contact?.deal_id || null;
+    } catch {}
+  }
+  if (!toEmail) throw new Error('No email address found for queued approval');
+
+  const approvedSubject = decision.subject || item.subject_a || item.subject || '';
+  const bodyToSend = decision.body || item.body || '';
+  let deal = null;
+  try {
+    if (dealId) {
+      const { getDeal } = await import('../core/supabaseSync.js');
+      deal = await getDeal(dealId);
+    }
+  } catch {}
+
+  if (item.contact_id) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'Email Approved',
+      updated_at: new Date().toISOString(),
+    }).eq('id', item.contact_id);
+  }
+
+  try {
+    const { isWithinChannelWindow } = await import('../core/scheduleChecker.js');
+    if (deal && !isWithinChannelWindow(deal, 'email')) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        approved_subject: approvedSubject || null,
+        edited_body: bodyToSend || null,
+        resolved_at: new Date().toISOString(),
+      }).eq('id', item.id);
+      notifyQueueUpdated();
+      return;
+    }
+  } catch {}
+
+  const sendResult = await sendEmail({ to: toEmail, toName: item.contact_name || '', subject: approvedSubject, body: bodyToSend });
+
+  await sb.from('approval_queue').update({
+    status: 'sent',
+    sent_at: new Date().toISOString(),
+    approved_subject: approvedSubject || null,
+  }).eq('id', item.id);
+
+  if (item.contact_id) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'Email Sent',
+      last_email_sent_at: new Date().toISOString(),
+      outreach_channel: 'email',
+      last_outreach_at: new Date().toISOString(),
+    }).eq('id', item.contact_id);
+
+    await sb.from('conversation_messages').insert({
+      contact_id: item.contact_id,
+      deal_id: dealId,
+      direction: 'outbound',
+      channel: 'email',
+      body: bodyToSend,
+      subject: approvedSubject,
+      sent_at: new Date().toISOString(),
+    }).catch(() => {});
+  }
+
+  if (dealId) {
+    await sb.from('activity_log').insert({
+      deal_id: dealId,
+      event_type: 'EMAIL_SENT',
+      summary: `Email sent to ${item.contact_name || ''} at ${item.firm || ''}`,
+      detail: {
+        channel: 'email',
+        account_id: sendResult?.accountId || null,
+        provider_id: sendResult?.providerId || null,
+        message_id: sendResult?.emailId || null,
+        thread_id: sendResult?.threadId || null,
+        to: toEmail,
+      },
+      created_at: new Date().toISOString(),
+    }).catch(() => {});
+  }
+
+  pushActivity({ type: 'email', action: `Email sent: ${item.contact_name || ''}`, note: `${item.firm || ''} · ${approvedSubject}` });
+  notifyQueueUpdated();
+}
+
+export async function reloadPendingInvestorApprovals() {
+  const { getSupabase } = await import('../core/supabase.js');
+  const sb = getSupabase();
+  if (!sb || !bot) return;
+
+  const existingQueueIds = new Set(
+    [...pendingApprovals.values()].map(entry => String(entry.queueId || '')).filter(Boolean)
+  );
+
+  const { data: pending } = await sb.from('approval_queue')
+    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, outreach_mode')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .limit(30);
+
+  const unsent = (pending || [])
+    .filter(item => item.outreach_mode !== 'company_sourcing')
+    .filter(item => !existingQueueIds.has(String(item.id)));
+  if (!unsent.length) return;
+
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!chatId) return;
+
+  info(`Reloading ${unsent.length} pending investor approvals`);
+
+  for (const item of unsent) {
+    try {
+      const hasSubjects = !!(item.subject_a || item.subject);
+      const bodyPreview = ((item.body || '').length > 800 ? `${item.body.slice(0, 800)}…` : (item.body || ''));
+      const msg = [
+        `*ROCO — ${item.stage || 'EMAIL'} Ready for Approval* _(reloaded)_`,
+        ``,
+        `👤 *${item.contact_name || 'Unknown'}* · ${item.firm || 'Unknown Firm'}`,
+        item.contact_email ? `📧 ${item.contact_email}` : null,
+        ``,
+        hasSubjects ? `📧 *Subject A:* _${item.subject_a || item.subject || ''}_` : null,
+        hasSubjects && item.subject_b ? `📧 *Subject B:* _${item.subject_b}_` : null,
+        `\`\`\``,
+        bodyPreview,
+        `\`\`\``,
+      ].filter(Boolean).join('\n');
+
+      const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      await bot.editMessageReplyMarkup(buildReloadedApprovalKeyboard(sent.message_id, hasSubjects), {
+        chat_id: chatId,
+        message_id: sent.message_id,
+      }).catch(() => {});
+
+      pendingApprovals.set(sent.message_id, {
+        name: item.contact_name || 'Unknown',
+        firm: item.firm || '',
+        stage: item.stage || 'EMAIL',
+        isLinkedInDM: isLinkedInStageLabel(item.stage),
+        contactId: item.contact_id || null,
+        emailDraft: {
+          subject: item.subject_a || item.subject || null,
+          alternativeSubject: item.subject_b || null,
+          body: item.body || '',
+        },
+        queuedAt: new Date().toISOString(),
+        queueId: item.id,
+        replayed: true,
+        resolve: async (decision) => executeReloadedApproval(item, decision),
+      });
+      await new Promise(r => setTimeout(r, 400));
+    } catch (err) {
+      error('Failed to reload investor approval', { err: err.message, approvalId: item.id });
+    }
+  }
 }
 
 /**
@@ -1159,7 +2081,7 @@ export async function reloadPendingSourcingApprovals() {
 
   for (const item of pending) {
     try {
-      const isLinkedIn = item.stage === 'LinkedIn DM';
+      const isLinkedIn = isLinkedInStageLabel(item.stage);
       const subjectBlock = !isLinkedIn && item.subject_a
         ? `*Subject A:* ${item.subject_a}\n*Subject B:* ${item.subject_b || 'N/A'}\n` : '';
       const msg = [
@@ -1178,7 +2100,7 @@ export async function reloadPendingSourcingApprovals() {
       ].join('\n');
 
       const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-      const isLinkedInItem = item.stage === 'LinkedIn DM';
+      const isLinkedInItem = isLinkedInStageLabel(item.stage);
       await bot.editMessageReplyMarkup(buildSourcingKeyboard(sent.message_id, isLinkedInItem), {
         chat_id: chatId,
         message_id: sent.message_id,
@@ -1258,20 +2180,102 @@ export function approveLatestPending({ subject } = {}) {
   return true;
 }
 
+async function handlePriorChatCallback(chatId, decision, approvalId) {
+  if (!approvalId) return;
+  const sb = getSupabase();
+  try {
+    let row = null;
+    if (sb) {
+      try {
+        const result = await sb.from('approval_queue')
+          .select('id, contact_id, contact_name, firm, deal_id, telegram_msg_id')
+          .eq('id', approvalId)
+          .single();
+        row = result?.data || null;
+      } catch {
+        row = null;
+      }
+    }
+    if (row?.telegram_msg_id) await clearTelegramApprovalControls(row.telegram_msg_id);
+
+    if (decision === 'proceed') {
+      // Mark approval as approved, restore invite_accepted, and queue the DM approval immediately.
+      if (sb) {
+        await sb.from('approval_queue').update({
+          status: 'telegram_approved', resolved_at: new Date().toISOString(),
+        }).eq('id', approvalId);
+
+        if (row?.contact_id) {
+          await sb.from('contacts').update({
+            pipeline_stage: 'invite_accepted',
+          }).eq('id', row.contact_id);
+        }
+      }
+      if (row?.contact_id) {
+        const { queueLinkedInDmApproval } = await import('../dashboard/server.js');
+        await queueLinkedInDmApproval(row.contact_id, { reason: 'prior_chat_approved' }).catch(() => {});
+      }
+      await bot.sendMessage(chatId, `✅ *Proceeding* — LinkedIn DM approval queued.`, { parse_mode: 'Markdown' });
+    } else {
+      // Skip — archive the contact
+      if (sb) {
+        await sb.from('approval_queue').update({
+          status: 'telegram_skipped', resolved_at: new Date().toISOString(),
+        }).eq('id', approvalId);
+
+        if (row?.contact_id) {
+          await sb.from('contacts').update({
+            pipeline_stage: 'Inactive',
+            conversation_state: 'do_not_contact',
+            conversation_ended_at: new Date().toISOString(),
+            conversation_ended_reason: 'Prior LinkedIn chat declined via Telegram',
+          }).eq('id', row.contact_id);
+        }
+      }
+      await bot.sendMessage(chatId, `✗ *Skipped* — contact will not receive a DM.`, { parse_mode: 'Markdown' });
+    }
+    import('../dashboard/server.js').then(({ pushActivity, notifyQueueUpdated }) => {
+      pushActivity({
+        type: 'linkedin',
+        action: decision === 'proceed' ? 'Prior chat approved via Telegram' : 'Prior chat skipped via Telegram',
+        note: row?.contact_name
+          ? `${row.contact_name}${row.firm ? ` @ ${row.firm}` : ''}`
+          : (row?.contact_id || approvalId),
+        dealId: row?.deal_id || null,
+      });
+      notifyQueueUpdated();
+    }).catch(() => {});
+  } catch (err) {
+    error('handlePriorChatCallback failed', { err: err.message });
+    await bot.sendMessage(chatId, `⚠ Could not process decision: ${err.message}`);
+  }
+}
+
 export function resolveApprovalFromDashboard(id, action, subject, editedBody) {
   const numId = Number(id);
   const approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
   if (!approval) return false;
 
   const key = pendingApprovals.has(numId) ? numId : String(id);
+  clearTelegramApprovalControls(key).catch(() => {});
   pendingApprovals.delete(key);
+
+  if (approval.queueId) {
+    if (action === 'approve') {
+      updateApprovalStatus(approval.queueId, 'approved', subject || approval.emailDraft.subject).catch(() => {});
+    } else if (action === 'skip') {
+      updateApprovalStatus(approval.queueId, 'skipped').catch(() => {});
+    }
+  }
 
   if (action === 'approve') {
     editLoops.delete(approval.contactPage?.id);
     approval.resolve({
       action: 'approve',
+      queueId: approval.queueId || null,
       variant: 'A',
-      subject: subject || approval.emailDraft.subject,
+      subject: sanitizeApprovalText(subject || approval.emailDraft.subject),
+      body: sanitizeApprovalText(editedBody || approval.emailDraft?.body),
     });
   } else if (action === 'skip') {
     editLoops.delete(approval.contactPage?.id);

@@ -11,8 +11,7 @@ import { getResearchContext } from '../core/agentContext.js';
 
 const DEFAULT_GEMINI_MODELS = [
   'gemini-2.5-flash',
-  'gemini-1.5-flash',
-  'gemini-1.5-pro',
+  'gemini-2.5-pro',
 ];
 
 const DEFAULT_GROK_MODEL = 'grok-4-latest';
@@ -100,7 +99,6 @@ Name: ${contact.name}
 ${firm ? `Firm: ${firm}` : 'No firm affiliation — independent investor'}
 Title: ${contact.job_title || 'Unknown'}
 Type: ${(isAngel || isIndividual) ? 'Individual Investor (personal capital)' : 'Institutional Investor'}
-${contact.linkedin_url ? `LinkedIn: ${contact.linkedin_url}` : ''}
 
 DEAL CONTEXT:
 Sector: ${deal.sector || 'AI / SaaS'}
@@ -118,7 +116,7 @@ Using web search, find and return:
 5. Their investment thesis or stated focus
 6. Geographies they invest in
 7. Any recent news about them${(isAngel || isIndividual) ? '' : ' or their firm'} (last 12 months)
-8. Their LinkedIn URL if findable
+8. Leave linkedin_url as null unless the profile was already verified elsewhere
 
 CONTACT TYPE CLASSIFICATION RULES (for contact_type_confirmed field):
 - "institutional" = operates a formal fund, VC, PE firm, family office, or invests on behalf of others/LPs
@@ -137,7 +135,7 @@ Return ONLY this JSON (no markdown, no other text):
   "geography": "<geographies they invest in>",
   "past_investments": "<comma-separated portfolio companies, 3-5>",
   "investment_thesis": "<1-2 sentence thesis>",
-  "linkedin_url": "<LinkedIn URL or null>",
+  "linkedin_url": null,
   "recent_news": "<relevant recent news or null>",
   "contact_type_confirmed": "<institutional|angel|individual — your assessment based on research>",
   "confidence": "high|medium|low"

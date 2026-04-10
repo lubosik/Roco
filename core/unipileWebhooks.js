@@ -3,7 +3,8 @@
 // Two event types: message_received (LinkedIn DM) and new_relation (connection accepted).
 
 import { getSupabase } from './supabase.js';
-import { getLiveCredentials, isWithinSendingWindow } from './unipile.js';
+import { getLiveCredentials, isWithinSendingWindow, getExistingChatWithContact, getChatMessages } from './unipile.js';
+import { aiComplete } from './aiClient.js';
 
 // In-memory dedupe cache — cleared every 5 minutes
 const recentlyProcessed = new Map();
@@ -40,12 +41,44 @@ function normalizeRelation(raw) {
   const data = raw?.data || raw;
   return {
     provider_id:
-      data.user_provider_id || data.provider_id || data.attendee?.provider_id ||
-      data.relation?.provider_id || data.sender_id || raw.provider_id,
-    name: data.user_full_name || data.name || data.full_name || data.display_name || '',
-    public_identifier: data.user_public_identifier || '',
-    profile_url:       data.user_profile_url || '',
+      data.user_provider_id ||
+      data.provider_id ||
+      data.attendee?.provider_id ||
+      data.attendee_provider_id ||
+      data.user?.provider_id ||
+      data.user?.id ||
+      data.relation?.provider_id ||
+      data.relation?.user_provider_id ||
+      data.sender_id ||
+      raw.provider_id,
+    name:
+      data.user_full_name ||
+      data.name ||
+      data.full_name ||
+      data.display_name ||
+      data.user?.full_name ||
+      data.user?.name ||
+      data.attendee?.display_name ||
+      '',
+    public_identifier:
+      data.user_public_identifier ||
+      data.public_identifier ||
+      data.user?.public_identifier ||
+      data.relation?.public_identifier ||
+      '',
+    profile_url:
+      data.user_profile_url ||
+      data.profile_url ||
+      data.linkedin_url ||
+      data.user?.profile_url ||
+      data.user?.linkedin_url ||
+      data.relation?.profile_url ||
+      '',
   };
+}
+
+function getDealName(contact) {
+  return contact?.deals?.name || contact?.deal_name || 'Unknown deal';
 }
 
 // ── CONTACT MATCHING ──────────────────────────────────────────────────────────
@@ -115,12 +148,36 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
   const contact = await findContact(sb, payload);
   if (!contact) {
     console.log('[UNIPILE/MSG] No matching contact — ignoring');
+    pushActivity({
+      type: 'excluded',
+      action: `LinkedIn reply received: ${payload.sender_provider_id || payload.chat_id || 'unknown sender'}`,
+      note: 'Sender did not match any active deals',
+    });
     return;
   }
 
   // Only process contacts linked to active deals
   const dealStatus = contact.deals?.status || contact.deal_status;
-  if (dealStatus && dealStatus.toUpperCase() !== 'ACTIVE') return;
+  if (dealStatus && dealStatus.toUpperCase() !== 'ACTIVE') {
+    console.log(`[UNIPILE/MSG] Deal is ${dealStatus} for ${contact.name} — ignoring event`);
+    pushActivity({
+      type: 'system',
+      action: `LinkedIn reply received: ${contact.name}`,
+      note: `${contact.name} matched deal ${getDealName(contact)}, but that deal is ${dealStatus}`,
+      dealId: contact.deal_id,
+      deal_name: getDealName(contact),
+    });
+    return;
+  }
+
+  pushActivity({
+    type: 'reply',
+    activity_badge: 'replied',
+    action: `LinkedIn replied: ${contact.name}`,
+    note: `Matched to deal ${getDealName(contact)}${contact.company_name ? ` · ${contact.company_name}` : ''}`,
+    dealId: contact.deal_id,
+    deal_name: getDealName(contact),
+  });
 
   // Batch within 90-second window per contact
   const batchKey = contact.id;
@@ -161,7 +218,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
         conversation_state: 'replied',
         reply_channel:      'linkedin',
         last_reply_at:      new Date().toISOString(),
-        pipeline_stage:     'Replied',
+        pipeline_stage:     'In Conversation',
         unipile_chat_id:    payload.chat_id || contact.unipile_chat_id || null,
       }).eq('id', contact.id);
     } catch {}
@@ -178,12 +235,6 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
       } catch {}
     }
 
-    pushActivity({
-      type:   'reply',
-      action: `LinkedIn reply: ${contact.name} at ${contact.company_name || ''}`,
-      note:   combinedText.slice(0, 80),
-    });
-
     console.log(`[UNIPILE/MSG] Processing reply from ${contact.name} — drafting response`);
 
     // Draft contextual reply via conversationManager
@@ -194,10 +245,181 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
         channel: 'linkedin',
         inboundMessage: combinedText,
       });
+      pushActivity({
+        type: 'approval',
+        action: `Next action: draft LinkedIn reply for ${contact.name}`,
+        note: `Matched to deal ${getDealName(contact)} · contextual reply workflow queued`,
+        dealId: contact.deal_id,
+        deal_name: getDealName(contact),
+      });
     } catch (err) {
       console.error('[UNIPILE/MSG] Draft reply error:', err.message);
     }
   }, 90_000);
+}
+
+// ── PRIOR CHAT HELPERS ────────────────────────────────────────────────────────
+
+async function summarisePriorChat(messages, contact, deal) {
+  const lines = messages
+    .filter(m => m.text || m.message || m.body)
+    .slice(0, 20)
+    .map(m => {
+      const who = m.is_self ? 'Roco' : (contact.name || 'Them');
+      const text = m.text || m.message || m.body || '';
+      return `${who}: ${text.slice(0, 300)}`;
+    })
+    .join('\n');
+
+  const prompt = `You are summarising a prior LinkedIn conversation for a fundraising AI.\n\nContact: ${contact.name || 'Unknown'} at ${contact.company_name || 'Unknown'}\nDeal: ${deal?.name || 'Unknown'}\n\nConversation:\n${lines}\n\nSummarise in 2-3 sentences: the relationship context, any prior interest or concerns expressed, and how the next message should be positioned. Be concise.`;
+
+  try {
+    const summary = await aiComplete(prompt, { maxTokens: 200, task: 'prior_chat_summary', model: 'claude-haiku-4-5-20251001' });
+    return summary?.trim() || 'Prior conversation found but could not be summarised.';
+  } catch (err) {
+    console.warn('[UNIPILE/PRIOR_CHAT] Summarise failed:', err.message);
+    return `Prior conversation found (${messages.length} message(s)) — review recommended before sending.`;
+  }
+}
+
+// Set stage to invite_accepted so phaseOutreach picks up the DM in next cycle
+async function queueLinkedInDM(contactId) {
+  const sb = getSupabase();
+  if (!sb) return;
+  try {
+    await sb.from('contacts').update({
+      pipeline_stage: 'invite_accepted',
+    }).eq('id', contactId);
+  } catch (err) {
+    console.warn('[UNIPILE/REL] queueLinkedInDM failed:', err.message);
+  }
+}
+
+// Full acceptance flow — checks for prior chat and routes accordingly
+export async function handleLinkedInAcceptance(contact, deal, pushActivity, queueForApproval = null) {
+  const sb    = getSupabase();
+  if (!sb) return;
+
+  // Already replied on another channel — no DM needed
+  if (contact.reply_channel) {
+    console.log(`[UNIPILE/REL] ${contact.name} already replied via ${contact.reply_channel} — skipping DM`);
+    return;
+  }
+
+  const within = await isWithinSendingWindow().catch(() => true);
+
+  // Check for existing chat history
+  const creds = await getLiveCredentials();
+  let existingChat = null;
+  if (contact.linkedin_provider_id && creds.linkedinAccountId) {
+    existingChat = await getExistingChatWithContact(contact.linkedin_provider_id, creds.linkedinAccountId);
+  }
+
+  if (existingChat?.id) {
+    const messages = await getChatMessages(existingChat.id, 20).catch(() => []);
+    const priorMessages = messages.filter(m => String(m.text || m.message || m.body || '').trim());
+
+    if (priorMessages.length > 0) {
+      // Prior conversation exists — summarise and route to approval
+      const summary = await summarisePriorChat(messages, contact, deal);
+
+      let approvalId = null;
+      try {
+        const { data: queueRow } = await sb.from('approval_queue').insert({
+          contact_id:   contact.id,
+          contact_name: contact.name,
+          firm:         contact.company_name || null,
+          deal_id:      deal?.id || contact.deal_id || null,
+          message_type: 'prior_chat_review',
+          message_text: summary,
+          stage:        'prior_chat_review',
+          status:       'pending',
+          metadata:     JSON.stringify({ messageCount: priorMessages.length, chatId: existingChat.id }),
+          created_at:   new Date().toISOString(),
+        }).select('id').single();
+        approvalId = queueRow?.id;
+      } catch (err) {
+        console.warn('[UNIPILE/REL] Could not store prior_chat_review:', err.message);
+      }
+
+      try {
+        await sb.from('contacts').update({
+          pipeline_stage:  'prior_chat_review',
+          unipile_chat_id: existingChat.id,
+        }).eq('id', contact.id);
+      } catch {}
+
+      // Notify via Telegram (lazy import avoids circular dep at module load time)
+      if (approvalId) {
+        try {
+          const { sendPriorChatForApproval } = await import('../approval/telegramBot.js');
+          await sendPriorChatForApproval({
+            contactName:  contact.name,
+            firm:         contact.company_name || 'Unknown',
+            dealName:     deal?.name || 'Unknown',
+            summary,
+            messageCount: priorMessages.length,
+            approvalId,
+          });
+        } catch (err) {
+          console.warn('[UNIPILE/REL] Telegram prior-chat notify failed:', err.message);
+        }
+      }
+
+      pushActivity({
+        type:   'linkedin',
+        action: `Existing LinkedIn conversation found: ${contact.name}`,
+        note:   `${priorMessages.length} prior message(s) found · awaiting proceed/decline`,
+        deal_name: deal?.name || null,
+        dealId: deal?.id || contact.deal_id || null,
+      });
+      return;
+    }
+  }
+
+  pushActivity({
+    type:   'linkedin',
+    action: `No existing LinkedIn conversation: ${contact.name}`,
+    note:   'Connection accepted · drafting DM approval',
+    deal_name: deal?.name || null,
+    dealId: deal?.id || contact.deal_id || null,
+  });
+
+  // No prior chat — draft now and queue for approval, even if the DM window is closed.
+  if (queueForApproval) {
+    try {
+      await queueForApproval({
+        contact,
+        deal,
+        channel: 'linkedin_dm',
+        action: 'draft_for_approval',
+        reason: within ? 'accepted_in_window' : 'accepted_outside_window',
+      });
+      await queueLinkedInDM(contact.id);
+      pushActivity({
+        type:   'linkedin',
+        action: `DM drafted for approval: ${contact.name}`,
+        note:   within
+          ? 'Connection accepted → approval queued'
+          : 'Connection accepted outside window → approval queued, send will wait for DM window',
+        deal_name: deal?.name || null,
+        dealId: deal?.id || contact.deal_id || null,
+      });
+      return;
+    } catch (err) {
+      console.warn('[UNIPILE/REL] queueForApproval failed:', err.message);
+    }
+  }
+
+  await queueLinkedInDM(contact.id);
+  try { await sb.from('contacts').update({ pending_linkedin_dm: true }).eq('id', contact.id); } catch {}
+  pushActivity({
+    type:   'linkedin',
+    action: `DM queued: ${contact.name}`,
+    note:   'Connection accepted → draft will be created next cycle',
+    deal_name: deal?.name || null,
+    dealId: deal?.id || contact.deal_id || null,
+  });
 }
 
 // ── HANDLER: CONNECTION ACCEPTED ──────────────────────────────────────────────
@@ -208,8 +430,13 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   const payload = normalizeRelation(raw);
 
-  if (!payload.provider_id) {
-    console.log('[UNIPILE/REL] Missing provider_id — ignoring');
+  if (!payload.provider_id && !payload.profile_url && !payload.public_identifier && !payload.name) {
+    console.log('[UNIPILE/REL] Missing usable identifiers — ignoring');
+    pushActivity({
+      type: 'error',
+      action: 'LinkedIn acceptance received',
+      note: 'Payload did not include a provider ID, profile URL, public identifier, or name, so no active deal could be matched',
+    });
     return;
   }
 
@@ -230,19 +457,34 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
   }
 
   if (!contact) {
-    console.log('[UNIPILE/REL] Contact not found for provider_id:', payload.provider_id);
+    console.log('[UNIPILE/REL] Contact not found for identifiers:', payload.provider_id || payload.public_identifier || payload.profile_url || payload.name);
+    pushActivity({
+      type: 'excluded',
+      action: `LinkedIn acceptance received: ${payload.name || payload.public_identifier || payload.provider_id}`,
+      note: 'Person did not match any active deals',
+    });
     return;
   }
 
   const dealStatus = contact.deals?.status || contact.deal_status;
-  if (dealStatus && dealStatus.toUpperCase() !== 'ACTIVE') return;
+  if (dealStatus && dealStatus.toUpperCase() !== 'ACTIVE') {
+    console.log(`[UNIPILE/REL] Deal is ${dealStatus} for ${contact.name} — ignoring event`);
+    pushActivity({
+      type: 'system',
+      action: `LinkedIn acceptance received: ${contact.name}`,
+      note: `${contact.name} matched deal ${getDealName(contact)}, but that deal is ${dealStatus}`,
+      dealId: contact.deal_id,
+      deal_name: getDealName(contact),
+    });
+    return;
+  }
 
   // Mark connection accepted
   try {
     await sb.from('contacts').update({
       linkedin_connected:  true,
       invite_accepted_at:  new Date().toISOString(),
-      pipeline_stage:      'LinkedIn Connected',
+      pipeline_stage:      'invite_accepted',
     }).eq('id', contact.id);
   } catch {}
 
@@ -260,53 +502,15 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   pushActivity({
     type:   'linkedin',
+    activity_badge: 'accepted',
     action: `LinkedIn accepted: ${contact.name} at ${contact.company_name || ''}`,
-    note:   contact.deals?.name || '',
+    note:   `Matched to deal ${getDealName(contact)}`,
+    dealId: contact.deal_id,
+    deal_name: getDealName(contact),
   });
 
-  console.log(`[UNIPILE/REL] ${contact.name} accepted LinkedIn invite`);
+  console.log(`[UNIPILE/REL] ${contact.name} accepted LinkedIn invite — running acceptance flow`);
 
-  // Skip DM if they've already replied via another channel
-  if (contact.reply_channel) {
-    console.log(`[UNIPILE/REL] ${contact.name} already replied via ${contact.reply_channel} — skipping DM`);
-    return;
-  }
-
-  // Check sending window
-  const within = await isWithinSendingWindow().catch(() => true);
-  if (!within) {
-    try {
-      await sb.from('contacts').update({ pending_linkedin_dm: true }).eq('id', contact.id);
-    } catch {}
-    console.log(`[UNIPILE/REL] Outside sending window — DM flagged for next cycle for ${contact.name}`);
-    return;
-  }
-
-  // Queue DM for approval
-  let template = null;
-  try {
-    const { data } = await sb.from('email_templates')
-      .select('*')
-      .eq('sequence_step', 'linkedin_dm_1')
-      .eq('is_primary', true)
-      .eq('is_active', true)
-      .limit(1).single();
-    template = data;
-  } catch {}
-
-  if (!template) {
-    console.warn('[UNIPILE/REL] No primary linkedin_dm_1 template — cannot queue DM');
-    return;
-  }
-
-  try {
-    await queueForApproval({ contact, template, channel: 'linkedin', action: 'send_dm' });
-    pushActivity({
-      type:   'outreach',
-      action: `LinkedIn DM queued: ${contact.name} at ${contact.company_name || ''}`,
-      note:   'Connection accepted → DM queued for approval',
-    });
-  } catch (err) {
-    console.error('[UNIPILE/REL] Queue DM error:', err.message);
-  }
+  const deal = contact.deals || { id: contact.deal_id, name: null };
+  await handleLinkedInAcceptance(contact, deal, pushActivity, queueForApproval);
 }

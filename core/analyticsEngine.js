@@ -1,136 +1,371 @@
 // core/analyticsEngine.js
-// Weekly analytics computation + AI recommendation generation.
+// Weekly analytics computation + recommendation generation.
 // Accepted recommendations update roco_learned_settings to influence agent behaviour.
 
 import Anthropic from '@anthropic-ai/sdk';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { DateTime } from 'luxon';
 import { getSupabase } from './supabase.js';
+import { calculateGoalTracking, gatherCurrentMetrics } from './fundraiserBrain.js';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const ANALYTICS_TIMEZONE = 'America/New_York';
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY || null;
+const ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io/v1';
+const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+const ELEVENLABS_DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb';
 
-export async function runWeeklyAnalytics() {
-  console.log('[ANALYTICS] Running weekly analysis...');
-  const supabase = getSupabase();
-  if (!supabase) return;
-
-  const weekStart = new Date();
-  weekStart.setDate(weekStart.getDate() - 7);
-  weekStart.setHours(0, 0, 0, 0);
-
-  const { data: deals } = await supabase.from('deals').select('*').eq('status', 'ACTIVE');
-  if (!deals?.length) return;
-
-  const analyticsData = [];
-
-  for (const deal of deals) {
-    try {
-      const snapshot = await computeDealSnapshot(deal, weekStart);
-      if (snapshot.total_outreach === 0) continue;
-
-      await supabase.from('deal_analytics').upsert({
-        ...snapshot,
-        deal_id: deal.id,
-        week_starting: weekStart.toISOString().split('T')[0],
-      }, { onConflict: 'deal_id,week_starting' });
-
-      analyticsData.push({ deal: deal.name, ...snapshot });
-    } catch (err) {
-      console.warn(`[ANALYTICS] Snapshot failed for ${deal.name}:`, err.message);
-    }
-  }
-
-  if (!analyticsData.length) {
-    console.log('[ANALYTICS] No outreach activity this week — skipping recommendations');
-    return;
-  }
-
-  await generateRecommendations(analyticsData, weekStart);
-  console.log('[ANALYTICS] Weekly analysis complete');
-}
-
-async function computeDealSnapshot(deal, weekStart) {
-  const supabase = getSupabase();
-
-  const { data: messages } = await supabase.from('conversation_messages')
-    .select('*')
-    .eq('deal_id', deal.id)
-    .gte('created_at', weekStart.toISOString());
-
-  const outbound = (messages || []).filter(m => m.direction === 'outbound');
-  const inbound  = (messages || []).filter(m => m.direction === 'inbound');
-
-  const emailsSent  = outbound.filter(m => m.channel === 'email').length;
-  const liInvites   = outbound.filter(m => m.channel === 'linkedin_invite').length;
-  const liDms       = outbound.filter(m => m.channel === 'linkedin_dm').length;
-  const emailReplies = inbound.filter(m => m.channel === 'email').length;
-  const liReplies    = inbound.filter(m => m.channel === 'linkedin_dm').length;
-
-  const positiveReplies = inbound.filter(m =>
-    ['interested_send_materials','interested_schedule_call','meeting_booked_confirmed'].includes(m.intent)
-  ).length;
-  const negativeReplies = inbound.filter(m =>
-    ['not_right_fit','remove_unsubscribe'].includes(m.intent)
-  ).length;
-  const tempCloses = inbound.filter(m =>
-    ['will_review_get_back','hold_period','out_of_office'].includes(m.intent)
-  ).length;
-
-  const { count: meetings } = await supabase.from('contacts')
-    .select('*', { count: 'exact', head: true })
-    .eq('deal_id', deal.id)
-    .eq('conversation_state', 'meeting_booked')
-    .gte('updated_at', weekStart.toISOString());
-
-  // Best response time
-  const replyHours = inbound.map(m => new Date(m.received_at || m.created_at).getHours());
-  const hourCounts = {};
-  replyHours.forEach(h => { hourCounts[h] = (hourCounts[h] || 0) + 1; });
-  const bestHour = Object.entries(hourCounts).sort(([,a],[,b]) => b - a)[0]?.[0];
-
-  const replyDays = inbound.map(m => new Date(m.received_at || m.created_at).getDay());
-  const dayCounts = {};
-  replyDays.forEach(d => { dayCounts[d] = (dayCounts[d] || 0) + 1; });
-  const bestDay = Object.entries(dayCounts).sort(([,a],[,b]) => b - a)[0]?.[0];
-
-  // Template performance
-  const templatePerf = {};
-  outbound.forEach(m => {
-    if (!m.template_name) return;
-    if (!templatePerf[m.template_name]) templatePerf[m.template_name] = { sent: 0, replies: 0 };
-    templatePerf[m.template_name].sent++;
-  });
-
-  const totalOutreach = emailsSent + liInvites + liDms;
-  const totalReplies  = emailReplies + liReplies;
-
+export function getAnalyticsWindow(reference = DateTime.now().setZone(ANALYTICS_TIMEZONE)) {
+  const end = reference.endOf('minute');
+  const start = end.minus({ days: 7 }).startOf('day');
   return {
-    emails_sent:          emailsSent,
-    linkedin_invites_sent: liInvites,
-    linkedin_dms_sent:    liDms,
-    total_outreach:       totalOutreach,
-    email_replies:        emailReplies,
-    linkedin_replies:     liReplies,
-    positive_responses:   positiveReplies,
-    negative_responses:   negativeReplies,
-    temp_closes:          tempCloses,
-    meetings_booked:      meetings || 0,
-    email_response_rate:  emailsSent > 0 ? emailReplies / emailsSent : 0,
-    linkedin_response_rate: (liInvites + liDms) > 0 ? liReplies / (liInvites + liDms) : 0,
-    overall_response_rate: totalOutreach > 0 ? totalReplies / totalOutreach : 0,
-    meeting_conversion_rate: totalReplies > 0 ? (meetings || 0) / totalReplies : 0,
-    best_response_hour:   bestHour != null ? parseInt(bestHour) : null,
-    best_response_day:    bestDay  != null ? parseInt(bestDay)  : null,
-    sector:               deal.sector,
-    deal_type:            deal.raise_type,
-    template_performance: templatePerf,
+    start,
+    end,
+    weekStarting: start.toISODate(),
+    timezone: ANALYTICS_TIMEZONE,
   };
 }
 
-async function generateRecommendations(analyticsData, weekStart) {
-  const dataStr = JSON.stringify(analyticsData, null, 2);
+function getDealAnalyticsTimezone(deal) {
+  return deal?.timezone || deal?.sending_timezone || ANALYTICS_TIMEZONE;
+}
 
-  const templateData = JSON.stringify(analyticsData.map(d => ({
-    deal: d.deal,
-    templates: d.template_performance || {},
+function safeIso(value) {
+  if (!value) return null;
+  if (DateTime.isDateTime(value)) return value.toUTC().toISO();
+  return DateTime.fromJSDate(new Date(value)).toUTC().toISO();
+}
+
+function sortByCountDesc(entries = []) {
+  return [...entries].sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+}
+
+function deriveBestValue(counts) {
+  return sortByCountDesc(Object.entries(counts))[0]?.[0] ?? null;
+}
+
+function parseClaudeJson(text) {
+  const cleaned = String(text || '').replace(/```json|```/g, '').trim();
+  const match = cleaned.match(/\[[\s\S]*\]/);
+  if (!match) return null;
+  return JSON.parse(match[0]);
+}
+
+function extractJSONObject(text) {
+  const cleaned = String(text || '').replace(/```json|```/g, '').trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  return match ? JSON.parse(match[0]) : null;
+}
+
+function normalizeWhitespace(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function sanitizeNarrationText(value) {
+  return normalizeWhitespace(value)
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\b(ACo|ACw|AE)[A-Za-z0-9_-]+\b/g, '')
+    .replace(/\bcannot_resend_yet\b/gi, 'temporary LinkedIn limit')
+    .replace(/\busers\/invite\b/gi, 'LinkedIn invite send')
+    .replace(/\bapi\/v1\/\S+\b/gi, 'API call')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function truncate(value, max = 200) {
+  const text = normalizeWhitespace(value);
+  if (!text) return '';
+  return text.length > max ? `${text.slice(0, max - 1)}...` : text;
+}
+
+function buildTimingRecommendation(analyticsData) {
+  const hourCounts = {};
+  const dayCounts = {};
+
+  analyticsData.forEach(row => {
+    if (row.best_response_hour != null) {
+      const key = String(row.best_response_hour);
+      hourCounts[key] = (hourCounts[key] || 0) + 1;
+    }
+    if (row.best_response_day != null) {
+      const key = String(row.best_response_day);
+      dayCounts[key] = (dayCounts[key] || 0) + 1;
+    }
+  });
+
+  const bestHour = deriveBestValue(hourCounts);
+  const bestDay = deriveBestValue(dayCounts);
+  if (bestHour == null && bestDay == null) return null;
+
+  const dayLabel = bestDay != null
+    ? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][Number(bestDay) - 1] || bestDay
+    : null;
+  const parts = [];
+  if (dayLabel) parts.push(dayLabel);
+  if (bestHour != null) parts.push(`${bestHour}:00`);
+
+  return {
+    category: 'timing',
+    title: 'Lean Into Best Window',
+    insight: `Replies cluster most often around ${parts.join(' at ') || 'the same repeat window'} in America/New_York time.`,
+    recommendation: `Bias new outreach toward ${parts.join(' at ') || 'that window'} and avoid spreading sends evenly across lower-response periods.`,
+    supporting_data: {
+      best_day: dayLabel,
+      best_hour: bestHour != null ? Number(bestHour) : null,
+    },
+    suggested_setting_change: bestHour != null
+      ? { key: 'preferred_outreach_hour_est', value: String(bestHour) }
+      : null,
+  };
+}
+
+function buildChannelRecommendation(analyticsData) {
+  const totals = analyticsData.reduce((acc, row) => {
+    acc.emailSent += Number(row.emails_sent || 0);
+    acc.emailReplies += Number(row.email_replies || 0);
+    acc.linkedinSent += Number(row.linkedin_invites_sent || 0) + Number(row.linkedin_dms_sent || 0);
+    acc.linkedinReplies += Number(row.linkedin_replies || 0);
+    return acc;
+  }, {
+    emailSent: 0,
+    emailReplies: 0,
+    linkedinSent: 0,
+    linkedinReplies: 0,
+  });
+
+  if (!totals.emailSent && !totals.linkedinSent) return null;
+
+  const emailRate = totals.emailSent ? totals.emailReplies / totals.emailSent : 0;
+  const linkedinRate = totals.linkedinSent ? totals.linkedinReplies / totals.linkedinSent : 0;
+  const winner = emailRate >= linkedinRate ? 'email' : 'LinkedIn';
+  const winnerRate = winner === 'email' ? emailRate : linkedinRate;
+  const loserRate = winner === 'email' ? linkedinRate : emailRate;
+
+  return {
+    category: 'channel',
+    title: 'Shift Toward Winning Channel',
+    insight: `${winner} is converting better this week (${(winnerRate * 100).toFixed(1)}% vs ${(loserRate * 100).toFixed(1)}%).`,
+    recommendation: `Prioritize ${winner} earlier in the sequence for similar deals until the weaker channel improves.`,
+    supporting_data: {
+      email_rate: Number(emailRate.toFixed(4)),
+      linkedin_rate: Number(linkedinRate.toFixed(4)),
+    },
+    suggested_setting_change: {
+      key: 'preferred_primary_channel',
+      value: winner === 'email' ? 'email' : 'linkedin',
+    },
+  };
+}
+
+function buildConversionRecommendation(analyticsData) {
+  const totals = analyticsData.reduce((acc, row) => {
+    acc.outreach += Number(row.total_outreach || 0);
+    acc.replies += Number(row.email_replies || 0) + Number(row.linkedin_replies || 0);
+    acc.meetings += Number(row.meetings_booked || 0);
+    acc.negative += Number(row.negative_responses || 0);
+    return acc;
+  }, {
+    outreach: 0,
+    replies: 0,
+    meetings: 0,
+    negative: 0,
+  });
+
+  if (!totals.outreach) return null;
+
+  const replyRate = totals.replies / totals.outreach;
+  const meetingRate = totals.replies ? totals.meetings / totals.replies : 0;
+  const negativeShare = totals.replies ? totals.negative / totals.replies : 0;
+
+  return {
+    category: negativeShare > 0.35 ? 'targeting' : 'sequence',
+    title: negativeShare > 0.35 ? 'Tighten Investor Targeting' : 'Improve Meeting Conversion',
+    insight: negativeShare > 0.35
+      ? `${(negativeShare * 100).toFixed(1)}% of replies are negative, which suggests the list quality is drifting.`
+      : `Reply rate is ${(replyRate * 100).toFixed(1)}%, but only ${(meetingRate * 100).toFixed(1)}% of replies become meetings.`,
+    recommendation: negativeShare > 0.35
+      ? 'Raise the investor quality bar and lean harder on firms already showing positive signals in this sector.'
+      : 'Tighten the follow-up CTA and move qualified respondents to call-booking faster while interest is warm.',
+    supporting_data: {
+      overall_reply_rate: Number(replyRate.toFixed(4)),
+      meeting_conversion_rate: Number(meetingRate.toFixed(4)),
+      negative_reply_share: Number(negativeShare.toFixed(4)),
+    },
+    suggested_setting_change: negativeShare > 0.35
+      ? { key: 'minimum_investor_score', value: '70' }
+      : null,
+  };
+}
+
+export function buildHeuristicRecommendations(analyticsData = []) {
+  return [
+    buildTimingRecommendation(analyticsData),
+    buildChannelRecommendation(analyticsData),
+    buildConversionRecommendation(analyticsData),
+  ].filter(Boolean).slice(0, 6);
+}
+
+async function fetchActiveDeals(supabase) {
+  const { data, error } = await supabase.from('deals').select('*').eq('status', 'ACTIVE');
+  if (error) throw error;
+  return data || [];
+}
+
+export async function computeDealSnapshot(deal, window = getAnalyticsWindow()) {
+  const supabase = getSupabase();
+  if (!supabase || !deal?.id) return null;
+
+  let query = supabase.from('conversation_messages')
+    .select('*')
+    .eq('deal_id', deal.id)
+    .gte('created_at', safeIso(window.start));
+
+  if (window.end) {
+    query = query.lte('created_at', safeIso(window.end));
+  }
+
+  const { data: messages, error: messageError } = await query;
+  if (messageError) throw messageError;
+
+  const outbound = (messages || []).filter(message => message.direction === 'outbound');
+  const inbound = (messages || []).filter(message => message.direction === 'inbound');
+
+  const emailsSent = outbound.filter(message => message.channel === 'email').length;
+  const liInvites = outbound.filter(message => message.channel === 'linkedin_invite').length;
+  const liDms = outbound.filter(message => message.channel === 'linkedin_dm').length;
+  const emailReplies = inbound.filter(message => message.channel === 'email').length;
+  const liReplies = inbound.filter(message => message.channel === 'linkedin_dm').length;
+
+  const positiveReplies = inbound.filter(message =>
+    ['interested_send_materials', 'interested_schedule_call', 'meeting_booked_confirmed'].includes(message.intent)
+  ).length;
+  const negativeReplies = inbound.filter(message =>
+    ['not_right_fit', 'remove_unsubscribe'].includes(message.intent)
+  ).length;
+  const tempCloses = inbound.filter(message =>
+    ['will_review_get_back', 'hold_period', 'out_of_office'].includes(message.intent)
+  ).length;
+
+  const meetingQuery = supabase.from('contacts')
+    .select('*', { count: 'exact', head: true })
+    .eq('deal_id', deal.id)
+    .eq('conversation_state', 'meeting_booked')
+    .gte('updated_at', safeIso(window.start));
+  const { count: meetings, error: meetingError } = await meetingQuery;
+  if (meetingError) throw meetingError;
+
+  const dealTz = getDealAnalyticsTimezone(deal);
+  const hourCounts = {};
+  const dayCounts = {};
+  for (const message of inbound) {
+    const timestamp = message.received_at || message.created_at;
+    if (!timestamp) continue;
+    const localized = DateTime.fromISO(timestamp, { zone: 'utc' }).setZone(dealTz);
+    if (!localized.isValid) continue;
+    hourCounts[localized.hour] = (hourCounts[localized.hour] || 0) + 1;
+    dayCounts[localized.weekday] = (dayCounts[localized.weekday] || 0) + 1;
+  }
+
+  const templatePerf = {};
+  for (const message of outbound) {
+    if (!message.template_name) continue;
+    if (!templatePerf[message.template_name]) {
+      templatePerf[message.template_name] = { sent: 0, replies: 0 };
+    }
+    templatePerf[message.template_name].sent += 1;
+  }
+
+  const totalOutreach = emailsSent + liInvites + liDms;
+  const totalReplies = emailReplies + liReplies;
+  const bestHour = deriveBestValue(hourCounts);
+  const bestDay = deriveBestValue(dayCounts);
+
+  return {
+    deal_id: deal.id,
+    deal_name: deal.name,
+    timezone: dealTz,
+    week_starting: window.weekStarting,
+    emails_sent: emailsSent,
+    linkedin_invites_sent: liInvites,
+    linkedin_dms_sent: liDms,
+    total_outreach: totalOutreach,
+    email_replies: emailReplies,
+    linkedin_replies: liReplies,
+    positive_responses: positiveReplies,
+    negative_responses: negativeReplies,
+    temp_closes: tempCloses,
+    meetings_booked: meetings || 0,
+    email_response_rate: emailsSent > 0 ? emailReplies / emailsSent : 0,
+    linkedin_response_rate: (liInvites + liDms) > 0 ? liReplies / (liInvites + liDms) : 0,
+    overall_response_rate: totalOutreach > 0 ? totalReplies / totalOutreach : 0,
+    meeting_conversion_rate: totalReplies > 0 ? (meetings || 0) / totalReplies : 0,
+    best_response_hour: bestHour != null ? Number(bestHour) : null,
+    best_response_day: bestDay != null ? Number(bestDay) : null,
+    sector: deal.sector || null,
+    deal_type: deal.raise_type || null,
+    template_performance: templatePerf,
+    source: 'live',
+  };
+}
+
+export async function getLiveAnalyticsSummary(options = {}) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+
+  const window = options.window || getAnalyticsWindow();
+  const deals = options.deals || await fetchActiveDeals(supabase);
+  const rows = [];
+
+  for (const deal of deals) {
+    try {
+      const snapshot = await computeDealSnapshot(deal, window);
+      if (snapshot && snapshot.total_outreach > 0) rows.push(snapshot);
+    } catch (err) {
+      console.warn(`[ANALYTICS] Live summary failed for ${deal?.name || deal?.id || 'deal'}:`, err.message);
+    }
+  }
+
+  return rows.sort((a, b) => Number(b.total_outreach || 0) - Number(a.total_outreach || 0));
+}
+
+function toPersistedAnalyticsRow(snapshot) {
+  return {
+    deal_id: snapshot.deal_id,
+    week_starting: snapshot.week_starting,
+    emails_sent: snapshot.emails_sent,
+    linkedin_invites_sent: snapshot.linkedin_invites_sent,
+    linkedin_dms_sent: snapshot.linkedin_dms_sent,
+    total_outreach: snapshot.total_outreach,
+    email_replies: snapshot.email_replies,
+    linkedin_replies: snapshot.linkedin_replies,
+    positive_responses: snapshot.positive_responses,
+    negative_responses: snapshot.negative_responses,
+    temp_closes: snapshot.temp_closes,
+    meetings_booked: snapshot.meetings_booked,
+    email_response_rate: snapshot.email_response_rate,
+    linkedin_response_rate: snapshot.linkedin_response_rate,
+    overall_response_rate: snapshot.overall_response_rate,
+    meeting_conversion_rate: snapshot.meeting_conversion_rate,
+    best_response_hour: snapshot.best_response_hour,
+    best_response_day: snapshot.best_response_day,
+    sector: snapshot.sector,
+    deal_type: snapshot.deal_type,
+    timezone: snapshot.timezone,
+    template_performance: snapshot.template_performance,
+  };
+}
+
+async function requestAiRecommendations(analyticsData) {
+  if (!anthropic) return null;
+
+  const dataStr = JSON.stringify(analyticsData, null, 2);
+  const templateData = JSON.stringify(analyticsData.map(row => ({
+    deal: row.deal_name || row.deal || 'Unknown deal',
+    templates: row.template_performance || {},
   })), null, 2);
 
   const prompt = `You are analysing outreach performance data for ROCO, an autonomous fundraising agent.
@@ -173,44 +408,183 @@ Use null for suggested_setting_change if no direct setting maps to this recommen
     messages: [{ role: 'user', content: prompt }],
   });
 
-  const text = response.content[0]?.text || '';
-  const match = text.replace(/```json|```/g, '').trim().match(/\[[\s\S]*\]/);
-  if (!match) {
-    console.warn('[ANALYTICS] Could not parse recommendations from Claude response');
-    return;
+  return parseClaudeJson(response.content?.[0]?.text || '');
+}
+
+async function persistRecommendations(supabase, recommendations, weekStarting, dealsAnalysed) {
+  try {
+    await supabase.from('roco_recommendations')
+      .delete()
+      .eq('week_starting', weekStarting)
+      .eq('status', 'pending');
+  } catch (err) {
+    console.warn('[ANALYTICS] Could not clear stale pending recommendations:', err.message);
   }
 
-  const recs = JSON.parse(match[0]);
-  const weekStr = weekStart.toISOString().split('T')[0];
+  let persisted = 0;
+  for (const recommendation of recommendations) {
+    try {
+      const { error } = await supabase.from('roco_recommendations').insert({
+        category: recommendation.category,
+        title: recommendation.title,
+        insight: recommendation.insight,
+        recommendation: recommendation.recommendation,
+        supporting_data: recommendation.supporting_data || {},
+        suggested_setting_change: recommendation.suggested_setting_change || null,
+        week_starting: weekStarting,
+        deals_analysed: dealsAnalysed,
+        status: 'pending',
+      });
+      if (!error) persisted += 1;
+      else console.warn('[ANALYTICS] Recommendation insert failed:', error.message);
+    } catch (err) {
+      console.warn('[ANALYTICS] Recommendation insert failed:', err.message);
+    }
+  }
+
+  return persisted;
+}
+
+async function generateRecommendations(analyticsData, weekStarting) {
+  let recommendations = null;
+
+  try {
+    recommendations = await requestAiRecommendations(analyticsData);
+  } catch (err) {
+    console.warn('[ANALYTICS] AI recommendation generation failed:', err.message);
+  }
+
+  if (!Array.isArray(recommendations) || !recommendations.length) {
+    recommendations = buildHeuristicRecommendations(analyticsData);
+  }
+
+  if (!recommendations.length) {
+    return {
+      count: 0,
+      recommendations: [],
+      persisted: 0,
+    };
+  }
+
   const supabase = getSupabase();
+  const persisted = supabase
+    ? await persistRecommendations(supabase, recommendations, weekStarting, analyticsData.length)
+    : 0;
 
-  for (const rec of recs) {
-    await supabase.from('roco_recommendations').insert({
-      category:               rec.category,
-      title:                  rec.title,
-      insight:                rec.insight,
-      recommendation:         rec.recommendation,
-      supporting_data:        rec.supporting_data || {},
-      suggested_setting_change: rec.suggested_setting_change || null,
-      week_starting:          weekStr,
-      deals_analysed:         analyticsData.length,
-    });
+  return {
+    count: recommendations.length,
+    recommendations,
+    persisted,
+  };
+}
+
+export async function getAnalyticsRecommendationsPreview(options = {}) {
+  const rows = options.analyticsData?.length
+    ? options.analyticsData
+    : await getLiveAnalyticsSummary(options);
+  return buildHeuristicRecommendations(rows).map((recommendation, index) => ({
+    ...recommendation,
+    id: `preview-${index + 1}`,
+    status: 'preview',
+    is_preview: true,
+  }));
+}
+
+export async function runWeeklyAnalytics(options = {}) {
+  const trigger = options.trigger || 'manual';
+  const supabase = getSupabase();
+  if (!supabase) return { ran: false, reason: 'no_supabase' };
+
+  const window = options.window || getAnalyticsWindow();
+  console.log(`[ANALYTICS] Running weekly analysis (${trigger}) for ${window.weekStarting} (${window.timezone})...`);
+
+  const deals = await fetchActiveDeals(supabase);
+  if (!deals.length) return { ran: false, reason: 'no_active_deals' };
+
+  const analyticsData = [];
+  let analyticsPersisted = 0;
+
+  for (const deal of deals) {
+    try {
+      const snapshot = await computeDealSnapshot(deal, window);
+      if (!snapshot || snapshot.total_outreach === 0) continue;
+
+      analyticsData.push(snapshot);
+
+      try {
+        const { error } = await supabase.from('deal_analytics').upsert(
+          toPersistedAnalyticsRow(snapshot),
+          { onConflict: 'deal_id,week_starting' }
+        );
+        if (error) console.warn(`[ANALYTICS] Summary upsert failed for ${deal.name}:`, error.message);
+        else analyticsPersisted += 1;
+      } catch (err) {
+        console.warn(`[ANALYTICS] Summary upsert failed for ${deal.name}:`, err.message);
+      }
+    } catch (err) {
+      console.warn(`[ANALYTICS] Snapshot failed for ${deal.name}:`, err.message);
+    }
   }
 
-  console.log(`[ANALYTICS] Generated ${recs.length} recommendations`);
+  if (!analyticsData.length) {
+    console.log('[ANALYTICS] No outreach activity in the last 7 days — skipping recommendations');
+    return {
+      ran: true,
+      analyticsCount: 0,
+      analyticsPersisted,
+      recommendationsGenerated: 0,
+      recommendationsPersisted: 0,
+      weekStarting: window.weekStarting,
+    };
+  }
+
+  const recommendationResult = await generateRecommendations(analyticsData, window.weekStarting);
+  const hasDashboardData = analyticsPersisted > 0 && recommendationResult.persisted > 0;
+
+  if (hasDashboardData) {
+    try {
+      const { pushActivity } = await import('../dashboard/server.js');
+      pushActivity({
+        type: 'system',
+        action: trigger === 'manual' ? 'Analytics complete' : 'Weekly analytics complete',
+        note: `Recommendations generated for ${analyticsData.length} active deal${analyticsData.length !== 1 ? 's' : ''} — check the Analytics tab`,
+      });
+    } catch {}
+
+    try {
+      const { sendTelegram } = await import('../approval/telegramBot.js');
+      const dealNames = analyticsData.map(row => row.deal_name).join(', ');
+      await sendTelegram(
+        `📊 *${trigger === 'manual' ? 'Analytics Complete' : 'Weekly Analytics Complete'}*\n\nNew recommendations generated for: ${dealNames}\n\nCheck the Analytics tab in the dashboard to review and apply them.`
+      );
+    } catch {}
+  } else {
+    console.warn('[ANALYTICS] Skipping external completion notification because analytics data was not fully persisted');
+  }
+
+  console.log(`[ANALYTICS] Weekly analysis complete (${trigger})`);
+  return {
+    ran: true,
+    analyticsCount: analyticsData.length,
+    analyticsPersisted,
+    recommendationsGenerated: recommendationResult.count,
+    recommendationsPersisted: recommendationResult.persisted,
+    weekStarting: window.weekStarting,
+    hasDashboardData,
+  };
 }
 
 export async function applyRecommendation(recommendationId) {
   const supabase = getSupabase();
   if (!supabase) return;
 
-  const { data: rec } = await supabase.from('roco_recommendations')
+  const { data: recommendation } = await supabase.from('roco_recommendations')
     .select('*').eq('id', recommendationId).single();
 
-  if (!rec || rec.status !== 'pending') return;
+  if (!recommendation || recommendation.status !== 'pending') return;
 
-  if (rec.suggested_setting_change) {
-    const { key, value } = rec.suggested_setting_change;
+  if (recommendation.suggested_setting_change) {
+    const { key, value } = recommendation.suggested_setting_change;
     await supabase.from('roco_learned_settings').upsert({
       key,
       value: String(value),
@@ -218,7 +592,6 @@ export async function applyRecommendation(recommendationId) {
       applied_at: new Date().toISOString(),
     }, { onConflict: 'key' });
 
-    // Invalidate agent context cache if available
     try {
       const { invalidateCache } = await import('./agentContext.js');
       invalidateCache();
@@ -230,5 +603,533 @@ export async function applyRecommendation(recommendationId) {
     applied_at: new Date().toISOString(),
   }).eq('id', recommendationId);
 
-  console.log(`[ANALYTICS] Applied recommendation: ${rec.title}`);
+  console.log(`[ANALYTICS] Applied recommendation: ${recommendation.title}`);
+
+  try {
+    const { pushActivity } = await import('../dashboard/server.js');
+    pushActivity({
+      type: 'system',
+      action: `Recommendation applied: ${recommendation.title}`,
+      note: recommendation.recommendation || '',
+    });
+  } catch {}
+}
+
+export function getDailyActivityWindow(reference = DateTime.now().setZone(ANALYTICS_TIMEZONE)) {
+  const end = reference.endOf('minute');
+  const start = reference.startOf('day');
+  return {
+    start,
+    end,
+    reportDate: reference.toISODate(),
+    timezone: ANALYTICS_TIMEZONE,
+  };
+}
+
+async function fetchDailyActivityEntries(window) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+
+  const { data, error } = await supabase.from('activity_log')
+    .select('*')
+    .gte('created_at', safeIso(window.start))
+    .lte('created_at', safeIso(window.end))
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchDealsForDailyLog(referenceDeals = [], activityEntries = []) {
+  const supabase = getSupabase();
+  const mapped = new Map((referenceDeals || []).filter(Boolean).map(deal => [String(deal.id), deal]));
+  const activityDealIds = [...new Set((activityEntries || []).map(entry => entry.deal_id).filter(Boolean).map(String))];
+  const missingIds = activityDealIds.filter(id => !mapped.has(id));
+
+  if (!supabase || !missingIds.length) return [...mapped.values()];
+
+  const { data } = await supabase.from('deals').select('*').in('id', missingIds);
+  for (const deal of data || []) mapped.set(String(deal.id), deal);
+  return [...mapped.values()];
+}
+
+function summarizeDailyActionCounts(entries = []) {
+  return entries.reduce((acc, entry) => {
+    const key = String(entry.type || entry.event_type || 'system').toLowerCase();
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+}
+
+async function buildDailyDealSnapshots(deals = [], activityEntries = []) {
+  const activityByDeal = new Map();
+  for (const entry of activityEntries) {
+    const dealId = entry.deal_id ? String(entry.deal_id) : null;
+    if (!dealId) continue;
+    if (!activityByDeal.has(dealId)) activityByDeal.set(dealId, []);
+    activityByDeal.get(dealId).push(entry);
+  }
+
+  const snapshots = [];
+  for (const deal of deals) {
+    if (!deal?.id) continue;
+    const metrics = await gatherCurrentMetrics(deal.id).catch(() => ({}));
+    const goal = calculateGoalTracking(deal, metrics);
+    const entries = activityByDeal.get(String(deal.id)) || [];
+    const highlights = entries
+      .slice(0, 8)
+      .map(entry => normalizeWhitespace(entry.action || entry.summary || entry.note || ''))
+      .filter(Boolean);
+    const launchContext = describeLaunchWindow(deal, metrics);
+
+    snapshots.push({
+      deal_id: deal.id,
+      deal_name: deal.name,
+      goal_status: goal.status,
+      goal,
+      metrics,
+      launch_context: launchContext,
+      reporting_status: deriveReportingProgressStatus({ goal_status: goal.status, metrics, goal, launch_context: launchContext }),
+      highlights,
+      next_move: sanitizeNarrationText(
+        goal.status === 'CRITICAL'
+          ? `increase outbound volume and unlock the next best contacts for ${deal.name}`
+          : goal.status === 'BEHIND'
+            ? `push the highest-conviction investors and convert activity into live conversations for ${deal.name}`
+            : highlights[0] || `keep ${deal.name} moving toward the ${goal.target_equity} million target`
+      ),
+      activity_count: entries.length,
+    });
+  }
+
+  return snapshots;
+}
+
+function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previousReport = null) {
+  const actionCounts = summarizeDailyActionCounts(activityEntries);
+  const globalMetrics = buildDailyGlobalMetrics(dealSnapshots, activityEntries);
+  const headline = `Daily operating log for ${DateTime.fromISO(`${window.reportDate}T12:00:00`, { zone: ANALYTICS_TIMEZONE }).toFormat('d LLL yyyy')}`;
+  const dealSections = dealSnapshots.map(snapshot => ({
+    deal_name: snapshot.deal_name,
+    progress_status: snapshot.reporting_status || snapshot.goal_status,
+    summary: sanitizeNarrationText(
+      `${snapshot.deal_name} is ${snapshot.reporting_status || snapshot.goal_status}. `
+      + `I sent ${snapshot.metrics.li_invites_today || 0} LinkedIn invites, ${snapshot.metrics.emails_sent_today || 0} emails, and ${snapshot.metrics.dms_sent_today || 0} LinkedIn DMs today. `
+      + `${snapshot.launch_context?.days_since_launch ? `This is day ${snapshot.launch_context.days_since_launch} since launch. ` : ''}`
+      + `I now have ${snapshot.metrics.firms_in_pipeline || 0} firms active in the pipeline${snapshot.launch_context?.pending_connections ? ` and ${snapshot.launch_context.pending_connections} LinkedIn requests still pending` : ''}.`
+    ),
+    key_actions: [
+      `${snapshot.metrics.li_invites_today || 0} LinkedIn invites sent`,
+      `${snapshot.metrics.emails_sent_today || 0} emails sent`,
+      `${snapshot.metrics.dms_sent_today || 0} LinkedIn DMs sent`,
+      `${snapshot.metrics.firms_in_pipeline || 0} firms currently in pipeline`,
+    ].map(sanitizeNarrationText).filter(Boolean),
+    target_status: buildDealStatusLine(snapshot),
+    next_move: snapshot.next_move,
+  }));
+  const previousContext = buildPreviousReportContext(previousReport);
+  const executiveSummary = dealSections.length
+    ? sanitizeNarrationText(
+        `I sent ${globalMetrics.linkedin_invites} LinkedIn invites, ${globalMetrics.emails_sent} emails, and ${globalMetrics.linkedin_dms} LinkedIn DMs across ${dealSections.length} active deals today. `
+        + `I logged ${globalMetrics.enrichment_actions} enrichment actions, kept ${globalMetrics.firms_in_pipeline} firms active in the pipeline, and have ${globalMetrics.meetings_booked} meetings booked so far. `
+        + `${previousContext ? `Compared with ${previousContext.report_date}, today I built on the prior log and kept the active work moving forward. ` : ''}`
+        + `Tomorrow I need to keep the approved outreach moving and convert the strongest active conversations into replies.`
+      )
+    : 'No active deal work was logged today.';
+
+  return {
+    headline,
+    executive_summary: executiveSummary,
+    telegram_caption: `Daily log ready · ${activityEntries.length} activity events · ${dealSections.length} deal${dealSections.length === 1 ? '' : 's'} covered`,
+    voice_script: sanitizeNarrationText(`Hey Dom, here is what I got through today. ${executiveSummary} ${dealSections.map(section => `${section.deal_name}: ${section.summary} Next I will focus on ${section.next_move}.`).join(' ')}`).slice(0, 1100),
+    deal_sections: dealSections,
+    raw_context: {
+      action_counts: actionCounts,
+      activity_count: activityEntries.length,
+      global_metrics: globalMetrics,
+    },
+  };
+}
+
+function buildDailyGlobalMetrics(dealSnapshots = [], activityEntries = []) {
+  const totals = dealSnapshots.reduce((acc, snapshot) => {
+    const metrics = snapshot.metrics || {};
+    acc.linkedin_invites += Number(metrics.li_invites_today || 0);
+    acc.emails_sent += Number(metrics.emails_sent_today || 0);
+    acc.linkedin_dms += Number(metrics.dms_sent_today || 0);
+    acc.total_replies += Number(metrics.total_replies || 0);
+    acc.positive_replies += Number(metrics.positive_replies || 0);
+    acc.meetings_booked += Number(metrics.meetings_booked || 0);
+    acc.firms_in_pipeline += Number(metrics.firms_in_pipeline || 0);
+    return acc;
+  }, {
+    linkedin_invites: 0,
+    emails_sent: 0,
+    linkedin_dms: 0,
+    total_replies: 0,
+    positive_replies: 0,
+    meetings_booked: 0,
+    firms_in_pipeline: 0,
+  });
+
+  const activityCounts = summarizeDailyActionCounts(activityEntries);
+  totals.enrichment_actions = Number(activityCounts.enrichment || 0);
+  totals.invite_failures = (activityEntries || []).filter(entry => String(entry.event_type || '').includes('LINKEDIN_INVITE_FAILED')).length;
+  totals.missing_linkedin = (activityEntries || []).filter(entry => String(entry.event_type || '').includes('LINKEDIN_INVITE_SKIPPED_NO_PROFILE')).length;
+  return totals;
+}
+
+function sanitizeDailyReport(aiReport = {}) {
+  const dealSections = Array.isArray(aiReport.deal_sections) ? aiReport.deal_sections : [];
+  return {
+    ...aiReport,
+    headline: sanitizeNarrationText(aiReport.headline || ''),
+    executive_summary: sanitizeNarrationText(aiReport.executive_summary || ''),
+    telegram_caption: sanitizeNarrationText(aiReport.telegram_caption || ''),
+    voice_script: sanitizeNarrationText(aiReport.voice_script || '').slice(0, 1150),
+    deal_sections: dealSections.map(section => ({
+      ...section,
+      deal_name: sanitizeNarrationText(section.deal_name || ''),
+      progress_status: sanitizeNarrationText(section.progress_status || ''),
+      summary: sanitizeNarrationText(section.summary || ''),
+      key_actions: Array.isArray(section.key_actions) ? section.key_actions.map(item => sanitizeNarrationText(item)).filter(Boolean).slice(0, 4) : [],
+      target_status: sanitizeNarrationText(section.target_status || ''),
+      next_move: sanitizeNarrationText(section.next_move || ''),
+    })),
+  };
+}
+
+function describeLaunchWindow(deal, metrics = {}) {
+  const timezone = getDealAnalyticsTimezone(deal);
+  const createdAt = deal?.created_at ? DateTime.fromISO(deal.created_at, { zone: 'utc' }) : null;
+  const launchDate = createdAt?.isValid ? createdAt.setZone(timezone) : null;
+  const daysSinceLaunch = launchDate
+    ? Math.max(1, Math.ceil(DateTime.now().setZone(timezone).diff(launchDate, 'days').days))
+    : null;
+  const todayTouches = Number(metrics.li_invites_today || 0) + Number(metrics.emails_sent_today || 0) + Number(metrics.dms_sent_today || 0);
+  const activePipeline = Number(metrics.firms_in_pipeline || 0);
+  const pendingConnections = Number(metrics.li_pending || 0);
+  const totalReplies = Number(metrics.total_replies || 0);
+  const earlyOutreach = daysSinceLaunch != null && daysSinceLaunch <= 3;
+  const activeBuildout = earlyOutreach && (todayTouches > 0 || activePipeline > 0 || pendingConnections > 0);
+
+  return {
+    launch_date: launchDate?.toISODate() || null,
+    launch_label: launchDate?.toFormat('d LLL yyyy') || null,
+    days_since_launch: daysSinceLaunch,
+    early_outreach: earlyOutreach,
+    active_buildout: activeBuildout,
+    today_touches: todayTouches,
+    total_replies: totalReplies,
+    pending_connections: pendingConnections,
+    active_pipeline: activePipeline,
+  };
+}
+
+function deriveReportingProgressStatus(snapshot) {
+  const rawStatus = String(snapshot?.goal_status || '').toUpperCase();
+  const launch = snapshot?.launch_context || {};
+
+  if (launch.active_buildout && Number(launch.total_replies || 0) === 0) {
+    return 'ON TRACK - EARLY OUTREACH';
+  }
+  if (rawStatus.includes('ON TARGET') || rawStatus.includes('ON TRACK')) return 'ON TRACK';
+  if (rawStatus.includes('BEHIND')) return 'BEHIND';
+  if (rawStatus.includes('CRITICAL')) return 'CRITICAL';
+  if (rawStatus.includes('DEADLINE PASSED')) return 'DEADLINE PASSED';
+  return sanitizeNarrationText(snapshot?.goal_status || 'IN PROGRESS');
+}
+
+function buildDealStatusLine(snapshot) {
+  const launch = snapshot?.launch_context || {};
+  const dayLabel = launch.days_since_launch ? `Day ${launch.days_since_launch} since launch` : null;
+  const meetings = `${snapshot?.metrics?.meetings_booked || 0}/${snapshot?.goal?.meetings_needed || 0} meetings`;
+  const pipeline = `${snapshot?.metrics?.firms_in_pipeline || 0} firms active`;
+  return [dayLabel, meetings, pipeline].filter(Boolean).join(' | ');
+}
+
+async function fetchPreviousDailyActivityReport(reportDate) {
+  const supabase = getSupabase();
+  if (!supabase || !reportDate) return null;
+  const { data, error } = await supabase.from('daily_activity_reports')
+    .select('*')
+    .lt('report_date', reportDate)
+    .order('report_date', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+function buildPreviousReportContext(previousReport) {
+  if (!previousReport) return null;
+  return {
+    report_date: previousReport.report_date || null,
+    headline: sanitizeNarrationText(previousReport.headline || ''),
+    executive_summary: sanitizeNarrationText(previousReport.executive_summary || ''),
+    deal_sections: Array.isArray(previousReport.deal_sections)
+      ? previousReport.deal_sections.slice(0, 8).map(section => ({
+          deal_name: sanitizeNarrationText(section.deal_name || ''),
+          progress_status: sanitizeNarrationText(section.progress_status || ''),
+          summary: sanitizeNarrationText(section.summary || ''),
+          target_status: sanitizeNarrationText(section.target_status || ''),
+          next_move: sanitizeNarrationText(section.next_move || ''),
+        }))
+      : [],
+  };
+}
+
+async function buildAiDailyReport(window, activityEntries, dealSnapshots, previousReport = null) {
+  if (!anthropic) throw new Error('Anthropic unavailable');
+  const globalMetrics = buildDailyGlobalMetrics(dealSnapshots, activityEntries);
+  const previousContext = buildPreviousReportContext(previousReport);
+  const prompt = `You are writing ROCO's end-of-day operating log for Dom.
+
+DATE
+${window.reportDate} (${window.timezone})
+
+PREVIOUS DAILY LOG
+${previousContext ? JSON.stringify(previousContext, null, 2) : 'None. This is the first available daily log in context.'}
+
+ACTIVITY COUNTS
+${JSON.stringify(summarizeDailyActionCounts(activityEntries), null, 2)}
+
+DEAL SNAPSHOTS
+${JSON.stringify(dealSnapshots, null, 2)}
+
+GLOBAL METRICS FOR THE DAY
+${JSON.stringify(globalMetrics, null, 2)}
+
+RECENT ACTIVITY ENTRIES
+${JSON.stringify(activityEntries.slice(0, 80).map(entry => ({
+    deal_id: entry.deal_id || null,
+    type: entry.type || entry.event_type || 'system',
+    action: sanitizeNarrationText(entry.action || entry.summary || ''),
+    note: sanitizeNarrationText(truncate(entry.note || entry.detail || entry.summary || '', 180)),
+    created_at: entry.created_at || null,
+  })), null, 2)}
+
+TASK
+Write a concise, conversational end-of-day update for Dom.
+Speak like an operator giving a clean verbal debrief, not like a log parser.
+Write entirely in first person singular. Use "I" and "my". Never say "Roco", "ROCO", or "the agent" when describing today's work.
+Be specific about what I actually did today: LinkedIn invites sent, emails sent, DMs sent, enrichment progress, pipeline depth by deal, replies, meetings, and whether each deal is on track.
+Every deal snapshot includes launch timing. Use it. If a deal launched only 1-3 days ago and outreach has only just started, do not frame zero meetings or zero replies as failure by itself. Pending LinkedIn requests, first emails going out, and pipeline build are signs of normal early momentum.
+Only call a deal behind or critical if the operating facts support that judgment beyond normal early outreach lag.
+Compare today against the previous daily log when one exists. Reference what changed since yesterday in natural language.
+State what matters tomorrow: the next focus, the blocker, and what action will help the deal catch up if it is behind.
+Never include URLs, provider IDs, LinkedIn slugs, raw API paths, or literal raw error payloads.
+Never read out contact profile links or opaque IDs.
+Do not enumerate long lists of contact names or firms. Use at most two concrete examples total, and only if they materially help the summary.
+Keep the voice script natural and short enough for a 60-90 second voice note.
+
+Return ONLY valid JSON:
+{
+  "headline": "short title",
+  "executive_summary": "2-4 sentences",
+  "telegram_caption": "1 sentence",
+  "voice_script": "spoken script under 1200 characters",
+  "deal_sections": [
+    {
+      "deal_name": "Project name",
+      "progress_status": "ON TRACK / BEHIND / CRITICAL",
+      "summary": "2-3 sentence summary",
+      "key_actions": ["...", "..."],
+      "target_status": "short target line",
+      "next_move": "next best action"
+    }
+  ]
+}`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1600,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const parsed = extractJSONObject(response.content?.[0]?.text || '');
+  if (!parsed) throw new Error('Daily activity report JSON parse failed');
+  return sanitizeDailyReport(parsed);
+}
+
+export async function buildDailyActivityReport({ deals = [], reference = DateTime.now().setZone(ANALYTICS_TIMEZONE) } = {}) {
+  const window = getDailyActivityWindow(reference);
+  const activityEntries = await fetchDailyActivityEntries(window);
+  const reportDeals = await fetchDealsForDailyLog(deals, activityEntries);
+  const dealSnapshots = await buildDailyDealSnapshots(reportDeals, activityEntries);
+  const previousReport = await fetchPreviousDailyActivityReport(window.reportDate).catch(() => null);
+
+  let aiReport = null;
+  try {
+    aiReport = await buildAiDailyReport(window, activityEntries, dealSnapshots, previousReport);
+  } catch {
+    aiReport = buildFallbackDailyReport(window, activityEntries, dealSnapshots, previousReport);
+  }
+  aiReport = sanitizeDailyReport(aiReport);
+
+  return {
+    report_date: window.reportDate,
+    timezone: window.timezone,
+    headline: aiReport.headline || `Daily operating log · ${window.reportDate}`,
+    executive_summary: aiReport.executive_summary || null,
+    voice_script: aiReport.voice_script || null,
+    telegram_caption: aiReport.telegram_caption || null,
+    deal_sections: Array.isArray(aiReport.deal_sections) ? aiReport.deal_sections : [],
+    raw_payload: {
+      ai_report: aiReport,
+      deal_snapshots: dealSnapshots,
+      action_counts: summarizeDailyActionCounts(activityEntries),
+      previous_report: buildPreviousReportContext(previousReport),
+    },
+    activity_count: activityEntries.length,
+    deals_covered: dealSnapshots.length,
+    status: 'generated',
+  };
+}
+
+export async function persistDailyActivityReport(report) {
+  const supabase = getSupabase();
+  if (!supabase || !report?.report_date) return null;
+
+  const row = {
+    report_date: report.report_date,
+    timezone: report.timezone || ANALYTICS_TIMEZONE,
+    headline: report.headline || null,
+    executive_summary: report.executive_summary || null,
+    voice_script: report.voice_script || null,
+    telegram_caption: report.telegram_caption || null,
+    deal_sections: report.deal_sections || [],
+    raw_payload: report.raw_payload || {},
+    activity_count: Number(report.activity_count || 0),
+    deals_covered: Number(report.deals_covered || 0),
+    status: report.status || 'generated',
+    voice_name: report.voice_name || null,
+    sent_to_telegram_at: report.sent_to_telegram_at || null,
+    voice_note_sent_at: report.voice_note_sent_at || null,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await supabase.from('daily_activity_reports')
+    .upsert(row, { onConflict: 'report_date' })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function listDailyActivityReports(limit = 90) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data, error } = await supabase.from('daily_activity_reports')
+    .select('*')
+    .order('report_date', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchElevenLabsVoices() {
+  if (!ELEVENLABS_API_KEY) return [];
+  const response = await fetch(`${ELEVENLABS_BASE_URL}/voices`, {
+    headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+  });
+  if (!response.ok) {
+    const err = await response.text().catch(() => '');
+    throw new Error(`ElevenLabs voices failed: ${response.status} ${truncate(err, 120)}`);
+  }
+  const data = await response.json();
+  return data.voices || [];
+}
+
+function choosePreferredElevenLabsVoice(voices = []) {
+  const preferredNames = ['darian', 'roger', 'adam'];
+  const ranked = [...voices].sort((left, right) => {
+    const score = voice => {
+      const name = String(voice?.name || '').toLowerCase();
+      const labels = voice?.labels || {};
+      let total = 0;
+      if (String(labels.gender || '').toLowerCase() === 'male') total += 50;
+      if (String(labels.category || '').toLowerCase().includes('default')) total += 15;
+      if (String(labels.accent || '').toLowerCase().includes('american')) total += 10;
+      preferredNames.forEach((preferred, index) => {
+        if (name.includes(preferred)) total += 30 - (index * 5);
+      });
+      return total;
+    };
+    return score(right) - score(left);
+  });
+  return ranked[0] || null;
+}
+
+async function synthesizeElevenLabsVoice(voiceId, text) {
+  const response = await fetch(`${ELEVENLABS_BASE_URL}/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+    method: 'POST',
+    headers: {
+      'xi-api-key': ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model_id: ELEVENLABS_MODEL_ID,
+      text: normalizeWhitespace(text).slice(0, 1150),
+      voice_settings: {
+        stability: 0.45,
+        similarity_boost: 0.8,
+        style: 0.15,
+        use_speaker_boost: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text().catch(() => '');
+    throw new Error(`ElevenLabs TTS failed: ${response.status} ${truncate(err, 120)}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const filePath = path.join(os.tmpdir(), `roco-daily-log-${Date.now()}.mp3`);
+  fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+export async function renderDailyVoiceNoteFromText(text) {
+  if (!ELEVENLABS_API_KEY || !normalizeWhitespace(text)) return null;
+
+  const attempts = [];
+
+  if (ELEVENLABS_DEFAULT_VOICE_ID) {
+    attempts.push({
+      voiceId: ELEVENLABS_DEFAULT_VOICE_ID,
+      voiceName: process.env.ELEVENLABS_VOICE_NAME || 'Configured voice',
+    });
+  }
+
+  try {
+    const voices = await fetchElevenLabsVoices();
+    const preferred = choosePreferredElevenLabsVoice(voices);
+    if (preferred?.voice_id && !attempts.some(voice => voice.voiceId === preferred.voice_id)) {
+      attempts.unshift({
+        voiceId: preferred.voice_id,
+        voiceName: preferred.name || null,
+      });
+    }
+  } catch (err) {
+    // Free-tier API access does not expose the voice library; fall back to configured/default voice IDs.
+    if (!attempts.length) {
+      throw new Error(`ElevenLabs voice lookup failed and no fallback voice ID is configured: ${err.message}`);
+    }
+  }
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const filePath = await synthesizeElevenLabsVoice(attempt.voiceId, text);
+      return {
+        filePath,
+        voiceName: attempt.voiceName || null,
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('ElevenLabs TTS failed with all configured voice attempts');
 }

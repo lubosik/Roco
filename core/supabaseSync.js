@@ -109,6 +109,13 @@ Dom`,
 // ─────────────────────────────────────────────
 
 export async function loadSessionState() {
+  let localState = null;
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      localState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    }
+  } catch {}
+
   const sb = getSupabase();
   if (sb) {
     try {
@@ -118,8 +125,11 @@ export async function loadSessionState() {
         .eq('id', 'singleton')
         .single();
       if (!error && data) {
-        // Cache locally
-        const mapped = mapSessionFromSupabase(data);
+        // Preserve any local-only keys that are not yet modeled in Supabase.
+        const mapped = {
+          ...(localState || {}),
+          ...mapSessionFromSupabase(data),
+        };
         fs.writeFileSync(STATE_FILE, JSON.stringify(mapped, null, 2));
         return mapped;
       }
@@ -129,11 +139,7 @@ export async function loadSessionState() {
   }
 
   // Fall back to local state.json
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    }
-  } catch {}
+  if (localState) return localState;
 
   return getDefaultState();
 }
@@ -196,6 +202,43 @@ function getDefaultState() {
   };
 }
 
+function normalizeDealRecord(deal) {
+  if (!deal) return deal;
+  const parsedDealInfo = (
+    deal.parsed_deal_info && typeof deal.parsed_deal_info === 'object'
+      ? deal.parsed_deal_info
+      : {}
+  );
+  const noFollowUps = deal.no_follow_ups !== undefined
+    ? !!deal.no_follow_ups
+    : !!parsedDealInfo.no_follow_ups;
+  return {
+    ...deal,
+    parsed_deal_info: parsedDealInfo,
+    no_follow_ups: noFollowUps,
+  };
+}
+
+function isMissingColumnError(err, column) {
+  const message = String(err?.message || err || '').toLowerCase();
+  const needle = String(column || '').toLowerCase();
+  return !!needle && (
+    message.includes(`could not find the '${needle}' column`)
+    || message.includes(`column "${needle}" does not exist`)
+    || message.includes(`"${needle}"`)
+  );
+}
+
+function mergeParsedDealInfo(existing, patch = {}) {
+  const base = existing && typeof existing === 'object' ? { ...existing } : {};
+  Object.entries(patch || {}).forEach(([key, value]) => {
+    if (value === undefined) return;
+    if (value === null) delete base[key];
+    else base[key] = value;
+  });
+  return base;
+}
+
 // ─────────────────────────────────────────────
 // DEALS
 // ─────────────────────────────────────────────
@@ -221,7 +264,7 @@ export async function getAllDeals() {
   if (!sb) return [];
   try {
     const { data } = await sb.from('deals').select('*').order('created_at', { ascending: false });
-    return data || [];
+    return (data || []).map(normalizeDealRecord);
   } catch {
     return [];
   }
@@ -232,7 +275,7 @@ export async function getDeal(dealId) {
   if (!sb) return null;
   try {
     const { data } = await sb.from('deals').select('*').eq('id', dealId).single();
-    return data;
+    return normalizeDealRecord(data);
   } catch {
     return null;
   }
@@ -243,20 +286,52 @@ export async function createDeal(fields) {
   if (!sb) throw new Error('Supabase not configured');
   const { data, error } = await sb.from('deals').insert([fields]).select().single();
   if (error) throw error;
-  return data;
+  return normalizeDealRecord(data);
 }
 
 export async function updateDeal(dealId, fields) {
   const sb = getSupabase();
   if (!sb) throw new Error('Supabase not configured');
-  const { data, error } = await sb
-    .from('deals')
-    .update({ ...fields, updated_at: new Date().toISOString() })
-    .eq('id', dealId)
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
+
+  const runUpdate = async (updates) => {
+    const { data, error } = await sb
+      .from('deals')
+      .update({ ...updates, updated_at: new Date().toISOString() })
+      .eq('id', dealId)
+      .select()
+      .single();
+    if (error) throw error;
+    return normalizeDealRecord(data);
+  };
+
+  try {
+    return await runUpdate(fields);
+  } catch (error) {
+    const fallback = { ...fields };
+    let changed = false;
+
+    if (Object.prototype.hasOwnProperty.call(fallback, 'target_geography') && isMissingColumnError(error, 'target_geography')) {
+      delete fallback.target_geography;
+      changed = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(fallback, 'no_follow_ups') && (
+      isMissingColumnError(error, 'no_follow_ups')
+      || isMissingColumnError(error, 'parsed_deal_info')
+    )) {
+      const existingDeal = await getDeal(dealId).catch(() => null);
+      if (existingDeal && !isMissingColumnError(error, 'parsed_deal_info')) {
+        fallback.parsed_deal_info = mergeParsedDealInfo(existingDeal.parsed_deal_info, {
+          no_follow_ups: !!fallback.no_follow_ups,
+        });
+      }
+      delete fallback.no_follow_ups;
+      changed = true;
+    }
+
+    if (!changed) throw error;
+    return runUpdate(fallback);
+  }
 }
 
 // ─────────────────────────────────────────────

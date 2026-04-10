@@ -2,7 +2,7 @@
 // Sending window helpers — all respect deal-level overrides, defaulting to Dom's preferred times.
 //
 // Defaults (Dom's preferences, EST):
-//   Email + LinkedIn DMs : 6am–8am  OR  8pm–11pm  (weekdays only)
+//   Email + LinkedIn DMs : 6am–8am  OR  8pm–11pm  (active deal days)
 //   LinkedIn connections  : anytime
 //   Research + enrichment: anytime
 //
@@ -19,6 +19,35 @@ const DEFAULTS = {
   eveningEnd:    23,
   timezone:      'America/New_York',
 };
+
+const DEFAULT_ACTIVE_DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'];
+const SHORT_TO_FULL_DAY = {
+  mon: 'monday',
+  tue: 'tuesday',
+  wed: 'wednesday',
+  thu: 'thursday',
+  fri: 'friday',
+  sat: 'saturday',
+  sun: 'sunday',
+};
+
+function resolveActiveDays(deal) {
+  if (deal?.active_days) {
+    const days = String(deal.active_days)
+      .split(',')
+      .map(day => SHORT_TO_FULL_DAY[String(day || '').trim().toLowerCase()] || String(day || '').trim().toLowerCase())
+      .filter(Boolean);
+    if (days.length) return days;
+  }
+
+  if (Array.isArray(deal?.sending_days) && deal.sending_days.length) {
+    return deal.sending_days
+      .map(day => String(day || '').trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  return DEFAULT_ACTIVE_DAYS;
+}
 
 /** Parse "HH:MM" or integer hour → integer hour. Returns null if value is null/undefined. */
 function parseHour(val) {
@@ -38,18 +67,16 @@ function currentHourIn(timezone) {
   );
 }
 
-/** Is it currently a weekday in target timezone? */
-function isWeekdayIn(timezone) {
+/** Return the lowercase weekday name in the target timezone. */
+function dayNameIn(timezone) {
   const now = new Date();
-  const tzDate = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
-  const day = tzDate.getDay(); // 0=Sun, 6=Sat
-  return day >= 1 && day <= 5;
+  return new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(now).toLowerCase();
 }
 
 /**
  * Is now within the email + LinkedIn DM sending window?
  *
- * Two windows (weekdays only):
+ * Two windows (on the deal's active days):
  *   Morning : send_from  → send_until   (default 6–8am)
  *   Evening : li_dm_from → li_dm_until  (default 8–11pm)
  *
@@ -58,7 +85,8 @@ function isWeekdayIn(timezone) {
 export function isWithinEmailWindow(deal) {
   const tz = deal?.timezone || DEFAULTS.timezone;
   const hour = currentHourIn(tz);
-  const weekday = isWeekdayIn(tz);
+  const dayName = dayNameIn(tz);
+  const activeDays = resolveActiveDays(deal);
 
   const morningStart = parseHour(deal?.send_from)    ?? DEFAULTS.morningStart;
   const morningEnd   = parseHour(deal?.send_until)   ?? DEFAULTS.morningEnd;
@@ -67,9 +95,9 @@ export function isWithinEmailWindow(deal) {
 
   const inMorning = hour >= morningStart && hour < morningEnd;
   const inEvening = hour >= eveningStart && hour < eveningEnd;
-  const within = weekday && (inMorning || inEvening);
+  const within = activeDays.includes(dayName) && (inMorning || inEvening);
 
-  console.log(`[SENDING WINDOW] ${hour}:xx ${tz} day=${new Date(new Date().toLocaleString('en-US', { timeZone: tz })).getDay()} → email ${within ? 'WITHIN' : 'OUTSIDE'} (${morningStart}-${morningEnd} or ${eveningStart}-${eveningEnd})`);
+  console.log(`[SENDING WINDOW] ${hour}:xx ${tz} day=${dayName} → email ${within ? 'WITHIN' : 'OUTSIDE'} (${morningStart}-${morningEnd} or ${eveningStart}-${eveningEnd})`);
   return within;
 }
 
@@ -101,18 +129,32 @@ export function isWithinResearchWindow() {
 export function describeNextEmailWindow(deal) {
   const tz = deal?.timezone || DEFAULTS.timezone;
   const hour = currentHourIn(tz);
-  const weekday = isWeekdayIn(tz);
+  const activeDays = resolveActiveDays(deal);
 
   const morningStart = parseHour(deal?.send_from)  ?? DEFAULTS.morningStart;
   const morningEnd   = parseHour(deal?.send_until) ?? DEFAULTS.morningEnd;
   const eveningStart = parseHour(deal?.li_dm_from) ?? DEFAULTS.eveningStart;
   const eveningEnd   = parseHour(deal?.li_dm_until)?? DEFAULTS.eveningEnd;
   const tzLabel      = tz === 'America/New_York' ? 'EST' : tz;
+  const now = new Date();
 
-  if (!weekday) return `Monday ${morningStart}am ${tzLabel}`;
-  if (hour < morningStart) return `today ${morningStart}am ${tzLabel}`;
-  if (hour < morningEnd)   return `now (morning window open, ${morningStart}–${morningEnd}am)`;
-  if (hour < eveningStart) return `tonight ${eveningStart === 20 ? '8pm' : eveningStart + ':00'} ${tzLabel}`;
-  if (hour < eveningEnd)   return `now (evening window open, ${eveningStart}–${eveningEnd})`;
-  return `tomorrow ${morningStart}am ${tzLabel}`;
+  for (let daysAhead = 0; daysAhead <= 7; daysAhead++) {
+    const candidate = new Date(now.getTime() + daysAhead * 24 * 60 * 60 * 1000);
+    const dayName = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(candidate).toLowerCase();
+    if (!activeDays.includes(dayName)) continue;
+
+    if (daysAhead === 0) {
+      if (hour < morningStart) return `today ${morningStart}am ${tzLabel}`;
+      if (hour < morningEnd)   return `now (morning window open, ${morningStart}-${morningEnd}am)`;
+      if (hour < eveningStart) return `tonight ${eveningStart === 20 ? '8pm' : eveningStart + ':00'} ${tzLabel}`;
+      if (hour < eveningEnd)   return `now (evening window open, ${eveningStart}-${eveningEnd})`;
+      continue;
+    }
+
+    const dayLabel = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(candidate);
+    if (daysAhead === 1) return `tomorrow ${morningStart}am ${tzLabel}`;
+    return `${dayLabel} ${morningStart}am ${tzLabel}`;
+  }
+
+  return `${morningStart}am ${tzLabel}`;
 }

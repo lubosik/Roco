@@ -10,6 +10,7 @@ const REFRESH_MS        = 30_000;
 const HEALTH_REFRESH_MS = 10_000;
 const WS_RECONNECT_MS   = 5_000;
 const POLL_FALLBACK_MS  = 8_000;
+const API_BASE          = '';
 
 
 const TEMPLATE_VARIABLES = [
@@ -46,9 +47,9 @@ const SAMPLE_DATA = {
   title: 'Managing Partner', jobTitle: 'Managing Partner',
   dealName: 'Apex Capital Series B',
   dealBrief: 'UK industrial property fund targeting 7.8% yield with strong institutional covenants',
-  targetAmount: '£50M', sector: 'Industrial Real Estate',
+  targetAmount: '$50M', sector: 'Industrial Real Estate',
   keyMetrics: '7.8% yield, 95% occupancy, 8-year WAULT',
-  geography: 'UK', minCheque: '£500k', maxCheque: '£5M',
+  geography: 'US', minCheque: '$500k', maxCheque: '$5M',
   investorProfile: 'UK-focused real estate and private equity investors',
   comparableDeal: 'Midlands Logistics Park acquisition (2023)',
   deckUrl: 'https://docsend.com/view/example',
@@ -75,11 +76,13 @@ let pipelineSort    = { key: 'score', dir: 'desc' };
 let activityLog     = [];
 let currentTemplate = null;
 let currentQueueTab = 'email';
+let _pendingReviewsCount = 0; // campaign batches awaiting approval — kept in sync by loadQueue
 let selectedDealId  = null;  // deal detail panel
 let selectedDealReadOnly   = false;   // true when viewing from Archive (no Roco actions)
 let selectedDealBackSection = 'deals'; // where Back button navigates to
 let docUploadController = null;
-
+let campaignReviewPage = 1;
+const CAMPAIGN_FIRMS_PER_PAGE = 20;
 // Deal brief launch state
 let dealBriefEditMode = false;
 let currentParsedDeal = null;
@@ -239,9 +242,16 @@ function connectWebSocket() {
 function handleWsMessage(msg) {
   switch (msg.type) {
     case 'activity':
-    case 'ACTIVITY':
-      prependActivity(msg.entry || msg.data || msg);
+    case 'ACTIVITY': {
+      const entry = msg.entry || msg.data || msg;
+      prependActivity(entry);
+      // If activity page is open and on page 1, also prepend to paginated view
+      const isOnActivityPage = window.location.hash === '#activity';
+      if (isOnActivityPage && _activityPage === 1) {
+        handleLiveActivityForPage(entry);
+      }
       break;
+    }
 
     case 'STATE_UPDATE':
       if (msg.state || msg.data) applyState(msg.state || msg.data);
@@ -282,9 +292,14 @@ function handleWsMessage(msg) {
       break;
 
     case 'QUEUE_UPDATED':
-      refreshQueueBadge(msg.count ?? null);
       if (!document.getElementById('view-queue')?.classList.contains('hidden')) {
-        loadQueue();
+        loadQueue(); // full refresh — sets _pendingReviewsCount and badge correctly
+      } else {
+        // Queue not visible — refresh reviews count in background so badge stays accurate
+        api('/api/campaign-reviews').then(r => {
+          _pendingReviewsCount = (r || []).length;
+          refreshQueueBadge(msg.count ?? null);
+        }).catch(() => refreshQueueBadge(msg.count ?? null));
       }
       break;
 
@@ -434,7 +449,7 @@ async function populateDealSelector() {
 }
 
 function populateDealFilters(deals) {
-  const filterIds = ['pipeline-deal-filter','activity-deal-filter','schedule-deal-select'];
+  const filterIds = ['pipeline-deal-filter','activity-deal-filter'];
   filterIds.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -465,7 +480,7 @@ function onDealSelectorChange(id) {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function loadOverview() {
-  await Promise.all([refreshStats(), refreshHealth(), loadActivityLog(true)]);
+  await Promise.all([refreshStats(), loadActivityLog(true)]);
 }
 
 async function refreshStats() {
@@ -498,6 +513,7 @@ function applyStats(s) {
 
   // LinkedIn metrics
   setText('stat-li-invites',     fmt(s.li_invites_sent));
+  setText('stat-li-invites-sub', s.li_active_pending != null ? `${fmt(s.li_active_pending)} active pending` : '');
   setText('stat-li-acceptance',  s.li_acceptance_rate != null ? pct(s.li_acceptance_rate) : '—');
   setText('stat-li-dms',         fmt(s.li_dms_sent));
   setText('stat-li-dm-response', s.li_dm_response_rate != null ? pct(s.li_dm_response_rate) : '—');
@@ -505,11 +521,13 @@ function applyStats(s) {
   refreshQueueBadge(s.queueCount || s.approval_queue);
 }
 
-function refreshQueueBadge(count) {
+function refreshQueueBadge(count, includesReviews = false) {
   const badge = document.getElementById('queue-badge');
   if (!badge) return;
-  if (count > 0) {
-    badge.textContent = count;
+  // If caller already included reviews (loadQueue), use as-is; otherwise add cached reviews count
+  const total = (count || 0) + (includesReviews ? 0 : _pendingReviewsCount);
+  if (total > 0) {
+    badge.textContent = total;
     badge.style.display = '';
   } else {
     badge.style.display = 'none';
@@ -560,11 +578,15 @@ function applyHealth(h) {
 
 async function loadActivityLog(renderToOverview = true) {
   try {
-    const data = await api('/api/activity/log');
+    // Use /api/activity/recent for overview widget (fast, no pagination)
+    const data = await api('/api/activity/recent').catch(async () => {
+      // Fallback to legacy endpoint if recent isn't available yet
+      const d = await api('/api/activity/log');
+      return Array.isArray(d) ? d : (d.log || d.items || []);
+    });
     const items = Array.isArray(data) ? data : (data.log || data.items || []);
     activityLog = items;
     if (renderToOverview) renderActivityFeed('overview-activity', items.slice(0, 10));
-    renderActivityFeed('activity-feed', items);
   } catch { /* silent */ }
 }
 
@@ -576,17 +598,24 @@ function renderActivityFeed(elId, items) {
     return;
   }
   el.innerHTML = items.map(item => {
-    const badge  = typeToBadge(item.type || item.event_type || item.activityType);
+    const type   = String(item.type || item.event_type || item.activityType || 'system').toLowerCase();
+    const badge  = getActivityBadgeMeta(item);
     const action = item.action || '';
     const note   = item.note || item.message || item.text || item.summary || '';
-    const text   = action && note ? `${action} · ${note}` : (action || note || '');
-    const ts     = item.timestamp || item.createdAt || item.created_at;
-    const deal   = item.deal_name || item.deal;
-    return `<div class="feed-item">
+    const isThinking  = type === 'thinking';
+    const fullContent = item.full_content || null;
+    // For thinking entries: show full_content when available; otherwise action
+    const displayText = isThinking && fullContent
+      ? fullContent
+      : (action && note ? `${action} · ${note}` : (action || note || ''));
+    const ts   = item.timestamp || item.createdAt || item.created_at;
+    const deal = item.deal_name || item.deal;
+    return `<div class="feed-item${isThinking ? ' feed-item--thinking' : ''}">
       <span class="feed-time">${formatTime(ts)}</span>
-      <span class="feed-badge ${badge}">${badge}</span>
+      <span class="feed-badge ${badge.className}">${badge.label}</span>
+      ${isThinking ? '<span class="feed-badge" style="background:rgba(167,139,250,0.15);color:#A78BFA;font-size:9px;padding:1px 5px">full reasoning</span>' : ''}
       ${deal ? `<span class="feed-deal">${esc(deal)}</span>` : ''}
-      <span class="feed-text">${esc(text)}</span>
+      <span class="feed-text" style="${isThinking ? 'white-space:pre-wrap;display:block;margin-top:4px;' : ''}">${esc(displayText)}</span>
     </div>`;
   }).join('');
 }
@@ -598,7 +627,7 @@ function prependActivity(item) {
   // Update overview feed
   const overviewFeed = document.getElementById('overview-activity');
   if (overviewFeed) {
-    const badge  = typeToBadge(item.type || item.event_type || item.activityType);
+    const badge  = getActivityBadgeMeta(item);
     const action = item.action || '';
     const note   = item.note || item.message || item.text || item.summary || '';
     const text   = action && note ? `${action} · ${note}` : (action || note || '');
@@ -608,7 +637,7 @@ function prependActivity(item) {
     div.className = 'feed-item';
     div.innerHTML = `
       <span class="feed-time">${formatTime(ts)}</span>
-      <span class="feed-badge ${badge}">${badge}</span>
+      <span class="feed-badge ${badge.className}">${badge.label}</span>
       ${deal ? `<span class="feed-deal">${esc(deal)}</span>` : ''}
       <span class="feed-text">${esc(text)}</span>
     `;
@@ -632,7 +661,13 @@ function filterActivity() {
   const typeFilter = document.getElementById('activity-type-filter')?.value || '';
   let filtered = activityLog;
   if (dealFilter) filtered = filtered.filter(i => i.dealId === dealFilter || i.deal_id === dealFilter || i.deal === dealFilter);
-  if (typeFilter) filtered = filtered.filter(i => (i.type || i.event_type || '').toLowerCase().includes(typeFilter));
+  if (typeFilter) {
+    filtered = filtered.filter(i => {
+      const badge = getActivityBadgeMeta(i).className;
+      if (typeFilter === 'linkedin') return ['linkedin', 'invite', 'dm', 'accepted'].includes(badge);
+      return badge === typeFilter;
+    });
+  }
   renderActivityFeed('activity-feed', filtered);
 }
 
@@ -962,6 +997,8 @@ function showLaunchStep2(parsed, documentId, filename) {
 
   // Load priority list selector options
   loadPriorityListsForLaunch();
+  // Load email account options
+  loadEmailAccountOptions();
 
   if (!parsed) return;
 
@@ -1073,6 +1110,7 @@ async function submitNewDeal(e) {
   const form   = e.target;
   const btn    = document.getElementById('launch-btn');
   const data   = new FormData(form);
+  const hasQueuedPbUploads = !!(window.pbFilesQueue?.investors || window.pbFilesQueue?.deals);
 
   // Collect geography checkboxes
   const geo = [...form.querySelectorAll('[name="geography"]:checked')].map(el => el.value);
@@ -1089,6 +1127,7 @@ async function submitNewDeal(e) {
     maxCheque:             data.get('maxCheque'),
     sector:                data.get('sector'),
     geography:             geo,
+    target_geography:      document.getElementById('deal-geography')?.value || 'Global',
     description:           data.get('description'),
     keyMetrics:            data.get('keyMetrics'),
     investorProfile:       data.get('investorProfile'),
@@ -1105,13 +1144,28 @@ async function submitNewDeal(e) {
     priority_lists:        JSON.stringify((window.selectedPriorityLists || []).map(l => ({
       list_id: l.id, list_name: l.name, list_type: l.type, priority_order: l.order,
     }))),
+    knowledge_base_list_id:   (() => { const s = document.getElementById('launch-kb-select'); return s?.value || null; })(),
+    knowledge_base_list_name: (() => { const s = document.getElementById('launch-kb-select'); return s?.options[s.selectedIndex]?.textContent?.split(' (')[0] || null; })(),
     exclusions:            JSON.stringify(parsedExclusions || []),
+    sending_account_id:    document.getElementById('launch-email-account')?.value || null,
+    sending_email:         (() => {
+      const sel = document.getElementById('launch-email-account');
+      return sel?.options[sel.selectedIndex]?.dataset?.email || null;
+    })(),
+    pending_intelligence_uploads: hasQueuedPbUploads,
   };
 
   btn.disabled    = true;
   btn.textContent = '⏳ Launching…';
 
   try {
+    let createdDealId = null;
+    const pbQueueSnapshot = {
+      investors: window.pbFilesQueue?.investors || null,
+      deals: window.pbFilesQueue?.deals || null,
+    };
+    const exclusionFileSnapshot = queuedExclusionFile;
+
     // Handle CSV separately if present
     const csvInput = document.getElementById('csv-input');
     let formData;
@@ -1132,6 +1186,8 @@ async function submitNewDeal(e) {
       formData.append('launchAssets',   JSON.stringify(launchAssets));
       const res = await fetch('/api/deals/create', { method: 'POST', body: formData });
       if (!res.ok) throw new Error(await res.text());
+      const created = await res.json().catch(() => ({}));
+      createdDealId = created?.deal?.id || null;
     } else {
       payload.timezone       = document.getElementById('nd-timezone')?.value || 'America/New_York';
       payload.activeDays     = getDayPickerValue('nd-active-days');
@@ -1141,15 +1197,37 @@ async function submitNewDeal(e) {
       payload.liDmUntil      = document.getElementById('nd-li-dm-until')?.value || '23:00';
       payload.emailFrom      = document.getElementById('nd-email-from')?.value || '08:00';
       payload.emailUntil     = document.getElementById('nd-email-until')?.value || '18:00';
-      await api('/api/deals/create', 'POST', payload);
+      const created = await api('/api/deals/create', 'POST', payload);
+      createdDealId = created?.deal?.id || null;
     }
 
     form.reset();
     document.getElementById('file-drop-text').textContent = 'Drop CSV here or click to browse';
     clearExclusionList();
     resetLaunchStep();
+    window.pbFilesQueue = { investors: null, deals: null };
+    const kbSelReset = document.getElementById('launch-kb-select');
+    if (kbSelReset) kbSelReset.value = '';
     await populateDealSelector();
     navigate('#deals');
+    showToast('Deal launched. Follow-up imports and research are continuing in the background.');
+
+    if (createdDealId) {
+      Promise.resolve().then(async () => {
+        const pbResults = await uploadQueuedPbFiles(createdDealId, pbQueueSnapshot);
+        await uploadQueuedExclusionFile(createdDealId, exclusionFileSnapshot);
+        const hadInvestorUniverse = !!pbQueueSnapshot.investors;
+        const investorUniverseOk = !hadInvestorUniverse || pbResults?.investors?.ok;
+        if (hasQueuedPbUploads && investorUniverseOk) {
+          await api(`/api/deals/${createdDealId}/trigger-research`, 'POST');
+        } else if (hasQueuedPbUploads && !investorUniverseOk) {
+          showToast('PitchBook Investor Universe import failed. Research was not started.', 'error', 6000);
+        }
+      }).catch(err => {
+        console.error('[LAUNCH] Background post-create steps failed:', err);
+        showToast(`Post-launch import failed: ${err.message}`, 'error', 5000);
+      });
+    }
   } catch (err) {
     alert(`Failed to launch deal: ${err.message}`);
   } finally {
@@ -1190,7 +1268,7 @@ async function loadDeals() {
       const data = await api('/api/deals');
       allDeals = Array.isArray(data) ? data : (data.deals || []);
       const activeDeals = allDeals.filter(d => !['CLOSED','ARCHIVED','COMPLETE','closed','archived','complete'].includes(d.status));
-      grid.innerHTML = activeDeals.map(deal => renderDealCard(deal)).join('');
+      patchDealsGrid(activeDeals);
     } catch { /* silent — user is in detail view */ }
     return;
   }
@@ -1206,10 +1284,36 @@ async function loadDeals() {
       grid.innerHTML = '<div class="loading-placeholder">No active deals. <a href="#launch" onclick="navigate(\'#launch\')">Launch one ↗</a></div>';
       return;
     }
-    grid.innerHTML = activeDeals.map(deal => renderDealCard(deal)).join('');
+    patchDealsGrid(activeDeals, true);
   } catch {
     grid.innerHTML = '<div class="loading-placeholder text-red">Failed to load deals.</div>';
   }
+}
+
+function patchDealsGrid(deals, forceReplace = false) {
+  const grid = document.getElementById('deals-grid');
+  if (!grid) return;
+  if (forceReplace || !grid.querySelector('.deal-card')) {
+    grid.innerHTML = deals.map(deal => renderDealCard(deal)).join('');
+    return;
+  }
+
+  const nextIds = new Set(deals.map(deal => String(deal.id || deal._id)));
+  deals.forEach(deal => {
+    const id = String(deal.id || deal._id);
+    const existing = document.getElementById(`deal-card-${id}`);
+    const html = renderDealCard(deal);
+    if (existing) {
+      existing.outerHTML = html;
+    } else {
+      grid.insertAdjacentHTML('beforeend', html);
+    }
+  });
+
+  grid.querySelectorAll('.deal-card[id^="deal-card-"]').forEach(card => {
+    const id = String(card.id.replace('deal-card-', ''));
+    if (!nextIds.has(id)) card.remove();
+  });
 }
 
 function renderDealCard(deal) {
@@ -1221,14 +1325,14 @@ function renderDealCard(deal) {
   const target   = deal.target_amount || deal.targetAmount || 0;
   const pct_     = target > 0 ? Math.min(100, Math.round((committed / target) * 100)) : 0;
   const contacts = fmt(deal.contacts || deal.live_contacts || deal.totalContacts || 0);
-  const emails   = fmt(deal.emails_sent || deal.live_emails_sent || deal.emailsSent || 0);
+  const firms    = fmt(deal.firms || deal.live_firms || deal.current_batch_ranked_firms || 0);
   const rr       = (deal.response_rate ?? deal.responseRate) != null ? pct(deal.response_rate ?? deal.responseRate) : '—';
   const paused   = deal.paused === true || status === 'paused';
   const badgeLabel = paused ? 'PAUSED' : status.toUpperCase();
   const badgeClass = paused ? 'paused' : status;
   const needsReview = deal.current_batch_status === 'pending_approval';
 
-  return `<div class="deal-card" id="deal-card-${id}">
+  return `<div class="deal-card" id="deal-card-${id}" data-deal-id="${id}">
     <div class="deal-card-top">
       <div>
         <div class="deal-card-name">${name}</div>
@@ -1236,7 +1340,7 @@ function renderDealCard(deal) {
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
         <span class="status-badge ${badgeClass}">${badgeLabel}</span>
-        ${needsReview ? `<span class="status-badge" style="background:rgba(234,179,8,.15);color:#eab308;font-size:9px;cursor:pointer" onclick="viewDeal('${id}');setTimeout(()=>switchDealTab('campaign',document.querySelector('[data-tab=campaign]')),400)">REVIEW REQUIRED</span>` : ''}
+        ${needsReview ? `<span class="status-badge" style="background:rgba(234,179,8,.15);color:#eab308;font-size:9px;cursor:pointer" onclick="viewDeal('${id}');setTimeout(()=>switchDealTab('rankings',document.querySelector('[data-tab=rankings]')),400)">REVIEW REQUIRED</span>` : ''}
       </div>
     </div>
     <div class="deal-progress-wrap">
@@ -1254,8 +1358,8 @@ function renderDealCard(deal) {
         <div class="deal-stat-lbl">Contacts</div>
       </div>
       <div class="deal-stat">
-        <div class="deal-stat-val">${emails}</div>
-        <div class="deal-stat-lbl">Emails</div>
+        <div class="deal-stat-val">${firms}</div>
+        <div class="deal-stat-lbl">Firms</div>
       </div>
       <div class="deal-stat">
         <div class="deal-stat-val">${rr}</div>
@@ -1348,11 +1452,61 @@ function closeDealDetail() {
   if (backSection === 'archive') navigate('#archive');
 }
 
+function mergeDealIntoCache(updatedDeal) {
+  if (!updatedDeal) return;
+  const updatedId = updatedDeal.id || updatedDeal._id;
+  if (!updatedId) return;
+  const existingIndex = (allDeals || []).findIndex(d => (d.id || d._id) === updatedId);
+  if (existingIndex >= 0) {
+    allDeals[existingIndex] = { ...allDeals[existingIndex], ...updatedDeal };
+  } else {
+    allDeals = [...(allDeals || []), updatedDeal];
+  }
+}
+
+function refreshSelectedDealChrome(deal) {
+  if (!deal || !selectedDealId) return;
+  window.__activeDealCurrency = deal.currency || 'USD';
+  setText('deal-detail-name', deal.dealName || deal.name || selectedDealId);
+  const statusBadge = document.getElementById('deal-detail-status-badge');
+  if (statusBadge) {
+    const normalizedStatus = String(deal.status || (selectedDealReadOnly ? 'closed' : 'active')).toLowerCase();
+    statusBadge.textContent = normalizedStatus.toUpperCase();
+    statusBadge.className = `status-badge ${normalizedStatus}`;
+  }
+}
+
+async function quietRefreshSelectedDeal() {
+  if (!selectedDealId) return;
+  try {
+    const deal = await api(`/api/deals/${selectedDealId}`);
+    mergeDealIntoCache(deal);
+    refreshSelectedDealChrome(deal);
+    await patchOpenDealTabInPlace(selectedDealId, deal);
+  } catch {
+    // Preserve the current open state if the quiet refresh fails.
+  }
+}
+
+async function patchOpenDealTabInPlace(dealId, deal = null) {
+  const activeTab = document.querySelector('.deal-tab.active')?.dataset?.tab;
+  if (!activeTab) return;
+  if (activeTab === 'overview') {
+    await patchDealOverviewInPlace(dealId, deal);
+  } else if (activeTab === 'rankings') {
+    await patchCampaignTrackerInPlace(dealId);
+  } else if (activeTab === 'pipeline') {
+    await patchDealPipelineInPlace(dealId);
+  } else if (activeTab === 'archived') {
+    await patchDealArchivedInPlace(dealId);
+  }
+}
+
 async function switchDealTab(tab, btn) {
   document.querySelectorAll('.deal-tab').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
 
-  ['overview','brief','pipeline','rankings','batches','settings','archived','exclusions','templates','campaign'].forEach(t => {
+  ['overview','brief','pipeline','rankings','batches','settings','archived','exclusions','templates'].forEach(t => {
     const el = document.getElementById(`deal-tab-${t}`);
     if (el) el.classList.toggle('hidden', t !== tab);
   });
@@ -1362,13 +1516,12 @@ async function switchDealTab(tab, btn) {
     case 'overview':   await loadDealTabOverview(selectedDealId);   break;
     case 'brief':      await loadDealTabBrief(selectedDealId);      break;
     case 'pipeline':   await loadDealTabPipeline(selectedDealId);   break;
-    case 'rankings':   await loadDealTabRankings(selectedDealId, window.__rankingsNavId === selectedDealId ? (window.__rankingsCurrentPage || 1) : 1);   break;
+    case 'rankings':   await loadCampaignReviewTab(selectedDealId); break;
     case 'batches':    await loadDealTabBatches(selectedDealId);    break;
     case 'settings':   await loadDealTabSettings(selectedDealId);   break;
     case 'archived':   await loadDealTabArchived(selectedDealId);   break;
     case 'exclusions': await loadDealTabExclusions(selectedDealId); break;
     case 'templates':  await loadDealTemplatesTab(selectedDealId);  break;
-    case 'campaign':   await loadCampaignReviewTab(selectedDealId); break;
   }
 }
 
@@ -1381,40 +1534,83 @@ async function loadDealTabOverview(id, deal) {
   let m = {};
   try { m = await api(`/api/deals/${id}/metrics`); } catch {}
 
-  const stat = (val, lbl, sub) => `<div class="deal-stat">
-    <div class="deal-stat-val">${val}</div>
+  const stat = (val, lbl, key, sub = '') => `<div class="deal-stat">
+    <div class="deal-stat-val" data-overview-stat="${key}">${val}</div>
     <div class="deal-stat-lbl">${lbl}</div>
-    ${sub ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">${sub}</div>` : ''}
+    <div data-overview-substat="${key}" style="font-size:10px;color:var(--text-dim);margin-top:2px;${sub ? '' : 'display:none'}">${sub || ''}</div>
   </div>`;
 
   el.innerHTML = `
+    <div data-overview-deal-id="${id}">
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Fundraise</div>
-    <div class="deal-stats" style="grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px">
-      ${stat(formatMoney(m.capitalCommitted || deal.committed_amount || 0, deal.currency || 'USD'), 'Capital Committed')}
-      ${stat(formatMoney(m.targetAmount || deal.target_amount || 0, deal.currency || 'USD'), 'Target')}
-      ${stat(fmt(m.activeProspects || 0), 'Active Prospects')}
-      ${stat(fmt(m.totalContacts || 0), 'Total Contacts')}
+    <div class="deal-stats" style="grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:24px">
+      ${stat(formatMoney(m.capitalCommitted || deal.committed_amount || 0, deal.currency || 'USD'), 'Capital Committed', 'capitalCommitted')}
+      ${stat(formatMoney(m.targetAmount || deal.target_amount || 0, deal.currency || 'USD'), 'Target', 'targetAmount')}
+      ${stat(fmt(m.firms || deal.firms || deal.live_firms || deal.current_batch_ranked_firms || 0), 'Firms', 'firms')}
+      ${stat(fmt(m.activeProspects || 0), 'Active Prospects', 'activeProspects')}
+      ${stat(fmt(m.totalContacts || 0), 'Total Contacts', 'totalContacts')}
     </div>
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Email</div>
     <div class="deal-stats" style="grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
-      ${stat(fmt(m.emailsSent || 0), 'Emails Sent')}
-      ${stat(fmt(m.emailReplies != null ? m.emailReplies : (m.emailResponses || 0)), 'Replies')}
-      ${stat(m.emailResponseRate != null ? m.emailResponseRate + '%' : '—', 'Response Rate')}
+      ${stat(fmt(m.emailsSent || 0), 'Emails Sent', 'emailsSent')}
+      ${stat(fmt(m.emailReplies != null ? m.emailReplies : (m.emailResponses || 0)), 'Replies', 'emailReplies')}
+      ${stat(m.emailResponseRate != null ? m.emailResponseRate + '%' : '—', 'Response Rate', 'emailResponseRate')}
     </div>
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">LinkedIn</div>
     <div class="deal-stats" style="grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:24px">
-      ${stat(fmt(m.invitesSent || 0), 'Invites Sent')}
-      ${stat(fmt(m.invitesAccepted || 0), 'Accepted', m.acceptanceRate != null ? m.acceptanceRate + '% rate' : '')}
-      ${stat(fmt(m.dmsSent || 0), 'DMs Sent')}
-      ${stat(fmt(m.dmResponses || 0), 'DM Replies')}
-      ${stat(m.dmResponseRate != null ? m.dmResponseRate + '%' : '—', 'DM Response Rate')}
+      ${stat(fmt(m.invitesSent || 0), 'Invites Sent', 'invitesSent', m.activePendingInvites != null ? `${fmt(m.activePendingInvites)} active pending` : '')}
+      ${stat(fmt(m.invitesAccepted || 0), 'Accepted', 'invitesAccepted', m.acceptanceRate != null ? m.acceptanceRate + '% rate' : '')}
+      ${stat(fmt(m.dmsSent || 0), 'DMs Sent', 'dmsSent')}
+      ${stat(fmt(m.dmResponses || 0), 'DM Replies', 'dmResponses')}
+      ${stat(m.dmResponseRate != null ? m.dmResponseRate + '%' : '—', 'DM Response Rate', 'dmResponseRate')}
     </div>
     <div class="form-group mb-16">
       <div class="form-label">Description</div>
       <div style="color:var(--text-mid);font-size:13px;line-height:1.6">${esc(deal.description || '—')}</div>
     </div>
     ${deal.sector ? `<div class="form-group"><div class="form-label">Sector</div><div style="color:var(--text-mid)">${esc(deal.sector)}</div></div>` : ''}
+    </div>
   `;
+}
+
+async function patchDealOverviewInPlace(id, deal = null) {
+  const container = document.querySelector(`#deal-tab-overview [data-overview-deal-id="${id}"]`);
+  if (!container) return;
+  if (!deal) {
+    try { deal = await api(`/api/deals/${id}`); } catch { deal = {}; }
+  }
+  let m = {};
+  try { m = await api(`/api/deals/${id}/metrics`); } catch {}
+  const currency = deal.currency || 'USD';
+  const values = {
+    capitalCommitted: formatMoney(m.capitalCommitted || deal.committed_amount || 0, currency),
+    targetAmount: formatMoney(m.targetAmount || deal.target_amount || 0, currency),
+    firms: fmt(m.firms || deal.firms || deal.live_firms || deal.current_batch_ranked_firms || 0),
+    activeProspects: fmt(m.activeProspects || 0),
+    totalContacts: fmt(m.totalContacts || 0),
+    emailsSent: fmt(m.emailsSent || 0),
+    emailReplies: fmt(m.emailReplies != null ? m.emailReplies : (m.emailResponses || 0)),
+    emailResponseRate: m.emailResponseRate != null ? `${m.emailResponseRate}%` : '—',
+    invitesSent: fmt(m.invitesSent || 0),
+    invitesAccepted: fmt(m.invitesAccepted || 0),
+    dmsSent: fmt(m.dmsSent || 0),
+    dmResponses: fmt(m.dmResponses || 0),
+    dmResponseRate: m.dmResponseRate != null ? `${m.dmResponseRate}%` : '—',
+  };
+  const subvalues = {
+    invitesSent: m.activePendingInvites != null ? `${fmt(m.activePendingInvites)} active pending` : '',
+    invitesAccepted: m.acceptanceRate != null ? `${m.acceptanceRate}% rate` : '',
+  };
+  Object.entries(values).forEach(([key, value]) => {
+    const node = container.querySelector(`[data-overview-stat="${key}"]`);
+    if (node) node.textContent = value;
+  });
+  Object.entries(subvalues).forEach(([key, value]) => {
+    const node = container.querySelector(`[data-overview-substat="${key}"]`);
+    if (!node) return;
+    node.textContent = value || '';
+    node.style.display = value ? '' : 'none';
+  });
 }
 
 async function loadDealTabBrief(id) {
@@ -1600,6 +1796,55 @@ function renderDealBriefTab(parsed) {
   </div>`;
 }
 
+function sentimentBadge(intentLabel, intentKey, convState) {
+  if (convState === 'meeting_booked')            return `<span style="background:rgba(74,222,128,0.15);color:#4ade80;padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">Meeting Booked</span>`;
+  if (convState === 'conversation_ended_positive') return `<span style="background:rgba(74,222,128,0.12);color:#4ade80;padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">Closed Positive</span>`;
+  if (convState === 'conversation_ended_negative') return `<span style="background:rgba(220,50,50,0.12);color:#e05c5c;padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">Closed Negative</span>`;
+  if (convState === 'do_not_contact')             return `<span style="background:rgba(220,50,50,0.12);color:#e05c5c;padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">Do Not Contact</span>`;
+  if (convState === 'temp_closed')                return `<span style="background:rgba(212,168,71,0.15);color:var(--gold);padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">Temp Closed</span>`;
+  if (!intentKey && !intentLabel) return '';
+  const colours = { positive: '#4ade80', soft: 'var(--gold)', negative: '#e05c5c', question: '#7dd3fc', unknown: 'var(--text-dim)' };
+  const bg = { positive: 'rgba(74,222,128,0.12)', soft: 'rgba(212,168,71,0.12)', negative: 'rgba(220,50,50,0.12)', question: 'rgba(125,211,252,0.12)', unknown: 'rgba(255,255,255,0.05)' };
+  const col = colours[intentLabel] || colours.unknown;
+  const bgCol = bg[intentLabel] || bg.unknown;
+  const label = intentKey ? intentKey.replace(/_/g,' ') : intentLabel || '';
+  return `<span style="background:${bgCol};color:${col};padding:2px 7px;border-radius:3px;font-size:10px;font-family:var(--font-mono)">${esc(label)}</span>`;
+}
+
+function renderDealPipelineRows(rows, dealId) {
+  const renderScheduledFollowUp = (value) => {
+    if (!value) return '<span class="text-dim">—</span>';
+    return `<span class="text-dim">${formatScheduleDate(value)}</span>`;
+  };
+
+  return rows.map(r => `
+    <tr data-pipeline-contact-id="${r.id}" style="cursor:pointer" onclick="toggleDealPipelineDetail('${r.id}', '${dealId}')">
+      <td>
+        <div style="font-weight:500">${esc(r.name || '—')}</div>
+        ${r.email ? `<div style="font-size:11px;color:var(--text-dim)">${esc(r.email)}</div>` : ''}
+      </td>
+      <td class="text-dim" style="font-size:12px">${r.jobTitle && r.firm ? `${esc(r.jobTitle)} <span style="opacity:0.5">·</span> ${esc(r.firm)}` : esc(r.jobTitle || r.firm || '—')}</td>
+      <td>${scoreHtml(r.score)}</td>
+      <td><span class="status-badge">${esc(r.stage || '—')}</span></td>
+      <td>${sentimentBadge(r.lastIntentLabel, r.lastIntent, r.conversationState)}</td>
+      <td class="text-dim">${renderScheduledFollowUp(r.scheduledFollowUpAt)}</td>
+      <td class="text-dim">${formatDate(r.lastReplyAt || r.lastContacted)}</td>
+      ${!selectedDealReadOnly ? `<td><button class="row-action-btn" style="color:#e05c5c" onclick="event.stopPropagation();deleteDealTabContact('${r.id}', '${dealId}', this)">✕</button></td>` : ''}
+    </tr>
+    <tr class="hidden" id="deal-pipeline-detail-${r.id}">
+      <td colspan="${!selectedDealReadOnly ? 8 : 7}" style="padding:0;background:var(--bg-raised)">
+        <div id="deal-pipeline-conv-${r.id}" style="padding:16px 20px;font-size:12px;color:var(--text-mid)">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">
+            ${r.email ? `<div><span style="color:var(--text-dim)">Email</span><br><a href="mailto:${esc(r.email)}" style="color:var(--accent)">${esc(r.email)}</a></div>` : ''}
+            ${r.phone ? `<div><span style="color:var(--text-dim)">Phone</span><br>${esc(r.phone)}</div>` : ''}
+            ${r.linkedinUrl ? `<div><span style="color:var(--text-dim)">LinkedIn</span><br><a href="${esc(r.linkedinUrl)}" target="_blank" style="color:var(--accent)">View profile</a></div>` : ''}
+          </div>
+          <div style="color:var(--text-dim);font-size:11px">Loading conversation…</div>
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
 async function loadDealTabPipeline(id) {
   const el = document.getElementById('deal-tab-pipeline');
   if (!el) return;
@@ -1607,37 +1852,253 @@ async function loadDealTabPipeline(id) {
   try {
     const rows = await api(`/api/pipeline?dealId=${id}`);
     if (!rows.length) { el.innerHTML = '<div class="loading-placeholder">No active contacts in pipeline.</div>'; return; }
-    const stageOrder = { invite_sent: 1, Enriched: 2, Ranked: 3, invite_accepted: 4, dm_sent: 5, email_sent: 6, Replied: 7, 'Meeting Booked': 8, Researched: 9 };
+    const stageOrder = { 'Approved for Outreach': 1, Ranked: 2, Enriched: 3, invite_sent: 4, invite_accepted: 5, dm_sent: 6, email_sent: 7, Replied: 8, 'In Conversation': 9, 'Meeting Booked': 10 };
     const sorted = [...rows].sort((a, b) => (stageOrder[b.stage] || 0) - (stageOrder[a.stage] || 0) || (b.score || 0) - (a.score || 0));
-    // Both Ranked and Enriched contacts get LinkedIn invites (parallel dual-channel for those with email)
-    const pendingInvites = rows.filter(r => (r.stage === 'Ranked' || r.stage === 'Enriched') && r.linkedinUrl).length;
     el.innerHTML = `
+      <div data-pipeline-deal-id="${id}">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div style="font-size:13px;color:var(--text-dim)">${rows.length} contact${rows.length !== 1 ? 's' : ''}</div>
+        <div data-pipeline-count style="font-size:13px;color:var(--text-dim)">${rows.length} contact${rows.length !== 1 ? 's' : ''}</div>
         <div style="display:flex;gap:8px;align-items:center">
-          ${!selectedDealReadOnly && pendingInvites > 0 ? `<button class="btn btn-sm" onclick="sendInvitesNow('${id}')" style="font-size:12px">Send ${pendingInvites} LinkedIn Invite${pendingInvites !== 1 ? 's' : ''} Now</button>` : ''}
           <button class="btn btn-ghost btn-sm" onclick="exportDealPipelineCSV('${id}')" style="font-size:12px">&#8595; Export CSV</button>
           ${!selectedDealReadOnly ? `<button class="btn btn-sm" onclick="clearPipeline('${id}', this)" style="font-size:12px;background:rgba(220,50,50,0.15);color:#e05;border:1px solid rgba(220,50,50,0.3)">Clear Pipeline</button>` : ''}
         </div>
       </div>
       <div class="table-wrap">
       <table class="data-table">
-        <thead><tr><th>Investor</th><th>Title / Firm</th><th>Score</th><th>Stage</th><th>Enrichment</th><th>Last Activity</th>${!selectedDealReadOnly ? '<th></th>' : ''}</tr></thead>
-        <tbody>
-          ${sorted.map(r => `<tr>
-            <td>${r.linkedinUrl ? `<a href="${esc(r.linkedinUrl)}" target="_blank" style="color:var(--accent)">${esc(r.name || '—')}</a>` : esc(r.name || '—')}</td>
-            <td class="text-dim" style="font-size:12px">${r.jobTitle && r.firm ? `${esc(r.jobTitle)} <span style="opacity:0.5">·</span> ${esc(r.firm)}` : esc(r.jobTitle || r.firm || '—')}</td>
-            <td>${scoreHtml(r.score)}</td>
-            <td><span class="status-badge">${esc(r.stage || '—')}</span></td>
-            <td class="text-dim" style="font-size:11px">${esc(r.enrichmentStatus || '—')}</td>
-            <td class="text-dim">${formatDate(r.lastContacted)}</td>
-            ${!selectedDealReadOnly ? `<td><button class="row-action-btn" style="color:#e05c5c" onclick="deleteDealTabContact('${r.id}', '${id}', this)">✕</button></td>` : ''}
-          </tr>`).join('')}
+        <thead><tr><th>Investor</th><th>Title / Firm</th><th>Score</th><th>Stage</th><th>Sentiment</th><th>Scheduled Follow-up</th><th>Last Activity</th>${!selectedDealReadOnly ? '<th></th>' : ''}</tr></thead>
+        <tbody id="deal-pipeline-tbody-${id}">
+          ${renderDealPipelineRows(sorted, id)}
         </tbody>
       </table>
     </div>
     </div>`;
   } catch { el.innerHTML = '<div class="loading-placeholder text-red">Failed to load.</div>'; }
+}
+
+async function patchDealPipelineInPlace(id) {
+  const container = document.querySelector(`#deal-tab-pipeline [data-pipeline-deal-id="${id}"]`);
+  if (!container) return;
+  const tbody = document.getElementById(`deal-pipeline-tbody-${id}`);
+  if (!tbody) return;
+  try {
+    const rows = await api(`/api/pipeline?dealId=${id}`);
+    const stageOrder = { 'Approved for Outreach': 1, Ranked: 2, Enriched: 3, invite_sent: 4, invite_accepted: 5, dm_sent: 6, email_sent: 7, Replied: 8, 'In Conversation': 9, 'Meeting Booked': 10 };
+    const sorted = [...rows].sort((a, b) => (stageOrder[b.stage] || 0) - (stageOrder[a.stage] || 0) || (b.score || 0) - (a.score || 0));
+    const countEl = container.querySelector('[data-pipeline-count]');
+    if (countEl) countEl.textContent = `${rows.length} contact${rows.length !== 1 ? 's' : ''}`;
+    tbody.innerHTML = renderDealPipelineRows(sorted, id);
+  } catch {
+    // Leave the current table intact on refresh failure.
+  }
+}
+
+async function toggleDealPipelineDetail(contactId, dealId) {
+  openContactSidePanel(contactId, dealId);
+}
+
+// ── CONTACT SIDE PANEL ────────────────────────────────────────────────────────
+
+let _sidePanelContactId = null;
+
+function buildFallbackConversationMessage(contact) {
+  if (!contact?.last_intent && !contact?.conversation_state) return null;
+  const fallbackBody = contact.last_intent === 'not_interested'
+    ? 'Not interested'
+    : contact.last_intent
+      ? String(contact.last_intent).replace(/_/g, ' ')
+      : String(contact.conversation_state || '').replace(/_/g, ' ');
+  if (!fallbackBody) return null;
+  return {
+    direction: 'inbound',
+    channel: 'email',
+    body: fallbackBody.charAt(0).toUpperCase() + fallbackBody.slice(1),
+    timestamp: contact.last_reply_at || contact.updated_at || null,
+    isFallback: true,
+  };
+}
+
+async function openContactSidePanel(contactId, dealId = null) {
+  const panel   = document.getElementById('contact-side-panel');
+  const overlay = document.getElementById('contact-panel-overlay');
+  const nameEl  = document.getElementById('contact-panel-name');
+  const bodyEl  = document.getElementById('contact-panel-body');
+  if (!panel) return;
+
+  _sidePanelContactId = contactId;
+  panel.style.right = '0';
+  if (overlay) overlay.style.display = 'block';
+  if (nameEl) nameEl.textContent = 'Loading…';
+  if (bodyEl) bodyEl.innerHTML = '<div style="padding:24px;color:var(--text-dim)">Loading contact…</div>';
+
+  try {
+    const qs = dealId ? `?dealId=${encodeURIComponent(dealId)}` : '';
+    const data = await api(`/api/contacts/${contactId}/conversation${qs}`);
+    if (_sidePanelContactId !== contactId) return; // navigated away
+    if (nameEl) nameEl.textContent = data.contact?.name || '—';
+    if (bodyEl) renderSidePanelBody(bodyEl, data);
+  } catch {
+    if (bodyEl) bodyEl.innerHTML = '<div style="padding:24px;color:#e05c5c">Failed to load contact.</div>';
+  }
+}
+
+function closeContactPanel() {
+  const panel   = document.getElementById('contact-side-panel');
+  const overlay = document.getElementById('contact-panel-overlay');
+  if (panel)   panel.style.right = '-520px';
+  if (overlay) overlay.style.display = 'none';
+  _sidePanelContactId = null;
+}
+
+function renderSidePanelBody(el, data) {
+  const { contact, messages, intentHistory } = data;
+  if (!contact) { el.innerHTML = '<div style="padding:24px;color:var(--text-dim)">No contact data.</div>'; return; }
+  const projectName = data.selectedDealName || contact.dealName || '';
+  const effectiveMessages = Array.isArray(messages) && messages.length
+    ? messages
+    : [buildFallbackConversationMessage(contact)].filter(Boolean);
+  const deals = Array.isArray(data.deals) ? data.deals : [];
+
+  const field = (label, value, href) => value ? `
+    <div style="margin-bottom:14px">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:3px">${label}</div>
+      ${href
+        ? `<a href="${esc(href)}" target="_blank" style="color:var(--accent);font-size:13px">${esc(value)}</a>`
+        : `<div style="color:#e5e7eb;font-size:13px">${esc(value)}</div>`}
+    </div>` : '';
+
+  const stageBadge = contact.pipeline_stage
+    ? `<span style="padding:3px 10px;border-radius:3px;font-size:11px;font-family:'DM Mono',monospace;background:rgba(212,168,71,0.1);color:#d4a847">${esc(contact.pipeline_stage)}</span>`
+    : '';
+  const sentimentBdg = contact.last_intent
+    ? sentimentBadge(contact.last_intent_label, contact.last_intent, contact.conversation_state)
+    : '';
+
+  // Contact info section
+  const infoHtml = `
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">${stageBadge}${sentimentBdg}</div>
+      ${projectName ? `<div style="margin-bottom:16px;padding:8px 10px;background:#141414;border:1px solid #262626;border-radius:6px;color:#d4a847;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-family:'DM Mono',monospace">Project ${esc(projectName)}</div>` : ''}
+      ${field('Email', contact.email, `mailto:${contact.email}`)}
+      ${field('Phone', contact.phone)}
+      ${field('LinkedIn', contact.linkedin_url ? 'View profile' : null, contact.linkedin_url)}
+      ${field('Title', contact.job_title)}
+      ${field('Firm', contact.company_name)}
+      ${field('Score', contact.investor_score ? `${contact.investor_score}/100` : null)}
+    </div>`;
+
+  const dealsHtml = deals.length ? `
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Deals</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${deals.map(d => `<span style="padding:4px 10px;border-radius:4px;font-size:11px;font-family:'DM Mono',monospace;background:${d.status === 'ACTIVE' ? 'rgba(212,168,71,0.12)' : '#1a1a1a'};color:${d.status === 'ACTIVE' ? '#d4a847' : '#9ca3af'};border:1px solid ${d.status === 'ACTIVE' ? 'rgba(212,168,71,0.28)' : '#2a2a2a'}">${esc(d.dealName || '—')}</span>`).join('')}
+      </div>
+    </div>` : '';
+
+  // Firm research from batch_firms
+  const fr = data.firmResearch;
+  const pastInv = Array.isArray(fr?.past_investments) ? fr.past_investments.slice(0, 6) : [];
+  const firmHtml = fr ? `
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Firm Research</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+        ${fr.score ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:2px">Score</div><div style="font-size:13px;color:#d4a847;font-family:'DM Mono',monospace">${fr.score}/100</div></div>` : ''}
+        ${fr.aum ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:2px">AUM</div><div style="font-size:13px;color:#e5e7eb">${esc(fr.aum)}</div></div>` : ''}
+      </div>
+      ${fr.thesis ? `<div style="margin-bottom:12px"><div style="font-size:10px;color:#6b7280;margin-bottom:4px">Investment Thesis</div><p style="color:#9ca3af;font-size:12px;line-height:1.6;margin:0">${esc(fr.thesis.slice(0,500))}${fr.thesis.length>500?'…':''}</p></div>` : ''}
+      ${fr.justification ? `<div style="margin-bottom:12px"><div style="font-size:10px;color:#6b7280;margin-bottom:4px">Why This Firm</div><p style="color:#9ca3af;font-size:12px;line-height:1.6;margin:0;font-style:italic">${esc(fr.justification.slice(0,400))}${fr.justification.length>400?'…':''}</p></div>` : ''}
+      ${pastInv.length ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:6px">Past Investments</div><div style="display:flex;flex-wrap:wrap;gap:5px">${pastInv.map(inv=>`<span style="padding:2px 8px;background:#1a1a2a;border:1px solid #2a2a3a;border-radius:3px;font-size:10px;color:#9ca3af;font-family:'DM Mono',monospace">${esc(typeof inv==='string'?inv:(inv.company||inv.name||''))}</span>`).join('')}</div></div>` : ''}
+    </div>` : (contact.notes ? `
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:8px">Notes</div>
+      <p style="color:#9ca3af;font-size:12px;line-height:1.65;margin:0">${esc(contact.notes)}</p>
+    </div>` : '');
+
+  // Conversation history
+  const msgHtml = `
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">
+        Conversation${projectName ? ` — ${esc(projectName)}` : ''} (${effectiveMessages.length} message${effectiveMessages.length !== 1 ? 's' : ''})
+      </div>
+      ${effectiveMessages.length ? `<div style="display:flex;flex-direction:column;gap:10px">
+        ${effectiveMessages.map(m => {
+          const isOut = m.direction === 'outbound';
+          const ts = m.timestamp ? new Date(m.timestamp).toLocaleDateString('en-GB', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '';
+          const intentTag = m.intent ? `<span style="background:rgba(255,255,255,0.07);padding:1px 6px;border-radius:2px;font-size:9px;font-family:'DM Mono',monospace"> ${esc(m.intent.replace(/_/g,' '))}</span>` : '';
+          const fallbackTag = m.isFallback ? `<span style="background:rgba(212,168,71,0.08);padding:1px 6px;border-radius:2px;font-size:9px;font-family:'DM Mono',monospace;color:#d4a847">state fallback</span>` : '';
+          return `<div style="display:flex;flex-direction:column;align-items:${isOut ? 'flex-end' : 'flex-start'}">
+            <div style="max-width:90%;background:${isOut ? 'rgba(212,168,71,0.08)' : 'rgba(255,255,255,0.04)'};border:1px solid ${isOut ? 'rgba(212,168,71,0.2)' : '#1e1e1e'};padding:10px 14px;border-radius:8px;line-height:1.55;font-size:12px;color:#d1d5db">
+              ${m.subject ? `<div style="font-size:10px;color:#6b7280;margin-bottom:6px;font-family:'DM Mono',monospace">Subject: ${esc(m.subject)}</div>` : ''}
+              ${esc(m.body || '')}
+            </div>
+            <div style="font-size:10px;color:#4a4a4a;margin-top:3px">${isOut ? 'Roco' : esc(contact.name || 'Investor')} · ${esc(m.channel || '')} · ${ts}${intentTag}${fallbackTag}</div>
+          </div>`;
+        }).join('')}
+      </div>` : `<div style="color:#4a4a4a;font-size:12px">No messages yet${projectName ? ` for ${esc(projectName)}` : ''}.</div>`}
+    </div>`;
+
+  // Intent timeline
+  const intentHtml = intentHistory.length ? `
+    <div style="padding:20px">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:10px">Intent Timeline</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${intentHistory.slice().reverse().slice(0, 12).map(h => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:#111;border-radius:4px">
+            <span style="font-size:12px;color:#d1d5db">${esc((h.intent || '').replace(/_/g,' '))}</span>
+            <span style="font-size:10px;color:#4a4a4a;font-family:'DM Mono',monospace">${new Date(h.timestamp).toLocaleDateString('en-GB',{day:'numeric',month:'short'})}</span>
+          </div>`).join('')}
+      </div>
+    </div>` : '';
+
+  el.innerHTML = infoHtml + dealsHtml + firmHtml + msgHtml + intentHtml;
+}
+
+// Also fetch firm research (AUM, EBITDA, thesis) and inject into the panel
+async function loadFirmResearchIntoPanel(contact) {
+  if (!contact?.company_name || !contact?.deal_id) return null;
+  try {
+    const { data: firm } = await fetch(`/api/firms/research?firm=${encodeURIComponent(contact.company_name)}&dealId=${contact.deal_id}`, { credentials: 'include' }).then(r => r.json()).catch(() => ({}));
+    return firm;
+  } catch { return null; }
+}
+
+function renderContactConvPanel(el, data) {
+  const { contact, messages, intentHistory } = data;
+  const contactInfo = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:16px">
+      ${contact?.email ? `<div><div style="color:var(--text-dim);font-size:10px;margin-bottom:2px">EMAIL</div><a href="mailto:${esc(contact.email)}" style="color:var(--accent)">${esc(contact.email)}</a></div>` : ''}
+      ${contact?.phone ? `<div><div style="color:var(--text-dim);font-size:10px;margin-bottom:2px">PHONE</div>${esc(contact.phone)}</div>` : ''}
+      ${contact?.linkedin_url ? `<div><div style="color:var(--text-dim);font-size:10px;margin-bottom:2px">LINKEDIN</div><a href="${esc(contact.linkedin_url)}" target="_blank" style="color:var(--accent)">View profile</a></div>` : ''}
+      ${contact?.job_title ? `<div><div style="color:var(--text-dim);font-size:10px;margin-bottom:2px">TITLE</div>${esc(contact.job_title)}</div>` : ''}
+      ${contact?.company_name ? `<div><div style="color:var(--text-dim);font-size:10px;margin-bottom:2px">FIRM</div>${esc(contact.company_name)}</div>` : ''}
+    </div>`;
+
+  const msgHtml = messages.length ? `
+    <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px;letter-spacing:0.08em">CONVERSATION HISTORY</div>
+    <div style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto">
+      ${messages.map(m => {
+        const isOut = m.direction === 'outbound';
+        const ts = m.timestamp ? new Date(m.timestamp).toLocaleDateString('en-GB', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '';
+        const intentTag = m.intent ? ` <span style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:2px;font-size:9px">${esc(m.intent.replace(/_/g,' '))}</span>` : '';
+        return `<div style="display:flex;flex-direction:column;align-items:${isOut ? 'flex-end' : 'flex-start'}">
+          <div style="max-width:85%;background:${isOut ? 'rgba(212,168,71,0.1)' : 'rgba(255,255,255,0.05)'};padding:8px 12px;border-radius:6px;line-height:1.5">
+            ${esc(m.body || '')}
+          </div>
+          <div style="font-size:10px;color:var(--text-dim);margin-top:2px">${isOut ? 'Roco' : 'Investor'} · ${esc(m.channel || '')} · ${ts}${intentTag}</div>
+        </div>`;
+      }).join('')}
+    </div>` : `<div style="color:var(--text-dim);font-size:12px">No messages yet.</div>`;
+
+  const intentHtml = intentHistory.length ? `
+    <div style="font-size:10px;color:var(--text-dim);margin:14px 0 8px;letter-spacing:0.08em">INTENT TIMELINE</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">
+      ${intentHistory.slice(-10).map(h => `
+        <div style="background:rgba(255,255,255,0.04);padding:4px 8px;border-radius:4px;font-size:10px">
+          <span style="color:var(--text-dim)">${new Date(h.timestamp).toLocaleDateString('en-GB', {day:'numeric',month:'short'})}</span>
+          <span style="margin-left:6px">${esc((h.intent || '').replace(/_/g,' '))}</span>
+        </div>`).join('')}
+    </div>` : '';
+
+  el.innerHTML = contactInfo + msgHtml + intentHtml;
 }
 
 async function sendInvitesNow(dealId) {
@@ -1698,8 +2159,9 @@ async function loadDealTabArchived(id) {
     if (!rows.length) { el.innerHTML = '<div class="loading-placeholder">No archived contacts.</div>'; return; }
     const reactivatable = rows.filter(r => (r.score || 0) >= 40);
     el.innerHTML = `
+      <div data-archived-deal-id="${id}">
       <div style="margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:12px">
-        <span style="color:var(--text-dim);font-size:13px">${rows.length} archived investor${rows.length !== 1 ? 's' : ''} — below minimum score threshold or outside deal criteria.</span>
+        <span data-archived-count style="color:var(--text-dim);font-size:13px">${rows.length} archived investor${rows.length !== 1 ? 's' : ''} — below minimum score threshold or outside deal criteria.</span>
         <div style="display:flex;gap:8px">
           <button class="btn btn-ghost btn-sm" style="font-size:12px;white-space:nowrap" onclick="exportDealArchivedCSV('${id}', this)">&#8595; Export CSV</button>
           ${!selectedDealReadOnly && reactivatable.length ? `<button class="btn btn-sm" style="white-space:nowrap" onclick="reactivateAllBorderline('${id}', this)">Re-activate borderline (${reactivatable.length})</button>` : ''}
@@ -1708,18 +2170,40 @@ async function loadDealTabArchived(id) {
       <div class="table-wrap">
         <table class="data-table">
           <thead><tr><th>Investor</th><th>Title / Firm</th><th>Score</th><th>Reason</th><th></th></tr></thead>
-          <tbody>
-            ${rows.map(r => `<tr id="archived-row-${r.id}">
-              <td>${esc(r.name || '—')}</td>
-              <td class="text-dim" style="font-size:12px">${r.jobTitle && r.firm ? `${esc(r.jobTitle)} <span style="opacity:0.5">·</span> ${esc(r.firm)}` : esc(r.jobTitle || r.firm || '—')}</td>
-              <td>${scoreHtml(r.score)}</td>
-              <td class="text-dim" style="font-size:12px;max-width:300px">${esc(r.archiveReason || '—')}</td>
-              <td>${!selectedDealReadOnly && (r.score || 0) >= 40 ? `<button class="btn btn-ghost" style="font-size:11px;padding:3px 8px;white-space:nowrap" onclick="reactivateContact('${r.id}', this)">Re-activate</button>` : ''}</td>
-            </tr>`).join('')}
+          <tbody id="deal-archived-tbody-${id}">
+            ${renderArchivedRows(rows)}
           </tbody>
         </table>
+      </div>
       </div>`;
   } catch { el.innerHTML = '<div class="loading-placeholder text-red">Failed to load.</div>'; }
+}
+
+function renderArchivedRows(rows) {
+  return rows.map(r => `<tr id="archived-row-${r.id}" data-archived-contact-id="${r.id}">
+    <td>${esc(r.name || '—')}</td>
+    <td class="text-dim" style="font-size:12px">${r.jobTitle && r.firm ? `${esc(r.jobTitle)} <span style="opacity:0.5">·</span> ${esc(r.firm)}` : esc(r.jobTitle || r.firm || '—')}</td>
+    <td>${scoreHtml(r.score)}</td>
+    <td class="text-dim" style="font-size:12px;max-width:300px">${esc(r.archiveReason || '—')}</td>
+    <td>${!selectedDealReadOnly && (r.score || 0) >= 40 ? `<button class="btn btn-ghost" style="font-size:11px;padding:3px 8px;white-space:nowrap" onclick="reactivateContact('${r.id}', this)">Re-activate</button>` : ''}</td>
+  </tr>`).join('');
+}
+
+async function patchDealArchivedInPlace(id) {
+  const container = document.querySelector(`#deal-tab-archived [data-archived-deal-id="${id}"]`);
+  if (!container) return;
+  const tbody = document.getElementById(`deal-archived-tbody-${id}`);
+  if (!tbody) return;
+  try {
+    const rows = await api(`/api/deals/${id}/archived`);
+    const countEl = container.querySelector('[data-archived-count]');
+    if (countEl) {
+      countEl.textContent = `${rows.length} archived investor${rows.length !== 1 ? 's' : ''} — below minimum score threshold or outside deal criteria.`;
+    }
+    tbody.innerHTML = renderArchivedRows(rows);
+  } catch {
+    // Keep current archived view intact if refresh fails.
+  }
 }
 
 async function reactivateContact(id, btn) {
@@ -1872,7 +2356,7 @@ window.handleExclFile = async function(file, dealId) {
   const formData = new FormData();
   formData.append('file', file);
   try {
-    const res = await fetch(`${API_BASE}/api/deals/${dealId}/exclusions/upload`, {
+    const res = await fetch(`/api/deals/${dealId}/exclusions/upload`, {
       method: 'POST',
       body: formData,
       credentials: 'include',
@@ -1940,9 +2424,6 @@ async function loadDealTemplatesTab(dealId) {
     const steps     = seqRes?.steps || [];
     const stepsJson = JSON.stringify(steps).replace(/'/g, '&#39;').replace(/"/g, '&quot;');
 
-    const typeColors = { email: '#1f3a5f', linkedin_invite: '#1a3a2a', linkedin_dm: '#2a1f3a' };
-    const typeLabels = { email: 'Email', linkedin_invite: 'LI Invite', linkedin_dm: 'LI DM' };
-
     el.innerHTML = `
       <div style="padding:20px">
 
@@ -1950,7 +2431,7 @@ async function loadDealTemplatesTab(dealId) {
         <div style="margin-bottom:28px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
             <div style="color:#e5e7eb;font-size:14px;font-weight:600">Outreach Sequence</div>
-            <button onclick="editDealSequence('${dealId}','${stepsJson}')"
+            <button onclick="window.editDealSequence('${dealId}')"
               style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;
                      color:#9ca3af;border-radius:6px;cursor:pointer;font-size:12px">
               Edit Sequence
@@ -1958,15 +2439,20 @@ async function loadDealTemplatesTab(dealId) {
           </div>
 
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            ${steps.map((s, i) => `
-              ${i > 0 ? '<div style="color:#2a2a2a;font-size:18px;align-self:center">&#8594;</div>' : ''}
-              <div style="padding:8px 14px;background:${typeColors[s.type] || '#1a1a1a'};
-                          border-radius:6px;text-align:center;min-width:100px">
-                <div style="color:#6b7280;font-size:10px;margin-bottom:2px">Day ${s.delay_days || 0}</div>
-                <div style="color:#e5e7eb;font-size:11px;font-family:'DM Mono',monospace;font-weight:600">${esc(s.label || '')}</div>
-                <div style="color:#9ca3af;font-size:10px;margin-top:2px">${typeLabels[s.type] || esc(s.type || '')}</div>
-              </div>
-            `).join('')}
+            ${steps.map((s, i) => {
+              const def = (typeof SEQ_STEP_DEFS !== 'undefined' && (SEQ_STEP_DEFS[s.label] || SEQ_STEP_DEFS[s.action_type])) || null;
+              const bg = def?.color || { email: '#1f3a5f', linkedin_invite: '#1a3a2a', linkedin_dm: '#2a1f3a' }[s.type] || '#1a1a1a';
+              const badge = def?.badge || '#6b7280';
+              const display = def?.display || (s.label || '').replace(/_/g,' ');
+              const delayLabel = Number(s.delay_days) > 0 ? `+${s.delay_days}d` : 'Day 0';
+              return `
+                ${i > 0 ? '<div style="color:#2a2a2a;font-size:18px;align-self:center">&#8594;</div>' : ''}
+                <div style="padding:8px 14px;background:${bg};border-radius:6px;text-align:center;min-width:100px">
+                  <div style="color:${badge};font-size:9px;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px">${delayLabel}</div>
+                  <div style="color:#e5e7eb;font-size:12px;font-weight:600">${esc(display)}</div>
+                  <div style="color:#3a3a3a;font-size:9px;font-family:'DM Mono',monospace;margin-top:2px">${s.type !== 'linkedin_invite' ? 'template' : 'auto'}</div>
+                </div>`;
+            }).join('')}
             ${steps.length === 0 ? '<span style="color:#4b5563;font-size:13px">No sequence yet — click Edit Sequence</span>' : ''}
           </div>
         </div>
@@ -1974,16 +2460,25 @@ async function loadDealTemplatesTab(dealId) {
         <!-- Templates section -->
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <div style="color:#e5e7eb;font-size:14px;font-weight:600">Message Templates</div>
-          <button onclick="window.showAddDealTemplateModal('${dealId}')"
-            style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;
-                   color:#9ca3af;border-radius:6px;cursor:pointer;font-size:12px">
-            + Add Template
-          </button>
+          <div style="display:flex;gap:8px">
+            <button id="regen-templates-btn-${dealId}" onclick="window.regenerateDealTemplates('${dealId}')"
+              style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;
+                     color:#60a5fa;border-radius:6px;cursor:pointer;font-size:12px">
+              Regenerate AI
+            </button>
+            <button onclick="window.showAddDealTemplateModal('${dealId}')"
+              style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;
+                     color:#9ca3af;border-radius:6px;cursor:pointer;font-size:12px">
+              + Add Template
+            </button>
+          </div>
         </div>
 
         <div style="display:flex;flex-direction:column;gap:12px">
           ${steps.filter(s => s.type !== 'linkedin_invite').map(step => {
-            const stepLabel = step.label || step.type || '';
+            const stepNorm = normaliseSeqStep(step);
+            const stepLabel = stepNorm.label || step.label || step.action_type || step.type || '';
+            const def = SEQ_STEP_DEFS[stepLabel] || null;
             const tmpl = templates.find(t => t.sequence_step === stepLabel && t.is_primary);
 
             if (!tmpl) {
@@ -1991,10 +2486,10 @@ async function loadDealTemplatesTab(dealId) {
                 <div style="padding:16px;border:1px dashed #2a2a2a;border-radius:8px;
                             display:flex;justify-content:space-between;align-items:center">
                   <div>
-                    <span style="font-family:'DM Mono',monospace;font-size:12px;color:#4a4a4a">${esc(stepLabel)}</span>
+                    <span style="font-family:'DM Mono',monospace;font-size:12px;color:#C9A84C">${esc(def?.display || stepLabel)}</span>
                     <span style="color:#374151;font-size:12px;margin-left:8px">No template assigned</span>
                   </div>
-                  <button onclick="window.showAddDealTemplateModal('${dealId}','${esc(stepLabel)}','${esc(step.type || 'email')}')"
+                  <button onclick="window.showAddDealTemplateModal('${dealId}','${esc(stepLabel)}','${esc(stepNorm.type || 'email')}')"
                     style="padding:5px 12px;background:#1a1a1a;border:1px solid #2a2a2a;
                            color:#9ca3af;border-radius:4px;cursor:pointer;font-size:11px">
                     + Add
@@ -2009,7 +2504,8 @@ async function loadDealTemplatesTab(dealId) {
               <div style="padding:16px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
                   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                    <span style="font-family:'DM Mono',monospace;font-size:12px;color:#9ca3af">${esc(stepLabel)}</span>
+                    <span style="font-family:'DM Mono',monospace;font-size:12px;color:#C9A84C">${esc(def?.display || stepLabel)}</span>
+                    <span style="padding:2px 6px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;color:#6b7280">${esc(stepLabel)}</span>
                     <span style="padding:2px 6px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;
                                  background:rgba(212,168,71,0.1);color:#d4a847">PRIMARY</span>
                     ${isAI ? `<span style="padding:2px 6px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;
@@ -2082,6 +2578,7 @@ const PREVIEW_SAMPLE_VALUES = {
   deckUrl:          'https://deck.example.com',
   callLink:         'https://cal.com/dom',
   senderName:       'Dom',
+  senderEmail:      'Dominick.Pandolfo@novastone-ca.com',
   senderTitle:      'Principal',
 };
 
@@ -2097,9 +2594,12 @@ function renderTemplateBody(body, values) {
 window.previewDealTemplate = function(tmpl, contactData) {
   const vals = { ...PREVIEW_SAMPLE_VALUES, ...(contactData || {}) };
   const isLinkedIn = tmpl.type === 'linkedin' || tmpl.type === 'linkedin_dm';
+  const previewSubject = tmpl.preview_subject ? renderTemplateBody(tmpl.preview_subject, vals) : null;
   const subjectA = tmpl.subject_a ? renderTemplateBody(tmpl.subject_a, vals) : null;
   const subjectB = tmpl.subject_b ? renderTemplateBody(tmpl.subject_b, vals) : null;
   const bodyHtml = renderTemplateBody(tmpl.body || '', vals).replace(/\n/g, '<br>');
+  const toEmail = vals.email || vals.contactEmail || 'james@meridiancapital.com';
+  const fromEmail = vals.senderEmail || 'Dominick.Pandolfo@novastone-ca.com';
 
   const modal = document.createElement('div');
   modal.id = 'tmpl-preview-modal';
@@ -2110,21 +2610,40 @@ window.previewDealTemplate = function(tmpl, contactData) {
   const dealId = tmpl.deal_id || window.__previewDealId;
 
   modal.innerHTML = isLinkedIn
-    ? `<div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;width:420px;max-height:85vh;overflow-y:auto;padding:0">
-        <div style="padding:16px 20px;border-bottom:1px solid #2a2a2a;display:flex;justify-content:space-between;align-items:center">
-          <div style="font-size:13px;font-weight:600;color:#e5e7eb">LinkedIn DM Preview</div>
+    ? `<div style="background:#f3f2ef;border:1px solid #d9d8d6;border-radius:16px;width:440px;max-height:88vh;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.35)">
+        <div style="background:#fff;padding:14px 18px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center">
+          <div style="display:flex;align-items:center;gap:12px;min-width:0">
+            <div style="width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg,#0a66c2,#378fe9);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:700;flex-shrink:0">${esc((vals.fullName || 'J').split(' ').map(part => part[0]).slice(0,2).join('').toUpperCase())}</div>
+            <div style="min-width:0">
+              <div style="font-size:14px;font-weight:600;color:#191919;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(vals.fullName || 'James Mitchell')}</div>
+              <div style="font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(vals.jobTitle || vals.title || 'Managing Partner')}${vals.firm ? ` · ${esc(vals.firm)}` : ''}</div>
+            </div>
+          </div>
           <div style="display:flex;gap:8px">
-            ${isEditing ? `<button onclick="modal.remove();window.editDealTemplateModal('${dealId}','${tmpl.id}',${JSON.stringify(tmpl).replace(/"/g,'&quot;')})" style="font-size:11px;color:#9ca3af;background:none;border:1px solid #2a2a2a;border-radius:4px;padding:3px 10px;cursor:pointer">Edit</button>` : ''}
-            <button onclick="document.getElementById('tmpl-preview-modal').remove()" style="font-size:16px;color:#6b7280;background:none;border:none;cursor:pointer">✕</button>
+            ${isEditing ? `<button onclick="document.getElementById('tmpl-preview-modal').remove();window.editDealTemplateModal('${dealId}','${tmpl.id}',${JSON.stringify(tmpl).replace(/"/g,'&quot;')})" style="font-size:11px;color:#344054;background:#f8fafc;border:1px solid #d0d5dd;border-radius:999px;padding:4px 10px;cursor:pointer">Edit</button>` : ''}
+            <button onclick="document.getElementById('tmpl-preview-modal').remove()" style="font-size:16px;color:#667085;background:none;border:none;cursor:pointer">✕</button>
           </div>
         </div>
-        <div style="padding:20px">
-          <div style="background:#0a66c2;border-radius:12px 12px 12px 0;padding:14px 16px;max-width:320px;font-size:13px;line-height:1.6;color:#fff">
-            ${bodyHtml}
+        <div style="padding:18px;background:linear-gradient(180deg,#f8fafc 0%,#f3f2ef 100%);min-height:420px;display:flex;flex-direction:column;gap:12px">
+          <div style="align-self:center;font-size:11px;color:#667085;background:rgba(255,255,255,.72);border:1px solid #e4e7ec;border-radius:999px;padding:4px 10px">Today · LinkedIn messaging</div>
+          <div style="display:flex;gap:10px;align-items:flex-end">
+            <div style="width:30px;height:30px;border-radius:50%;background:#d0d5dd;display:flex;align-items:center;justify-content:center;color:#475467;font-size:11px;font-weight:700;flex-shrink:0">${esc((vals.fullName || 'J')[0].toUpperCase())}</div>
+            <div style="background:#fff;border:1px solid #e4e7ec;border-radius:18px 18px 18px 6px;padding:10px 13px;max-width:260px;font-size:12px;line-height:1.5;color:#344054;box-shadow:0 6px 20px rgba(16,24,40,.04)">
+              Thanks for connecting.
+            </div>
           </div>
-          <div style="margin-top:8px;font-size:10px;color:#4b5563">Sent as: Dom · via LinkedIn</div>
+          <div style="display:flex;justify-content:flex-end">
+            <div style="background:#0a66c2;border:1px solid #095aa8;border-radius:18px 18px 6px 18px;padding:12px 14px;max-width:300px;font-size:13px;line-height:1.65;color:#fff;box-shadow:0 10px 26px rgba(10,102,194,.22)">
+              ${bodyHtml}
+            </div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;padding-right:6px;font-size:10px;color:#667085">You · Draft preview</div>
+          <div style="margin-top:auto;background:#fff;border:1px solid #d0d5dd;border-radius:14px;padding:12px 14px;display:flex;align-items:center;gap:10px">
+            <div style="color:#98a2b3;font-size:13px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Write a message...</div>
+            <div style="width:28px;height:28px;border-radius:50%;background:#eef2f6;display:flex;align-items:center;justify-content:center;color:#667085;font-size:13px">+</div>
+          </div>
         </div>
-        <div style="padding:12px 20px;border-top:1px solid #2a2a2a;font-size:11px;color:#4b5563">
+        <div style="padding:12px 18px;border-top:1px solid #e4e7ec;background:#fff;font-size:11px;color:#667085">
           <span style="color:#60a5fa">■</span> Variable filled &nbsp; <span style="color:#f87171">■</span> Variable missing
         </div>
       </div>`
@@ -2144,21 +2663,21 @@ window.previewDealTemplate = function(tmpl, contactData) {
         <div style="padding:0 16px;border-bottom:1px solid #e0e0e0;font-family:'Google Sans',system-ui,sans-serif">
           <div style="display:flex;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0;font-size:13px;color:#444">
             <span style="color:#888;width:40px;flex-shrink:0">From</span>
-            <span>Dom &lt;dom@roco.ai&gt;</span>
+            <span>${esc(vals.senderName || 'Dom')} &lt;${esc(fromEmail)}&gt;</span>
           </div>
           <div style="display:flex;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0;font-size:13px;color:#444">
             <span style="color:#888;width:40px;flex-shrink:0">To</span>
-            <span>${esc(vals.fullName)} &lt;james@meridiancapital.com&gt;</span>
+            <span>${esc(vals.fullName)} &lt;${esc(toEmail)}&gt;</span>
           </div>
-          ${subjectA ? `
+          ${previewSubject ? `
           <div style="padding:8px 0">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-              <span style="font-size:11px;color:#888;width:64px;flex-shrink:0">Subject A</span>
-              <span style="font-size:14px;font-weight:500;color:#202124">${subjectA}</span>
+              <span style="font-size:11px;color:#888;width:64px;flex-shrink:0">Subject</span>
+              <span style="font-size:14px;font-weight:500;color:#202124">${previewSubject}</span>
             </div>
-            ${subjectB ? `<div style="display:flex;align-items:center;gap:8px">
-              <span style="font-size:11px;color:#888;width:64px;flex-shrink:0">Subject B</span>
-              <span style="font-size:14px;color:#444">${subjectB}</span>
+            ${(subjectA && subjectB) ? `<div style="display:flex;align-items:center;gap:8px">
+              <span style="font-size:11px;color:#888;width:64px;flex-shrink:0">A/B</span>
+              <span style="font-size:12px;color:#444">${subjectA} &nbsp;|&nbsp; ${subjectB}</span>
             </div>` : ''}
           </div>` : ''}
         </div>
@@ -2198,10 +2717,11 @@ window.editDealTemplateModal = function(dealId, templateId, tmpl) {
 
 function showDealTemplateModal({ dealId, templateId, sequenceStep, type, name, subject_a, subject_b, body, is_primary }) {
   const isEmail = (type || 'email') === 'email';
-  const standardVars = [
-    'firstName', 'lastName', 'fullName', 'firm', 'title',
-    'dealName', 'dealType', 'sector', 'ebitda', 'ev', 'equity',
-    'investorFocus', 'firmLine', 'contactType', 'senderName',
+  const varGroups = [
+    { label: 'Contact',           vars: ['firstName','lastName','fullName','firm','jobTitle'] },
+    { label: 'Investor Research', vars: ['pastInvestments','investmentThesis','sectorFocus','investorGeography'] },
+    { label: 'Deal',              vars: ['dealName','dealBrief','sector','targetAmount','keyMetrics','geography','minCheque','maxCheque','investorProfile','comparableDeal'] },
+    { label: 'Links & Sender',    vars: ['deckUrl','callLink','senderName','senderTitle'] },
   ];
 
   const existing = document.getElementById('deal-tmpl-modal');
@@ -2259,14 +2779,20 @@ function showDealTemplateModal({ dealId, templateId, sequenceStep, type, name, s
         <label style="color:#6b7280;font-size:10px;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:8px">
           Variables — click to insert, or type your own {{variable}}
         </label>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px">
-          ${standardVars.map(v => `
-            <button onclick="window.insertDtmVar('{{${v}}}')"
-              style="padding:3px 8px;background:#1a1a2a;border:1px solid #2a2a3a;
-                     color:#818cf8;border-radius:3px;cursor:pointer;font-size:11px;
-                     font-family:'DM Mono',monospace">
-              {{${v}}}
-            </button>`).join('')}
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+          ${varGroups.map(g => `
+            <div>
+              <div style="font-size:10px;color:#4b5563;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">${g.label}</div>
+              <div style="display:flex;flex-wrap:wrap;gap:4px">
+                ${g.vars.map(v => `
+                  <button onclick="window.insertDtmVar('{{${v}}}')"
+                    style="padding:3px 8px;background:#1a1a2a;border:1px solid #2a2a3a;
+                           color:#818cf8;border-radius:3px;cursor:pointer;font-size:11px;
+                           font-family:'DM Mono',monospace">
+                    {{${v}}}
+                  </button>`).join('')}
+              </div>
+            </div>`).join('')}
         </div>
       </div>
 
@@ -2360,14 +2886,203 @@ window.deleteDealTemplate = async function(dealId, templateId) {
   }
 };
 
-window.editDealSequence = function(dealId, stepsJsonStr) {
-  let steps = [];
-  try { steps = JSON.parse(stepsJsonStr); } catch {}
+window.regenerateDealTemplates = async function(dealId) {
+  const btn = document.getElementById(`regen-templates-btn-${dealId}`);
+  if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
+  try {
+    const data = await api(`/api/deals/${dealId}/templates/regenerate`, 'POST');
+    showToast(`${data.count} templates regenerated with latest deal data`);
+    loadDealTemplatesTab(dealId);
+  } catch (err) {
+    showToast('Regeneration failed: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.textContent = 'Regenerate AI'; btn.disabled = false; }
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEQUENCE EDITOR
+// Steps use {type, label, delay_days} — orchestrator filters by type per channel
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SEQ_STEP_DEFS = {
+  linkedin_invite:  { type: 'linkedin_invite', label: 'linkedin_invite',  display: 'LI Invite',          note: 'Sends connection request — no template needed',  color: '#1a3a2a', badge: '#4ade80' },
+  linkedin_dm_1:    { type: 'linkedin_dm',     label: 'linkedin_dm_1',    display: 'LI DM Intro',        note: 'First DM sent on acceptance',                    color: '#2a1f3a', badge: '#a78bfa' },
+  linkedin_dm_2:    { type: 'linkedin_dm',     label: 'linkedin_dm_2',    display: 'LI DM Follow-up',    note: 'Follow-up DM if no reply',                       color: '#2a1f3a', badge: '#a78bfa' },
+  email_intro:      { type: 'email',           label: 'email_intro',      display: 'Email Intro',        note: 'First email — requires template',                color: '#1f3a5f', badge: '#60a5fa' },
+  email_followup_1: { type: 'email',           label: 'email_followup_1', display: 'Email Follow-up 1',  note: 'Second email if no reply',                       color: '#1f3a5f', badge: '#60a5fa' },
+  email_followup_2: { type: 'email',           label: 'email_followup_2', display: 'Email Follow-up 2',  note: 'Third email if no reply',                        color: '#1f3a5f', badge: '#60a5fa' },
+};
+
+const SEQ_DEFAULT_STEPS = [
+  { type: 'linkedin_invite',  label: 'linkedin_invite',  delay_days: 0 },
+  { type: 'linkedin_dm',      label: 'linkedin_dm_1',    delay_days: 0 },
+  { type: 'linkedin_dm',      label: 'linkedin_dm_2',    delay_days: 7 },
+  { type: 'email',            label: 'email_intro',      delay_days: 0 },
+  { type: 'email',            label: 'email_followup_1', delay_days: 7 },
+  { type: 'email',            label: 'email_followup_2', delay_days: 14 },
+];
+
+// Normalise steps from DB — handle legacy action_type format
+function normaliseSeqStep(s) {
+  if (s.type && s.label) return s;
+  // Legacy: action_type field
+  const key = s.action_type || s.label || 'email_intro';
+  const def = SEQ_STEP_DEFS[key];
+  return { ...s, type: def?.type || 'email', label: def?.label || key };
+}
+
+function buildSeqStepRow(s, isNew = false) {
+  const key = s.label || s.action_type || 'email_intro';
+  const def = SEQ_STEP_DEFS[key] || SEQ_STEP_DEFS.email_intro;
+  const delay = Number(s.delay_days) || 0;
+  const typeColor = { linkedin_invite: '#4ade80', linkedin_dm: '#a78bfa', email: '#60a5fa' }[def.type] || '#6b7280';
+
+  return `
+    <div class="seq-step-row" style="display:grid;grid-template-columns:120px 1fr auto 32px;gap:10px;
+         align-items:center;padding:10px 12px;background:#111;border:1px solid #1C1C1F;
+         border-radius:6px;margin-bottom:6px${isNew ? ';border-color:#C9A84C44' : ''}">
+      <select class="seq-type-select"
+        style="background:#0d0d0f;border:1px solid #2a2a2a;color:#e5e7eb;
+               padding:5px 8px;border-radius:4px;font-size:11px;font-family:'DM Mono',monospace">
+        ${Object.entries(SEQ_STEP_DEFS).map(([k, d]) =>
+          `<option value="${k}"${key === k ? ' selected' : ''}>${d.display}</option>`
+        ).join('')}
+      </select>
+      <div style="font-size:11px;color:#4a4845;font-family:'DM Mono',monospace" class="seq-step-note">
+        ${esc(def.note)}
+        ${def.type !== 'linkedin_invite' ? `<span style="color:#3a3a3a;margin-left:4px">· template required</span>` : ''}
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="color:#4a4845;font-size:11px;font-family:'DM Mono',monospace;white-space:nowrap">+</span>
+        <input type="number" class="seq-delay-input" value="${delay}" min="0"
+          style="width:50px;background:#0d0d0f;border:1px solid #2a2a2a;color:#e5e7eb;
+                 padding:5px;border-radius:4px;font-size:11px;text-align:center;font-family:'DM Mono',monospace">
+        <span style="color:#4a4845;font-size:11px;font-family:'DM Mono',monospace;white-space:nowrap">days</span>
+      </div>
+      <button onclick="this.closest('.seq-step-row').remove()"
+        style="background:none;border:1px solid #2a2a2a;color:#6b7280;width:28px;height:28px;
+               border-radius:4px;cursor:pointer;font-size:14px;line-height:1">&#215;</button>
+    </div>`;
+}
+
+// Update note text when step type dropdown changes
+window._seqTypeChanged = function(sel) {
+  const row = sel.closest('.seq-step-row');
+  const key = sel.value;
+  const def = SEQ_STEP_DEFS[key] || SEQ_STEP_DEFS.email_intro;
+  const note = row.querySelector('.seq-step-note');
+  if (note) note.innerHTML = esc(def.note) + (def.type !== 'linkedin_invite' ? `<span style="color:#3a3a3a;margin-left:4px">· template required</span>` : '');
+};
+
+window.editDealSequence = async function(dealId) {
   window._editingDealSequenceId = dealId;
-  if (typeof renderSequenceEditorModal === 'function') {
-    renderSequenceEditorModal(steps, { dealId });
-  } else {
-    showToast('Sequence editor not available', 'error');
+  await window.openEditSequence(dealId);
+};
+
+window.openEditSequence = async function(dealId) {
+  const id = dealId || window._editingDealSequenceId || activeDeal;
+  if (!id) { showToast('No deal selected', 'error'); return; }
+  window._editingDealSequenceId = id;
+
+  let rawSteps = [];
+  try {
+    const data = await api(`/api/deals/${id}/sequence`);
+    rawSteps = data?.steps || [];
+  } catch {}
+
+  const steps = rawSteps.length ? rawSteps.map(normaliseSeqStep) : SEQ_DEFAULT_STEPS;
+
+  let modal = document.getElementById('deal-sequence-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'deal-sequence-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:700;display:flex;align-items:center;justify-content:center;padding:24px';
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+
+  modal.innerHTML = `
+    <div style="background:#0A0A0C;border:1px solid #1C1C1F;border-radius:10px;
+                width:100%;max-width:640px;max-height:88vh;overflow-y:auto;padding:28px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h3 style="color:#EDE9E3;font-family:'Cormorant Garamond',serif;font-size:20px;margin:0">
+          Edit Outreach Sequence
+        </h3>
+        <button onclick="document.getElementById('deal-sequence-modal').remove()"
+          style="background:none;border:1px solid #2a2a2a;color:#6b7280;width:30px;height:30px;border-radius:4px;cursor:pointer;font-size:16px">&#215;</button>
+      </div>
+      <p style="color:#4a4845;font-size:12px;font-family:'DM Mono',monospace;margin:0 0 20px">
+        One contact per firm at a time. LI invite &rarr; LI DM on acceptance &rarr; email if no reply.
+        All outreach to other contacts at the firm is suppressed once anyone responds.
+      </p>
+
+      <div id="deal-seq-steps">
+        ${steps.map(s => buildSeqStepRow(s)).join('')}
+      </div>
+
+      <div style="margin-top:14px;padding-top:14px;border-top:1px solid #1C1C1F;
+                  display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="color:#4a4845;font-size:11px;font-family:'DM Mono',monospace">Add step:</span>
+        ${Object.entries(SEQ_STEP_DEFS).map(([k, d]) => `
+          <button onclick="window._addSeqStep('${k}')"
+            style="padding:4px 10px;background:#111;border:1px solid #2a2a2a;color:#9ca3af;
+                   border-radius:4px;cursor:pointer;font-size:11px;font-family:'DM Mono',monospace">
+            + ${esc(d.display)}
+          </button>`).join('')}
+      </div>
+
+      <div style="margin-top:20px;display:flex;gap:10px">
+        <button onclick="window.saveDealSequence()"
+          style="padding:10px 22px;background:#C9A84C;border:none;color:#000;border-radius:6px;cursor:pointer;font-weight:700;font-size:13px">
+          Save Sequence
+        </button>
+        <button onclick="document.getElementById('deal-sequence-modal').remove()"
+          style="padding:10px 18px;background:none;border:1px solid #2a2a2a;color:#6b7280;border-radius:6px;cursor:pointer;font-size:13px">
+          Cancel
+        </button>
+      </div>
+    </div>`;
+
+  // Wire up the onchange handlers after innerHTML is set
+  modal.addEventListener('change', e => {
+    if (e.target.classList.contains('seq-type-select')) window._seqTypeChanged(e.target);
+  });
+
+  document.body.appendChild(modal);
+};
+
+window._addSeqStep = function(key) {
+  const container = document.getElementById('deal-seq-steps');
+  if (!container) return;
+  const def = SEQ_STEP_DEFS[key] || SEQ_STEP_DEFS.email_intro;
+  const defaultDelay = key.includes('followup_2') ? 14 : key.includes('followup') ? 7 : 0;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = buildSeqStepRow({ type: def.type, label: def.label, delay_days: defaultDelay }, true);
+  container.appendChild(tmp.firstElementChild);
+};
+
+window.saveDealSequence = async function() {
+  const id = window._editingDealSequenceId;
+  if (!id) { showToast('No deal context', 'error'); return; }
+
+  const rows = document.querySelectorAll('#deal-seq-steps .seq-step-row');
+  const steps = [...rows].map((row, i) => {
+    const key = row.querySelector('.seq-type-select')?.value || 'email_intro';
+    const def = SEQ_STEP_DEFS[key] || { type: 'email', label: key };
+    const delay = parseInt(row.querySelector('.seq-delay-input')?.value) || 0;
+    return { step: i + 1, type: def.type, label: def.label, delay_days: delay };
+  });
+
+  const btn = document.querySelector('#deal-sequence-modal button[onclick="window.saveDealSequence()"]');
+  if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+
+  try {
+    await api(`/api/deals/${id}/sequence`, 'PUT', { steps });
+    showToast('Sequence saved');
+    document.getElementById('deal-sequence-modal')?.remove();
+    await loadDealTemplatesTab(id).catch(() => {});
+  } catch (err) {
+    showToast('Save failed: ' + err.message, 'error');
+    if (btn) { btn.textContent = 'Save Sequence'; btn.disabled = false; }
   }
 };
 
@@ -2375,249 +3090,1014 @@ window.editDealSequence = function(dealId, stepsJsonStr) {
 // CAMPAIGN REVIEW TAB
 // ─────────────────────────────────────────────────────────────────────────────
 
+let campaignRefreshInterval = null;
 async function loadCampaignReviewTab(dealId) {
-  const el = document.getElementById('deal-tab-campaign');
-  if (!el) return;
-  el.innerHTML = '<div class="loading-placeholder">Loading campaign…</div>';
+  const container = document.getElementById('deal-tab-rankings');
+  if (!container) return;
+
+  container.innerHTML = '<div style="padding:24px;color:#6b7280">Loading...</div>';
+
   try {
-    const [batch, allBatches] = await Promise.all([
-      api(`/api/deals/${dealId}/campaign/current`),
-      api(`/api/deals/${dealId}/batches`).catch(() => []),
-    ]);
+    const batchRes = await fetch(`${API_BASE}/api/deals/${dealId}/batch/current`, { credentials: 'include' });
+    const batch = batchRes.ok ? await batchRes.json() : null;
+
     if (!batch) {
-      el.innerHTML = `<div style="padding:32px;text-align:center;color:var(--text-dim)">
-        <div style="font-size:14px;margin-bottom:8px">No active campaign batch</div>
-        <div style="font-size:12px">The orchestrator will create a batch automatically when research begins.</div>
-      </div>`;
+      stopCampaignAutoRefresh();
+      container.innerHTML = `
+        <div style="padding:32px;text-align:center;color:#374151">
+          No batch active. Research will begin automatically.
+        </div>
+      `;
       return;
     }
-    // Show "next batch ready" banner if a ready batch exists alongside an approved batch
-    const readyBatch = (allBatches || []).find(b => b.status === 'ready');
-    const nextBanner = readyBatch && batch.status === 'approved' ? `
-      <div style="background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.25);border-radius:8px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
-        <span style="font-size:16px">✅</span>
-        <div style="flex:1">
-          <div style="font-size:13px;font-weight:600;color:#a78bfa">Batch #${readyBatch.batch_number} ready</div>
-          <div style="font-size:12px;color:var(--text-dim)">Pre-built and waiting. Close this batch to queue it for review.</div>
-        </div>
-      </div>` : '';
-    el.innerHTML = nextBanner + renderCampaignBatch(batch, dealId);
+
+    const firmsUrl = batch.status === 'pending_approval'
+      ? `${API_BASE}/api/deals/${dealId}/batch/${batch.id}/firms?page=${campaignReviewPage}&limit=${CAMPAIGN_FIRMS_PER_PAGE}`
+      : `${API_BASE}/api/deals/${dealId}/batch/${batch.id}/firms`;
+    const firmsRes = await fetch(firmsUrl, { credentials: 'include' });
+    if (!firmsRes.ok) {
+      const errText = await firmsRes.text().catch(() => '');
+      throw new Error(errText || `Failed to load firms (${firmsRes.status})`);
+    }
+    const firmsPayload = await firmsRes.json();
+    const firms = Array.isArray(firmsPayload) ? firmsPayload : (firmsPayload.firms || []);
+
+    if (batch.status === 'researching') {
+      container.innerHTML = renderResearchingState(dealId, batch);
+      await loadResearchFirmsList(dealId, batch.id);
+      startCampaignAutoRefresh(dealId);
+    } else if (batch.status === 'pending_approval') {
+      stopCampaignAutoRefresh();
+      const allFirmsRes = await fetch(`${API_BASE}/api/deals/${dealId}/batch/${batch.id}/firms`, { credentials: 'include' });
+      const allFirmsPayload = allFirmsRes.ok ? await allFirmsRes.json() : firms;
+      const allFirms = Array.isArray(allFirmsPayload) ? allFirmsPayload : firms;
+      container.innerHTML = renderCampaignReview(dealId, batch, firms, {
+        total: firmsPayload.total || firms.length,
+        pages: firmsPayload.pages || 1,
+        page: firmsPayload.page || campaignReviewPage,
+        allFirms,
+      });
+    } else if (batch.status === 'approved' || batch.status === 'active') {
+      stopCampaignAutoRefresh();
+      const allEnriched = firms.length > 0 && firms.every(f => f.enrichment_status === 'complete');
+      container.innerHTML = allEnriched
+        ? renderCampaignTrackerState(dealId, batch, firms)
+        : renderEnrichmentState(dealId, batch, firms);
+      if (!allEnriched) {
+        startEnrichmentStatusPoll(dealId, batch.id);
+      }
+    } else {
+      stopCampaignAutoRefresh();
+      container.innerHTML = renderCampaignReview(dealId, batch, firms);
+    }
   } catch (e) {
-    el.innerHTML = `<div class="loading-placeholder text-red">Failed to load: ${esc(e.message)}</div>`;
+    container.innerHTML = `<div class="loading-placeholder text-red">Failed to load: ${esc(e.message)}</div>`;
   }
 }
 
-function renderCampaignBatch(batch, dealId) {
-  const statusColors = {
-    researching: 'color:#60a5fa',
-    ready: 'color:#a78bfa',
-    pending_approval: 'color:#eab308',
-    approved: 'color:#22c55e',
-    rejected: 'color:#ef4444',
-    completed: 'color:var(--text-dim)',
-  };
-  const statusLabel = {
-    researching: 'Researching',
-    ready: 'Ready (Queued)',
-    pending_approval: 'Review Required',
-    approved: 'Approved — Outreach Active',
-    rejected: 'Rejected',
-    completed: 'Completed',
-  };
-  const firms = batch.firms || [];
-  const rankedFirms = batch.ranked_firms || firms.length;
-  const targetFirms = batch.target_firms || 20;
-  const progressPct = Math.min(100, Math.round((rankedFirms / targetFirms) * 100));
-
-  const firmCards = firms.map(f => {
-    const fos = f.firm_outreach_state || {};
-    const firmData = fos.firms || {};
-    const firmName = esc(f.firm_name || firmData.name || 'Unknown');
-    const sector = esc(firmData.sector || '');
-    const location = esc(firmData.hq_location || '');
-    const score = fos.rank_score ? Math.round(fos.rank_score) : '—';
-    const justification = esc(f.justification || '');
-    const contacts = f.contacts || [];
-    const cardId = `cbf-${f.id}`;
-    const detailId = `cbf-detail-${f.id}`;
-
-    const contactRows = contacts.map(c => {
-      const hasEmail = !!c.email;
-      const hasLi = !!c.linkedin_url;
-      const researched = c.person_researched;
-      const typeLabel = c.contact_type === 'individual' ? '👤' : '🏢';
-      const channelIcons = [
-        hasEmail ? `<span title="Email" style="font-size:11px">📧</span>` : '',
-        hasLi ? `<span title="LinkedIn" style="font-size:11px">💼</span>` : '',
-      ].filter(Boolean).join(' ');
-      return `<div style="padding:10px 0;border-bottom:1px solid var(--border-color)">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
-          <div>
-            <span style="font-size:12px;font-weight:600;color:var(--text-primary)">${typeLabel} ${esc(c.name || '—')}</span>
-            ${c.job_title ? `<span style="font-size:11px;color:var(--text-dim);margin-left:6px">${esc(c.job_title)}</span>` : ''}
-          </div>
-          <div style="display:flex;align-items:center;gap:6px">
-            ${channelIcons}
-            ${c.investor_score ? `<span style="font-size:11px;font-family:var(--font-mono);color:var(--text-dim)">${Math.round(c.investor_score)}</span>` : ''}
-            ${researched ? `<span style="font-size:10px;color:#22c55e">✓ researched</span>` : `<span style="font-size:10px;color:#eab308">researching…</span>`}
-          </div>
-        </div>
-        ${c.past_investments ? `<div style="font-size:11px;color:var(--text-dim);margin-bottom:3px"><span style="color:var(--text-secondary);font-weight:500">Past investments:</span> ${esc(c.past_investments)}</div>` : ''}
-        ${c.investment_thesis ? `<div style="font-size:11px;color:var(--text-dim);margin-bottom:3px"><span style="color:var(--text-secondary);font-weight:500">Thesis:</span> ${esc(c.investment_thesis)}</div>` : ''}
-        ${c.sector_focus ? `<div style="font-size:11px;color:var(--text-dim);margin-bottom:3px"><span style="color:var(--text-secondary);font-weight:500">Sectors:</span> ${esc(c.sector_focus)}</div>` : ''}
-        ${c.geography ? `<div style="font-size:11px;color:var(--text-dim)"><span style="color:var(--text-secondary);font-weight:500">Geography:</span> ${esc(c.geography)}</div>` : ''}
-      </div>`;
-    }).join('');
-
-    return `<div class="card" style="padding:0;margin-bottom:10px;overflow:hidden" id="${cardId}">
-      <div style="padding:14px 16px;display:flex;justify-content:space-between;align-items:flex-start;cursor:pointer" onclick="toggleFirmDetail('${detailId}')">
-        <div style="flex:1">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
-            <span style="font-size:13px;font-weight:600;color:var(--text-primary)">${firmName}</span>
-            ${contacts.length ? `<span style="font-size:10px;background:rgba(96,165,250,.12);color:#60a5fa;padding:1px 6px;border-radius:10px">${contacts.length} contact${contacts.length !== 1 ? 's' : ''}</span>` : ''}
-          </div>
-          ${sector ? `<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">${sector}${location ? ' · ' + location : ''}</div>` : ''}
-          ${justification ? `<div style="font-size:12px;color:var(--text-secondary);font-style:italic">"${justification}"</div>` : ''}
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;margin-left:16px;flex-shrink:0">
-          ${score !== '—' ? `<div style="font-size:18px;font-family:var(--font-mono);font-weight:700;color:var(--text-primary)">${score}</div>` : ''}
-          ${batch.status === 'pending_approval' ? `<button class="btn btn-ghost btn-sm" style="color:#ef4444" onclick="event.stopPropagation();removeFirmFromBatch('${f.id}','${dealId}')">Remove</button>` : ''}
-          <span style="font-size:10px;color:var(--text-dim)">▼</span>
-        </div>
-      </div>
-      <div id="${detailId}" style="display:none;border-top:1px solid var(--border-color);padding:0 16px 12px">
-        ${contacts.length ? contactRows : `<div style="padding:12px 0;font-size:12px;color:var(--text-dim)">No contacts found yet — research in progress.</div>`}
-      </div>
-    </div>`;
-  }).join('');
-
-  const approveBtn = batch.status === 'pending_approval' ? `
-    <button class="btn btn-primary" onclick="approveCampaignBatch('${batch.id}','${dealId}')" style="min-width:140px">Approve Campaign</button>
-    <button class="btn btn-ghost btn-sm" style="color:#ef4444" onclick="rejectCampaignBatch('${batch.id}','${dealId}')">Reject</button>
-  ` : batch.status === 'approved' ? `
-    <button class="btn btn-ghost" onclick="closeBatchAndNext('${dealId}')" style="border-color:#eab308;color:#eab308">Close Batch &amp; Next</button>
-  ` : '';
-
-  const researchProgress = batch.status === 'researching' ? `
-    <div style="margin-bottom:20px">
-      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-dim);margin-bottom:6px">
-        <span>Research progress</span><span>${rankedFirms} / ${targetFirms} firms</span>
-      </div>
-      <div style="height:4px;background:var(--border-color);border-radius:2px">
-        <div style="height:4px;background:#60a5fa;border-radius:2px;width:${progressPct}%;transition:width .3s"></div>
-      </div>
-      <div style="font-size:11px;color:var(--text-dim);margin-top:6px">Outreach is gated until ${targetFirms} firms are ranked and you approve the campaign.</div>
-    </div>
-  ` : '';
-
-  const timeline = renderProjectedTimeline(batch);
+function renderResearchingState(dealId, batch) {
+  const firmsFound = batch.firms_researched || batch.ranked_firms || 0;
+  const target = batch.firms_target || batch.target_firms || 100;
+  const pct = Math.min(Math.round((firmsFound / target) * 100), 100);
+  const startedAt = batch.created_at ? new Date(batch.created_at) : new Date();
+  const elapsedMs = Date.now() - startedAt.getTime();
+  const elapsedHours = Math.floor(elapsedMs / (1000 * 60 * 60));
+  const elapsedMins = Math.floor((elapsedMs % (1000 * 60 * 60)) / (1000 * 60));
+  const elapsedStr = elapsedHours > 0 ? `${elapsedHours}h ${elapsedMins}m` : `${elapsedMins}m`;
+  const msPerFirm = firmsFound > 0 ? elapsedMs / firmsFound : 0;
+  const remaining = target - firmsFound;
+  const estimatedMsLeft = msPerFirm * remaining;
+  const estHours = Math.floor(estimatedMsLeft / (1000 * 60 * 60));
+  const estMins = Math.floor((estimatedMsLeft % (1000 * 60 * 60)) / (1000 * 60));
+  const estStr = firmsFound > 2 ? (estHours > 0 ? `~${estHours}h ${estMins}m remaining` : `~${estMins}m remaining`) : 'Estimating...';
 
   return `
-    <div style="padding:0 0 24px">
+    <div style="padding:24px">
+      <div style="margin-bottom:28px">
+        <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:4px">
+          Batch ${batch.batch_number}
+        </div>
+        <h2 style="font-family:'Playfair Display',serif;font-size:22px;color:#e5e7eb;margin:0 0 4px">Researching Firms</h2>
+        <div style="color:#6b7280;font-size:13px">
+          Roco is identifying and ranking the best-fit investors for this deal. No outreach will begin until you approve the campaign.
+        </div>
+      </div>
+
+      <div style="background:#0d0d0f;border:1px solid #1a1a1a;border-radius:10px;padding:24px;margin-bottom:20px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:16px">
+          <div>
+            <span data-firms-count style="font-size:36px;font-weight:600;color:#d4a847;font-family:'Playfair Display',serif">${firmsFound}</span>
+            <span style="font-size:18px;color:#4a4a4a;font-family:'Playfair Display',serif">/${target}</span>
+            <span style="font-size:13px;color:#6b7280;margin-left:8px">firms researched</span>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:12px;color:#6b7280;font-family:'DM Mono',monospace">${elapsedStr} elapsed</div>
+            <div style="font-size:11px;color:#374151;font-family:'DM Mono',monospace;margin-top:2px">${estStr}</div>
+          </div>
+        </div>
+        <div style="background:#1a1a1a;border-radius:4px;height:8px;overflow:hidden;margin-bottom:10px;position:relative">
+          <div data-progress-bar style="height:100%;border-radius:4px;background:linear-gradient(90deg,#b8903e,#d4a847,#e8c97a);width:${pct}%;transition:width 0.6s ease;box-shadow:0 0 8px rgba(212,168,71,0.4)"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#374151;font-family:'DM Mono',monospace">
+          <span>${pct}% complete</span>
+          <span>${remaining} firms to go</span>
+        </div>
+      </div>
+
+      ${firmsFound > 0 ? `
+        <div>
+          <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:10px">
+            Firms Found So Far
+          </div>
+          <div id="research-firms-list">Loading...</div>
+        </div>
+      ` : `
+        <div style="text-align:center;padding:32px;color:#374151;border:1px dashed #1a1a1a;border-radius:8px">
+          Research starting — firms will appear here as they are ranked.
+        </div>
+      `}
+    </div>
+  `;
+}
+
+async function loadResearchFirmsList(dealId, batchId) {
+  const container = document.getElementById('research-firms-list');
+  if (!container) return;
+  const res = await fetch(`${API_BASE}/api/deals/${dealId}/batch/${batchId}/firms`, { credentials: 'include' });
+  if (!res.ok) { container.innerHTML = ''; return; }
+  const firms = await res.json();
+  container.innerHTML = firms.length === 0
+    ? '<div style="color:#374151;font-size:12px">No firms yet.</div>'
+    : firms.map((f, i) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#111;border-radius:6px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="color:#d4a847;font-size:13px;font-family:'DM Mono',monospace;width:20px">${f.rank || i + 1}</span>
+            <span style="color:#e5e7eb;font-size:13px">${esc(f.firm_name || 'Unknown')}</span>
+          </div>
+          <span style="padding:2px 8px;background:rgba(212,168,71,0.1);color:#d4a847;border-radius:3px;font-size:11px;font-family:'DM Mono',monospace">
+            ${f.score || '--'}
+          </span>
+        </div>
+      `).join('');
+}
+
+function startCampaignAutoRefresh(dealId) {
+  stopCampaignAutoRefresh();
+  campaignRefreshInterval = setInterval(async () => {
+    const res = await fetch(`${API_BASE}/api/deals/${dealId}/batch/current`, { credentials: 'include' });
+    if (!res.ok) return;
+    const batch = await res.json();
+    if (!batch) return;
+
+    const countEl = document.querySelector('[data-firms-count]');
+    if (countEl) countEl.textContent = batch.firms_researched || batch.ranked_firms || 0;
+
+    const barEl = document.querySelector('[data-progress-bar]');
+    if (barEl) {
+      const target = batch.firms_target || batch.target_firms || 100;
+      const pct = Math.min(Math.round((((batch.firms_researched || batch.ranked_firms || 0)) / target) * 100), 100);
+      barEl.style.width = pct + '%';
+    }
+
+    if (batch.status === 'pending_approval') {
+      stopCampaignAutoRefresh();
+      await loadCampaignReviewTab(dealId);
+    } else if (batch.status === 'researching') {
+      await loadResearchFirmsList(dealId, batch.id);
+    }
+  }, 8000);
+}
+
+function stopCampaignAutoRefresh() {
+  if (campaignRefreshInterval) {
+    clearInterval(campaignRefreshInterval);
+    campaignRefreshInterval = null;
+  }
+  stopEnrichmentStatusPoll();
+}
+
+let enrichmentPollInterval = null;
+function startEnrichmentStatusPoll(dealId, batchId) {
+  stopEnrichmentStatusPoll();
+  enrichmentPollInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/deals/${dealId}/batch/${batchId}/firms`, { credentials: 'include' });
+      if (!res.ok) return;
+      const firms = await res.json();
+
+      // Patch each firm's status badge in-place — never rebuild the DOM
+      let allDone = true;
+      for (const firm of firms) {
+        const badge = document.getElementById(`enrich-status-${firm.id}`);
+        if (!badge) continue;
+        if (firm.enrichment_status !== 'complete') allDone = false;
+        const { label, color } = enrichStatusDisplay(firm);
+        badge.textContent = label;
+        badge.style.color = color;
+        const countEl = document.getElementById(`enrich-count-${firm.id}`);
+        if (countEl && firm.contacts_found != null) {
+          countEl.textContent = `${firm.contacts_found} contact${firm.contacts_found !== 1 ? 's' : ''}`;
+        }
+      }
+
+      // Update overall progress bar if present
+      const enriched = firms.filter(f => f.enrichment_status === 'complete').length;
+      const pct = Math.round((enriched / (firms.length || 1)) * 100);
+      const bar = document.querySelector('[data-enrich-bar]');
+      if (bar) bar.style.width = pct + '%';
+      const countSummary = document.querySelector('[data-enrich-summary]');
+      if (countSummary) countSummary.textContent = `${enriched} / ${firms.length} firms enriched`;
+
+      if (allDone) {
+        stopEnrichmentStatusPoll();
+        await loadCampaignReviewTab(dealId);
+      }
+    } catch (_) {}
+  }, 10000);
+}
+
+function parseFirmEnrichmentMeta(firm) {
+  const raw = String(firm?.status_reason || '').trim();
+  if (!raw.startsWith('{')) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function enrichStatusDisplay(firmOrStatus) {
+  const firm = typeof firmOrStatus === 'object' && firmOrStatus !== null ? firmOrStatus : { enrichment_status: firmOrStatus };
+  const status = firm.enrichment_status || firmOrStatus;
+  const meta = parseFirmEnrichmentMeta(firm);
+  switch (status) {
+    case 'complete':     return { label: '✓ Enriched',    color: '#4ade80' };
+    case 'in_progress':  return { label: '⟳ In progress', color: '#d4a847' };
+    case 'failed':
+      return meta.manual_review_required
+        ? { label: '✕ Manual review', color: '#ef4444' }
+        : { label: '✕ Failed', color: '#ef4444' };
+    default:             return { label: '· Pending',     color: '#4a4a4a' };
+  }
+}
+
+function stopEnrichmentStatusPoll() {
+  if (enrichmentPollInterval) {
+    clearInterval(enrichmentPollInterval);
+    enrichmentPollInterval = null;
+  }
+}
+
+function getFirmTrackerStatusDisplay(firm) {
+  switch (firm.firm_stage) {
+    case 'meeting_booked':   return { label: 'Meeting booked', color: '#22c55e', bg: 'rgba(34,197,94,0.12)' };
+    case 'replied':          return { label: 'Replied', color: '#38bdf8', bg: 'rgba(56,189,248,0.12)' };
+    case 'invite_accepted':  return { label: 'Connection accepted', color: '#a78bfa', bg: 'rgba(167,139,250,0.12)' };
+    case 'outreach_started': return { label: 'Outreach in progress', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' };
+    case 'ready_for_outreach': return { label: 'Ready for outreach', color: '#4ade80', bg: 'rgba(74,222,128,0.12)' };
+    case 'closed':           return { label: 'Closed', color: '#f87171', bg: 'rgba(248,113,113,0.12)' };
+    default:                 return { label: 'Finding decision makers', color: '#d4a847', bg: 'rgba(212,168,71,0.12)' };
+  }
+}
+
+function renderFirmTrackerProgress(firm) {
+  const total = Number(firm.total_contacts || firm.contacts_found || 0);
+  const contacted = Math.min(Number(firm.contacted_count || 0), total || Number(firm.contacted_count || 0));
+  const accepted = Math.min(Number(firm.invite_accepted_count || 0), total || Number(firm.invite_accepted_count || 0));
+  const replied = Math.min(Number(firm.replied_count || 0), total || Number(firm.replied_count || 0));
+  const meeting = Math.min(Number(firm.meeting_booked_count || 0), total || Number(firm.meeting_booked_count || 0));
+  if (!total) return '0 contacts found';
+  if (meeting > 0) return `${meeting}/${total} meeting booked`;
+  if (replied > 0) return `${replied}/${total} replied`;
+  if (accepted > 0) return `${accepted}/${total} accepted`;
+  if (contacted > 0) return `${contacted}/${total} outreached`;
+  return `0/${total} outreached`;
+}
+
+function renderFirmTrackerMilestones(firm) {
+  const total = Number(firm.total_contacts || firm.contacts_found || 0);
+  const items = [
+    [`Invite sent`, Number(firm.invite_sent_count || 0)],
+    [`Email sent`, Number(firm.email_sent_count || 0)],
+    [`Accepted`, Number(firm.invite_accepted_count || 0)],
+    [`Replied`, Number(firm.replied_count || 0)],
+  ].filter(([, count]) => count > 0);
+  if (!total) return 'No contacts enriched';
+  if (!items.length) return `0/${total} outreached`;
+  return items.map(([label, count]) => `${label}: ${count}/${total}`).join(' · ');
+}
+
+const CONTROL_STYLE = {
+  majority: { label: 'Majority',  color: '#C9A84C', bg: 'rgba(201,168,76,0.12)'  },
+  minority: { label: 'Minority',  color: '#60A5FA', bg: 'rgba(96,165,250,0.12)'  },
+  both:     { label: 'Maj+Min',   color: '#4ADE80', bg: 'rgba(74,222,128,0.12)'  },
+  unknown:  { label: 'Control ?', color: '#4A4845', bg: 'rgba(74,72,69,0.10)'    },
+};
+
+function controlSortKey(firm) {
+  // Perfect match first, flexible second, unknown third, mismatch last
+  const pref = (firm.control_preference || 'unknown').toLowerCase();
+  if (pref === 'majority') return 0;
+  if (pref === 'both')     return 1;
+  if (pref === 'unknown')  return 2;
+  if (pref === 'minority') return 3;
+  return 2;
+}
+
+function renderControlMixSummary(firms, dealControlPref) {
+  const counts = { majority: 0, minority: 0, both: 0, unknown: 0 };
+  firms.forEach(f => {
+    const p = (f.control_preference || 'unknown').toLowerCase();
+    if (counts[p] !== undefined) counts[p]++;
+    else counts.unknown++;
+  });
+  const total = firms.length;
+  return `
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;
+                padding:10px 16px;background:#0d0d0f;border-radius:6px;
+                margin-bottom:14px;font-family:'DM Mono',monospace;font-size:11px">
+      <span style="color:#6b7280">Control mix (${total} firms):</span>
+      ${counts.majority > 0 ? `<span style="color:#C9A84C">&#9679;&nbsp;${counts.majority} majority</span>` : ''}
+      ${counts.minority > 0 ? `<span style="color:#60A5FA">&#9679;&nbsp;${counts.minority} minority</span>` : ''}
+      ${counts.both > 0    ? `<span style="color:#4ADE80">&#9679;&nbsp;${counts.both} flexible</span>` : ''}
+      ${counts.unknown > 0 ? `<span style="color:#4A4845">&#9679;&nbsp;${counts.unknown} unclassified</span>` : ''}
+      ${dealControlPref && dealControlPref !== 'either'
+        ? `<span style="color:#6b7280;margin-left:4px">&#183; Deal requires: <span style="color:#EDE9E3">${esc(dealControlPref)}</span></span>`
+        : ''}
+    </div>`;
+}
+
+function renderFirmCard(firm, rank, dealId, batchId) {
+  const pastInv = Array.isArray(firm.past_investments) ? firm.past_investments.slice(0, 5) : [];
+  const isAngel = firm.contact_type === 'angel';
+  const displayRank = firm.rank || rank;
+  const scoreValue = Number.isFinite(Number(firm.score)) ? Math.round(Number(firm.score)) : 0;
+  const firmLinkUrl = firm.firm_link_url || null;
+  const firmLinkType = firm.firm_link_type || null;
+  const firmLabel = firmLinkUrl
+    ? `<a href="${esc(firmLinkUrl)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" style="color:#e5e7eb;text-decoration:underline;text-underline-offset:3px">${esc(firm.firm_name || 'Unknown')}</a>`
+    : `<span style="color:#e5e7eb;font-size:14px;font-weight:600">${esc(firm.firm_name || 'Unknown')}</span>`;
+  const firmLinkBadge = firmLinkUrl
+    ? `<span style="padding:2px 8px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;background:${firmLinkType === 'linkedin' ? 'rgba(96,165,250,0.12)' : 'rgba(34,197,94,0.12)'};color:${firmLinkType === 'linkedin' ? '#60a5fa' : '#4ade80'}">${firmLinkType === 'linkedin' ? 'LinkedIn' : 'Website'}</span>`
+    : '';
+  return `
+    <div id="firm-card-${firm.id}" style="border:1px solid #1e1e1e;border-radius:8px;margin-bottom:8px;overflow:hidden">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:#111;cursor:pointer;user-select:none"
+           onclick="window.toggleFirmCard('${firm.id}','${dealId}')"
+           onmouseover="this.style.background='#161616'"
+           onmouseout="this.style.background='#111'">
+        <div style="display:flex;align-items:center;gap:12px">
+          <span style="font-size:22px;font-weight:500;color:#C9A84C;font-family:'Playfair Display',serif;min-width:42px;flex-shrink:0;line-height:1">
+            #${displayRank}
+          </span>
+          <div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:3px">
+              ${firmLabel}
+              ${firmLinkBadge}
+              <span style="padding:2px 8px;border-radius:999px;font-size:10px;font-family:'DM Mono',monospace;background:rgba(201,168,76,0.12);color:#C9A84C;border:1px solid rgba(201,168,76,0.2)">
+                ${scoreValue}/100
+              </span>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+              ${firm.aum ? `<span style="padding:2px 8px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;background:#1a1a2a;color:#818cf8">AUM: ${esc(firm.aum)}</span>` : ''}
+              ${isAngel ? `<span style="padding:2px 8px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;background:rgba(245,158,11,0.1);color:#f59e0b">Angel</span>` : ''}
+              ${(() => { const cp = CONTROL_STYLE[(firm.control_preference || 'unknown').toLowerCase()] || CONTROL_STYLE.unknown; return `<span style="padding:2px 8px;border-radius:3px;font-size:10px;font-family:'DM Mono',monospace;background:${cp.bg};color:${cp.color}">${cp.label}</span>`; })()}
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button onclick="event.stopPropagation();window.removeFirmFromBatch('${batchId}','${firm.id}','${dealId}')"
+            style="padding:4px 10px;background:none;border:1px solid #2a2a2a;color:#ef4444;border-radius:4px;cursor:pointer;font-size:11px">
+            Remove
+          </button>
+          <span id="chevron-${firm.id}" style="color:#3a3a3a;font-size:16px;display:inline-block;transition:transform 0.2s">▾</span>
+        </div>
+      </div>
+      <div id="firm-detail-${firm.id}" data-batch-id="${batchId}" style="display:none;padding:16px;background:#0d0d0f;border-top:1px solid #1a1a1a">
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Why This Firm</div>
+          <p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0;font-style:italic">${esc(firm.justification || 'Justification not available.')}</p>
+        </div>
+        ${firm.thesis ? `<div style="margin-bottom:14px"><div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Investment Thesis</div><p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0">${esc(firm.thesis.slice(0, 400))}${firm.thesis.length > 400 ? '...' : ''}</p></div>` : ''}
+        ${pastInv.length > 0 ? `<div style="margin-bottom:14px"><div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Past Investments in Similar Deals</div><div style="display:flex;flex-wrap:wrap;gap:6px">${pastInv.map(inv => `<span style="padding:4px 10px;background:#1a1a2a;border:1px solid #2a2a3a;border-radius:4px;font-size:11px;color:#9ca3af;font-family:'DM Mono',monospace">${esc(typeof inv === 'string' ? inv : (inv.company || inv.name || JSON.stringify(inv)))}</span>`).join('')}</div></div>` : ''}
+        <div>
+          <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:8px">
+            Contacts${firm.contacts_found ? ` — ${firm.contacts_found} found` : ''}
+          </div>
+          <div data-contacts-slot></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function getDealTimezone(dealId) {
+  const deal = (allDeals || []).find(d => String(d.id || d._id) === String(dealId));
+  return deal?.timezone || 'America/New_York';
+}
+
+function renderVisualTimeline(batch, firms, dealId) {
+  const steps = [
+    { label: 'Email Intro', type: 'email', day: 0, color: '#3b82f6', mode: 'fixed' },
+    { label: 'LI Connect', type: 'linkedin', day: 0, color: '#22c55e', mode: 'fixed' },
+    { label: 'Email Follow-up', type: 'email', day: 7, color: '#3b82f6', mode: 'fixed' },
+    { label: 'Final Email', type: 'email', day: 14, color: '#3b82f6', mode: 'fixed' },
+    { label: 'LI DM', type: 'linkedin', day: 3, color: '#a78bfa', mode: 'event', meta: 'On acceptance' },
+    { label: 'LI Follow-up', type: 'linkedin', day: 10, color: '#a78bfa', mode: 'event', meta: 'After LI DM' },
+  ];
+  const totalDays = 21;
+  const firmCount = firms.length;
+  const enrichedContacts = firms.reduce((sum, firm) => sum + Number(firm.contacts_found || 0), 0);
+  const readyEmailCount = enrichedContacts > 0 ? enrichedContacts * 3 : 0;
+  const readyLinkedInCount = enrichedContacts > 0 ? enrichedContacts * 3 : 0;
+  const timezone = getDealTimezone(dealId);
+  const today = new Date();
+  const addDays = (date, days) => {
+    const result = new Date(date);
+    result.setDate(result.getDate() + days);
+    return result;
+  };
+  const fmtDate = (date) => date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: timezone,
+  });
+  const startDate = today;
+  const endDate = addDays(today, totalDays);
+  const timelineRows = steps.map(step => ({ ...step, stepDate: addDays(startDate, step.day), leftPct: (step.day / totalDays) * 100, fmtDate: fmtDate(addDays(startDate, step.day)) }));
+
+  return `
+    <div style="background:#080809;border:1px solid #1e1e20;border-radius:10px;padding:28px;margin-bottom:24px;overflow:hidden">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px">
+        <div>
+          <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.2em;font-family:'DM Mono',monospace;margin-bottom:6px">Projected Outreach Timeline</div>
+          <div style="font-family:'Playfair Display',serif;font-size:18px;color:#e5e7eb">${fmtDate(startDate)} — ${fmtDate(endDate)}</div>
+        </div>
+        <div style="display:flex;gap:16px;text-align:right">
+          ${[['Firms', firmCount], ['Emails Ready', readyEmailCount], ['LinkedIn Ready', readyLinkedInCount]].map(([l, v]) => `<div><div style="font-size:18px;color:#d4a847;font-family:'Playfair Display',serif">${v}</div><div style="font-size:10px;color:#4a4a4a;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.1em">${l}</div></div>`).join('')}
+        </div>
+      </div>
+      <div style="position:relative;margin-bottom:6px;padding:0 2px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          ${[0, 7, 14, 21].map(d => `<div style="font-size:10px;color:#2a2a2a;font-family:'DM Mono',monospace;text-align:center">Day ${d}<br><span style="font-size:9px;color:#1e1e1e">${fmtDate(addDays(startDate, d))}</span></div>`).join('')}
+        </div>
+        <div style="position:relative;height:3px;background:#1a1a1a;border-radius:2px;margin-bottom:4px">
+          <div style="position:absolute;left:0;top:0;height:3px;border-radius:2px;width:66%;background:linear-gradient(90deg,#1a2a3a,#2a3a4a);opacity:0.4"></div>
+          ${timelineRows.map(step => `<div style="position:absolute;left:${step.leftPct}%;top:-4px;transform:translateX(-50%)"><div style="width:2px;height:11px;background:${step.color};border-radius:1px;opacity:0.6"></div></div>`).join('')}
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:16px">
+        ${timelineRows.map(step => `<div style="display:grid;grid-template-columns:110px 1fr auto;align-items:center;gap:12px;padding:10px 14px;background:#0f0f11;border-radius:6px;border:1px solid #141416;border-left:3px solid ${step.color}"><div><div style="font-size:12px;color:#e5e7eb;font-weight:500">${step.label}</div><div style="font-size:10px;color:#4a4a4a;font-family:'DM Mono',monospace;margin-top:1px">${step.type === 'email' ? 'Email' : 'LinkedIn'}</div></div><div style="position:relative;height:6px;background:#111;border-radius:3px"><div style="position:absolute;left:${step.leftPct}%;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:${step.color};box-shadow:0 0 6px ${step.color}88"></div><div style="position:absolute;left:0;top:50%;transform:translateY(-50%);height:2px;width:${step.leftPct}%;background:${step.color}33;border-radius:1px"></div></div><div style="text-align:right;white-space:nowrap"><div style="font-size:11px;color:${step.color};font-family:'DM Mono',monospace">${step.mode === 'fixed' ? step.fmtDate : (step.meta || 'Event-based')}</div><div style="font-size:10px;color:#2a2a2a;font-family:'DM Mono',monospace">${step.mode === 'fixed' ? `Day ${step.day}` : 'Trigger-based'}</div></div></div>`).join('')}
+      </div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid #141416;display:flex;justify-content:space-between;align-items:center">
+        <div style="display:flex;gap:14px">${[['#3b82f6', 'Email'], ['#22c55e', 'Connection'], ['#a78bfa', 'LinkedIn DM']].map(([c, l]) => `<div style="display:flex;align-items:center;gap:5px"><div style="width:8px;height:8px;border-radius:50%;background:${c}"></div><span style="font-size:11px;color:#4a4a4a">${l}</span></div>`).join('')}</div>
+        <div style="font-size:10px;color:#2a2a2a;font-family:'DM Mono',monospace">Timezone: ${esc(timezone)} · Sends in the deal's configured windows</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderScoringMethodology(deal) {
+  const d = deal || {};
+  const rows = [
+    ['Geographic alignment',   '25 pts', `Target: ${d.geography || d.target_geography || 'Global'}`],
+    ['Check size / EBITDA fit', '25 pts', `Deal equity: $${d.equity || d.min_cheque || '?'}M`],
+    ['Sector alignment',        '25 pts', d.sector || 'Not specified'],
+    ['Investor type match',     '15 pts', d.deal_type || d.raise_type || 'Not specified'],
+    ['Recent deal activity',    '10 pts', 'Investments in last 12 months'],
+    ['Deal intelligence boost', '+20 max', 'Backed comparable deals in PitchBook'],
+  ];
+  return `
+    <details style="margin-bottom:16px">
+      <summary style="cursor:pointer;font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;
+                      text-transform:uppercase;letter-spacing:0.15em;list-style:none;user-select:none">
+        How firms are scored ▾
+      </summary>
+      <div style="margin-top:10px;padding:14px;background:#0d0d0f;border:1px solid #1a1a1a;border-radius:6px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          ${rows.map(([label, pts, context]) => `
+            <div style="padding:8px 10px;background:#111;border-radius:4px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+                <span style="font-size:12px;color:#e5e7eb">${label}</span>
+                <span style="font-size:11px;color:#d4a847;font-family:'DM Mono',monospace">${pts}</span>
+              </div>
+              <div style="font-size:10px;color:#4a4a4a">${context}</div>
+            </div>
+          `).join('')}
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#374151;font-family:'DM Mono',monospace">
+          Maximum score: 100 + 20 intelligence boost = 100 (capped)
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function renderCampaignReview(dealId, batch, firms) {
+  const deal = (allDeals || []).find(d => String(d.id) === String(dealId)) || {};
+  const meta = arguments[3] || { total: (firms || []).length, pages: 1, page: 1 };
+  const dealControlPref = deal.investor_control_preference || 'majority';
+  const orderedFirms = [...(firms || [])].sort((a, b) => {
+    const rankDiff = Number(a.rank || 9999) - Number(b.rank || 9999);
+    if (rankDiff !== 0) return rankDiff;
+    // Within same rank tier, sort by control match quality
+    const ctrlDiff = controlSortKey(a) - controlSortKey(b);
+    if (ctrlDiff !== 0) return ctrlDiff;
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
+  const totalPages = meta.pages || 1;
+  const currentPage = meta.page || 1;
+  const totalFirms = meta.total || orderedFirms.length;
+  const timelineFirms = Array.isArray(meta.allFirms) && meta.allFirms.length ? meta.allFirms : orderedFirms;
+  const startRank = ((currentPage - 1) * CAMPAIGN_FIRMS_PER_PAGE) + 1;
+  return `
+    <div style="padding:24px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
         <div>
-          <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Batch #${batch.batch_number}</div>
-          <div style="font-size:20px;font-weight:600;${statusColors[batch.status] || ''}">${statusLabel[batch.status] || batch.status}</div>
+          <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:4px">Batch ${batch.batch_number}</div>
+          <h2 style="font-family:'Playfair Display',serif;font-size:22px;color:#e5e7eb;margin:0 0 4px">Campaign Review</h2>
+          <div style="color:#6b7280;font-size:13px">${totalFirms} ranked firms, reviewed before any contact enrichment begins.</div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center">
-          ${approveBtn}
+        <div style="display:flex;gap:10px">
+          <button class="btn btn-ghost" onclick="showAddFirmModal('${batch.id}','${dealId}')">Add Firm</button>
+          <button class="btn btn-ghost" style="border-color:#7f1d1d;color:#fca5a5" onclick="rejectCampaignBatch('${batch.id}','${dealId}')">Reject Campaign</button>
+          <button class="btn btn-primary" onclick="approveCampaignBatch('${batch.id}','${dealId}')">Approve Campaign</button>
         </div>
       </div>
-
-      ${researchProgress}
-      ${timeline}
-
-      <div style="margin-top:20px">
-        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px">
-          Target Firms (${firms.length})
+      ${renderScoringMethodology(deal)}
+      ${renderVisualTimeline(batch, timelineFirms, dealId)}
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #1C1C1F">
+        <div style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace">
+          ${totalFirms} firms total · Page ${currentPage} of ${totalPages}
         </div>
-        ${firms.length ? firmCards : `<div style="color:var(--text-dim);font-size:13px">No firms added yet — research in progress.</div>`}
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${Array.from({ length: totalPages }, (_, index) => index + 1).map(page => `
+            <button onclick="window.loadCampaignReviewPage('${dealId}', ${page})"
+              style="width:28px;height:28px;border-radius:4px;cursor:pointer;font-size:11px;font-family:'DM Mono',monospace;background:${page === currentPage ? '#C9A84C' : '#1a1a1a'};border:1px solid ${page === currentPage ? '#C9A84C' : '#2a2a2a'};color:${page === currentPage ? '#000' : '#6b7280'}">
+              ${page}
+            </button>`).join('')}
+        </div>
       </div>
+      ${renderControlMixSummary(orderedFirms, dealControlPref)}
+      <div>${orderedFirms.map((firm, index) => renderFirmCard(firm, startRank + index, dealId, batch.id)).join('')}</div>
+      ${totalPages > 1 ? `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-top:16px;border-top:1px solid #1C1C1F;margin-top:12px">
+          ${currentPage > 1 ? `<button onclick="window.loadCampaignReviewPage('${dealId}', ${currentPage - 1})" style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;color:#8A8680;border-radius:4px;cursor:pointer;font-size:11px">← Page ${currentPage - 1}</button>` : '<div></div>'}
+          <div style="font-size:11px;color:#3A3835;font-family:'DM Mono',monospace">
+            Showing ranks ${startRank}–${startRank + orderedFirms.length - 1} of ${totalFirms}
+          </div>
+          ${currentPage < totalPages ? `<button onclick="window.loadCampaignReviewPage('${dealId}', ${currentPage + 1})" style="padding:6px 14px;background:#1a1a1a;border:1px solid #2a2a2a;color:#8A8680;border-radius:4px;cursor:pointer;font-size:11px">Page ${currentPage + 1} →</button>` : '<div></div>'}
+        </div>` : ''}
     </div>
   `;
 }
 
-function renderProjectedTimeline(batch) {
-  if (batch.status !== 'pending_approval' && batch.status !== 'approved') return '';
-  const firmCount = batch.ranked_firms || (batch.firms || []).length || 20;
-  // Project: 3 contacts per firm avg, outreach over ~2 weeks
-  const estimatedContacts = Math.round(firmCount * 2.5);
-  const estimatedEmails = Math.round(estimatedContacts * 0.6);
-  const estimatedLI = estimatedContacts - estimatedEmails;
+window.loadCampaignReviewPage = async function(dealId, page = 1) {
+  campaignReviewPage = Math.max(1, Number(page) || 1);
+  await loadCampaignReviewTab(dealId);
+};
+
+function renderEnrichmentState(dealId, batch, firms) {
+  const enriched = firms.filter(f => f.enrichment_status === 'complete').length;
+  const total = firms.length || 1;
+  const pct = Math.round((enriched / total) * 100);
   return `
-    <div class="card" style="padding:16px;margin-bottom:20px;background:rgba(96,165,250,.04);border-color:rgba(96,165,250,.15)">
-      <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px">Projected Outreach</div>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
-        <div><div style="font-size:22px;font-family:var(--font-mono);font-weight:700">${firmCount}</div><div style="font-size:11px;color:var(--text-dim)">Firms</div></div>
-        <div><div style="font-size:22px;font-family:var(--font-mono);font-weight:700">~${estimatedEmails}</div><div style="font-size:11px;color:var(--text-dim)">Emails</div></div>
-        <div><div style="font-size:22px;font-family:var(--font-mono);font-weight:700">~${estimatedLI}</div><div style="font-size:11px;color:var(--text-dim)">LinkedIn</div></div>
+    <div style="padding:24px">
+      <div style="margin-bottom:20px">
+        <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:4px">Batch ${batch.batch_number}</div>
+        <h2 style="font-family:'Playfair Display',serif;font-size:22px;color:#e5e7eb;margin:0 0 4px">Finding Decision Makers</h2>
+        <div style="color:#6b7280;font-size:13px">Outreach will begin as each firm's contacts are confirmed.</div>
       </div>
-      <div style="font-size:11px;color:var(--text-dim);margin-top:10px">Outreach runs 6–8am and 8–11pm EST weekdays only.</div>
+      <div style="background:#0d0d0f;border:1px solid #1a1a1a;border-radius:10px;padding:24px;margin-bottom:20px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+          <span data-enrich-summary style="color:#e5e7eb;font-size:14px">${enriched}/${firms.length} firms enriched</span>
+          <span style="color:#6b7280;font-size:12px;font-family:'DM Mono',monospace">${pct}%</span>
+        </div>
+        <div style="background:#1a1a1a;border-radius:4px;height:6px;overflow:hidden">
+          <div data-enrich-bar style="height:100%;background:linear-gradient(90deg,#22c55e,#4ade80);width:${pct}%;border-radius:4px;transition:width 0.6s ease"></div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${firms.map((f, i) => {
+          const { label, color } = enrichStatusDisplay(f);
+          const pastInv = Array.isArray(f.past_investments) ? f.past_investments.slice(0, 5) : [];
+          return `<div style="border:1px solid #1e1e1e;border-radius:6px;overflow:hidden">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#111;cursor:pointer"
+                 onclick="toggleEnrichFirmCard('${f.id}','${dealId}','${batch.id}')"
+                 onmouseover="this.style.background='#161616'" onmouseout="this.style.background='#111'">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="color:#4a4a4a;font-size:12px;font-family:'DM Mono',monospace;width:20px">${i + 1}</span>
+                <div>
+                  <div style="color:#e5e7eb;font-size:13px">${esc(f.firm_name || 'Unknown')}</div>
+                  ${f.score ? `<div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">Score: ${f.score}</div>` : ''}
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px">
+                <span id="enrich-count-${f.id}" style="color:#6b7280;font-size:11px">${f.contacts_found ? `${f.contacts_found} contact${f.contacts_found !== 1 ? 's' : ''}` : ''}</span>
+                <span id="enrich-status-${f.id}" style="color:${color};font-size:12px;font-family:'DM Mono',monospace;min-width:80px;text-align:right">${label}</span>
+                <button onclick="event.stopPropagation();window.removeFirmFromBatch('${batch.id}','${f.id}','${dealId}')"
+                  style="padding:3px 8px;background:none;border:1px solid #2a2a2a;color:#ef4444;border-radius:4px;cursor:pointer;font-size:11px">Remove</button>
+                <span id="enrich-chevron-${f.id}" style="color:#3a3a3a;font-size:14px">▾</span>
+              </div>
+            </div>
+            <div id="enrich-firm-detail-${f.id}" style="display:none;padding:16px;background:#0d0d0f;border-top:1px solid #1a1a1a">
+              ${f.justification ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Why This Firm</div>
+                <p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0;font-style:italic">${esc(f.justification)}</p>
+              </div>` : ''}
+              ${f.thesis ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Investment Thesis</div>
+                <p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0">${esc(f.thesis.slice(0,400))}${f.thesis.length > 400 ? '…' : ''}</p>
+              </div>` : ''}
+              ${pastInv.length ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Past Investments</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">${pastInv.map(inv => `<span style="padding:3px 8px;background:#1a1a2a;border:1px solid #2a2a3a;border-radius:4px;font-size:11px;color:#9ca3af;font-family:'DM Mono',monospace">${esc(typeof inv === 'string' ? inv : (inv.company || inv.name || ''))}</span>`).join('')}</div>
+              </div>` : ''}
+              <div>
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Contacts${f.contacts_found ? ` — ${f.contacts_found} found` : ''}</div>
+                <div id="enrich-contacts-slot-${f.id}">
+                  <div style="font-size:11px;color:#4a4a4a;font-family:'DM Mono',monospace">Loading…</div>
+                </div>
+              </div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:16px"><button onclick="window.closeBatch('${dealId}','${batch.id}')" style="padding:8px 16px;background:#1a1a1a;border:1px solid #d4a847;color:#d4a847;border-radius:6px;cursor:pointer;font-size:13px">Close Batch</button></div>
     </div>
   `;
 }
 
-window.toggleFirmDetail = function(detailId) {
-  const el = document.getElementById(detailId);
-  if (!el) return;
-  const isOpen = el.style.display !== 'none';
-  el.style.display = isOpen ? 'none' : 'block';
-  // flip the arrow on the parent card header
-  const arrow = el.previousElementSibling?.querySelector('span[style*="▼"], span[style*="▲"]');
-  if (arrow) arrow.textContent = isOpen ? '▼' : '▲';
+function renderCampaignTrackerState(dealId, batch, firms) {
+  const totalFirms = firms.length || 1;
+  const totalContacts = firms.reduce((sum, firm) => sum + Number(firm.total_contacts || firm.contacts_found || 0), 0);
+  const outreachedFirms = firms.filter(firm => Number(firm.contacted_count || 0) > 0).length;
+  const repliedFirms = firms.filter(firm => Number(firm.replied_count || 0) > 0).length;
+  const closedFirms = firms.filter(firm => firm.firm_stage === 'closed').length;
+  const pct = Math.round((outreachedFirms / totalFirms) * 100);
+
+  return `
+    <div style="padding:24px" data-campaign-tracker-deal-id="${dealId}" data-campaign-tracker-batch-id="${batch.id}">
+      <div style="margin-bottom:20px">
+        <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:4px">Batch ${batch.batch_number}</div>
+        <h2 style="font-family:'Playfair Display',serif;font-size:22px;color:#e5e7eb;margin:0 0 4px">Campaign Tracker</h2>
+        <div style="color:#6b7280;font-size:13px">Firm-level outreach progress for the current batch. The pipeline continues to track each individual contact.</div>
+      </div>
+      <div style="background:#0d0d0f;border:1px solid #1a1a1a;border-radius:10px;padding:24px;margin-bottom:20px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-bottom:16px">
+          <div><div data-campaign-summary="outreachedFirms" style="font-size:28px;color:#d4a847;font-family:'Playfair Display',serif">${outreachedFirms}/${firms.length}</div><div style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.12em">Firms Reached</div></div>
+          <div><div data-campaign-summary="repliedFirms" style="font-size:28px;color:#38bdf8;font-family:'Playfair Display',serif">${repliedFirms}</div><div style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.12em">Firms Replied</div></div>
+          <div><div data-campaign-summary="totalContacts" style="font-size:28px;color:#4ade80;font-family:'Playfair Display',serif">${totalContacts}</div><div style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.12em">Decision Makers</div></div>
+          <div><div data-campaign-summary="closedFirms" style="font-size:28px;color:#f87171;font-family:'Playfair Display',serif">${closedFirms}</div><div style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.12em">Closed Firms</div></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+          <span data-campaign-summary="outreachLabel" style="color:#e5e7eb;font-size:14px">${outreachedFirms}/${firms.length} firms in outreach</span>
+          <span data-campaign-summary="outreachPct" style="color:#6b7280;font-size:12px;font-family:'DM Mono',monospace">${pct}%</span>
+        </div>
+        <div style="background:#1a1a1a;border-radius:4px;height:6px;overflow:hidden">
+          <div data-campaign-summary="outreachBar" style="height:100%;background:linear-gradient(90deg,#38bdf8,#4ade80);width:${pct}%;border-radius:4px;transition:width 0.6s ease"></div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${firms.map((f, i) => {
+          const status = getFirmTrackerStatusDisplay(f);
+          const pastInv = Array.isArray(f.past_investments) ? f.past_investments.slice(0, 5) : [];
+          return `<div style="border:1px solid #1e1e1e;border-radius:6px;overflow:hidden" data-campaign-firm-id="${f.id}">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#111;cursor:pointer"
+                 onclick="toggleEnrichFirmCard('${f.id}','${dealId}','${batch.id}')"
+                 onmouseover="this.style.background='#161616'" onmouseout="this.style.background='#111'">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="color:#4a4a4a;font-size:12px;font-family:'DM Mono',monospace;width:20px">${f.rank || i + 1}</span>
+                <div>
+                  <div style="color:#e5e7eb;font-size:13px">${esc(f.firm_name || 'Unknown')}</div>
+                  <div data-campaign-firm-progress="${f.id}" style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">${renderFirmTrackerProgress(f)}</div>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end">
+                <span data-campaign-firm-milestones="${f.id}" style="color:#6b7280;font-size:11px;max-width:320px;text-align:right">${renderFirmTrackerMilestones(f)}</span>
+                <span id="enrich-status-${f.id}" style="padding:3px 8px;border-radius:999px;background:${status.bg};color:${status.color};font-size:11px;font-family:'DM Mono',monospace;white-space:nowrap">${status.label}</span>
+                <button onclick="event.stopPropagation();window.removeFirmFromBatch('${batch.id}','${f.id}','${dealId}')"
+                  style="padding:3px 8px;background:none;border:1px solid #2a2a2a;color:#ef4444;border-radius:4px;cursor:pointer;font-size:11px">Remove</button>
+                <span id="enrich-chevron-${f.id}" style="color:#3a3a3a;font-size:14px">▾</span>
+              </div>
+            </div>
+            <div id="enrich-firm-detail-${f.id}" style="display:none;padding:16px;background:#0d0d0f;border-top:1px solid #1a1a1a">
+              ${f.justification ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Why This Firm</div>
+                <p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0;font-style:italic">${esc(f.justification)}</p>
+              </div>` : ''}
+              ${f.thesis ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Investment Thesis</div>
+                <p style="color:#9ca3af;font-size:13px;line-height:1.65;margin:0">${esc(f.thesis.slice(0,400))}${f.thesis.length > 400 ? '…' : ''}</p>
+              </div>` : ''}
+              ${pastInv.length ? `<div style="margin-bottom:12px">
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Past Investments</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">${pastInv.map(inv => `<span style="padding:3px 8px;background:#1a1a2a;border:1px solid #2a2a3a;border-radius:4px;font-size:11px;color:#9ca3af;font-family:'DM Mono',monospace">${esc(typeof inv === 'string' ? inv : (inv.company || inv.name || ''))}</span>`).join('')}</div>
+              </div>` : ''}
+              <div>
+                <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.15em;font-family:'DM Mono',monospace;margin-bottom:6px">Contacts${f.total_contacts ? ` — ${f.total_contacts} tracked` : ''}</div>
+                <div id="enrich-contacts-slot-${f.id}">
+                  <div style="font-size:11px;color:#4a4a4a;font-family:'DM Mono',monospace">Loading…</div>
+                </div>
+              </div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:16px"><button onclick="window.closeBatch('${dealId}','${batch.id}')" style="padding:8px 16px;background:#1a1a1a;border:1px solid #d4a847;color:#d4a847;border-radius:6px;cursor:pointer;font-size:13px">Close Batch</button></div>
+    </div>
+  `;
+}
+
+async function patchCampaignTrackerInPlace(dealId) {
+  const container = document.querySelector(`#deal-tab-rankings [data-campaign-tracker-deal-id="${dealId}"]`);
+  if (!container) return;
+  const batchId = container.getAttribute('data-campaign-tracker-batch-id');
+  if (!batchId) return;
+
+  let firms = [];
+  try {
+    firms = await api(`/api/deals/${dealId}/batch/${batchId}/firms`);
+  } catch {
+    return;
+  }
+
+  const totalFirms = firms.length || 1;
+  const totalContacts = firms.reduce((sum, firm) => sum + Number(firm.total_contacts || firm.contacts_found || 0), 0);
+  const outreachedFirms = firms.filter(firm => Number(firm.contacted_count || 0) > 0).length;
+  const repliedFirms = firms.filter(firm => Number(firm.replied_count || 0) > 0).length;
+  const closedFirms = firms.filter(firm => firm.firm_stage === 'closed').length;
+  const pct = Math.round((outreachedFirms / totalFirms) * 100);
+
+  const summaryValues = {
+    outreachedFirms: `${outreachedFirms}/${firms.length}`,
+    repliedFirms: String(repliedFirms),
+    totalContacts: String(totalContacts),
+    closedFirms: String(closedFirms),
+    outreachLabel: `${outreachedFirms}/${firms.length} firms in outreach`,
+    outreachPct: `${pct}%`,
+  };
+  Object.entries(summaryValues).forEach(([key, value]) => {
+    const node = container.querySelector(`[data-campaign-summary="${key}"]`);
+    if (node) node.textContent = value;
+  });
+  const bar = container.querySelector('[data-campaign-summary="outreachBar"]');
+  if (bar) bar.style.width = `${pct}%`;
+
+  firms.forEach(firm => {
+    const progress = container.querySelector(`[data-campaign-firm-progress="${firm.id}"]`);
+    if (progress) progress.textContent = renderFirmTrackerProgress(firm);
+    const milestones = container.querySelector(`[data-campaign-firm-milestones="${firm.id}"]`);
+    if (milestones) milestones.textContent = renderFirmTrackerMilestones(firm);
+    const badge = document.getElementById(`enrich-status-${firm.id}`);
+    if (badge) {
+      const status = getFirmTrackerStatusDisplay(firm);
+      badge.textContent = status.label;
+      badge.style.color = status.color;
+      badge.style.background = status.bg;
+    }
+  });
+}
+
+function getContactCampaignStatus(contact) {
+  if (contact.pipeline_stage === 'Meeting Booked') return { label: 'Meeting booked', color: '#22c55e' };
+  if (['Archived', 'Deleted — Do Not Contact', 'Suppressed — Opt Out', 'Inactive'].includes(contact.pipeline_stage)) {
+    return { label: 'Closed', color: '#f87171' };
+  }
+  if (contact.response_received || contact.last_reply_at || ['Replied', 'In Conversation'].includes(contact.pipeline_stage)) {
+    return { label: 'Replied', color: '#38bdf8' };
+  }
+  if (contact.invite_accepted_at || ['invite_accepted', 'dm_sent'].includes(contact.pipeline_stage)) {
+    return { label: 'Connection accepted', color: '#a78bfa' };
+  }
+  if (contact.invite_sent_at || contact.last_email_sent_at || contact.last_outreach_at || ['invite_sent', 'email_sent'].includes(contact.pipeline_stage)) {
+    return { label: 'Outreach sent', color: '#f59e0b' };
+  }
+  return { label: 'Ready', color: '#4ade80' };
+}
+
+function renderBatchFirmContacts(contacts) {
+  if (!contacts.length) {
+    return '<div style="font-size:11px;color:#374151;font-family:\'DM Mono\',monospace">No contacts found yet</div>';
+  }
+  return contacts.map(contact => {
+    const status = getContactCampaignStatus(contact);
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:#111;border-radius:4px;margin-bottom:4px;gap:12px">
+        <div>
+          <div style="font-size:13px;color:#e5e7eb">${contact.linkedin_url ? `<a href="${esc(contact.linkedin_url)}" target="_blank" style="color:#e5e7eb;text-decoration:none">${esc(contact.name || '—')}</a>` : esc(contact.name || '—')}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:2px">${esc(contact.job_title || '—')}</div>
+        </div>
+        <div style="text-align:right">
+          ${contact.email ? `<div style="font-size:11px;color:#4ade80;font-family:'DM Mono',monospace">${esc(contact.email)}</div>` : '<div style="font-size:11px;color:#374151">No email yet</div>'}
+          <div style="font-size:10px;color:${status.color};margin-top:2px">${status.label}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+window.toggleEnrichFirmCard = async function(firmId, dealId, batchId) {
+  const detail = document.getElementById(`enrich-firm-detail-${firmId}`);
+  const chevron = document.getElementById(`enrich-chevron-${firmId}`);
+  if (!detail) return;
+  const isOpen = detail.style.display !== 'none';
+  detail.style.display = isOpen ? 'none' : 'block';
+  if (chevron) chevron.style.transform = isOpen ? 'rotate(0deg)' : 'rotate(180deg)';
+  if (!isOpen) {
+    const slot = document.getElementById(`enrich-contacts-slot-${firmId}`);
+    if (slot && !slot.dataset.loaded) {
+      slot.dataset.loaded = '1';
+      try {
+        const contacts = await api(`/api/deals/${dealId}/batch/${batchId}/firms/${firmId}/contacts`);
+        slot.innerHTML = renderBatchFirmContacts(contacts);
+      } catch { slot.innerHTML = '<div style="font-size:11px;color:#ef4444">Failed to load</div>'; }
+    }
+  }
+};
+
+window.toggleFirmCard = async function(firmId, dealId) {
+  const detail = document.getElementById(`firm-detail-${firmId}`);
+  const chevron = document.getElementById(`chevron-${firmId}`);
+  const card = document.getElementById(`firm-card-${firmId}`);
+  if (!detail) return;
+  const isOpen = detail.style.display !== 'none';
+  detail.style.display = isOpen ? 'none' : 'block';
+  chevron.style.transform = isOpen ? 'rotate(0deg)' : 'rotate(180deg)';
+  if (card) card.style.borderColor = isOpen ? '#1e1e1e' : '#d4a847';
+
+  // Load contacts when opening, only once
+  if (!isOpen && dealId && !detail.dataset.contactsLoaded) {
+    const contactSlot = detail.querySelector('[data-contacts-slot]');
+    if (!contactSlot) return;
+    contactSlot.innerHTML = '<div style="font-size:11px;color:#4a4a4a;font-family:\'DM Mono\',monospace">Loading contacts…</div>';
+    try {
+      // Resolve batchId from the nearest data attribute or the current active batch
+      const batchId = detail.dataset.batchId;
+      if (!batchId) { contactSlot.innerHTML = ''; return; }
+      const contacts = await api(`/api/deals/${dealId}/batch/${batchId}/firms/${firmId}/contacts`);
+      contactSlot.innerHTML = renderBatchFirmContacts(contacts);
+      detail.dataset.contactsLoaded = '1';
+    } catch (e) {
+      contactSlot.innerHTML = `<div style="font-size:11px;color:#ef4444">Failed to load contacts</div>`;
+    }
+  }
 };
 
 window.approveCampaignBatch = async function(batchId, dealId) {
   try {
-    await api(`/api/deals/${dealId}/campaign/${batchId}/approve`, { method: 'POST' });
-    showToast('Campaign approved. Outreach begins next EST window.', 'success');
+    await api(`/api/deals/${dealId}/batch/${batchId}/approve`, 'POST');
+    showToast('Campaign approved. Contact enrichment starting.', 'success');
     await loadCampaignReviewTab(dealId);
-    await loadDeals(); // refresh deal cards for badge update
+    await loadDeals();
   } catch (e) {
     showToast('Failed to approve: ' + e.message, 'error');
   }
 };
 
+window.closeBatch = async function(dealId, batchId) {
+  if (!confirm('Close this batch? The next batch will begin on the next orchestrator cycle.')) return;
+  try {
+    await api(`/api/deals/${dealId}/batch/${batchId}/close`, 'POST');
+    showToast('Batch closed.', 'success');
+    await loadCampaignReviewTab(dealId);
+    await loadDeals();
+  } catch (e) {
+    showToast('Failed: ' + e.message, 'error');
+  }
+};
+
 window.rejectCampaignBatch = async function(batchId, dealId) {
-  if (!confirm('Reject this campaign batch? The orchestrator will continue researching and submit a new batch when ready.')) return;
+  if (!confirm('Reject this campaign batch? The current firms will be skipped and the next batch will be rebuilt on the next cycle.')) return;
   try {
-    await api(`/api/deals/${dealId}/campaign/${batchId}/reject`, { method: 'POST', body: JSON.stringify({ reason: 'Manual rejection' }) });
-    showToast('Batch rejected. Research continues.', 'success');
+    await api(`/api/deals/${dealId}/batch/${batchId}/skip`, 'POST', { reason: 'Rejected during campaign review' });
+    showToast('Campaign rejected.', 'success');
     await loadCampaignReviewTab(dealId);
     await loadDeals();
   } catch (e) {
-    showToast('Failed: ' + e.message, 'error');
+    showToast('Reject failed: ' + e.message, 'error');
   }
 };
 
-window.closeBatchAndNext = async function(dealId) {
-  if (!confirm('Close this batch? Outreach to remaining uncontacted firms in this batch will stop. The next pre-built batch (or the one in progress) will be queued for review.')) return;
-  try {
-    const result = await api(`/api/deals/${dealId}/campaign/close`, { method: 'POST' });
-    if (result.promoted) {
-      showToast(`Batch #${result.closed} closed. Batch #${result.promoted} is now up for review.`, 'success');
-    } else if (result.building) {
-      showToast(`Batch #${result.closed} closed. Next batch #${result.building} is still building (${result.buildingProgress || '…'}). Check back soon.`, 'info');
-    } else {
-      showToast('Batch closed. Research will build the next batch automatically.', 'success');
-    }
-    await loadCampaignReviewTab(dealId);
-    await loadDeals();
-  } catch (e) {
-    showToast('Failed: ' + e.message, 'error');
-  }
-};
-
-window.removeFirmFromBatch = async function(firmId, dealId) {
+window.removeFirmFromBatch = async function(batchId, firmId, dealId) {
   if (!confirm('Remove this firm from the campaign batch?')) return;
   try {
-    await api(`/api/campaign-firms/${firmId}`, { method: 'DELETE' });
-    document.getElementById(`cbf-${firmId}`)?.remove();
+    await api(`/api/deals/${dealId}/batch/${batchId}/firms/${firmId}`, 'DELETE');
     showToast('Firm removed.', 'success');
+    await loadCampaignReviewTab(dealId);
   } catch (e) {
     showToast('Failed: ' + e.message, 'error');
   }
 };
+
+window.showAddFirmModal = function(batchId, dealId) {
+  const existing = document.getElementById('add-firm-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'add-firm-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:2000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML = `
+    <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:28px;width:520px;max-height:80vh;display:flex;flex-direction:column">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <h3 style="color:#e5e7eb;margin:0;font-family:'Cormorant Garamond',serif;font-size:20px">Add Firm to Campaign</h3>
+        <button onclick="document.getElementById('add-firm-modal').remove()" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:24px;line-height:1">&#215;</button>
+      </div>
+      <input id="afm-search" type="text" placeholder="Search investor database by firm name…"
+        style="width:100%;padding:10px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;box-sizing:border-box;font-size:13px;margin-bottom:12px"
+        oninput="searchFirmsForBatch(this.value)" autocomplete="off" />
+      <div id="afm-results" style="flex:1;overflow-y:auto;min-height:80px;max-height:320px">
+        <div style="color:#6b7280;font-size:13px">Type to search the investor database…</div>
+      </div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid #2a2a2a">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:8px">Not in the database? Create a new entry:</div>
+        <div style="display:flex;gap:8px">
+          <input id="afm-new-name" type="text" placeholder="Firm name"
+            style="flex:1;padding:8px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;font-size:13px" />
+          <button onclick="addNewFirmToBatch('${batchId}','${dealId}')"
+            style="padding:8px 16px;background:#1e293b;border:1px solid #2a2a3a;color:#818cf8;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap">
+            Create &amp; Add
+          </button>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  setTimeout(() => document.getElementById('afm-search')?.focus(), 50);
+};
+
+let _afmSearchTimer = null;
+window.searchFirmsForBatch = function(q) {
+  clearTimeout(_afmSearchTimer);
+  const el = document.getElementById('afm-results');
+  if (!el) return;
+  if (!q || q.length < 2) {
+    el.innerHTML = '<div style="color:#6b7280;font-size:13px">Type to search the investor database…</div>';
+    return;
+  }
+  el.innerHTML = '<div style="color:#6b7280;font-size:13px">Searching…</div>';
+  _afmSearchTimer = setTimeout(async () => {
+    try {
+      const data = await api(`/api/investors-db/search?search=${encodeURIComponent(q)}&limit=12`);
+      const results = data?.investors || [];
+      if (!results.length) {
+        el.innerHTML = '<div style="color:#6b7280;font-size:13px">No matches found — use "Create & Add" below.</div>';
+        return;
+      }
+      el.innerHTML = results.map(r => `
+        <div onclick="selectFirmForBatch('${r.id}','${esc(r.name || '')}','${document.getElementById('add-firm-modal')?.dataset?.batchId || ''}')"
+          style="padding:10px 12px;border-radius:6px;cursor:pointer;border:1px solid transparent;margin-bottom:4px;transition:all .15s"
+          onmouseover="this.style.background='#1a1a2a';this.style.borderColor='#2a2a3a'"
+          onmouseout="this.style.background='';this.style.borderColor='transparent'">
+          <div style="font-size:13px;font-weight:600;color:#e5e7eb">${esc(r.name || '—')}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:2px">
+            ${[r.investor_type, r.hq_country, r.preferred_industries].filter(Boolean).slice(0,3).map(v => esc(String(v))).join(' · ') || 'No details'}
+          </div>
+        </div>`).join('');
+      // Store batchId on modal for the onclick
+      const modal = document.getElementById('add-firm-modal');
+      if (modal) modal.dataset.batchId = modal.dataset.batchId || '';
+    } catch {
+      el.innerHTML = '<div style="color:#ef4444;font-size:13px">Search failed — try again.</div>';
+    }
+  }, 300);
+};
+
+window.selectFirmForBatch = async function(investorsDbId, firmName, batchId) {
+  // batchId comes from the modal's data attribute — re-read it from DOM
+  const modal = document.getElementById('add-firm-modal');
+  if (!modal) return;
+  // Extract batchId and dealId from the modal's "Create & Add" button onclick
+  const createBtn = modal.querySelector('button[onclick*="addNewFirmToBatch"]');
+  const match = createBtn?.getAttribute('onclick')?.match(/addNewFirmToBatch\('([^']+)','([^']+)'\)/);
+  if (!match) return;
+  const [, bId, dealId] = match;
+  await _addFirmToBatch(bId, dealId, firmName, investorsDbId);
+};
+
+window.addNewFirmToBatch = async function(batchId, dealId) {
+  const name = document.getElementById('afm-new-name')?.value?.trim();
+  if (!name) { showToast('Enter a firm name first', 'error'); return; }
+  await _addFirmToBatch(batchId, dealId, name, null);
+};
+
+async function _addFirmToBatch(batchId, dealId, firmName, investorsDbId) {
+  try {
+    const result = await api(`/api/deals/${dealId}/campaign/${batchId}/firms`, 'POST', {
+      firm_name: firmName, investors_db_id: investorsDbId || undefined,
+    });
+    document.getElementById('add-firm-modal')?.remove();
+    if (result.researched) {
+      showToast(`${firmName} added to campaign.`, 'success');
+    } else {
+      showToast(`${firmName} added — Roco will research them before outreach fires.`, 'success');
+    }
+    await loadCampaignReviewTab(dealId);
+  } catch (e) {
+    showToast('Failed: ' + e.message, 'error');
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2643,8 +4123,48 @@ async function loadDealTabSettings(id) {
                'Asia/Dubai','Asia/Singapore','Asia/Tokyo','Australia/Sydney',
                'Europe/Paris','Europe/Berlin'];
 
+  // Load email accounts for the switcher
+  let emailAccountsHtml = '<option value="">Loading&#8230;</option>';
+  try {
+    const accounts = await api('/api/email-accounts');
+    emailAccountsHtml = '<option value="">No sending account</option>' +
+      (accounts || []).map(a =>
+        `<option value="${esc(a.connection_id)}" data-email="${esc(a.email)}" ${deal.sending_account_id === a.connection_id ? 'selected' : ''}>${esc(a.label || a.email)}</option>`
+      ).join('');
+  } catch {}
+
+  const priorityLists = deal.pitchbook?.priority_lists || [];
+  const kbList        = deal.pitchbook?.kb_list || null;
+
+  // Load available lists for dropdowns (async, populated after render)
+  let availableInvestorLists = [];
+  let availableKBLists = [];
+  try {
+    [availableInvestorLists, availableKBLists] = await Promise.all([
+      api('/api/investor-lists?type=investors'),
+      api('/api/investor-lists?type=knowledge_base'),
+    ]);
+  } catch {}
+
+  const attachedListIds = new Set(priorityLists.map(l => String(l.list_id)));
+  const priorityListOpts = (availableInvestorLists || [])
+    .filter(l => !attachedListIds.has(String(l.id)))
+    .map(l => `<option value="${esc(l.id)}" data-name="${esc(l.name)}">${esc(l.name)} (${(l.investor_count||0).toLocaleString()})</option>`)
+    .join('');
+  const kbOpts = (availableKBLists || [])
+    .map(l => `<option value="${esc(l.id)}" data-name="${esc(l.name)}" ${kbList?.id === l.id ? 'selected' : ''}>${esc(l.name)} (${(l.investor_count||0).toLocaleString()})</option>`)
+    .join('');
+
   el.innerHTML = `
     <div style="max-width:720px">
+
+      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">Sending Account</h3>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:24px">
+        <select class="form-input" id="ds-email-account-${id}" style="flex:1">
+          ${emailAccountsHtml}
+        </select>
+        <button class="btn btn-gold" id="ds-email-account-btn-${id}" onclick="window.saveDealEmailAccount('${id}')" style="white-space:nowrap">Save Account</button>
+      </div>
 
       <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 12px">Deal Info</h3>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">
@@ -2665,6 +4185,15 @@ async function loadDealTabSettings(id) {
         <div class="form-group">
           <label class="form-label">Geography</label>
           <input type="text" class="form-input" id="ds-geography" value="${esc(deal.geography || '')}" placeholder="e.g. UK, Europe" />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Target Investor Geography</label>
+          <select class="form-input" id="ds-target-geography">
+            ${['Global','US','UK','US,UK','UAE','Europe','North America'].map(opt => `
+              <option value="${opt}" ${String(deal.target_geography || 'Global') === opt ? 'selected' : ''}>${opt}</option>
+            `).join('')}
+          </select>
         </div>
 
         <div class="form-group">
@@ -2700,7 +4229,7 @@ async function loadDealTabSettings(id) {
       </div>
 
       <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Sending Windows</h3>
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email + LinkedIn DMs send in these two daily windows (weekdays only). Connections send anytime.</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email + LinkedIn DMs send in these two daily windows on the deal's selected active days. Connections send anytime.</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">
         <div class="form-group">
           <label class="form-label">Morning window — start</label>
@@ -2775,16 +4304,16 @@ async function loadDealTabSettings(id) {
           <label class="form-label">Days Before Email Follow-up</label>
           <input type="number" class="form-input" id="ds-followup-email" value="${deal.followup_days_email || 7}" />
         </div>
-
-        <div class="form-group">
-          <label class="form-label">Max Active Pipeline Size</label>
-          <input type="number" class="form-input" id="ds-pipeline-max" value="${deal.pipeline_max || 100}" />
+        <div class="form-group" style="grid-column:1/-1">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+            <input type="checkbox" id="ds-no-followups" ${deal.no_follow_ups ? 'checked' : ''}
+              style="width:16px;height:16px;accent-color:#C9A84C;cursor:pointer" />
+            <span class="form-label" style="margin:0">No follow-ups — intro only on each channel</span>
+          </label>
+          <div style="font-size:11px;color:#6b7280;margin-top:4px;padding-left:26px;font-family:'DM Mono',monospace">
+            LinkedIn DM sent &rarr; ${deal.followup_days_li || 3}d no response &rarr; email intro &rarr; ${deal.followup_days_email || 7}d no response &rarr; next person
+          </div>
         </div>
-        <div class="form-group">
-          <label class="form-label">Refill When Below</label>
-          <input type="number" class="form-input" id="ds-pipeline-refill" value="${deal.pipeline_refill_threshold || 30}" />
-        </div>
-
       </div>
 
     </div>
@@ -2828,6 +4357,60 @@ async function loadDealTabSettings(id) {
     <div style="margin-top:20px">
       <button class="btn btn-gold" onclick="saveDealSettings('${id}')">Save Settings</button>
     </div>
+
+    <div style="margin-top:32px;padding-top:24px;border-top:1px solid var(--border)">
+
+      <!-- Priority Lists -->
+      <div style="margin-bottom:24px">
+        <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Priority Lists</h3>
+        <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Investor lists Roco will search first when identifying candidates. Scored in priority order.</p>
+        <div id="deal-priority-list-rows-${id}" style="margin-bottom:10px">
+          ${priorityLists.length ? priorityLists.map((l, i) => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:7px;margin-bottom:6px">
+              <div>
+                <span style="font-size:13px;color:var(--text-bright)">${esc(l.list_name || l.list_id)}</span>
+                <span style="font-size:11px;color:var(--text-muted);margin-left:8px">Priority ${i + 1}</span>
+              </div>
+              <button onclick="removeDealPriorityList('${id}','${esc(l.list_id)}')" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;line-height:1;padding:0 4px" title="Remove">&times;</button>
+            </div>
+          `).join('') : '<div style="font-size:12px;color:var(--text-dim);padding:8px 0">No priority lists attached — Roco will query the full investor database.</div>'}
+        </div>
+        ${priorityListOpts ? `
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="add-priority-list-select-${id}" style="flex:1;padding:7px 10px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;font-size:12px">
+            <option value="">Select a list to add…</option>
+            ${priorityListOpts}
+          </select>
+          <button onclick="addDealPriorityList('${id}')" class="btn btn-ghost btn-sm" style="white-space:nowrap">+ Add List</button>
+        </div>` : '<div style="font-size:12px;color:var(--text-dim)">All available investor lists are already attached.</div>'}
+      </div>
+
+      <!-- Knowledge Base -->
+      <div>
+        <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Knowledge Base</h3>
+        <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Enrichment source — fills data gaps in investor profiles before scoring. Upload KB lists in the Database section.</p>
+        <div style="padding:10px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:7px;margin-bottom:10px">
+          ${kbList
+            ? `<div style="display:flex;align-items:center;justify-content:space-between">
+                 <div>
+                   <span style="font-size:13px;color:var(--text-bright)">${esc(kbList.name)}</span>
+                   <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${(kbList.investor_count||0).toLocaleString()} records</span>
+                 </div>
+                 <button onclick="removeDealKB('${id}')" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;line-height:1;padding:0 4px" title="Remove">&times;</button>
+               </div>`
+            : '<div style="font-size:12px;color:var(--text-dim)">No knowledge base attached — gap-fill research will use Gemini/Grok for sparse profiles.</div>'}
+        </div>
+        ${kbOpts ? `
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="change-kb-select-${id}" style="flex:1;padding:7px 10px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;font-size:12px">
+            <option value="">Select a knowledge base…</option>
+            ${kbOpts}
+          </select>
+          <button onclick="setDealKB('${id}')" class="btn btn-ghost btn-sm" style="white-space:nowrap">${kbList ? 'Change KB' : '+ Attach KB'}</button>
+        </div>` : '<div style="font-size:12px;color:var(--text-dim)">No knowledge base lists in database yet. Upload one in the Database section.</div>'}
+      </div>
+
+    </div>
   `;
   loadDealAssets(id);
 }
@@ -2852,6 +4435,43 @@ async function loadDealAssets(dealId) {
   } catch (e) {
     el.innerHTML = '<div style="font-size:12px;color:var(--text-dim)">Could not load assets.</div>';
   }
+}
+
+async function addDealPriorityList(dealId) {
+  const sel = document.getElementById(`add-priority-list-select-${dealId}`);
+  if (!sel?.value) return showToast('Select a list first', 'error');
+  const listName = sel.options[sel.selectedIndex]?.dataset?.name || sel.options[sel.selectedIndex]?.textContent?.split(' (')[0] || sel.value;
+  try {
+    await api(`/api/deals/${dealId}/priority-lists`, 'POST', { list_id: sel.value, list_name: listName });
+    showToast(`"${listName}" added as priority list`);
+    await loadDealTabSettings(dealId);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function removeDealPriorityList(dealId, listId) {
+  try {
+    await api(`/api/deals/${dealId}/priority-lists/${listId}`, 'DELETE');
+    await loadDealTabSettings(dealId);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function setDealKB(dealId) {
+  const sel = document.getElementById(`change-kb-select-${dealId}`);
+  if (!sel?.value) return showToast('Select a knowledge base first', 'error');
+  const kbName = sel.options[sel.selectedIndex]?.dataset?.name || sel.options[sel.selectedIndex]?.textContent?.split(' (')[0] || sel.value;
+  try {
+    await api(`/api/deals/${dealId}/kb`, 'PATCH', { kb_list_id: sel.value, kb_list_name: kbName });
+    showToast(`Knowledge base set to "${kbName}"`);
+    await loadDealTabSettings(dealId);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function removeDealKB(dealId) {
+  try {
+    await api(`/api/deals/${dealId}/kb`, 'PATCH', { kb_list_id: null, kb_list_name: null });
+    showToast('Knowledge base removed');
+    await loadDealTabSettings(dealId);
+  } catch (e) { showToast(e.message, 'error'); }
 }
 
 async function addDealAsset(dealId) {
@@ -2894,6 +4514,7 @@ async function saveDealSettings(id) {
     deck_url:              document.getElementById('ds-deck')?.value?.trim(),
     sector:                document.getElementById('ds-sector')?.value?.trim(),
     geography:             document.getElementById('ds-geography')?.value?.trim(),
+    target_geography:      document.getElementById('ds-target-geography')?.value || 'Global',
     raise_type:            document.getElementById('ds-raise-type')?.value?.trim(),
     description:           document.getElementById('ds-description')?.value?.trim(),
     key_metrics:           document.getElementById('ds-key-metrics')?.value?.trim(),
@@ -2915,8 +4536,9 @@ async function saveDealSettings(id) {
     min_investor_score:    Number(document.getElementById('ds-min-score')?.value),
     followup_days_li:      Number(document.getElementById('ds-followup-li')?.value),
     followup_days_email:   Number(document.getElementById('ds-followup-email')?.value),
-    pipeline_max:          Number(document.getElementById('ds-pipeline-max')?.value) || 100,
-    pipeline_refill_threshold: Number(document.getElementById('ds-pipeline-refill')?.value) || 30,
+    no_follow_ups:         document.getElementById('ds-no-followups')?.checked || false,
+    sending_account_id:    (() => { const s = document.getElementById(`ds-email-account-${id}`); return s?.value || null; })(),
+    sending_email:         (() => { const s = document.getElementById(`ds-email-account-${id}`); return s?.options[s.selectedIndex]?.dataset?.email || null; })(),
   };
   const btn = document.querySelector(`[onclick="saveDealSettings('${id}')"]`);
   const origText = btn?.textContent;
@@ -3179,6 +4801,10 @@ async function openProspectDrawer(contactId, dealId) {
     <div style="padding:20px 24px;border-bottom:1px solid #1a1a1a">
       <div style="color:#6b7280;font-size:10px;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:12px">Outreach Status</div>
       ${row('Stage', `<span style="background:#1a1a1a;color:#e5e7eb;padding:2px 10px;border-radius:4px;font-size:12px">${esc(contact.pipeline_stage || '—')}</span>`)}
+      ${contact.last_intent || contact.conversation_state ? row('Sentiment',
+        `${sentimentBadge(contact.last_intent_label, contact.last_intent, contact.conversation_state)}${contact.last_intent ? ` <span style="color:#9ca3af;font-size:12px">${esc(String(contact.last_intent).replace(/_/g, ' '))}</span>` : ''}`) : ''}
+      ${row('Conversation', contact.conversation_state ? `<span style="color:#d4a847">${esc(contact.conversation_state)}</span>` : '')}
+      ${row('Reply Channel', contact.reply_channel ? esc(String(contact.reply_channel).toUpperCase()) : '')}
       ${row('Enrichment', contact.enrichment_status || 'Pending',
         contact.enrichment_status === 'Enriched' ? '#4ade80' : '#6b7280')}
       ${row('LI Invite Sent', contact.linkedin_invite_sent ? 'Yes' : 'No',
@@ -3207,30 +4833,39 @@ async function openProspectDrawer(contactId, dealId) {
 
   // Load conversation history asynchronously
   try {
-    const convData = await api(`/api/contacts/${contactId}/conversation`);
+    const qs = dealId ? `?dealId=${encodeURIComponent(dealId)}` : '';
+    const convData = await api(`/api/contacts/${contactId}/conversation${qs}`);
     const msgs = convData.messages || [];
+    const projectName = convData.selectedDealName || (dealId ? 'Unknown Project' : null);
     const convEl = document.getElementById(`conv-history-${contactId}`);
     if (convEl) {
       convEl.innerHTML = `
         <div style="color:#6b7280;font-size:10px;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:12px">
-          Conversation History (${msgs.length} message${msgs.length !== 1 ? 's' : ''})
+          Conversation History${projectName ? ` — ${esc(projectName)}` : ''} (${msgs.length} message${msgs.length !== 1 ? 's' : ''})
         </div>
+        ${projectName ? `<div style="margin-bottom:12px;padding:8px 10px;background:#141414;border:1px solid #262626;border-radius:6px;color:#d4a847;font-size:11px;letter-spacing:0.08em;text-transform:uppercase">Project ${esc(projectName)}</div>` : ''}
         ${msgs.length === 0
-          ? '<div style="color:#374151;font-size:12px">No messages logged yet.</div>'
+          ? `<div style="color:#374151;font-size:12px">No messages logged yet${projectName ? ` for ${esc(projectName)}` : ''}.</div>`
           : msgs.map(m => {
             const isOut  = m.direction === 'outbound';
-            const ts     = new Date(m.sent_at || m.received_at || Date.now()).toLocaleDateString('en-GB');
+            const ts     = new Date(m.timestamp || Date.now()).toLocaleDateString('en-GB');
             const label  = isOut ? 'ROCO' : esc(contact.name || 'INVESTOR');
             const color  = isOut ? '#1f3a5f' : '#2a1a0a';
             const border = isOut ? '#60a5fa' : '#d4a847';
             const nameC  = isOut ? '#60a5fa' : '#d4a847';
             const preview = (m.body || '').substring(0, 350);
+            const messageProject = m.dealName ? `<div style="color:#6b7280;font-size:10px;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em">${esc(m.dealName)}</div>` : '';
+            const subjectHtml = (m.channel === 'email' && m.subject)
+              ? `<div style="color:#e5e7eb;font-size:11px;margin-bottom:6px;font-weight:600">Subject: ${esc(m.subject)}</div>`
+              : '';
             return `<div style="margin-bottom:10px;padding:10px 12px;background:${color};border-radius:6px;border-left:3px solid ${border}">
+              ${messageProject}
               <div style="display:flex;justify-content:space-between;margin-bottom:4px">
                 <span style="color:${nameC};font-size:11px;font-weight:600">${label}</span>
                 <span style="color:#374151;font-size:10px">${ts}${m.channel ? ` · ${m.channel}` : ''}</span>
               </div>
               ${m.intent ? `<div style="color:#6b7280;font-size:10px;margin-bottom:4px;font-style:italic">Intent: ${esc(m.intent)}</div>` : ''}
+              ${subjectHtml}
               <p style="color:#9ca3af;font-size:12px;margin:0;line-height:1.5;white-space:pre-wrap">${esc(preview)}${m.body && m.body.length > 350 ? '…' : ''}</p>
             </div>`;
           }).join('')
@@ -3306,7 +4941,7 @@ async function loadPipeline() {
   const tbody  = document.getElementById('pipeline-tbody');
   const dealId = document.getElementById('pipeline-deal-filter')?.value || activeDeal || '';
   if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="10" class="table-empty">Loading…</td></tr>';
 
   try {
     const qs   = dealId ? `?dealId=${dealId}` : '';
@@ -3314,7 +4949,7 @@ async function loadPipeline() {
     pipelineData = Array.isArray(data) ? data : (data.contacts || data.pipeline || []);
     renderPipelineTable();
   } catch {
-    tbody.innerHTML = '<tr><td colspan="8" class="table-empty text-red">Failed to load pipeline.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="table-empty text-red">Failed to load pipeline.</td></tr>';
   }
 }
 
@@ -3334,33 +4969,42 @@ function renderPipelineTable() {
   });
 
   if (!sorted.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No contacts in pipeline.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="table-empty">No contacts in pipeline.</td></tr>';
     return;
   }
+
+  const renderDealsCell = (deals) => {
+    if (!Array.isArray(deals) || deals.length === 0) return '<span class="text-dim">—</span>';
+    return `<div style="display:flex;flex-wrap:wrap;gap:4px">${deals.map(d =>
+      `<span class="status-badge" style="background:#1a1a1a;color:#9ca3af;border:1px solid #2a2a2a">${esc(d.dealName || '—')}</span>`
+    ).join('')}</div>`;
+  };
 
   tbody.innerHTML = sorted.map(c => {
     const id      = c.id || c._id;
     const name    = esc(c.name || (c.firstName ? (c.firstName + ' ' + (c.lastName || '')).trim() : null) || '—');
     const firm    = esc(c.firm || c.company || '—');
-    const deal    = (c.dealName || c.deal_name) ? `<span class="status-badge" style="background:var(--gold-dim);color:var(--gold)">${esc(c.dealName || c.deal_name)}</span>` : '<span class="text-dim">—</span>';
-    const stage   = c.stage || 'prospecting';
-    return `<tr onclick="togglePipelineRow(this, '${id}')">
-      <td><strong>${name}</strong></td>
-      <td>${firm}</td>
-      <td>${deal}</td>
-      <td>${scoreHtml(c.score)}</td>
+    const activeDeal = c.activeDealName ? `<span class="status-badge" style="background:var(--gold-dim);color:var(--gold)">${esc(c.activeDealName)}</span>` : '<span class="text-dim">—</span>';
+    const project = c.projectName ? `<span class="status-badge" style="background:#1f2937;color:#9ca3af">${esc(c.projectName)}</span>` : '<span class="text-dim">—</span>';
+    const deals = renderDealsCell(c.deals);
+    const stage   = c.stage || '';
+    const badge   = sentimentBadge(c.lastIntentLabel, c.lastIntent, c.conversationState);
+    return `<tr onclick="togglePipelineRow(this, '${id}', '${c.deal_id || ''}')" style="cursor:pointer">
       <td>
-        <select class="stage-select" onclick="event.stopPropagation()" onchange="updateStage('${id}', this.value)">
-          ${['prospecting','contacted','interested','meeting','term_sheet','closed','rejected'].map(s =>
-            `<option value="${s}" ${s === stage ? 'selected' : ''}>${s.replace(/_/g,' ')}</option>`
-          ).join('')}
-        </select>
+        <div style="font-weight:500">${name}</div>
+        ${c.email ? `<div style="font-size:11px;color:var(--text-dim)">${esc(c.email)}</div>` : ''}
       </td>
-      <td class="text-dim">${formatDate(c.lastContact || c.lastContacted)}</td>
-      <td class="text-dim">${formatDate(c.nextFollowup || c.nextFollowUp)}</td>
+      <td>${firm}</td>
+      <td>${activeDeal}</td>
+      <td>${project}</td>
+      <td>${deals}</td>
+      <td>${scoreHtml(c.score)}</td>
+      <td><span class="status-badge">${esc(stage || '—')}</span></td>
+      <td>${badge || '<span class="text-dim">—</span>'}</td>
+      <td class="text-dim">${formatDate(c.lastReplyAt || c.lastContacted)}</td>
       <td>
         <div class="row-actions">
-          <button class="row-action-btn" onclick="event.stopPropagation(); viewContact('${id}')">View</button>
+          <button class="row-action-btn" onclick="event.stopPropagation(); openPipelineContactPanel('${id}', '${c.deal_id || ''}')">View</button>
           <button class="row-action-btn" onclick="event.stopPropagation(); skipContact('${id}')">Skip</button>
           <button class="row-action-btn danger" onclick="event.stopPropagation(); suppressFirm('${esc(c.firm || c.company || '')}')">Suppress Firm</button>
           <button class="row-action-btn" style="color:#e05c5c" onclick="event.stopPropagation(); deleteContact('${id}')">Delete</button>
@@ -3368,20 +5012,21 @@ function renderPipelineTable() {
       </td>
     </tr>
     <tr class="pipeline-row-detail hidden" id="pipeline-detail-${id}">
-      <td colspan="8">
-        <div style="color:var(--text-mid);font-size:12px;line-height:1.6">
-          ${c.researchSummary ? `<div><strong>Research:</strong> ${esc(c.researchSummary)}</div>` : ''}
-          ${c.comparableDeals ? `<div style="margin-top:6px"><strong>Comparable Deals:</strong> ${esc(c.comparableDeals)}</div>` : ''}
-          ${!c.researchSummary && !c.comparableDeals ? 'No additional data.' : ''}
+      <td colspan="10" style="padding:0;background:var(--bg-raised)">
+        <div id="pipeline-conv-${id}" style="padding:16px 20px;font-size:12px;color:var(--text-mid)">
+          <div style="color:var(--text-dim);font-size:11px">Click to expand…</div>
         </div>
       </td>
     </tr>`;
   }).join('');
 }
 
-function togglePipelineRow(row, id) {
-  const detail = document.getElementById(`pipeline-detail-${id}`);
-  if (detail) detail.classList.toggle('hidden');
+async function togglePipelineRow(row, id, dealId = '') {
+  openContactSidePanel(id, dealId || null);
+}
+
+async function openPipelineContactPanel(id, dealId = '') {
+  openContactSidePanel(id, dealId || null);
 }
 
 async function sortPipeline(key) {
@@ -3442,17 +5087,111 @@ async function deleteContact(id) {
 
 async function loadQueue() {
   try {
-    const data  = await api('/api/queue');
-    const emails = Array.isArray(data) ? data.filter(i => i.channel !== 'linkedin') : (data.emails || []);
-    const linkedin = Array.isArray(data) ? data.filter(i => i.channel === 'linkedin') : (data.linkedin || []);
+    const [data, reviews] = await Promise.all([
+      api('/api/queue'),
+      api('/api/campaign-reviews').catch(() => []),
+    ]);
+    const inferChannel = item => {
+      const stage = String(item?.stage || '').toLowerCase();
+      const explicit = String(item?.channel || '').toLowerCase();
+      if (explicit) return explicit;
+      if (stage.includes('linkedin') || item?.message_type === 'prior_chat_review') return 'linkedin';
+      return 'email';
+    };
+    const emails   = Array.isArray(data) ? data.filter(i => inferChannel(i) !== 'linkedin') : (data.emails || []);
+    const linkedin = Array.isArray(data) ? data.filter(i => inferChannel(i) === 'linkedin') : (data.linkedin || []);
 
-    document.getElementById('queue-email-count').textContent = emails.length;
-    document.getElementById('queue-linkedin-count').textContent = linkedin.length;
-    refreshQueueBadge(emails.length + linkedin.length);
+    document.getElementById('queue-email-count').textContent     = emails.length;
+    document.getElementById('queue-linkedin-count').textContent  = linkedin.length;
+    document.getElementById('queue-campaigns-count').textContent = reviews.length;
+    _pendingReviewsCount = reviews.length;
+    refreshQueueBadge(emails.length + linkedin.length + reviews.length, true);
 
     renderQueueList('queue-email-list', emails, 'email');
     renderQueueList('queue-linkedin-list', linkedin, 'linkedin');
+    renderCampaignReviewCards(reviews);
+
+    // Auto-surface the campaigns tab if reviews are waiting and nothing else is active
+    if (reviews.length > 0) {
+      const activeTab = document.querySelector('.queue-tab.active');
+      if (!activeTab || activeTab.id === 'qtab-email') {
+        switchQueueTab('campaigns', document.getElementById('qtab-campaigns'));
+      }
+    }
   } catch { /* silent */ }
+}
+
+function renderCampaignReviewCards(reviews) {
+  const el = document.getElementById('queue-campaigns-list');
+  if (!el) return;
+  if (!reviews.length) {
+    el.innerHTML = '<div class="queue-empty">&#10003;&nbsp; No campaigns awaiting review.</div>';
+    return;
+  }
+  el.innerHTML = reviews.map(r => {
+    const topFirms  = (r.firms || []).slice(0, 5);
+    const totalRanked = Number(r.ranked_firms || (r.firms || []).length || 0);
+    const remaining = Math.max(0, totalRanked - topFirms.length);
+    return `
+    <div style="background:var(--surface-1,var(--bg-card));border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px">
+
+      <!-- Header -->
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:20px">
+        <div>
+          <div style="font-size:18px;font-weight:600;color:var(--text-bright);margin-bottom:6px">${esc(r.deal_name)}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+            <span style="font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border);padding:3px 10px;border-radius:20px">Batch ${r.batch_number}</span>
+            <span style="font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border);padding:3px 10px;border-radius:20px">${totalRanked} firms ranked</span>
+            ${r.deal_sector    ? `<span style="font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border);padding:3px 10px;border-radius:20px">${esc(r.deal_sector)}</span>`    : ''}
+            ${r.deal_raise_type ? `<span style="font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border);padding:3px 10px;border-radius:20px">${esc(r.deal_raise_type)}</span>` : ''}
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-shrink:0;align-items:center">
+          <button class="btn btn-ghost" style="font-size:13px;padding:8px 18px" onclick="openDealAndBatch('${r.deal_id}')">View Detail</button>
+          <button class="btn btn-gold"  style="font-size:13px;padding:8px 18px" onclick="approveCampaignFromQueue('${r.deal_id}','${r.id}',this)">&#10003;&nbsp; Approve Campaign</button>
+        </div>
+      </div>
+
+      <!-- Top firms -->
+      <div style="border-top:1px solid var(--border);padding-top:16px">
+        <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin-bottom:10px">Top Firms</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${topFirms.map((f, i) => `
+            <div style="display:flex;align-items:center;gap:14px;padding:10px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px">
+              <span style="font-size:12px;color:var(--text-muted);font-family:'DM Mono',monospace;width:18px;flex-shrink:0">${i + 1}</span>
+              <span style="font-size:13px;color:var(--text-bright);flex:1">${f.firm_link_url ? `<a href="${esc(f.firm_link_url)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;text-underline-offset:3px">${esc(f.firm_name)}</a>` : esc(f.firm_name)}</span>
+              <span style="font-size:13px;font-family:'DM Mono',monospace;color:var(--gold);font-weight:600">${f.score}<span style="font-size:10px;color:var(--text-muted);font-weight:400">/100</span></span>
+            </div>`).join('')}
+          ${remaining > 0 ? `
+            <div style="text-align:center;padding:10px 0;font-size:12px;color:var(--text-muted)">
+              + ${remaining} more — click <strong style="color:var(--text)">View Detail</strong> for the full ranked list
+            </div>` : ''}
+        </div>
+      </div>
+
+    </div>`;
+  }).join('');
+}
+
+async function approveCampaignFromQueue(dealId, batchId, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+  try {
+    await api(`/api/deals/${dealId}/batch/${batchId}/approve`, 'POST');
+    showToast('Campaign approved — enrichment starting');
+    await loadQueue();
+  } catch (e) {
+    showToast(e.message || 'Approval failed', 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '✓ Approve'; }
+  }
+}
+
+async function openDealAndBatch(dealId) {
+  // Navigate to Deals section, open the deal, land on Campaign tab
+  window.location.hash = '#deals';
+  await loadDeals();
+  await viewDeal(dealId);
+  const campaignBtn = document.querySelector('.deal-tab[data-tab="rankings"]');
+  await switchDealTab('rankings', campaignBtn);
 }
 
 function renderQueueList(containerId, items, type) {
@@ -3462,6 +5201,8 @@ function renderQueueList(containerId, items, type) {
     el.innerHTML = `<div class="queue-empty">&#10003;&nbsp; No ${type} messages pending approval.</div>`;
     return;
   }
+  window._qItems = window._qItems || {};
+  items.forEach(item => { window._qItems[item.id || item._id] = item; });
   el.innerHTML = items.map(item => renderQueueCard(item)).join('');
 }
 
@@ -3469,6 +5210,33 @@ function renderQueueCard(item) {
   const id      = item.id || item._id;
   const name    = esc(item.name || item.firstName || '—');
   const firm    = esc(item.firm || item.company || '');
+
+  // Prior chat review — amber card with Proceed/Skip
+  if (item.message_type === 'prior_chat_review') {
+    const summary      = esc(item.message_text || 'Prior conversation found — review before sending DM.');
+    const msgCount     = item.metadata?.messageCount || '?';
+    const contactId    = item.contact_id || '';
+    return `<div class="queue-card" id="qcard-${id}" style="border-left:3px solid #f5a623">
+      <div class="queue-card-header">
+        <div>
+          <div class="queue-name">${name}</div>
+          <div class="queue-firm">${firm}</div>
+        </div>
+        <div class="queue-meta">
+          <span class="status-badge" style="background:#f5a62322;color:#f5a623;border-color:#f5a623">Prior Chat</span>
+          <span style="font-size:11px;color:var(--text-muted)">${msgCount} msg(s)</span>
+        </div>
+      </div>
+      <div class="queue-body">
+        <div class="queue-preview" style="font-style:italic;color:var(--text-secondary)">${summary}</div>
+      </div>
+      <div class="queue-actions">
+        <button class="btn-approve" onclick="decidePriorChat('${id}','${contactId}','proceed')">&#10003; PROCEED — SEND DM</button>
+        <button class="btn btn-danger btn-sm" onclick="decidePriorChat('${id}','${contactId}','skip')">SKIP CONTACT</button>
+      </div>
+    </div>`;
+  }
+
   const scoreHt = scoreHtml(item.score);
   const stage   = esc(item.stage || '');
   const subA    = esc(item.subjectA || item.subject || '');
@@ -3506,6 +5274,24 @@ function renderQueueCard(item) {
   <script>window._qSubjects = window._qSubjects || {}; window._qSubjects['${id}'] = {a:'${subA.replace(/'/g,"\\'")}',b:'${subB.replace(/'/g,"\\'")}',current:'a'};<\/script>`;
 }
 
+window.decidePriorChat = async function(approvalId, contactId, decision) {
+  const card = document.getElementById(`qcard-${approvalId}`);
+  if (card) card.style.opacity = '0.5';
+  try {
+    const r = await fetch(`/api/approvals/${approvalId}/prior-chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    if (card) card.remove();
+    showToast(decision === 'proceed' ? 'DM queued for next cycle' : 'Contact skipped');
+  } catch (err) {
+    if (card) card.style.opacity = '1';
+    showToast('Error: ' + err.message, 'error');
+  }
+};
+
 function switchSubject(id, variant) {
   const subjects = window._qSubjects?.[id];
   if (!subjects) return;
@@ -3521,25 +5307,30 @@ function currentQueueVariant(id) {
 }
 
 function previewQueueItem(id) {
+  const item = window._qItems?.[id] || {};
   const subjects = window._qSubjects?.[id] || {};
-  const card = document.getElementById(`qcard-${id}`);
-  const bodyEl = card?.querySelector('.queue-preview');
-  const nameEl = card?.querySelector('.queue-name');
-  const firmEl = card?.querySelector('.queue-firm');
-  const body = bodyEl?.textContent || '';
-  const isLinkedIn = !subjects.a; // no subject = LinkedIn
+  const variant = currentQueueVariant(id);
+  const body = item.body || item.emailBody || '';
+  const stage = String(item.stage || '').toLowerCase();
+  const channel = String(item.channel || '').toLowerCase();
+  const messageType = String(item.message_type || '').toLowerCase();
+  const isLinkedIn = channel === 'linkedin'
+    || stage.includes('linkedin')
+    || messageType === 'prior_chat_review';
 
   const tmpl = {
     type: isLinkedIn ? 'linkedin_dm' : 'email',
     subject_a: subjects.a || null,
     subject_b: subjects.b || null,
+    preview_subject: subjects[variant] || subjects.a || null,
     body,
   };
   const contactData = {
-    firstName: (nameEl?.textContent || '').split(' ')[0] || 'James',
-    fullName:  nameEl?.textContent || 'James Mitchell',
-    firm:      firmEl?.textContent || 'Meridian Capital',
-    company:   firmEl?.textContent || 'Meridian Capital',
+    firstName: (item.name || item.firstName || '').split(' ')[0] || 'James',
+    fullName:  item.name || item.fullName || 'James Mitchell',
+    email:     item.contactEmail || item.email || 'james@meridiancapital.com',
+    firm:      item.firm || item.company || 'Meridian Capital',
+    company:   item.firm || item.company || 'Meridian Capital',
   };
   window.previewDealTemplate(tmpl, contactData);
 }
@@ -3548,6 +5339,7 @@ function switchQueueTab(tab, btn) {
   currentQueueTab = tab;
   document.querySelectorAll('.queue-tab').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
+  document.getElementById('qpanel-campaigns')?.classList.toggle('hidden', tab !== 'campaigns');
   document.getElementById('qpanel-email')?.classList.toggle('hidden', tab !== 'email');
   document.getElementById('qpanel-linkedin')?.classList.toggle('hidden', tab !== 'linkedin');
 }
@@ -3563,14 +5355,17 @@ async function approveEmail(id, variant, _unused) {
 }
 
 async function editApproval(id) {
-  openModal('Edit Email', async () => {
-    const instructions = document.getElementById('modal-instructions').value;
+  const item = window._qItems?.[id] || {};
+  const stage = String(item.stage || '').toLowerCase();
+  const isLinkedIn = String(item.channel || '').toLowerCase() === 'linkedin' || stage.includes('linkedin');
+  openModal(isLinkedIn ? 'Edit LinkedIn DM' : 'Edit Email', async () => {
+    const body = document.getElementById('modal-instructions').value;
     try {
-      await api('/api/edit-approval', 'POST', { id, instructions });
+      await api('/api/edit-approval', 'POST', { id, body });
       closeModal();
       await loadQueue();
     } catch (err) { alert(`Edit failed: ${err.message}`); }
-  });
+  }, item.body || item.emailBody || '');
 }
 
 async function skipApproval(id) {
@@ -3592,15 +5387,171 @@ async function skipApproval(id) {
    LIVE ACTIVITY
    ═══════════════════════════════════════════════════════════════════════════ */
 
-async function loadActivity() {
+// Paginated activity log state
+let _activityPage    = 1;
+let _activityDealFilter = null;
+let _activityTotal   = 0;
+let _activityPages   = 1;
+let _activityLastServerEvents = [];
+let _activityLivePending = [];
+
+function activityEventKey(event) {
+  if (!event) return '';
+  return String(
+    event.id
+    || [
+      event.created_at || event.timestamp || '',
+      event.type || event.event_type || '',
+      event.action || event.summary || '',
+      event.note || event.detail || '',
+      event.deal_id || event.dealId || '',
+    ].join('|')
+  );
+}
+
+function activityMatchesDealFilter(event, dealId) {
+  if (!dealId) return true;
+  return String(event?.deal_id || event?.dealId || event?.deal || '') === String(dealId);
+}
+
+function mergeActivityEvents(events = [], dealId = null) {
+  const merged = [];
+  const seen = new Set();
+
+  const add = (event) => {
+    if (!event || !activityMatchesDealFilter(event, dealId)) return;
+    const key = activityEventKey(event);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    merged.push(event);
+  };
+
+  _activityLivePending.forEach(add);
+  events.forEach(add);
+  return merged;
+}
+
+function reconcilePendingActivity(events = []) {
+  const persistedKeys = new Set((events || []).map(activityEventKey));
+  _activityLivePending = _activityLivePending.filter(event => !persistedKeys.has(activityEventKey(event)));
+}
+
+async function loadActivity(page = 1) {
+  _activityPage = page;
   const dealId = document.getElementById('activity-deal-filter')?.value || activeDeal || '';
+  _activityDealFilter = dealId || null;
+
   try {
-    const qs   = dealId ? `?dealId=${dealId}` : '';
-    const data = await api(`/api/activity/log${qs}`);
+    const params = new URLSearchParams({ page });
+    if (dealId) params.set('deal_id', dealId);
+
+    const data = await api(`/api/activity?${params}`);
+
+    // New paginated format
+    if (data && typeof data === 'object' && 'events' in data) {
+      _activityLastServerEvents = data.events || [];
+      reconcilePendingActivity(_activityLastServerEvents);
+      _activityTotal = data.total || 0;
+      _activityPages = data.pages || 1;
+      const mergedEvents = page === 1
+        ? mergeActivityEvents(_activityLastServerEvents, _activityDealFilter).slice(0, 50)
+        : _activityLastServerEvents;
+      const mergedTotal = page === 1 ? Math.max(_activityTotal, mergedEvents.length) : _activityTotal;
+      renderPaginatedActivityLog(mergedEvents, page, data.pages, mergedTotal);
+      return;
+    }
+
+    // Fallback: flat array from legacy endpoint
     const items = Array.isArray(data) ? data : (data.log || data.items || []);
     activityLog = items;
     filterActivity();
   } catch { /* silent */ }
+}
+
+function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
+  const container = document.getElementById('activity-feed');
+  if (!container) return;
+
+  const typeColors = {
+    thinking: '#A78BFA', research: '#60A5FA', email: '#C9A84C',
+    linkedin: '#4ADE80', accepted: '#A78BFA', reply: '#C084FC', system: '#8A8680',
+    error: '#F87171', analysis: '#4ADE80', excluded: '#6b7280',
+  };
+  const typeIcons = {
+    thinking: '🧠', research: '🔍', email: '📧', linkedin: '💼',
+    accepted: '✓', reply: '↩️', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
+  };
+
+  const eventsHtml = (events || []).map(event => {
+    const badge = getActivityBadgeMeta(event);
+    const type  = badge.className;
+    const color = typeColors[type] || '#8A8680';
+    const icon  = typeIcons[type] || '⚙️';
+    const isThinking = type === 'thinking';
+    const ts    = new Date(event.created_at || event.timestamp).toLocaleString('en-US', {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+    });
+    const mainText = isThinking && event.full_content
+      ? event.full_content
+      : (event.action || event.summary || '');
+    const note  = event.note || event.detail || '';
+
+    return `<div style="padding:10px 14px;background:rgba(${color === '#A78BFA' ? '167,139,250' : '138,134,128'},0.06);
+                        border-left:3px solid ${color};border-radius:0 4px 4px 0;margin-bottom:5px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:13px">${icon}</span>
+          <span style="font-size:10px;color:${color};font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">
+            ${badge.label}${isThinking ? ' · full reasoning' : ''}
+          </span>
+        </div>
+        <span style="font-size:10px;color:#3A3835;font-family:'DM Mono',monospace;white-space:nowrap;flex-shrink:0">${ts}</span>
+      </div>
+      <div style="font-size:12px;color:#EDE9E3;line-height:1.6;margin-top:5px;word-break:break-word;${isThinking ? 'white-space:pre-wrap;' : ''}">
+        ${esc(mainText)}
+      </div>
+      ${note ? `<div style="margin-top:3px;font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">${esc(note)}</div>` : ''}
+    </div>`;
+  }).join('') || '<div style="color:#3A3835;font-size:12px;padding:16px 0">No activity yet.</div>';
+
+  const paginationHtml = totalPages > 1 ? `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-top:1px solid #1C1C1F;margin-top:10px">
+      <span style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace">
+        ${Number(total).toLocaleString()} events · Page ${currentPage} of ${totalPages}
+      </span>
+      <div style="display:flex;gap:6px">
+        ${currentPage > 1 ? `<button onclick="loadActivity(${currentPage - 1})" style="padding:4px 10px;background:#1a1a1a;border:1px solid #2a2a2a;color:#8A8680;border-radius:4px;cursor:pointer;font-size:11px">← Newer</button>` : ''}
+        ${currentPage < totalPages ? `<button onclick="loadActivity(${currentPage + 1})" style="padding:4px 10px;background:#1a1a1a;border:1px solid #2a2a2a;color:#8A8680;border-radius:4px;cursor:pointer;font-size:11px">Older →</button>` : ''}
+      </div>
+    </div>` : '';
+
+  container.innerHTML = `
+    <div style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:11px;color:#3A3835;font-family:'DM Mono',monospace">
+        ${Number(total).toLocaleString()} events · Page ${currentPage}/${totalPages}
+      </span>
+      <button onclick="loadActivity(1)" style="padding:4px 10px;background:#1a1a1a;border:1px solid #2a2a2a;color:#6b7280;border-radius:4px;cursor:pointer;font-size:11px">↻ Refresh</button>
+    </div>
+    ${eventsHtml}
+    ${paginationHtml}
+  `;
+}
+
+// Live WS: prepend new event to activity page when on page 1
+function handleLiveActivityForPage(event) {
+  if (_activityPage !== 1) return;
+  const container = document.getElementById('activity-feed');
+  if (!container) return;
+  const key = activityEventKey(event);
+  if (key && !_activityLivePending.some(item => activityEventKey(item) === key)) {
+    _activityLivePending.unshift(event);
+    if (_activityLivePending.length > 50) _activityLivePending.pop();
+    _activityTotal = (_activityTotal || 0) + 1;
+  }
+  if (!activityMatchesDealFilter(event, _activityDealFilter)) return;
+
+  const mergedEvents = mergeActivityEvents(_activityLastServerEvents, _activityDealFilter).slice(0, 50);
+  renderPaginatedActivityLog(mergedEvents, 1, _activityPages, Math.max(_activityTotal, mergedEvents.length));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -3668,18 +5619,22 @@ function toggleArchiveExpand(row, id) {
 
 async function deleteDeal(id, name) {
   if (!confirm(`Permanently delete "${name}"?\n\nAll contacts, emails, firms and activity will be removed. This cannot be undone.`)) return;
+  // Remove both archive table rows immediately to prevent double-click
+  const expandRow = document.getElementById(`archive-expand-${id}`);
+  const mainRow = expandRow?.previousElementSibling;
+  expandRow?.remove();
+  mainRow?.remove();
+  document.getElementById(`deal-card-${id}`)?.remove();
   try {
-    const data = await api(`/api/deals/${id}`, 'DELETE');
-    if (data?.success !== false) {
-      showToast?.('Deal deleted permanently');
-      loadArchive?.();
-      loadDeals?.();
-    } else {
-      showToast?.('Delete failed: ' + (data.error || 'Unknown error'), 'error');
-    }
+    await api(`/api/deals/${id}`, 'DELETE');
+    showToast?.('Deal deleted permanently');
+    loadArchive?.();
+    loadDeals?.();
   } catch (err) {
     console.error('[DELETE] Error:', err);
     showToast?.('Delete failed: ' + err.message, 'error');
+    loadArchive?.();
+    loadDeals?.();
   }
 }
 
@@ -3724,13 +5679,16 @@ async function exportGlobalPipelineCSV() {
   const rows = pipelineData.map(c => ({
     name: c.name || '',
     firm: c.firm || c.company || '',
-    deal: c.dealName || c.deal_name || '',
+    active_deal: c.activeDealName || '',
+    project: c.projectName || c.dealName || c.deal_name || '',
+    deals: c.dealNamesText || '',
     score: c.score || '',
     stage: c.stage || '',
     enrichment_status: c.enrichmentStatus || '',
     email: c.email || '',
     linkedin_url: c.linkedinUrl || c.linkedin_url || '',
     last_contact: c.lastContact || c.lastContacted || '',
+    scheduled_follow_up: c.scheduledFollowUpAt || '',
     next_followup: c.nextFollowup || c.nextFollowUp || '',
   }));
   downloadCSV(rows, `pipeline-export-${Date.now()}.csv`);
@@ -3750,6 +5708,7 @@ async function exportDealPipelineCSV(id) {
       enrichment_status: r.enrichmentStatus || r.enrichment_status || '',
       email: r.email || '',
       linkedin_url: r.linkedinUrl || r.linkedin_url || '',
+      scheduled_follow_up: r.scheduledFollowUpAt || '',
       last_contacted: r.lastContacted || '',
     }));
     downloadCSV(mapped, `deal-pipeline-${id}-${Date.now()}.csv`);
@@ -3865,7 +5824,7 @@ async function exportContactsCSV(btn) {
     do {
       const params = new URLSearchParams({ page, limit: 500 });
       if (search) params.set('search', search);
-      const data = await api(`/api/contacts-db/search?${params}`);
+      const data = await api(`/api/contacts-db/researched?${params}`);
       allRows = allRows.concat(data.contacts || []);
       totalPages = data.pages || 1;
       page++;
@@ -3873,12 +5832,15 @@ async function exportContactsCSV(btn) {
     if (!allRows.length) { showToast('No contacts to export', 'error'); return; }
     const mapped = allRows.map(r => ({
       name: r.name || '',
-      firm_name: r.firm_name || '',
-      title: r.title || '',
+      firm_name: r.company_name || '',
+      title: r.job_title || '',
+      active_deal: r.activeDealName || '',
+      project: r.projectName || r.dealName || '',
+      deals: r.dealNamesText || '',
       email: r.email || '',
       linkedin_url: r.linkedin_url || '',
-      source: r.source || '',
-      verified: r.verified ? 'Yes' : 'No',
+      stage: r.pipeline_stage || '',
+      verified: r.enrichment_status || '',
       updated_at: r.updated_at ? r.updated_at.substring(0, 10) : '',
     }));
     downloadCSV(mapped, `contacts-export-${Date.now()}.csv`);
@@ -3953,16 +5915,21 @@ function renderSequenceBar(steps) {
     bar.innerHTML = '<span style="color:#4b5563;font-size:13px">No sequence configured — click Edit Sequence to set one up.</span>';
     return;
   }
-  const typeBg = { email: '#1f3a5f', linkedin_invite: '#1a3a2a', linkedin_dm: '#2a1f3a' };
-  const typeLabel = { email: 'Email', linkedin_invite: 'LI Invite', linkedin_dm: 'LI DM' };
-  bar.innerHTML = steps.map((s, i) => `
-    ${i > 0 ? '<div style="color:#3a3a3a;font-size:20px;align-self:center">&#8594;</div>' : ''}
-    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 16px;
-                background:${typeBg[s.type] || '#1a1a1a'};border-radius:6px;min-width:110px;text-align:center">
-      <div style="color:#6b7280;font-size:10px;text-transform:uppercase;letter-spacing:0.1em">Day ${s.delay_days || 0}</div>
-      <div style="color:#e5e7eb;font-size:12px;font-weight:600;font-family:'DM Mono',monospace">${esc(s.label || '')}</div>
-      <div style="font-size:10px;padding:2px 6px;border-radius:3px;background:rgba(255,255,255,0.05);color:#9ca3af">${typeLabel[s.type] || esc(s.type || '')}</div>
-    </div>`).join('');
+  bar.innerHTML = steps.map((s, i) => {
+    const def = SEQ_STEP_DEFS[s.label] || SEQ_STEP_DEFS[s.action_type] || null;
+    const bg = def?.color || { email: '#1f3a5f', linkedin_invite: '#1a3a2a', linkedin_dm: '#2a1f3a' }[s.type] || '#1a1a1a';
+    const badge = def?.badge || '#6b7280';
+    const display = def?.display || (s.label || '').replace(/_/g, ' ');
+    const delayLabel = Number(s.delay_days) > 0 ? `+${s.delay_days}d` : 'Day 0';
+    return `
+      ${i > 0 ? '<div style="color:#2a2a2a;font-size:18px;align-self:center;padding-top:8px">&#8594;</div>' : ''}
+      <div style="display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 14px;
+                  background:${bg};border-radius:6px;min-width:100px;text-align:center">
+        <span style="font-size:9px;color:${badge};font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.12em">${delayLabel}</span>
+        <span style="color:#e5e7eb;font-size:12px;font-weight:600">${esc(display)}</span>
+        ${s.type !== 'linkedin_invite' ? '<span style="font-size:9px;color:#3a3a3a;font-family:\'DM Mono\',monospace">template</span>' : '<span style="font-size:9px;color:#2a2a2a;font-family:\'DM Mono\',monospace">auto</span>'}
+      </div>`;
+  }).join('');
 }
 
 function renderActiveTemplates(active, missingSteps) {
@@ -4113,7 +6080,24 @@ window.openEditTemplate = function(template) {
       </div>
       <div class="form-group">
         <label class="form-label">Variables <span class="label-muted">(click to insert)</span></label>
-        <div class="variable-chips" id="variable-chips">${TEMPLATE_VARIABLES.map(v => `<span class="var-chip" onclick="insertVariable('${v}')">${v}</span>`).join('')}</div>
+        <div id="variable-chips" style="display:flex;flex-direction:column;gap:8px">
+          <div>
+            <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Contact</div>
+            <div class="variable-chips">${['{{firstName}}','{{lastName}}','{{fullName}}','{{firm}}','{{jobTitle}}'].map(v=>`<span class="var-chip" onclick="insertVariable('${v}')">${v}</span>`).join('')}</div>
+          </div>
+          <div>
+            <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Investor Research</div>
+            <div class="variable-chips">${['{{pastInvestments}}','{{investmentThesis}}','{{sectorFocus}}','{{investorGeography}}'].map(v=>`<span class="var-chip" onclick="insertVariable('${v}')">${v}</span>`).join('')}</div>
+          </div>
+          <div>
+            <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Deal</div>
+            <div class="variable-chips">${['{{dealName}}','{{dealBrief}}','{{sector}}','{{targetAmount}}','{{keyMetrics}}','{{geography}}','{{minCheque}}','{{maxCheque}}','{{investorProfile}}','{{comparableDeal}}'].map(v=>`<span class="var-chip" onclick="insertVariable('${v}')">${v}</span>`).join('')}</div>
+          </div>
+          <div>
+            <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Links &amp; Sender</div>
+            <div class="variable-chips">${['{{deckUrl}}','{{callLink}}','{{senderName}}','{{senderTitle}}'].map(v=>`<span class="var-chip" onclick="insertVariable('${v}')">${v}</span>`).join('')}</div>
+          </div>
+        </div>
       </div>
       <div class="tmpl-toggles">
         <div class="toggle-row-inline">
@@ -4745,10 +6729,12 @@ async function loadControls() {
   try {
     const state = await api('/api/state');
     applyState(state);
+    refreshHealth();
+    loadWebhookStatus();
 
-    // Populate all deal selectors (schedule + research + enrichment)
+    // Populate controls deal selectors
     const deals = allDeals.length ? allDeals : ((await api('/api/deals').catch(() => [])) || []);
-    for (const selId of ['schedule-deal-select', 'research-deal-select', 'enrichment-deal-select']) {
+    for (const selId of ['research-deal-select', 'enrichment-deal-select']) {
       const sel = document.getElementById(selId);
       if (!sel || !deals.length) continue;
       const prev = sel.value;
@@ -4762,6 +6748,69 @@ async function loadControls() {
       if (prev) sel.value = prev;
     }
   } catch { /* silent */ }
+}
+
+async function loadWebhookStatus() {
+  const el = document.getElementById('webhook-monitor-body');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--text-dim);font-size:13px">Loading webhook status…</div>';
+
+  try {
+    const data = await api('/api/admin/webhook-status');
+    renderWebhookStatus(el, data || {});
+  } catch (err) {
+    el.innerHTML = `<div style="color:#e05c5c;font-size:13px">Failed to load webhook status: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderWebhookStatus(el, data) {
+  const latest = data?.latest || {};
+  const hooks = Array.isArray(data?.hooks) ? data.hooks : [];
+  const row = (label, item, tone = '#4ade80') => `
+    <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:13px;color:var(--text-bright)">${esc(label)}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:3px">${esc(item?.event_type || 'No receipt yet')}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:12px;color:${item ? tone : 'var(--text-dim)'};font-family:var(--font-mono)">${item ? formatDate(item.received_at) : 'Never'}</div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:3px">${item?.received_at ? esc(formatTime(item.received_at)) : ''}</div>
+      </div>
+    </div>`;
+
+  const hookCards = hooks.length
+    ? hooks.map(hook => {
+        const name = hook.name || hook.label || hook.id || 'Unnamed webhook';
+        const url = hook.request_url || hook.url || hook.endpoint || hook.target_url || '';
+        const events = Array.isArray(hook.events) ? hook.events.join(', ') : (hook.event || hook.type || '');
+        const source = hook.source || hook.object_type || '';
+        return `<div style="padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px">
+          <div style="font-size:12px;color:var(--text-bright);margin-bottom:4px">${esc(name)}</div>
+          <div style="font-size:10px;color:var(--text-dim);font-family:var(--font-mono);margin-bottom:4px;word-break:break-all">${esc(url || 'No URL')}</div>
+          <div style="font-size:10px;color:var(--gold);font-family:var(--font-mono)">${esc(events || 'No events listed')}</div>
+          ${source ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--font-mono);margin-top:4px">${esc(source)}</div>` : ''}
+        </div>`;
+      }).join('')
+    : '<div style="color:var(--text-dim);font-size:12px">No registered webhooks returned by Unipile.</div>';
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1.15fr);gap:24px">
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Latest Receipts</div>
+        ${row('Gmail', latest.gmail)}
+        ${row('Outlook', latest.outlook, '#60a5fa')}
+        ${row('LinkedIn Acceptance', latest.linkedin_acceptance, 'var(--gold)')}
+        ${row('LinkedIn DM', latest.linkedin_dm, '#c084fc')}
+      </div>
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Registered Webhooks</div>
+          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">${hooks.length} total</div>
+        </div>
+        <div style="display:grid;gap:10px">${hookCards}</div>
+      </div>
+    </div>
+  `;
 }
 
 async function onSwitchChange(key, checked) {
@@ -4878,88 +6927,13 @@ function clearPauseDisplay() {
   if (form) form.style.display = '';
 }
 
-/* ─── SCHEDULE VISUALIZER ────────────────────────────────────────────────── */
-
-async function loadDealSchedule(dealId) {
-  const content = document.getElementById('schedule-content');
-  if (!dealId) { if (content) content.style.display = 'none'; return; }
-  if (content) content.style.display = '';
-
-  try {
-    const data = await api(`/api/deals/${dealId}/schedule`);
-    renderScheduleViz(data);
-    renderWindowStatus(data);
-  } catch { /* silent */ }
-}
-
-function renderScheduleViz(data) {
-  const el = document.getElementById('schedule-viz');
-  if (!el) return;
-
-  const DAYS    = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  const windows = data?.sendingWindows || data?.windows || {};
-  const startH  = data?.startHour ?? 8;
-  const endH    = data?.endHour   ?? 18;
-
-  el.innerHTML = `
-    <div class="schedule-timeline-labels" style="margin-left:40px;max-width:calc(100% - 40px)">
-      ${Array.from({length:7}, (_,i) => `<span>${(i*4).toString().padStart(2,'0')}:00</span>`).join('')}
-    </div>
-    ${DAYS.map((day, idx) => {
-      const key      = day.toLowerCase();
-      const active   = windows[key] !== false && windows[idx] !== false;
-      const dayStart = startH / 24 * 100;
-      const dayEnd   = endH   / 24 * 100;
-      const width    = dayEnd - dayStart;
-      return `<div class="schedule-row">
-        <span class="schedule-day-label">${day}</span>
-        <div class="schedule-timeline">
-          ${active ? `<div class="schedule-window" style="left:${dayStart}%;width:${width}%"></div>` : ''}
-        </div>
-      </div>`;
-    }).join('')}
-  `;
-}
-
-function renderWindowStatus(data) {
-  const el = document.getElementById('schedule-cadence');
-  if (!el || !data) return;
-  el.innerHTML = `
-    <div class="cadence-row">
-      <span class="cadence-label">Send Window</span>
-      <span class="cadence-val">${data.startHour ?? 8}:00 – ${data.endHour ?? 18}:00</span>
-    </div>
-    <div class="cadence-row">
-      <span class="cadence-label">Timezone</span>
-      <span class="cadence-val">${esc(data.timezone || 'Europe/London')}</span>
-    </div>
-    <div class="cadence-row">
-      <span class="cadence-label">Emails / Day</span>
-      <span class="cadence-val">${data.emailsPerDay ?? '—'}</span>
-    </div>
-    <div class="cadence-row">
-      <span class="cadence-label">Follow-up Delay</span>
-      <span class="cadence-val">${data.followUpDays ? data.followUpDays + ' days' : '—'}</span>
-    </div>
-  `;
-}
-
-async function saveDealSchedule() {
-  const dealId = document.getElementById('schedule-deal-select')?.value;
-  if (!dealId) { showToast('Select a deal first.', 'error'); return; }
-  try {
-    await api(`/api/deals/${dealId}/schedule`, 'PATCH', {});
-    showToast('Schedule saved');
-  } catch (err) { showToast(`Save failed: ${err.message}`, 'error'); }
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
    MODAL
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function openModal(title, onConfirm) {
+function openModal(title, onConfirm, initialValue = '') {
   document.getElementById('modal-title').textContent = title;
-  document.getElementById('modal-instructions').value = '';
+  document.getElementById('modal-instructions').value = initialValue;
   document.getElementById('edit-modal').classList.remove('hidden');
   modalCallback = onConfirm;
 }
@@ -4996,14 +6970,12 @@ function closeSidebar() {
 
 async function fullRefresh() {
   await Promise.all([refreshStats(), populateDealSelector()]);
-  // If user has a deal detail open, only silently refresh data-only tabs (not settings/batches)
-  // to avoid wiping unsaved form edits
+  // If a deal detail is open, keep the tab DOM intact and only refresh shared/cache data.
   if (selectedDealId) {
-    const activeTab = document.querySelector('.deal-tab.active')?.dataset?.tab;
-    const safeToRefresh = ['overview', 'pipeline', 'rankings', 'archived'];
-    if (activeTab && safeToRefresh.includes(activeTab)) {
-      switchDealTab(activeTab, document.querySelector('.deal-tab.active'));
-    }
+    await Promise.all([
+      quietRefreshSelectedDeal(),
+      (!document.getElementById('view-deals')?.classList.contains('hidden') ? loadDeals() : Promise.resolve()),
+    ]);
     return;
   }
   const view = (window.location.hash || '#overview').replace('#', '');
@@ -5013,6 +6985,7 @@ async function fullRefresh() {
     case 'pipeline':  await loadPipeline();  break;
     case 'queue':     await loadQueue();     break;
     case 'activity':  await loadActivity();  break;
+    case 'controls':  await loadControls();  break;
     case 'archive':         await loadArchive();         break;
     case 'sourcing':        await loadSourcingCampaigns(); break;
     case 'sourcing-detail': if (currentSourcingCampaignId) await loadSourcingCampaignDetail(currentSourcingCampaignId); break;
@@ -5112,6 +7085,29 @@ function formatDate(d) {
   } catch { return String(d); }
 }
 
+function formatScheduleDate(d) {
+  if (!d) return '—';
+  try {
+    const date = new Date(d);
+    if (isNaN(date)) return String(d);
+    const datePart = date.toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      timeZone: DOM_TZ,
+    });
+    const timePart = date.toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZone: DOM_TZ,
+    });
+    return `${datePart} ${timePart}`;
+  } catch {
+    return String(d);
+  }
+}
+
 function formatTime(d) {
   if (!d) return '—';
   try {
@@ -5125,6 +7121,7 @@ function formatTime(d) {
 function typeToBadge(type) {
   if (!type) return 'system';
   const t = String(type).toLowerCase();
+  if (t === 'accepted' || t.includes('accepted') || t.includes('invite_accepted'))               return 'accepted';
   if (t === 'reply'  || t.includes('reply') || t.includes('inbound') || t.includes('response')) return 'reply';
   if (t === 'invite' || t.includes('invite_sent') || t.includes('linkedin_invite'))              return 'invite';
   if (t === 'dm'     || t.includes('dm_sent')     || t.includes('linkedin_dm'))                  return 'dm';
@@ -5136,7 +7133,31 @@ function typeToBadge(type) {
   if (t.includes('approv') || t.includes('queue'))                                               return 'approval';
   if (t.includes('error') || t.includes('fail'))                                                 return 'error';
   if (t === 'excluded' || t.includes('excluded'))                                                return 'excluded';
+  if (t === 'analysis' || t.includes('analysis'))                                                return 'analysis';
   return 'system';
+}
+
+function getActivityBadgeMeta(item) {
+  const explicitBadge = String(item?.activity_badge || item?.badge || '').toLowerCase();
+  const normalizedExplicitBadge = explicitBadge === 'replied' ? 'reply' : explicitBadge;
+  const className = normalizedExplicitBadge || typeToBadge(item?.type || item?.event_type || item?.activityType);
+  const labels = {
+    accepted: 'Accepted',
+    reply: 'Replied',
+    invite: 'Invite',
+    dm: 'DM',
+    linkedin: 'LinkedIn',
+    email: 'Email',
+    research: 'Research',
+    enrichment: 'Enrichment',
+    approval: 'Approval',
+    error: 'Error',
+    excluded: 'No Match',
+    analysis: 'Analysis',
+    thinking: 'Thinking',
+    system: 'System',
+  };
+  return { className, label: labels[className] || className };
 }
 
 function scoreHtml(score) {
@@ -5788,21 +7809,58 @@ async function loadInvestorListsPanel() {
   const panel = document.getElementById('db-lists-panel');
   if (!panel) return;
   try {
-    const lists = await api('/api/investor-lists');
+    const lists = await api('/api/lists');
     if (!lists?.length) { panel.innerHTML = ''; return; }
     panel.innerHTML = `
       <div class="card">
-        <div class="card-header"><h2 class="card-title">Named Lists</h2></div>
-        <div style="padding:0 24px 16px;display:flex;flex-wrap:wrap;gap:8px">
+        <div class="card-header"><h2 class="card-title">Investor Lists</h2></div>
+        <div style="padding:0 24px 24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px">
           ${lists.map(l => `
-            <div style="display:flex;align-items:center;gap:6px;padding:6px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px">
-              <span id="list-label-${l.id}" style="font-size:13px;color:var(--text-bright)">${esc(l.name)}</span>
-              <input id="list-input-${l.id}" type="text" value="${esc(l.name)}"
-                style="display:none;padding:2px 6px;background:#111;border:1px solid var(--gold);color:var(--text-bright);border-radius:4px;font-size:13px;width:180px"
-                onblur="savePillName('${l.id}')" onkeydown="if(event.key==='Enter')savePillName('${l.id}');if(event.key==='Escape')cancelEditList('${l.id}')">
-              <span style="color:var(--text-dim);font-size:11px;margin-left:2px">(${(l.investor_count||0).toLocaleString()})</span>
-              <button onclick="startEditList('${l.id}')" title="Rename"
-                style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:13px;padding:0 2px;line-height:1" aria-label="Edit">✎</button>
+            <div style="background:#111113;border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:12px">
+              <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
+                <div>
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <input id="list-input-${l.id}" type="text" value="${esc(l.name)}"
+                      style="padding:6px 8px;background:#0b0b0d;border:1px solid var(--border);color:var(--text-bright);border-radius:6px;font-size:14px;font-weight:600;width:min(100%,240px)">
+                    <span style="${listTypeBadgeStyle(l.list_type)}">${esc(formatListTypeLabel(l.list_type))}</span>
+                  </div>
+                  <div style="margin-top:8px;color:var(--text-dim);font-size:12px">${(l.investor_count || 0).toLocaleString()} investors · Used ${Number(l.use_count || 0).toLocaleString()} deals · ${Number(l.success_rate || 0)}% response rate</div>
+                </div>
+                <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">Priority ${l.priority_order ?? 99}</div>
+              </div>
+              <div>
+                <label style="display:block;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);font-family:var(--font-mono);margin-bottom:6px">Description</label>
+                <textarea id="list-description-${l.id}" rows="3" class="form-textarea" style="min-height:82px">${esc(l.description || '')}</textarea>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                <div>
+                  <label style="display:block;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);font-family:var(--font-mono);margin-bottom:6px">List Type</label>
+                  <select id="list-type-${l.id}" class="form-input">
+                    ${buildListTypeOptions(l.list_type)}
+                  </select>
+                </div>
+                <div>
+                  <label style="display:block;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);font-family:var(--font-mono);margin-bottom:6px">Priority Order</label>
+                  <input id="list-priority-${l.id}" type="number" min="1" max="99" class="form-input" value="${Number(l.priority_order ?? 99)}">
+                </div>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                <div>
+                  <label style="display:block;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);font-family:var(--font-mono);margin-bottom:6px">Deal Types</label>
+                  <select id="list-deal-types-${l.id}" class="form-input" multiple size="4">${buildMultiSelectOptions(DEAL_TYPE_OPTIONS, l.deal_types)}</select>
+                </div>
+                <div>
+                  <label style="display:block;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);font-family:var(--font-mono);margin-bottom:6px">Sectors</label>
+                  <select id="list-sectors-${l.id}" class="form-input" multiple size="6">${buildMultiSelectOptions(SECTOR_OPTIONS, l.sectors)}</select>
+                </div>
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px">
+                ${renderTagGroup(l.sectors, '#1f2937', '#9ca3af')}
+                ${renderTagGroup(l.deal_types, 'rgba(201,168,76,0.12)', 'var(--gold)')}
+              </div>
+              <div style="display:flex;justify-content:flex-end">
+                <button class="btn btn-gold btn-sm" onclick="saveListMetadata('${l.id}')">Save Metadata</button>
+              </div>
             </div>
           `).join('')}
         </div>
@@ -5811,39 +7869,86 @@ async function loadInvestorListsPanel() {
   } catch (_) { panel.innerHTML = ''; }
 }
 
-function startEditList(id) {
-  document.getElementById(`list-label-${id}`).style.display = 'none';
-  const input = document.getElementById(`list-input-${id}`);
-  input.style.display = '';
-  input.focus();
-  input.select();
+const DEAL_TYPE_OPTIONS = ['buyout', 'independent_sponsor', 'growth_equity', 'secondaries'];
+const SECTOR_OPTIONS = ['healthcare', 'manufacturing', 'distribution', 'business_services', 'software', 'industrial', 'consumer', 'financial_services'];
+
+function formatListTypeLabel(value) {
+  const labels = {
+    deal_specific: 'Deal-Specific PitchBook',
+    comparable_deals: 'Comparable Deals',
+    standing: 'Standing List',
+    news_research: 'News Research',
+    manual: 'Other',
+    knowledge_base: 'Knowledge Base',
+    warm: 'Warm',
+    standard: 'Standing List',
+  };
+  return labels[value] || 'Other';
 }
 
-function cancelEditList(id) {
-  const label = document.getElementById(`list-label-${id}`);
-  const input = document.getElementById(`list-input-${id}`);
-  if (!label || !input) return;
-  input.value = label.textContent;
-  input.style.display = 'none';
-  label.style.display = '';
+function listTypeBadgeStyle(value) {
+  const styles = {
+    deal_specific: 'display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:rgba(201,168,76,0.16);color:var(--gold);font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.12em',
+    comparable_deals: 'display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:rgba(56,189,248,0.14);color:#7dd3fc;font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.12em',
+    standing: 'display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:rgba(148,163,184,0.14);color:#cbd5e1;font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.12em',
+    news_research: 'display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:rgba(74,222,128,0.14);color:#86efac;font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.12em',
+    manual: 'display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:rgba(244,114,182,0.14);color:#f9a8d4;font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.12em',
+  };
+  return styles[value] || styles.manual;
 }
 
-async function savePillName(id) {
-  const label = document.getElementById(`list-label-${id}`);
-  const input = document.getElementById(`list-input-${id}`);
-  if (!label || !input) return;
-  const newName = input.value.trim();
-  if (!newName || newName === label.textContent) { cancelEditList(id); return; }
-  input.onblur = null;
-  try {
-    await api(`/api/investor-lists/${id}`, 'PUT', { name: newName });
-    label.textContent = newName;
-    showToast('List renamed');
-  } catch (e) {
-    showToast(`Failed: ${e.message}`, 'error');
+function buildListTypeOptions(selected) {
+  const options = [
+    ['deal_specific', 'Deal-Specific PitchBook'],
+    ['comparable_deals', 'Comparable Deals'],
+    ['standing', 'Standing List'],
+    ['manual', 'Other'],
+  ];
+  return options.map(([value, label]) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${label}</option>`).join('');
+}
+
+function buildMultiSelectOptions(options, selectedValues) {
+  const selected = new Set((selectedValues || []).map(v => String(v)));
+  return options.map(value => `<option value="${value}" ${selected.has(String(value)) ? 'selected' : ''}>${value.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</option>`).join('');
+}
+
+function renderTagGroup(values, bg, color) {
+  if (!values?.length) return '';
+  return values.map(value => `
+    <span style="padding:4px 8px;border-radius:999px;background:${bg};color:${color};font-size:11px">
+      ${esc(String(value).replace(/_/g, ' '))}
+    </span>
+  `).join('');
+}
+
+function getMultiSelectValues(id) {
+  const el = document.getElementById(id);
+  if (!el) return [];
+  return Array.from(el.selectedOptions).map(option => option.value);
+}
+
+async function saveListMetadata(id) {
+  const payload = {
+    name: document.getElementById(`list-input-${id}`)?.value?.trim(),
+    list_type: document.getElementById(`list-type-${id}`)?.value || null,
+    description: document.getElementById(`list-description-${id}`)?.value?.trim() || '',
+    priority_order: Number(document.getElementById(`list-priority-${id}`)?.value || 99),
+    deal_types: getMultiSelectValues(`list-deal-types-${id}`),
+    sectors: getMultiSelectValues(`list-sectors-${id}`),
+  };
+
+  if (!payload.name) {
+    showToast('List name is required', 'error');
+    return;
   }
-  input.style.display = 'none';
-  label.style.display = '';
+
+  try {
+    await api(`/api/lists/${id}`, 'PUT', payload);
+    showToast('List metadata updated');
+    await loadDatabase();
+  } catch (err) {
+    showToast(`Failed: ${err.message}`, 'error');
+  }
 }
 
 async function loadListsTab() {
@@ -5851,7 +7956,7 @@ async function loadListsTab() {
   if (!container) return;
   container.innerHTML = '<div class="loading-placeholder">Loading&#8230;</div>';
   try {
-    const lists = await api('/api/investor-lists');
+    const lists = await api('/api/lists');
     if (!lists?.length) {
       container.innerHTML = '<p style="color:#6b7280;padding:40px;text-align:center">No lists yet. Upload an XLSX to create your first list.</p>';
       return;
@@ -5877,6 +7982,10 @@ async function loadListsTab() {
                   data-original="${(l.name || '').replace(/"/g, '&quot;')}">
                   ${esc(l.name)}
                 </span>
+                <div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                  <span style="${listTypeBadgeStyle(l.list_type)}">${esc(formatListTypeLabel(l.list_type))}</span>
+                  <span style="font-size:12px;color:var(--text-dim)">${esc(l.description || 'No description')}</span>
+                </div>
               </td>
               <td style="padding:10px 16px;color:var(--text-dim);font-size:12px">${esc(l.source || 'pitchbook')}</td>
               <td style="padding:10px 16px;text-align:right;color:var(--text-muted);font-family:var(--font-mono)">${(l.investor_count || 0).toLocaleString()}</td>
@@ -5939,7 +8048,7 @@ window.saveListName = async function(listId) {
   if (!newName) { window.loadListsTab(); return; }
 
   try {
-    const data = await api(`/api/investor-lists/${listId}`, 'PUT', { name: newName });
+    const data = await api(`/api/lists/${listId}`, 'PUT', { name: newName });
     if (data && data.success) {
       showToast(`List renamed to "${newName}"`);
     } else if (data && data.error) {
@@ -6006,34 +8115,43 @@ async function loadContactsTable(page) {
   const search = document.getElementById('db-contacts-search')?.value?.trim() || '';
   const tbody  = document.getElementById('db-contacts-body');
   if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading&#8230;</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="11" class="table-empty">Loading&#8230;</td></tr>';
   try {
     const params = new URLSearchParams({ page: contactsCurrentPage, limit: 50 });
     if (search) params.set('search', search);
     const data = await api(`/api/contacts-db/researched?${params}`);
     const rows = data.contacts || [];
     if (!rows.length) {
-      tbody.innerHTML = `<tr><td colspan="8" class="table-empty">
+      tbody.innerHTML = `<tr><td colspan="11" class="table-empty">
         <div style="padding:20px 0">
-          <div style="font-size:24px;margin-bottom:8px">🔬</div>
-          <div>No researched contacts yet.</div>
-          <div style="font-size:12px;margin-top:4px;color:var(--text-muted)">Contacts appear here after Roco has researched and enriched them for a deal.</div>
+          <div style="font-size:24px;margin-bottom:8px">👥</div>
+          <div>No contacts found.</div>
+          <div style="font-size:12px;margin-top:4px;color:var(--text-muted)">Contacts tied to deals appear here, including closed conversations unless they were deleted or suppressed.</div>
         </div>
       </td></tr>`;
       renderPagination('db-contacts-pagination', 1, 1, 'loadContactsTable');
       return;
     }
+    const renderDealsCell = (deals) => {
+      if (!Array.isArray(deals) || deals.length === 0) return '<span style="color:#555">—</span>';
+      return `<div style="display:flex;flex-wrap:wrap;gap:4px">${deals.map(d =>
+        `<span style="padding:2px 8px;border-radius:4px;font-size:10px;border:1px solid #2a2a2a;background:#1a1a1a;color:#9ca3af">${esc(d.dealName || '—')}</span>`
+      ).join('')}</div>`;
+    };
     tbody.innerHTML = rows.map(r => `<tr
       style="cursor:pointer;transition:background 0.15s"
       onmouseover="this.style.background='var(--surface-2,#1a1a1a)'"
       onmouseout="this.style.background=''"
-      onclick="openProspectDrawer('${r.id}', null)">
+      onclick="openProspectDrawer('${r.id}', '${r.deal_id || ''}')">
       <td style="font-weight:500">${esc(r.name || '—')}</td>
       <td style="font-size:12px">${esc(r.company_name || '—')}</td>
       <td style="font-size:12px;color:var(--text-dim)">${esc(r.job_title || '—')}</td>
+      <td>${r.activeDealName ? `<span class="status-badge" style="background:var(--gold-dim);color:var(--gold)">${esc(r.activeDealName)}</span>` : '<span style="color:#555">—</span>'}</td>
+      <td>${r.projectName ? `<span class="status-badge" style="background:#1f2937;color:#9ca3af">${esc(r.projectName)}</span>` : '<span style="color:#555">—</span>'}</td>
+      <td style="max-width:220px">${renderDealsCell(r.deals)}</td>
       <td style="font-size:11px;font-family:var(--font-mono)">${r.email ? `<span style="color:#4ade80">${esc(r.email)}</span>` : '<span style="color:#555">—</span>'}</td>
       <td style="font-size:12px">${r.linkedin_url ? `<a href="${esc(r.linkedin_url.startsWith('http') ? r.linkedin_url : 'https://'+r.linkedin_url)}" target="_blank" onclick="event.stopPropagation()" style="color:#0a66c2">LinkedIn</a>` : '<span style="color:#555">—</span>'}</td>
-      <td style="font-size:11px;color:var(--text-dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.past_investments ? esc(r.past_investments.split(',').slice(0,3).join(', ')) : '—'}</td>
+      <td style="font-size:11px;color:var(--text-dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.pipeline_stage || '—')}</td>
       <td><span style="padding:2px 8px;border-radius:4px;font-size:11px;
         background:${r.enrichment_status==='Enriched'?'#064e3b':r.enrichment_status==='Partial'?'#1e3a5f':'#1a1a1a'};
         color:${r.enrichment_status==='Enriched'?'#4ade80':r.enrichment_status==='Partial'?'#60a5fa':'#6b7280'}">
@@ -6042,7 +8160,7 @@ async function loadContactsTable(page) {
     </tr>`).join('');
     renderPagination('db-contacts-pagination', contactsCurrentPage, data.pages || 1, 'loadContactsTable');
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="table-empty" style="color:var(--text-muted)">${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="table-empty" style="color:var(--text-muted)">${err.message}</td></tr>`;
   }
 }
 
@@ -6053,7 +8171,7 @@ function getContactTypeBadge(contact_type, is_angel) {
     return `<span style="padding:2px 6px;border-radius:3px;font-size:10px;font-family:var(--font-mono);background:rgba(96,165,250,0.15);color:#60a5fa">Institutional</span>`;
   if (contact_type === 'firm')
     return `<span style="padding:2px 6px;border-radius:3px;font-size:10px;font-family:var(--font-mono);background:rgba(167,139,250,0.15);color:#a78bfa">Firm</span>`;
-  return '<span style="color:#374151;font-size:10px">—</span>';
+  return '';
 }
 
 function renderInvestorTable(rows, total, pages) {
@@ -6160,16 +8278,32 @@ function renderPagination(containerId, currentPage, totalPages, onPageChangeFn) 
 // ─── EXCLUSION CSV (Launch Deal) ─────────────────────────────────────────────
 
 let parsedExclusions = [];
+let queuedExclusionFile = null; // XLSX files — uploaded server-side after deal creation
 
 window.handleExclusionDrop = function(e) {
   e.preventDefault();
   document.getElementById('exclusion-drop-zone').style.borderColor = '#2a2a2a';
   const file = e.dataTransfer?.files?.[0];
-  if (file?.name.endsWith('.csv')) handleExclusionFile(file);
+  if (file) handleExclusionFile(file);
 };
 
 window.handleExclusionFile = function(file) {
   if (!file) return;
+  const isXlsx = /\.(xlsx|xls)$/i.test(file.name);
+  if (isXlsx) {
+    // XLSX files are uploaded server-side after deal creation — just queue and preview the filename
+    queuedExclusionFile = file;
+    parsedExclusions = []; // will be parsed server-side
+    const preview = document.getElementById('exclusion-preview');
+    const count   = document.getElementById('exclusion-count');
+    const sample  = document.getElementById('exclusion-sample');
+    if (preview) preview.style.display = 'block';
+    if (count)   count.textContent = `${file.name} queued`;
+    if (sample)  sample.innerHTML  = 'Will be parsed and uploaded after deal is created.';
+    return;
+  }
+  // CSV — parse client-side as before
+  queuedExclusionFile = null;
   const reader = new FileReader();
   reader.onload = (e) => {
     parsedExclusions = parseExclusionCsv(e.target.result);
@@ -6210,6 +8344,7 @@ function showExclusionPreview(exclusions) {
 
 window.clearExclusionList = function() {
   parsedExclusions = [];
+  queuedExclusionFile = null;
   const preview = document.getElementById('exclusion-preview');
   if (preview) preview.style.display = 'none';
   const input = document.getElementById('exclusion-csv-input');
@@ -6226,8 +8361,8 @@ async function loadPriorityListsForLaunch() {
   const sel = document.getElementById('add-list-select');
   if (!sel) return;
   try {
-    const lists = await api('/api/investor-lists');
-    // Preserve first placeholder option
+    // Only show investor-type lists (not knowledge bases) in priority dropdown
+    const lists = await api('/api/investor-lists?type=investors');
     sel.innerHTML = '<option value="">+ Add a list to prioritise\u2026</option>';
     (lists || []).forEach(l => {
       const opt = document.createElement('option');
@@ -6240,7 +8375,158 @@ async function loadPriorityListsForLaunch() {
   } catch (e) {
     console.warn('[PRIORITY] Failed to load lists:', e.message);
   }
+
+  // Load Knowledge Base dropdown separately
+  const kbSel = document.getElementById('launch-kb-select');
+  if (!kbSel) return;
+  try {
+    const kbLists = await api('/api/investor-lists?type=knowledge_base');
+    kbSel.innerHTML = '<option value="">None \u2014 use standard database scoring only</option>';
+    (kbLists || []).forEach(l => {
+      const opt = document.createElement('option');
+      opt.value = l.id;
+      opt.dataset.name = l.name;
+      const label = `${l.name} (${(l.investor_count || 0).toLocaleString()} records)`;
+      opt.textContent = label;
+      opt.title = label;
+      kbSel.appendChild(opt);
+    });
+    // Also update the select's own title to show the selected option on hover
+    kbSel.addEventListener('change', () => {
+      const sel = kbSel.options[kbSel.selectedIndex];
+      kbSel.title = sel ? sel.title || sel.textContent : '';
+    });
+  } catch (e) {
+    console.warn('[KB] Failed to load knowledge bases:', e.message);
+  }
 }
+
+async function loadEmailAccountOptions(selectedId) {
+  const sel = document.getElementById('launch-email-account');
+  if (!sel) return;
+  try {
+    const accounts = await api('/api/email-accounts');
+    sel.innerHTML = '<option value="">No sending account selected…</option>';
+    (accounts || []).forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a.connection_id;
+      opt.dataset.email = a.email;
+      opt.textContent = a.label || a.email;
+      if (selectedId && a.connection_id === selectedId) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (!selectedId && accounts?.length === 1) sel.value = accounts[0].connection_id;
+  } catch (e) {
+    console.warn('[EMAIL ACCOUNTS] Failed to load:', e.message);
+  }
+}
+
+// Queue of PitchBook files to upload after deal creation
+window.pbFilesQueue = { investors: null, deals: null };
+
+window.queuePbFile = function(file, type) {
+  if (!file) return;
+  window.pbFilesQueue[type] = file;
+  const labelId = type === 'investors' ? 'pb-investors-label' : 'pb-deals-label';
+  const label = document.getElementById(labelId);
+  if (label) label.textContent = `\u2713 ${file.name}`;
+};
+
+async function uploadQueuedPbFiles(dealId, queueOverride = null) {
+  const queue = queueOverride || window.pbFilesQueue || {};
+  const results = {};
+  for (const type of ['investors', 'deals']) {
+    const file = queue[type];
+    if (!file) continue;
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('fileType', type === 'deals' ? 'intelligence' : type);
+      const res = await fetch(`/api/deals/${dealId}/import-intelligence`, {
+        method: 'POST',
+        body: fd,
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const msg = await res.text().catch(() => '');
+        console.warn(`[PB IMPORT] ${type} upload failed:`, msg);
+        results[type] = { ok: false, error: msg || `HTTP ${res.status}` };
+      } else {
+        const data = await res.json().catch(() => ({}));
+        console.log(`[PB IMPORT] ${type} uploaded for deal ${dealId}`);
+        results[type] = { ok: true, data };
+      }
+    } catch (e) {
+      console.warn(`[PB IMPORT] ${type} error:`, e.message);
+      results[type] = { ok: false, error: e.message };
+    }
+  }
+  window.pbFilesQueue = { investors: null, deals: null };
+  return results;
+}
+
+async function uploadQueuedExclusionFile(dealId, fileOverride = null) {
+  const file = fileOverride || queuedExclusionFile;
+  if (!file) return;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch(`/api/deals/${dealId}/exclusions/upload`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => '');
+      console.warn('[EXCLUSION UPLOAD] failed:', msg);
+    } else {
+      const data = await res.json().catch(() => ({}));
+      console.log(`[EXCLUSION UPLOAD] ${data.imported || '?'} exclusions imported for deal ${dealId}`);
+    }
+  } catch (e) {
+    console.warn('[EXCLUSION UPLOAD] error:', e.message);
+  }
+  queuedExclusionFile = null;
+}
+
+window.uploadActiveDealFile = async function(file, dealId, fileType = null) {
+  if (!file || !dealId) return;
+  const btn = document.getElementById(`pb-upload-btn-${dealId}`);
+  const origText = btn?.textContent;
+  if (btn) { btn.textContent = 'Uploading…'; btn.disabled = true; }
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    if (fileType) fd.append('fileType', fileType);
+    const res = await fetch(`/api/deals/${dealId}/import-intelligence`, {
+      method: 'POST',
+      body: fd,
+      credentials: 'include',
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const result = await res.json();
+    showToast(result.message || 'File imported successfully');
+    await loadDealTabSettings(dealId);
+  } catch (e) {
+    showToast(`Import failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.textContent = origText; btn.disabled = false; }
+  }
+};
+
+window.saveDealEmailAccount = async function(dealId) {
+  const sel = document.getElementById(`ds-email-account-${dealId}`);
+  if (!sel) return;
+  const accountId = sel.value;
+  const email = sel.options[sel.selectedIndex]?.dataset?.email || '';
+  const btn = document.getElementById(`ds-email-account-btn-${dealId}`);
+  const origText = btn?.textContent;
+  if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+  try {
+    await api(`/api/deals/${dealId}`, 'PATCH', { sending_account_id: accountId, sending_email: email });
+    showToast('Sending account updated');
+  } catch (e) {
+    showToast(`Failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.textContent = origText; btn.disabled = false; }
+  }
+};
 
 function addPriorityList() {
   const sel = document.getElementById('add-list-select');
@@ -6292,180 +8578,468 @@ function renderPriorityList() {
   `).join('');
 }
 
-// ─── ANALYTICS PAGE ───────────────────────────────────────────────────────────
+// ─── ANALYTICS PAGE — WEEKLY INTELLIGENCE BOOKS ──────────────────────────────
 
 async function loadAnalyticsPage() {
-  switchAnalyticsTab('performance');
-  loadAnalyticsPerformance();
-  loadAnalyticsRecommendations();
-}
+  const container = document.getElementById('analytics-main-container');
+  if (!container) return;
 
-function switchAnalyticsTab(tab) {
-  document.getElementById('analytics-panel-performance').style.display = tab === 'performance' ? '' : 'none';
-  document.getElementById('analytics-panel-recommendations').style.display = tab === 'recommendations' ? '' : 'none';
-  const perfBtn = document.getElementById('analytics-tab-performance');
-  const recBtn  = document.getElementById('analytics-tab-recommendations');
-  if (perfBtn) {
-    perfBtn.style.borderBottomColor = tab === 'performance' ? 'var(--gold)' : 'transparent';
-    perfBtn.style.color = tab === 'performance' ? 'var(--gold)' : 'var(--text-dim)';
-  }
-  if (recBtn) {
-    recBtn.style.borderBottomColor = tab === 'recommendations' ? 'var(--gold)' : 'transparent';
-    recBtn.style.color = tab === 'recommendations' ? 'var(--gold)' : 'var(--text-dim)';
-  }
-}
+  container.innerHTML = `
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400&family=DM+Mono:wght@300;400;500&display=swap');
+      :root {
+        --gold:#C9A84C; --gold-dim:rgba(201,168,76,0.12);
+        --gold-b:rgba(201,168,76,0.25);
+        --bg:#080809; --card:#0F0F11; --deep:#0A0A0C;
+        --border:#1C1C1F; --text:#EDE9E3;
+        --mid:#8A8680; --dim:#3A3835;
+        --green:#4ADE80; --red:#F87171;
+        --blue:#60A5FA; --amber:#FBBF24;
+      }
+      .ap { padding:32px; background:var(--bg); min-height:100vh;
+            font-family:'DM Mono',monospace; }
+      .ap-head { margin-bottom:48px; }
+      .ap-title { font-family:'Playfair Display',serif; font-size:32px;
+                  font-weight:400; color:var(--text); margin:0 0 6px; }
+      .ap-sub { font-size:11px; color:var(--dim); text-transform:uppercase;
+                letter-spacing:0.15em; }
+      .ap-section { margin-bottom:34px; }
+      .ap-section-head { display:flex; justify-content:space-between; align-items:flex-end; gap:20px; margin-bottom:14px; }
+      .ap-section-title { font-family:'Playfair Display',serif; font-size:20px; color:var(--text); margin:0; font-weight:400; }
+      .ap-section-sub { font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:.14em; }
+      .ap-tabs { display:flex; gap:10px; margin-bottom:24px; }
+      .ap-tab { background:transparent; border:1px solid var(--border); color:var(--mid); padding:10px 14px; border-radius:999px; cursor:pointer; font-family:'DM Mono',monospace; font-size:11px; letter-spacing:.12em; text-transform:uppercase; transition:border-color .2s,color .2s,background .2s; }
+      .ap-tab.active { border-color:var(--gold); color:var(--gold); background:var(--gold-dim); }
+      .analytics-panel.hidden { display:none; }
+      .shelf { display:flex; gap:20px; align-items:flex-end;
+               padding:0 4px 40px; overflow-x:auto; scrollbar-width:none; }
+      .shelf::-webkit-scrollbar { display:none; }
+      .book { flex-shrink:0; width:120px; height:180px; cursor:pointer;
+              transition:transform .3s,filter .3s; }
+      .book:hover { transform:translateY(-14px) rotateY(-6deg);
+                    filter:brightness(1.2); }
+      .cover { width:100%; height:100%;
+               background:linear-gradient(160deg,#1C1C1F 0%,#141416 60%,#0F0F11 100%);
+               border-radius:4px 8px 8px 4px;
+               border-left:6px solid var(--gold);
+               border-top:1px solid #2a2a2a; border-right:1px solid #1a1a1a;
+               border-bottom:1px solid #2a2a2a;
+               display:flex; flex-direction:column;
+               justify-content:space-between; padding:14px 10px 12px;
+               position:relative;
+               box-shadow:4px 4px 20px rgba(0,0,0,.7),
+                          inset -1px 0 0 rgba(255,255,255,.02); }
+      .cover::before { content:''; position:absolute; left:-6px; top:0;
+                       width:6px; height:100%;
+                       background:linear-gradient(90deg,#a88828,#C9A84C,#b8942e);
+                       border-radius:4px 0 0 4px; }
+      .ribbon { position:absolute; top:-4px; right:12px; width:14px; height:28px;
+                background:var(--gold);
+                clip-path:polygon(0 0,100% 0,100% 78%,50% 100%,0 78%); }
+      .latest-b { position:absolute; top:9px; right:9px; font-size:7px;
+                  padding:2px 5px; background:var(--gold-dim); color:var(--gold);
+                  border:1px solid var(--gold-b); border-radius:2px;
+                  text-transform:uppercase; letter-spacing:.15em; }
+      .book-wn { font-family:'Playfair Display',serif; font-size:22px;
+                 color:var(--gold); font-weight:500; line-height:1; }
+      .book-lbl { font-size:8px; color:var(--dim); text-transform:uppercase;
+                  letter-spacing:.15em; margin-top:2px; }
+      .book-dates { font-size:9px; color:#5a5855; letter-spacing:.05em;
+                    line-height:1.5; }
+      .bst { font-size:8px; padding:3px 6px; border-radius:2px;
+             text-transform:uppercase; letter-spacing:.1em; margin-top:8px;
+             display:inline-block; }
+      .st-gen { background:rgba(74,222,128,.12); color:#4ADE80;
+                border:1px solid rgba(74,222,128,.2); }
+      .st-pend { background:rgba(201,168,76,.1); color:#C9A84C;
+                 border:1px solid rgba(201,168,76,.2); }
+      .st-gen2 { background:rgba(96,165,250,.1); color:#60A5FA;
+                 border:1px solid rgba(96,165,250,.2);
+                 animation:pulse 1.5s ease-in-out infinite; }
+      .st-fail { background:rgba(248,113,113,.1); color:#F87171;
+                 border:1px solid rgba(248,113,113,.2); }
+      @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+      .ov { position:fixed; inset:0; background:rgba(0,0,0,.88);
+            z-index:600; display:flex; align-items:center;
+            justify-content:center; padding:24px;
+            animation:fadeIn .2s ease forwards; }
+      @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+      .rp { background:var(--deep); border:1px solid var(--border);
+            border-radius:10px; width:100%; max-width:860px;
+            max-height:88vh; overflow-y:auto; scrollbar-width:thin;
+            scrollbar-color:#2a2a2a transparent;
+            animation:up .25s ease forwards; }
+      @keyframes up { from{transform:translateY(24px)} to{transform:translateY(0)} }
+      .rph { padding:26px 32px 22px; border-bottom:1px solid var(--border);
+             display:flex; justify-content:space-between; align-items:flex-start;
+             position:sticky; top:0; background:var(--deep); z-index:5; }
+      .rp-tag { font-size:10px; color:var(--gold); text-transform:uppercase;
+                letter-spacing:.2em; margin-bottom:6px; }
+      .rp-hl { font-family:'Playfair Display',serif; font-size:20px;
+               color:var(--text); font-weight:400; line-height:1.3;
+               max-width:580px; margin:0; }
+      .xbtn { background:none; border:1px solid #2a2a2a; color:#5a5855;
+              width:32px; height:32px; border-radius:4px; cursor:pointer;
+              font-size:18px; display:flex; align-items:center;
+              justify-content:center; flex-shrink:0;
+              transition:border-color .2s,color .2s; }
+      .xbtn:hover { border-color:var(--gold); color:var(--gold); }
+      .rpb { padding:26px 32px; }
+      .sec-lbl { font-size:9px; color:var(--dim); text-transform:uppercase;
+                 letter-spacing:.2em; margin-bottom:14px;
+                 padding-bottom:8px; border-bottom:1px solid var(--border); }
+      .mgrid { display:grid; grid-template-columns:repeat(4,1fr);
+               gap:1px; background:var(--border); border-radius:8px;
+               overflow:hidden; margin-bottom:28px; }
+      .mc { background:var(--card); padding:18px; text-align:center; }
+      .mv { font-family:'Playfair Display',serif; font-size:28px;
+            color:var(--gold); margin-bottom:3px; font-weight:400; }
+      .ml { font-size:9px; color:var(--dim); text-transform:uppercase;
+            letter-spacing:.15em; }
+      .ms { font-size:10px; color:#5a5855; margin-top:2px; }
+      .crow { display:flex; align-items:center; gap:14px; margin-bottom:10px; }
+      .cn { font-size:12px; color:var(--mid); width:130px; flex-shrink:0; }
+      .cbg { flex:1; height:6px; background:var(--border); border-radius:3px;
+             overflow:hidden; }
+      .cf { height:100%; border-radius:3px; }
+      .cr { font-size:12px; color:var(--text); width:48px; text-align:right; }
+      .sg { display:grid; grid-template-columns:180px 1fr; gap:20px;
+            margin-bottom:28px; align-items:center; }
+      .sdial { text-align:center; }
+      .sscore { font-family:'Playfair Display',serif; font-size:48px;
+                font-weight:400; margin-bottom:4px; }
+      .slbl { font-size:10px; color:var(--dim); text-transform:uppercase;
+              letter-spacing:.15em; }
+      .ig { display:grid; grid-template-columns:1fr 1fr; gap:10px;
+            margin-bottom:28px; }
+      .ic { background:var(--card); border:1px solid var(--border);
+            border-radius:6px; padding:18px; }
+      .ic.fw { grid-column:1/-1; }
+      .icl { font-size:9px; color:var(--gold); text-transform:uppercase;
+             letter-spacing:.2em; margin-bottom:10px; }
+      .ict { font-size:13px; color:var(--mid); line-height:1.7; }
+      .acts { display:flex; flex-direction:column; gap:8px; }
+      .ai { display:flex; gap:14px; align-items:flex-start; padding:12px 16px;
+            background:rgba(201,168,76,.05);
+            border:1px solid rgba(201,168,76,.12); border-radius:6px; }
+      .an { font-family:'Playfair Display',serif; font-size:18px;
+            color:var(--gold); flex-shrink:0; line-height:1; margin-top:1px; }
+      .at { font-size:13px; color:var(--mid); line-height:1.6; }
+      .pend-c { padding:48px 32px; text-align:center; }
+      .pend-ico { font-size:40px; margin-bottom:16px; }
+      .pend-t { font-family:'Playfair Display',serif; font-size:20px;
+                color:var(--text); margin-bottom:8px; }
+      .pend-s { font-size:13px; color:var(--dim); }
+    </style>
 
-async function loadAnalyticsPerformance() {
-  const el = document.getElementById('analytics-summary-table');
-  if (!el) return;
-  try {
-    const data = await api('/api/analytics/summary');
-    if (!data?.length) {
-      el.innerHTML = '<div class="loading-placeholder">No analytics data yet. Run analysis to generate metrics.</div>';
-      return;
-    }
-
-    const DAY_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-    el.innerHTML = `
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Deal</th>
-              <th>Week</th>
-              <th>Outreach</th>
-              <th>Email Rate</th>
-              <th>LI Rate</th>
-              <th>Overall Rate</th>
-              <th>Meetings</th>
-              <th>Best Day</th>
-              <th>Best Hour</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${data.map(r => `
-              <tr>
-                <td style="font-weight:500">${esc(r.deals?.name || r.deal_id || '—')}</td>
-                <td style="font-size:12px;color:var(--text-dim)">${esc(r.week_starting || '—')}</td>
-                <td>${r.total_outreach || 0}</td>
-                <td>${r.email_response_rate ? (r.email_response_rate * 100).toFixed(1) + '%' : '—'}</td>
-                <td>${r.linkedin_response_rate ? (r.linkedin_response_rate * 100).toFixed(1) + '%' : '—'}</td>
-                <td style="font-weight:600;color:${(r.overall_response_rate || 0) > 0.1 ? '#4ade80' : 'var(--text-bright)'}">
-                  ${r.overall_response_rate ? (r.overall_response_rate * 100).toFixed(1) + '%' : '—'}
-                </td>
-                <td>${r.meetings_booked || 0}</td>
-                <td>${r.best_response_day != null ? (DAY_NAMES[r.best_response_day] || r.best_response_day) : '—'}</td>
-                <td>${r.best_response_hour != null ? r.best_response_hour + ':00' : '—'}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+    <div class="ap">
+      <div class="ap-head">
+        <h1 class="ap-title">Intelligence</h1>
+        <div class="ap-sub">Weekly reports plus end-of-day operating logs in America/New_York time</div>
       </div>
-    `;
-  } catch (e) {
-    el.innerHTML = `<div class="loading-placeholder text-red">Failed to load: ${esc(e.message)}</div>`;
-  }
-}
-
-async function loadAnalyticsRecommendations() {
-  const el = document.getElementById('analytics-recs-list');
-  if (!el) return;
-  try {
-    const data = await api('/api/analytics/recommendations');
-    if (!data?.length) {
-      el.innerHTML = '<div class="loading-placeholder">No recommendations yet. Run analysis to generate insights.</div>';
-      return;
-    }
-
-    const CATEGORY_COLOURS = {
-      timing: '#a78bfa', copy: '#60a5fa', targeting: '#f59e0b',
-      sequence: '#34d399', channel: '#fb7185',
-    };
-
-    const pending = data.filter(r => r.status === 'pending');
-    const applied = data.filter(r => r.status === 'applied');
-    const rejected = data.filter(r => r.status === 'rejected');
-
-    const renderCard = (r) => `
-      <div style="padding:16px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;margin-bottom:10px">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-          <span style="padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;
-            background:${CATEGORY_COLOURS[r.category] || '#6b7280'}22;color:${CATEGORY_COLOURS[r.category] || '#6b7280'}">
-            ${esc(r.category || '—')}
-          </span>
-          <span style="font-weight:600;font-size:14px;color:var(--text-bright)">${esc(r.title || '—')}</span>
-          ${r.status === 'applied' ? '<span style="margin-left:auto;color:#4ade80;font-size:11px">\u2713 Applied</span>' : ''}
-          ${r.status === 'rejected' ? '<span style="margin-left:auto;color:#6b7280;font-size:11px">Dismissed</span>' : ''}
-        </div>
-        <p style="font-size:13px;color:var(--text-dim);margin:0 0 6px">${esc(r.insight || '')}</p>
-        <p style="font-size:13px;color:var(--text-bright);margin:0 0 10px">${esc(r.recommendation || '')}</p>
-        ${r.status === 'pending' ? `
-          <div style="display:flex;gap:8px">
-            <button onclick="applyRecommendation('${r.id}', this)"
-              style="padding:6px 14px;background:#d4a847;border:none;color:#000;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">
-              Apply \u2192
-            </button>
-            <button onclick="dismissRecommendation('${r.id}', this)"
-              style="padding:6px 14px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:5px;font-size:12px;cursor:pointer">
-              Dismiss
-            </button>
+      <div class="ap-tabs">
+        <button class="ap-tab active" id="analytics-tab-daily" onclick="switchAnalyticsTab('daily')">Daily Logs</button>
+        <button class="ap-tab" id="analytics-tab-weekly" onclick="switchAnalyticsTab('weekly')">Weekly Reports</button>
+      </div>
+      <div id="analytics-panel-daily" class="analytics-panel">
+        <div class="ap-section">
+          <div class="ap-section-head">
+            <div>
+              <h2 class="ap-section-title">Daily Logs</h2>
+              <div class="ap-section-sub">Generated automatically at the end of each America/New_York day</div>
+            </div>
           </div>
-        ` : ''}
+          <div class="shelf" id="daily-log-shelf">
+            <div style="color:#3A3835;font-size:12px;padding:40px 0">Loading daily logs...</div>
+          </div>
+        </div>
       </div>
-    `;
+      <div id="analytics-panel-weekly" class="analytics-panel hidden">
+        <div class="ap-section">
+          <div class="ap-section-head">
+            <div>
+              <h2 class="ap-section-title">Weekly Reports</h2>
+              <div class="ap-section-sub">Generated automatically every Monday at 9am EST</div>
+            </div>
+          </div>
+          <div class="shelf" id="roco-shelf">
+            <div style="color:#3A3835;font-size:12px;padding:40px 0">Loading reports...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
 
-    let html = '';
-    if (pending.length) {
-      html += `<h3 style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);margin:0 0 12px">Pending (${pending.length})</h3>`;
-      html += pending.map(renderCard).join('');
-    }
-    if (applied.length) {
-      html += `<h3 style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);margin:16px 0 12px">Applied (${applied.length})</h3>`;
-      html += applied.map(renderCard).join('');
-    }
-    if (rejected.length) {
-      html += `<details style="margin-top:16px"><summary style="font-size:12px;color:var(--text-dim);cursor:pointer">Dismissed (${rejected.length})</summary><div style="margin-top:8px">${rejected.map(renderCard).join('')}</div></details>`;
-    }
-    el.innerHTML = html;
-  } catch (e) {
-    el.innerHTML = `<div class="loading-placeholder text-red">Failed: ${esc(e.message)}</div>`;
-  }
+  renderDailyLogShelf();
+  renderShelf();
+  window.switchAnalyticsTab('daily');
 }
 
-async function applyRecommendation(id, btn) {
-  if (btn) { btn.textContent = 'Applying\u2026'; btn.disabled = true; }
-  try {
-    await api(`/api/analytics/recommendations/${id}/apply`, 'POST', {});
-    showToast('Recommendation applied');
-    loadAnalyticsRecommendations();
-  } catch (e) {
-    showToast(`Failed: ${e.message}`, 'error');
-    if (btn) { btn.textContent = 'Apply \u2192'; btn.disabled = false; }
-  }
-}
+window.switchAnalyticsTab = function(tab) {
+  const dailyBtn = document.getElementById('analytics-tab-daily');
+  const weeklyBtn = document.getElementById('analytics-tab-weekly');
+  const dailyPanel = document.getElementById('analytics-panel-daily');
+  const weeklyPanel = document.getElementById('analytics-panel-weekly');
+  if (!dailyBtn || !weeklyBtn || !dailyPanel || !weeklyPanel) return;
 
-async function dismissRecommendation(id, btn) {
-  if (btn) { btn.textContent = 'Dismissing\u2026'; btn.disabled = true; }
-  try {
-    await api(`/api/analytics/recommendations/${id}/dismiss`, 'POST', {});
-    loadAnalyticsRecommendations();
-  } catch (e) {
-    showToast(`Failed: ${e.message}`, 'error');
-    if (btn) { btn.textContent = 'Dismiss'; btn.disabled = false; }
-  }
-}
+  const showDaily = tab !== 'weekly';
+  dailyBtn.classList.toggle('active', showDaily);
+  weeklyBtn.classList.toggle('active', !showDaily);
+  dailyPanel.classList.toggle('hidden', !showDaily);
+  weeklyPanel.classList.toggle('hidden', showDaily);
+};
 
-async function runAnalyticsNow(btn) {
-  if (btn) { btn.textContent = 'Running\u2026'; btn.disabled = true; }
+async function renderShelf() {
+  const shelf = document.getElementById('roco-shelf');
+  if (!shelf) return;
+
+  let weeks;
   try {
-    await api('/api/action', 'POST', { action: 'run_analytics' });
-    showToast('Analytics queued — check back in a minute');
+    weeks = await api('/api/analytics/weeks');
+    if (!Array.isArray(weeks)) weeks = [];
   } catch {
-    showToast('Trigger not available — analytics will run automatically on next weekly cycle');
-  } finally {
-    if (btn) { btn.textContent = '\u25BA Run Analysis Now'; btn.disabled = false; }
+    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load reports.</div>';
+    return;
   }
+
+  if (!weeks.length) {
+    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No reports yet. First report generates automatically next Monday.</div>';
+    return;
+  }
+
+  const sorted = [...weeks].sort((a, b) => new Date(a.week_start) - new Date(b.week_start));
+
+  shelf.innerHTML = sorted.map((w, i) => {
+    const isLatest = i === sorted.length - 1;
+    const isGen    = w.status === 'generated';
+    const isGenning = w.status === 'generating';
+    const isFailed = w.status === 'failed';
+    const stClass  = isGen ? 'st-gen' : isGenning ? 'st-gen2' : isFailed ? 'st-fail' : 'st-pend';
+    const stText   = isGen ? 'Ready' : isGenning ? 'Generating...' : isFailed ? 'Failed' : 'Pending';
+    const d1 = new Date(w.week_start);
+    const d2 = new Date(w.week_end);
+    const fmtD = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+
+    return `
+      <div class="book" onclick="window.openBook('${esc(w.week_start)}')">
+        <div class="cover">
+          ${isLatest ? '<div class="latest-b">Latest</div>' : ''}
+          ${isGen    ? '<div class="ribbon"></div>'          : ''}
+          <div>
+            <div class="book-wn">W${w.week_number}</div>
+            <div class="book-lbl">Week ${w.week_number}</div>
+          </div>
+          <div>
+            <div class="book-dates">${fmtD(d1)}<br>${fmtD(d2)}</div>
+            <div class="bst ${stClass}">${stText}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
 }
+
+async function renderDailyLogShelf() {
+  const shelf = document.getElementById('daily-log-shelf');
+  if (!shelf) return;
+
+  let logs;
+  try {
+    logs = await api('/api/analytics/daily-logs');
+    if (!Array.isArray(logs)) logs = [];
+  } catch {
+    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load daily logs.</div>';
+    return;
+  }
+
+  if (!logs.length) {
+    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No daily logs yet. The first end-of-day log will appear automatically.</div>';
+    return;
+  }
+
+  const sorted = [...logs].sort((a, b) => new Date(a.report_date) - new Date(b.report_date));
+  shelf.innerHTML = sorted.map((log, index) => {
+    const isLatest = index === sorted.length - 1;
+    const isGen = log.status === 'generated';
+    const isFailed = log.status === 'failed';
+    const stClass = isGen ? 'st-gen' : isFailed ? 'st-fail' : 'st-pend';
+    const stText = isGen ? 'Ready' : isFailed ? 'Failed' : 'Pending';
+    const date = new Date(`${log.report_date}T12:00:00`);
+    const day = date.toLocaleDateString('en-GB', { day: 'numeric' });
+    const month = date.toLocaleDateString('en-GB', { month: 'short' });
+
+    return `
+      <div class="book" onclick="window.openDailyLog('${esc(log.report_date)}')">
+        <div class="cover">
+          ${isLatest ? '<div class="latest-b">Latest</div>' : ''}
+          ${isGen ? '<div class="ribbon"></div>' : ''}
+          <div>
+            <div class="book-wn">${day}</div>
+            <div class="book-lbl">${month}</div>
+          </div>
+          <div>
+            <div class="book-dates">${esc(log.headline || 'Daily Log')}<br>${log.deals_covered || 0} deals · ${log.activity_count || 0} actions</div>
+            <div class="bst ${stClass}">${stText}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+window.openBook = async function(weekStart) {
+  let weeks;
+  try {
+    weeks = await api('/api/analytics/weeks');
+    if (!Array.isArray(weeks)) weeks = [];
+  } catch { return; }
+
+  const w = weeks.find(x => x.week_start === weekStart);
+  if (!w) return;
+
+  const d1 = new Date(w.week_start);
+  const d2 = new Date(w.week_end);
+  const fmtFull = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  const sentColor = w.avg_sentiment >= 0.3 ? '#4ADE80'
+    : w.avg_sentiment <= -0.3 ? '#F87171' : '#FBBF24';
+  const sentLabel = w.avg_sentiment >= 0.3 ? 'Positive'
+    : w.avg_sentiment <= -0.3 ? 'Negative' : 'Neutral';
+  const raw = w.raw_recommendations || {};
+
+  const ov = document.createElement('div');
+  ov.className = 'ov';
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+
+  const inner = w.status !== 'generated' ? `
+    <div class="pend-c">
+      <div class="pend-ico">${w.status === 'generating' ? '⟳' : w.status === 'failed' ? '⚠' : '📋'}</div>
+      <div class="pend-t">${w.status === 'generating' ? 'Generating...' : w.status === 'failed' ? 'Generation Failed' : 'Report Pending'}</div>
+      <div class="pend-s">
+        ${w.status === 'generating'
+          ? "SAGE is analysing this week's data. Check back in a moment."
+          : w.status === 'failed'
+            ? esc(raw.error || 'This report failed to save. The watchdog will retry automatically.')
+          : 'This report will be generated automatically next Monday at 9am EST.'}
+      </div>
+    </div>` : `
+    <div class="rpb">
+      <div class="sec-lbl">Key Metrics</div>
+      <div class="mgrid">
+        <div class="mc"><div class="mv">${w.emails_sent || 0}</div><div class="ml">Emails Sent</div><div class="ms">${w.email_reply_rate || 0}% reply rate</div></div>
+        <div class="mc"><div class="mv">${w.linkedin_invites_sent || 0}</div><div class="ml">LI Invites</div><div class="ms">${w.linkedin_acceptance_rate || 0}% acceptance</div></div>
+        <div class="mc"><div class="mv">${w.linkedin_dms_sent || 0}</div><div class="ml">LI DMs</div><div class="ms">${w.linkedin_dm_reply_rate || 0}% reply rate</div></div>
+        <div class="mc"><div class="mv">${w.meetings_booked || 0}</div><div class="ml">Meetings</div><div class="ms">booked this week</div></div>
+      </div>
+      <div class="sec-lbl">Channel Performance</div>
+      ${[['Email Reply Rate', w.email_reply_rate || 0, '#60A5FA'], ['LI Acceptance Rate', w.linkedin_acceptance_rate || 0, '#4ADE80'], ['LI DM Reply Rate', w.linkedin_dm_reply_rate || 0, '#A78BFA']].map(([label, rate, color]) => `
+      <div class="crow">
+        <div class="cn">${label}</div>
+        <div class="cbg"><div class="cf" style="width:${Math.min(rate * 3, 100)}%;background:${color};box-shadow:0 0 6px ${color}44"></div></div>
+        <div class="cr">${rate}%</div>
+      </div>`).join('')}
+      <div class="sec-lbl" style="margin-top:22px">Conversation Sentiment</div>
+      <div class="sg">
+        <div class="sdial">
+          <div class="sscore" style="color:${sentColor}">${w.avg_sentiment >= 0 ? '+' : ''}${(w.avg_sentiment || 0).toFixed(2)}</div>
+          <div class="slbl">${sentLabel}</div>
+        </div>
+        <div>
+          ${[['Positive', w.sentiment_breakdown?.positive || 0, '#4ADE80'], ['Neutral', w.sentiment_breakdown?.neutral || 0, '#FBBF24'], ['Negative', w.sentiment_breakdown?.negative || 0, '#F87171']].map(([l, p, c]) => `
+          <div class="crow">
+            <div class="cn" style="width:80px">${l}</div>
+            <div class="cbg"><div class="cf" style="width:${p}%;background:${c}"></div></div>
+            <div class="cr">${p}%</div>
+          </div>`).join('')}
+        </div>
+      </div>
+      <div class="sec-lbl">Intelligence</div>
+      <div class="ig">
+        <div class="ic"><div class="icl">What Worked</div><div class="ict">${esc(w.what_worked || 'Collecting data...')}</div></div>
+        <div class="ic"><div class="icl">What Underperformed</div><div class="ict">${esc(w.what_didnt_work || 'Collecting data...')}</div></div>
+        <div class="ic"><div class="icl">Best Investor Profile</div><div class="ict">${esc(w.best_investor_profile || 'Collecting data...')}</div></div>
+        <div class="ic"><div class="icl">Best Sending Time</div><div class="ict">${esc(w.best_sending_time || 'Collecting data...')}</div></div>
+        <div class="ic fw"><div class="icl">Template Direction — Next Week</div><div class="ict">${esc(w.template_recommendations || 'Collecting data...')}</div></div>
+      </div>
+      <div class="sec-lbl">Three Actions for Next Week</div>
+      <div class="acts">
+        ${(raw.three_actions || ['Gather more data.', 'Review investor match quality.', 'Check template performance.']).map((a, i) => `
+        <div class="ai"><div class="an">${i + 1}</div><div class="at">${esc(a)}</div></div>`).join('')}
+      </div>
+      ${raw.trend_vs_last_week ? `<div style="margin-top:22px;padding:14px 18px;background:var(--card);border:1px solid var(--border);border-radius:6px"><div class="icl">Trend vs Last Week</div><div class="ict">${esc(raw.trend_vs_last_week)}</div></div>` : ''}
+    </div>`;
+
+  ov.innerHTML = `
+    <div class="rp">
+      <div class="rph">
+        <div>
+          <div class="rp-tag">Week ${w.week_number} · ${fmtFull(d1)} — ${fmtFull(d2)}</div>
+          <p class="rp-hl">${esc(w.headline || 'Weekly Intelligence Report')}</p>
+        </div>
+        <button class="xbtn" onclick="this.closest('.ov').remove()">×</button>
+      </div>
+      ${inner}
+    </div>`;
+
+  document.body.appendChild(ov);
+};
+
+window.openDailyLog = async function(reportDate) {
+  let logs;
+  try {
+    logs = await api('/api/analytics/daily-logs');
+    if (!Array.isArray(logs)) logs = [];
+  } catch { return; }
+
+  const log = logs.find(entry => entry.report_date === reportDate);
+  if (!log) return;
+
+  const date = new Date(`${log.report_date}T12:00:00`);
+  const fmtFull = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  const ov = document.createElement('div');
+  ov.className = 'ov';
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+
+  const dealSections = Array.isArray(log.deal_sections) ? log.deal_sections : [];
+  const inner = log.status !== 'generated' ? `
+    <div class="pend-c">
+      <div class="pend-ico">${log.status === 'failed' ? '⚠' : '📋'}</div>
+      <div class="pend-t">${log.status === 'failed' ? 'Daily Log Failed' : 'Daily Log Pending'}</div>
+      <div class="pend-s">${esc(log.raw_payload?.error || 'This daily log is not ready yet.')}</div>
+    </div>` : `
+    <div class="rpb">
+      <div class="sec-lbl">Daily Summary</div>
+      <div class="ic fw" style="margin-bottom:22px"><div class="icl">Executive Summary</div><div class="ict">${esc(log.executive_summary || 'No executive summary saved.')}</div></div>
+      <div class="mgrid">
+        <div class="mc"><div class="mv">${log.activity_count || 0}</div><div class="ml">Activity Events</div><div class="ms">captured today</div></div>
+        <div class="mc"><div class="mv">${log.deals_covered || 0}</div><div class="ml">Deals Covered</div><div class="ms">with progress checks</div></div>
+        <div class="mc"><div class="mv">${dealSections.length}</div><div class="ml">Deal Notes</div><div class="ms">written summary cards</div></div>
+        <div class="mc"><div class="mv">${log.voice_name ? esc(log.voice_name) : 'Text'}</div><div class="ml">Voice Note</div><div class="ms">${log.voice_note_sent_at ? 'sent to Telegram' : 'not sent'}</div></div>
+      </div>
+      <div class="sec-lbl">Per-Deal Operating Notes</div>
+      <div class="ig">
+        ${dealSections.length ? dealSections.map(section => `
+          <div class="ic fw">
+            <div class="icl">${esc(section.deal_name || 'Deal')}</div>
+            <div class="ict"><strong>${esc(section.target_status || section.progress_status || 'Status')}</strong><br>${esc(section.summary || 'No summary saved.')}</div>
+            ${(section.key_actions || []).length ? `<div class="acts" style="margin-top:14px">${section.key_actions.map((action, index) => `<div class="ai"><div class="an">${index + 1}</div><div class="at">${esc(action)}</div></div>`).join('')}</div>` : ''}
+            ${section.next_move ? `<div style="margin-top:14px;padding:14px 18px;background:var(--card);border:1px solid var(--border);border-radius:6px"><div class="icl">Next Move</div><div class="ict">${esc(section.next_move)}</div></div>` : ''}
+          </div>`).join('') : '<div class="ic fw"><div class="ict">No deal-specific notes were saved for this day.</div></div>'}
+      </div>
+      ${log.voice_script ? `<div class="sec-lbl">Voice Script</div><div class="ic fw"><div class="ict">${esc(log.voice_script)}</div></div>` : ''}
+    </div>`;
+
+  ov.innerHTML = `
+    <div class="rp">
+      <div class="rph">
+        <div>
+          <div class="rp-tag">Daily Log · ${fmtFull}</div>
+          <p class="rp-hl">${esc(log.headline || 'Daily Operating Log')}</p>
+        </div>
+        <button class="xbtn" onclick="this.closest('.ov').remove()">×</button>
+      </div>
+      ${inner}
+    </div>`;
+
+  document.body.appendChild(ov);
+};
 
 function onDbFileSelected(input) {
   if (!input.files?.[0]) return;
@@ -6501,6 +9075,8 @@ async function uploadInvestorXLSX(file) {
     fd.append('file', file);
     const listNameEl = document.getElementById('import-list-name');
     if (listNameEl?.value?.trim()) fd.append('list_name', listNameEl.value.trim());
+    const listTypeEl = document.getElementById('import-list-type');
+    if (listTypeEl?.value) fd.append('list_type', listTypeEl.value);
     const res = await fetch('/api/investors-db/import', { method: 'POST', body: fd });
     const data = await res.json();
     progressEl.style.display = 'none';
@@ -6511,10 +9087,16 @@ async function uploadInvestorXLSX(file) {
     const newCount     = data.imported ?? 0;
     const updatedCount = data.updated  ?? 0;
     const totalCount   = data.total;
-    let msg = `✓ Import complete — ${newCount.toLocaleString()} new investors added`;
-    if (updatedCount > 0) msg += `, ${updatedCount.toLocaleString()} existing updated`;
-    if (data.skipped)     msg += `, ${data.skipped} skipped`;
-    if (totalCount)       msg += `. Total DB: ${totalCount.toLocaleString()}`;
+    const recognized   = newCount + updatedCount;
+    let msg;
+    if (newCount === 0 && updatedCount > 0) {
+      msg = `✓ Import successful — ${recognized.toLocaleString()} investors recognised`;
+    } else {
+      msg = `✓ Import complete — ${newCount.toLocaleString()} new investors added`;
+      if (updatedCount > 0) msg += `, ${updatedCount.toLocaleString()} existing updated`;
+    }
+    if (data.skipped) msg += `, ${data.skipped} skipped`;
+    if (totalCount)   msg += `. Total DB: ${totalCount.toLocaleString()}`;
     resultEl.textContent = msg;
     document.getElementById('db-drop-text').textContent = 'Drop XLSX here or click to browse';
     document.getElementById('db-file-input').value = '';

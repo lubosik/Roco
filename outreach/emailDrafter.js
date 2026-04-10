@@ -59,7 +59,7 @@ export async function draftEmail(contactPage, researchData, stage = 'INTRO', edi
   info(`Drafting ${stage} email for ${firstName}`);
 
   const guidanceBlock = await buildGuidanceBlock('investor_outreach').catch(() => '');
-  const userPrompt = buildUserPrompt(firstName, name, researchData, deal, stage, len, editInstructions, guidanceBlock);
+  const userPrompt = buildUserPrompt(contactPage, firstName, name, researchData, deal, stage, len, editInstructions, guidanceBlock);
 
   // Try Claude Sonnet first
   try {
@@ -104,10 +104,22 @@ export async function draftEmail(contactPage, researchData, stage = 'INTRO', edi
   }
 }
 
-function buildUserPrompt(firstName, fullName, research, deal, stage, len, editInstructions, guidanceBlock = '') {
+function buildUserPrompt(contactPage, firstName, fullName, research, deal, stage, len, editInstructions, guidanceBlock = '') {
   const comparableDeals = research?.comparableDeals?.join(', ') || 'None on record';
   const criteria = research?.investmentCriteria?.slice(0, 400) || 'Unknown';
   const approach = research?.approachAngle?.slice(0, 300) || 'General interest in sector';
+  const whyThisFirm = getContactProp(contactPage, 'Why This Firm')
+    || research?.whyThisFirm
+    || 'Not on record';
+  const pastInvestments = getContactProp(contactPage, 'Past Investments')
+    || research?.pastInvestments
+    || comparableDeals;
+  const investmentThesis = getContactProp(contactPage, 'Investment Thesis')
+    || research?.investmentThesis
+    || approach;
+  const aum = getContactProp(contactPage, 'AUM')
+    || research?.aum
+    || 'Unknown';
 
   let editNote = '';
   if (editInstructions) {
@@ -117,7 +129,10 @@ function buildUserPrompt(firstName, fullName, research, deal, stage, len, editIn
   return `${guidanceBlock}Write an outreach email from Dom to ${fullName}.
 
 Investor research summary: ${approach}
-Comparable deals they have done: ${comparableDeals}
+Why this firm matches: ${whyThisFirm}
+Comparable deals they have done: ${pastInvestments}
+Investment thesis: ${investmentThesis}
+Known AUM / fund size: ${aum}
 Their stated investment criteria: ${criteria}
 
 The deal Dom is fundraising for:
@@ -142,6 +157,7 @@ For FOLLOW-UP emails, do not repeat the same angle. Each follow-up must take a s
 
 Apply these psychological principles:
 - Specificity over flattery — reference actual past deals by name
+- Use the "Why this firm matches" rationale when it gives a stronger, more precise reason to write than the generic criteria line
 - Scarcity without desperation — imply the deal is moving forward
 - Pattern interrupt subject lines — not "Investment Opportunity" — ever
 - For follow-ups, use the Ben Franklin effect — ask a small question rather than restating the pitch

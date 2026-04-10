@@ -91,6 +91,8 @@ export async function constructOutreachMessage(contact, firm, dealId, messageTyp
   const pastInvestments = Array.isArray(firm?.past_investments)
     ? firm.past_investments.slice(0, 3).join(', ')
     : (firm?.past_investments || 'Not on record');
+  const investmentThesis = firm?.investment_thesis || firm?.thesis || 'not available';
+  const whyThisFirm = firm?.match_rationale || firm?.justification || contact?.why_this_firm || 'strong sector and geography alignment';
 
   // Load phase-specific guidance — investor outreach gets only identity + voice + outreach rules
   const guidanceBlock = mode === 'investor_outreach'
@@ -125,9 +127,9 @@ FIRM RESEARCH:
 ${resolvedFirmName
   ? `- Firm: ${resolvedFirmName}
 - Firm type: ${firm?.firm_type || 'investment firm'}
-- Investment thesis: ${firm?.investment_thesis || 'not available'}
+- Investment thesis: ${investmentThesis}
 - Past investments: ${pastInvestments}
-- Why this deal matches them: ${firm?.match_rationale || 'strong sector and geography alignment'}`
+- Why this deal matches them: ${whyThisFirm}`
   : `- ${firstName} is an independent/angel investor — do NOT reference a firm. Reference their investing background directly.`
 }
 

@@ -21,7 +21,7 @@ create table if not exists deals (
   sending_days text[] default array['monday','tuesday','wednesday','thursday','friday'],
   sending_start time default '08:00',
   sending_end time default '18:00',
-  sending_timezone text default 'Europe/London',
+  sending_timezone text default 'America/New_York',
   max_emails_per_day integer default 20,
   max_emails_per_hour integer default 5,
   batch_size integer default 15,
@@ -259,11 +259,87 @@ create table if not exists schedule_log (
   created_at timestamptz default now()
 );
 
+-- ─── ANALYTICS ───────────────────────────────────────────────────────────────
+create table if not exists deal_analytics (
+  id uuid primary key default gen_random_uuid(),
+  deal_id uuid references deals(id) on delete cascade,
+  week_starting date not null,
+  emails_sent integer default 0,
+  linkedin_invites_sent integer default 0,
+  linkedin_dms_sent integer default 0,
+  total_outreach integer default 0,
+  email_replies integer default 0,
+  linkedin_replies integer default 0,
+  positive_responses integer default 0,
+  negative_responses integer default 0,
+  temp_closes integer default 0,
+  meetings_booked integer default 0,
+  email_response_rate numeric default 0,
+  linkedin_response_rate numeric default 0,
+  overall_response_rate numeric default 0,
+  meeting_conversion_rate numeric default 0,
+  best_response_hour integer,
+  best_response_day integer,
+  sector text,
+  deal_type text,
+  timezone text default 'America/New_York',
+  template_performance jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (deal_id, week_starting)
+);
+
+create table if not exists roco_recommendations (
+  id uuid primary key default gen_random_uuid(),
+  category text not null,
+  title text not null,
+  insight text,
+  recommendation text,
+  supporting_data jsonb default '{}'::jsonb,
+  suggested_setting_change jsonb,
+  week_starting date,
+  deals_analysed integer default 0,
+  status text default 'pending',
+  applied_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists roco_learned_settings (
+  id uuid primary key default gen_random_uuid(),
+  key text not null unique,
+  value text,
+  source_recommendation_id uuid references roco_recommendations(id) on delete set null,
+  applied_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists daily_activity_reports (
+  id uuid primary key default gen_random_uuid(),
+  report_date date not null unique,
+  timezone text default 'America/New_York',
+  headline text,
+  executive_summary text,
+  voice_script text,
+  telegram_caption text,
+  deal_sections jsonb default '[]'::jsonb,
+  raw_payload jsonb default '{}'::jsonb,
+  activity_count integer default 0,
+  deals_covered integer default 0,
+  status text default 'generated',
+  voice_name text,
+  sent_to_telegram_at timestamptz,
+  voice_note_sent_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 -- ─── ALTER TABLES (add new columns safely) ────────────────────────────────────
 alter table deals add column if not exists sending_days text[] default array['monday','tuesday','wednesday','thursday','friday'];
 alter table deals add column if not exists sending_start time default '08:00';
 alter table deals add column if not exists sending_end time default '18:00';
-alter table deals add column if not exists sending_timezone text default 'Europe/London';
+alter table deals add column if not exists sending_timezone text default 'America/New_York';
 alter table deals add column if not exists max_emails_per_day integer default 20;
 alter table deals add column if not exists max_emails_per_hour integer default 5;
 alter table deals add column if not exists batch_size integer default 15;
@@ -272,10 +348,35 @@ alter table deals add column if not exists outreach_paused_until timestamptz;
 alter table deals add column if not exists max_contacts_per_firm integer default 3;
 alter table deals add column if not exists max_total_outreach integer default 200;
 alter table deals add column if not exists min_investor_score integer default 60;
+alter table contacts add column if not exists last_email_sent_at timestamptz;
+alter table contacts add column if not exists dm_sent_at timestamptz;
+alter table contacts add column if not exists last_outreach_at timestamptz;
+alter table contacts add column if not exists follow_up_due_at timestamptz;
+alter table contacts add column if not exists follow_up_count integer default 0;
 alter table emails add column if not exists queued_to_send_at timestamptz;
 alter table emails add column if not exists contact_email text;
 alter table firm_suppressions add column if not exists suppression_type text default 'DECLINE';
 alter table sessions add column if not exists outreach_paused_until timestamptz;
+alter table deal_analytics add column if not exists created_at timestamptz default now();
+alter table deal_analytics add column if not exists updated_at timestamptz default now();
+alter table deal_analytics add column if not exists timezone text default 'America/New_York';
+alter table roco_recommendations add column if not exists created_at timestamptz default now();
+alter table roco_recommendations add column if not exists updated_at timestamptz default now();
+alter table roco_recommendations add column if not exists status text default 'pending';
+alter table roco_learned_settings add column if not exists created_at timestamptz default now();
+alter table roco_learned_settings add column if not exists updated_at timestamptz default now();
+alter table daily_activity_reports add column if not exists created_at timestamptz default now();
+alter table daily_activity_reports add column if not exists updated_at timestamptz default now();
+alter table daily_activity_reports add column if not exists timezone text default 'America/New_York';
+alter table daily_activity_reports add column if not exists telegram_caption text;
+alter table daily_activity_reports add column if not exists deal_sections jsonb default '[]'::jsonb;
+alter table daily_activity_reports add column if not exists raw_payload jsonb default '{}'::jsonb;
+alter table daily_activity_reports add column if not exists activity_count integer default 0;
+alter table daily_activity_reports add column if not exists deals_covered integer default 0;
+alter table daily_activity_reports add column if not exists status text default 'generated';
+alter table daily_activity_reports add column if not exists voice_name text;
+alter table daily_activity_reports add column if not exists sent_to_telegram_at timestamptz;
+alter table daily_activity_reports add column if not exists voice_note_sent_at timestamptz;
 
 -- ─── RLS POLICIES ─────────────────────────────────────────────────────────────
 alter table deals enable row level security;
@@ -285,6 +386,7 @@ alter table activity_log enable row level security;
 alter table email_templates enable row level security;
 alter table sessions enable row level security;
 alter table batches enable row level security;
+alter table daily_activity_reports enable row level security;
 
 -- Drop existing policies if they exist (safe re-run)
 do $$ begin
@@ -295,6 +397,7 @@ do $$ begin
   drop policy if exists "service_role_all" on email_templates;
   drop policy if exists "service_role_all" on sessions;
   drop policy if exists "service_role_all" on batches;
+  drop policy if exists "service_role_all" on daily_activity_reports;
 exception when others then null;
 end $$;
 
@@ -305,3 +408,4 @@ create policy "service_role_all" on activity_log for all using (true);
 create policy "service_role_all" on email_templates for all using (true);
 create policy "service_role_all" on sessions for all using (true);
 create policy "service_role_all" on batches for all using (true);
+create policy "service_role_all" on daily_activity_reports for all using (true);

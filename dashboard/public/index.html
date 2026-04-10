@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ROCO — Mission Control</title>
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <link rel="apple-touch-icon" href="/favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@300;400;500&family=Figtree:wght@300;400;500;600&display=swap" rel="stylesheet" />
@@ -151,7 +153,7 @@
             <div class="stat-sub" id="stat-emails-sub"></div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Response Rate</div>
+            <div class="stat-label">Email Response Rate</div>
             <div class="stat-value mono" id="stat-response-rate">&#8212;</div>
             <div class="stat-sub" id="stat-response-sub"></div>
           </div>
@@ -189,49 +191,6 @@
             <div class="stat-label">LI DM Response</div>
             <div class="stat-value mono" id="stat-li-dm-response">&#8212;</div>
             <div class="stat-sub" id="stat-li-dm-response-sub"></div>
-          </div>
-        </div>
-
-        <!-- API Health Grid -->
-        <div class="card mt-24">
-          <div class="card-header">
-            <h2 class="card-title">API Health</h2>
-            <button class="btn btn-ghost btn-sm" onclick="refreshHealth()">&#8635;</button>
-          </div>
-          <div class="health-grid" id="health-grid">
-            <div class="health-item" id="health-anthropic">
-              <span class="health-dot unknown"></span><span class="health-name">Anthropic</span>
-            </div>
-            <div class="health-item" id="health-openai">
-              <span class="health-dot unknown"></span><span class="health-name">OpenAI</span>
-            </div>
-            <div class="health-item" id="health-gemini">
-              <span class="health-dot unknown"></span><span class="health-name">Gemini</span>
-            </div>
-            <div class="health-item" id="health-kaspr">
-              <span class="health-dot unknown"></span><span class="health-name">KASPR</span>
-            </div>
-            <div class="health-item" id="health-notion">
-              <span class="health-dot unknown"></span><span class="health-name">Notion</span>
-            </div>
-            <div class="health-item" id="health-gmail">
-              <span class="health-dot unknown"></span><span class="health-name">Gmail</span>
-            </div>
-            <div class="health-item" id="health-telegram">
-              <span class="health-dot unknown"></span><span class="health-name">Telegram</span>
-            </div>
-            <div class="health-item" id="health-serpapi">
-              <span class="health-dot unknown"></span><span class="health-name">SerpAPI</span>
-            </div>
-            <div class="health-item" id="health-apify">
-              <span class="health-dot unknown"></span><span class="health-name">Apify</span>
-            </div>
-            <div class="health-item" id="health-grok">
-              <span class="health-dot unknown"></span><span class="health-name">Grok</span>
-            </div>
-            <div class="health-item" id="health-millionverifier">
-              <span class="health-dot unknown"></span><span class="health-name">MillionVerifier</span>
-            </div>
           </div>
         </div>
 
@@ -373,6 +332,19 @@
               </div>
             </div>
 
+            <div class="form-group">
+              <label class="form-label">Target Investor Geography</label>
+              <select id="deal-geography" name="target_geography" class="form-input">
+                <option value="Global">Global (no geographic filter)</option>
+                <option value="US">United States</option>
+                <option value="UK">United Kingdom</option>
+                <option value="US,UK">US + UK</option>
+                <option value="UAE">UAE / Middle East</option>
+                <option value="Europe">Europe</option>
+                <option value="North America">North America</option>
+              </select>
+            </div>
+
             <div class="form-row-2">
               <div class="form-group">
                 <label class="form-label">Ideal Investor Types <span class="label-optional">(optional)</span></label>
@@ -499,17 +471,18 @@
             <!-- Exclusion List Upload -->
             <div style="margin-bottom:24px">
               <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Exclusion List <span style="font-weight:400;font-size:11px;text-transform:none;letter-spacing:0">(optional)</span></h3>
-              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Contacts or firms that should never be touched for this deal.</p>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 6px">Firms or people Roco should never contact for this deal — e.g. existing investors, competitors, or anyone already in conversation.</p>
+              <p style="color:#4a4a4a;font-size:11px;font-family:'DM Mono',monospace;margin:0 0 10px">Accepts CSV or XLSX. Expected columns: firm_name / person_name / email (any one is enough).</p>
               <div id="exclusion-drop-zone"
                 style="border:1px dashed #2a2a2a;border-radius:6px;padding:20px;text-align:center;cursor:pointer;background:#0f0f0f;transition:border-color 0.2s"
                 onclick="document.getElementById('exclusion-csv-input').click()"
                 ondragover="event.preventDefault();this.style.borderColor='#d4a847'"
                 ondragleave="this.style.borderColor='#2a2a2a'"
                 ondrop="handleExclusionDrop(event)">
-                <div style="color:#4a4a4a;font-size:13px;margin-bottom:4px">Drop exclusion CSV here or click to browse</div>
-                <div style="color:#2a2a2a;font-size:11px;font-family:'DM Mono',monospace">firm_name, person_name, email — any one column is enough</div>
+                <div style="color:#4a4a4a;font-size:13px;margin-bottom:4px">Drop exclusion list here or click to browse</div>
+                <div style="color:#2a2a2a;font-size:11px;font-family:'DM Mono',monospace">CSV or XLSX — any export with firm, person, or email columns</div>
               </div>
-              <input type="file" id="exclusion-csv-input" accept=".csv" style="display:none" onchange="handleExclusionFile(this.files[0])">
+              <input type="file" id="exclusion-csv-input" accept=".csv,.xlsx,.xls" style="display:none" onchange="handleExclusionFile(this.files[0])">
               <div id="exclusion-preview" style="display:none;margin-top:12px;padding:12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px">
                 <div style="display:flex;justify-content:space-between;align-items:center">
                   <span id="exclusion-count" style="color:#e5e7eb;font-size:13px"></span>
@@ -522,7 +495,8 @@
             <!-- Priority List Selector -->
             <div id="launch-priority-section" style="margin-bottom:20px">
               <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">List Priority <span style="font-weight:400;font-size:11px;text-transform:none;letter-spacing:0">(optional)</span></h3>
-              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Select which investor lists Roco searches first. Leave empty to search the full database.</p>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 4px">Choose named investor lists for Roco to work through in order before falling back to the full database. Add multiple lists and drag to reorder.</p>
+              <p style="color:#4a4a4a;font-size:11px;margin:0 0 10px">If you also drop a PitchBook file below, that file is always searched first — ahead of anything selected here.</p>
               <div id="priority-list-container" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px"></div>
               <div style="display:flex;gap:8px;align-items:center">
                 <select id="add-list-select" style="flex:1;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px">
@@ -530,6 +504,24 @@
                 </select>
                 <button type="button" onclick="addPriorityList()" style="padding:8px 14px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-muted);border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap">Add</button>
               </div>
+            </div>
+
+            <!-- Email Account Selector -->
+            <div id="launch-email-account-section" style="margin-bottom:20px">
+              <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">Sending Account</h3>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Choose which email account Roco sends outreach from for this deal.</p>
+              <select id="launch-email-account" style="width:100%;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px">
+                <option value="">Loading email accounts&#8230;</option>
+              </select>
+            </div>
+
+            <!-- Knowledge Base Selector -->
+            <div id="launch-kb-section" style="margin-bottom:20px">
+              <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">Knowledge Base <span style="font-weight:400;font-size:11px;text-transform:none;letter-spacing:0">(optional)</span></h3>
+              <p style="color:#6b7280;font-size:12px;margin:0 0 10px">Select an enriched knowledge base to boost investor scoring accuracy. Knowledge bases are uploaded in the Database section — they enrich investor records with richer thesis and comparable deal data before scoring.</p>
+              <select id="launch-kb-select" style="width:100%;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);border-radius:6px;white-space:normal;text-overflow:clip;overflow:visible" title="">
+                <option value="">None — use standard database scoring only</option>
+              </select>
             </div>
 
             <div class="form-submit-row">
@@ -575,20 +567,29 @@
             <span style="font-size:12px;color:var(--text-muted)">Drag and drop a PitchBook export file to import investors</span>
           </div>
           <div style="padding:0 24px 24px">
-            <div style="margin-bottom:12px">
-              <label style="color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px">List Name</label>
-              <input type="text" id="import-list-name" placeholder="e.g. Healthcare PE Q1 2026"
-                style="width:100%;padding:8px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;box-sizing:border-box">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+              <div>
+                <label style="color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px">List Name</label>
+                <input type="text" id="import-list-name" placeholder="e.g. Healthcare PE Q1 2026"
+                  style="width:100%;padding:8px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;box-sizing:border-box">
+              </div>
+              <div>
+                <label style="color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;display:block;margin-bottom:4px">List Type</label>
+                <select id="import-list-type" style="width:100%;padding:8px 12px;background:#1a1a1a;border:1px solid #2a2a2a;color:#e5e7eb;border-radius:6px;box-sizing:border-box">
+                  <option value="investors">Investor List (priority pool)</option>
+                  <option value="knowledge_base">Knowledge Base (enrichment / comparable deals)</option>
+                </select>
+              </div>
             </div>
             <div class="file-drop-zone" id="db-drop-zone"
                  onclick="document.getElementById('db-file-input').click()"
                  ondragover="event.preventDefault(); this.classList.add('drag-over')"
                  ondragleave="this.classList.remove('drag-over')"
                  ondrop="onDbFileDrop(event)">
-              <input type="file" id="db-file-input" accept=".xlsx,.xls" style="display:none" onchange="onDbFileSelected(this)" />
+              <input type="file" id="db-file-input" accept=".xlsx,.xls,.csv" style="display:none" onchange="onDbFileSelected(this)" />
               <div class="file-drop-icon" id="db-drop-icon">&#128196;</div>
-              <div class="file-drop-text" id="db-drop-text">Drop XLSX here or click to browse</div>
-              <div class="file-drop-hint">PitchBook investor export — all columns mapped automatically</div>
+              <div class="file-drop-text" id="db-drop-text">Drop XLSX / CSV here or click to browse</div>
+              <div class="file-drop-hint">Investor list or knowledge base — columns mapped automatically</div>
             </div>
             <div id="db-import-progress" style="display:none;margin-top:12px">
               <div style="display:flex;align-items:center;gap:10px">
@@ -731,9 +732,9 @@
         <div id="db-contacts-view" style="display:none">
           <div class="card">
             <div class="card-header">
-              <h2 class="card-title">Enriched Contacts</h2>
+              <h2 class="card-title">Contacts</h2>
               <div style="display:flex;align-items:center;gap:10px">
-                <span style="font-size:12px;color:var(--text-muted)">Individual decision makers found and enriched by Roco</span>
+                <span style="font-size:12px;color:var(--text-muted)">All deal-linked contacts, including prior and closed deal participation</span>
                 <button class="btn btn-ghost btn-sm" onclick="exportContactsCSV(this)" style="white-space:nowrap;flex-shrink:0">&#8595; Export CSV</button>
               </div>
             </div>
@@ -748,15 +749,18 @@
                     <th>Name</th>
                     <th>Firm</th>
                     <th>Title</th>
+                    <th>Active Deal</th>
+                    <th>Project</th>
+                    <th>Deals</th>
                     <th>Email</th>
                     <th>LinkedIn</th>
-                    <th>Source</th>
+                    <th>Stage</th>
                     <th>Verified</th>
                     <th>Updated</th>
                   </tr>
                 </thead>
                 <tbody id="db-contacts-body">
-                  <tr><td colspan="8" class="table-empty">No enriched contacts yet</td></tr>
+                  <tr><td colspan="11" class="table-empty">No contacts yet</td></tr>
                 </tbody>
               </table>
             </div>
@@ -804,12 +808,11 @@
             <button class="deal-tab active" data-tab="overview" onclick="switchDealTab('overview', this)">Overview</button>
             <button class="deal-tab" data-tab="brief" onclick="switchDealTab('brief', this)">Deal Brief</button>
             <button class="deal-tab" data-tab="pipeline" onclick="switchDealTab('pipeline', this)">Pipeline</button>
-            <button class="deal-tab" data-tab="rankings" onclick="switchDealTab('rankings', this)">Rankings</button>
+            <button class="deal-tab" data-tab="rankings" onclick="switchDealTab('rankings', this)">Campaign</button>
+            <button class="deal-tab" data-tab="templates" onclick="switchDealTab('templates', this)">Templates</button>
             <button class="deal-tab" data-tab="settings" onclick="switchDealTab('settings', this)">Settings</button>
             <button class="deal-tab" data-tab="archived" onclick="switchDealTab('archived', this)">Archived</button>
             <button class="deal-tab" data-tab="exclusions" onclick="switchDealTab('exclusions', this)">Exclusions</button>
-            <button class="deal-tab" data-tab="templates" onclick="switchDealTab('templates', this)">Templates</button>
-            <button class="deal-tab" data-tab="campaign" onclick="switchDealTab('campaign', this)" id="deal-tab-btn-campaign">Campaign</button>
           </div>
           <div id="deal-tab-overview" class="deal-tab-content"></div>
           <div id="deal-tab-brief" class="deal-tab-content hidden"></div>
@@ -845,8 +848,14 @@
                   <th class="sortable-th" onclick="sortPipeline('firm')">
                     Firm <span class="sort-icon" data-col="firm">&#8597;</span>
                   </th>
-                  <th class="sortable-th" onclick="sortPipeline('deal_name')">
-                    Deal <span class="sort-icon" data-col="deal_name">&#8597;</span>
+                  <th class="sortable-th" onclick="sortPipeline('activeDealName')">
+                    Active Deal <span class="sort-icon" data-col="activeDealName">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('projectName')">
+                    Project <span class="sort-icon" data-col="projectName">&#8597;</span>
+                  </th>
+                  <th class="sortable-th" onclick="sortPipeline('dealNamesText')">
+                    Deals <span class="sort-icon" data-col="dealNamesText">&#8597;</span>
                   </th>
                   <th class="sortable-th" onclick="sortPipeline('score')">
                     Score <span class="sort-icon" data-col="score">&#8597;</span>
@@ -854,17 +863,15 @@
                   <th class="sortable-th" onclick="sortPipeline('stage')">
                     Stage <span class="sort-icon" data-col="stage">&#8597;</span>
                   </th>
-                  <th class="sortable-th" onclick="sortPipeline('lastContact')">
-                    Last Contact <span class="sort-icon" data-col="lastContact">&#8597;</span>
-                  </th>
-                  <th class="sortable-th" onclick="sortPipeline('nextFollowup')">
-                    Next Follow-up <span class="sort-icon" data-col="nextFollowup">&#8597;</span>
+                  <th>Sentiment</th>
+                  <th class="sortable-th" onclick="sortPipeline('lastReplyAt')">
+                    Last Activity <span class="sort-icon" data-col="lastReplyAt">&#8597;</span>
                   </th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody id="pipeline-tbody">
-                <tr><td colspan="8" class="table-empty">Loading pipeline&#8230;</td></tr>
+                <tr><td colspan="10" class="table-empty">Loading pipeline&#8230;</td></tr>
               </tbody>
             </table>
           </div>
@@ -877,12 +884,20 @@
           <h1 class="section-title">Approval Queue</h1>
         </div>
         <div class="queue-tab-bar">
+          <button class="queue-tab" id="qtab-campaigns" onclick="switchQueueTab('campaigns', this)">
+            Campaign Reviews <span class="tab-count" id="queue-campaigns-count">0</span>
+          </button>
           <button class="queue-tab active" id="qtab-email" onclick="switchQueueTab('email', this)">
             Emails <span class="tab-count" id="queue-email-count">0</span>
           </button>
           <button class="queue-tab" id="qtab-linkedin" onclick="switchQueueTab('linkedin', this)">
             LinkedIn <span class="tab-count" id="queue-linkedin-count">0</span>
           </button>
+        </div>
+        <div id="qpanel-campaigns" class="queue-panel hidden">
+          <div id="queue-campaigns-list">
+            <div class="queue-empty">&#10003;&nbsp; No campaigns awaiting review.</div>
+          </div>
         </div>
         <div id="qpanel-email" class="queue-panel">
           <div id="queue-email-list">
@@ -908,12 +923,14 @@
           </select>
           <select class="form-input sm" id="activity-type-filter" onchange="filterActivity()">
             <option value="">All Types</option>
-            <option value="email_sent">Email Sent</option>
-            <option value="email_reply">Reply</option>
+            <option value="email">Email</option>
+            <option value="reply">Reply</option>
+            <option value="linkedin">LinkedIn</option>
             <option value="research">Research</option>
             <option value="enrichment">Enrichment</option>
             <option value="approval">Approval</option>
             <option value="system">System</option>
+            <option value="error">Error</option>
           </select>
         </div>
         <div class="card">
@@ -925,30 +942,7 @@
 
       <!-- ══════════════════════════════════ ANALYTICS ══════════════════════════════════ -->
       <section id="view-analytics" class="view-section hidden">
-        <div class="section-header">
-          <h1 class="section-title">Analytics</h1>
-          <button class="btn btn-ghost btn-sm" onclick="runAnalyticsNow(this)">&#9654; Run Analysis Now</button>
-        </div>
-
-        <!-- Sub-tabs -->
-        <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px">
-          <button id="analytics-tab-performance" onclick="switchAnalyticsTab('performance')"
-            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid var(--gold);color:var(--gold);cursor:pointer;font-size:13px;font-family:var(--font-body)">
-            Performance
-          </button>
-          <button id="analytics-tab-recommendations" onclick="switchAnalyticsTab('recommendations')"
-            style="padding:10px 20px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);cursor:pointer;font-size:13px;font-family:var(--font-body)">
-            Recommendations
-          </button>
-        </div>
-
-        <div id="analytics-panel-performance">
-          <div id="analytics-summary-table"><div class="loading-placeholder">Loading performance data&#8230;</div></div>
-        </div>
-
-        <div id="analytics-panel-recommendations" style="display:none">
-          <div id="analytics-recs-list"><div class="loading-placeholder">Loading recommendations&#8230;</div></div>
-        </div>
+        <div id="analytics-main-container"></div>
       </section>
 
       <!-- ══════════════════════════════════ SOURCING CAMPAIGNS ══════════════════════════════════ -->
@@ -1519,23 +1513,57 @@
             </div>
           </div>
 
-          <!-- Per-Deal Schedule (full width) -->
+          <!-- API Health (full width) -->
           <div class="card card-full">
             <div class="card-header">
-              <h2 class="card-title">Per-Deal Schedule</h2>
+              <h2 class="card-title">API Health</h2>
+              <button class="btn btn-ghost btn-sm" onclick="refreshHealth()">&#8635;</button>
             </div>
-            <div class="schedule-body">
-              <div class="form-group mb-16" style="max-width:320px">
-                <label class="form-label">Deal</label>
-                <select class="form-input" id="schedule-deal-select" onchange="loadDealSchedule(this.value)">
-                  <option value="">Select a deal&#8230;</option>
-                </select>
+            <div class="health-grid" id="health-grid">
+              <div class="health-item" id="health-anthropic">
+                <span class="health-dot unknown"></span><span class="health-name">Anthropic</span>
               </div>
-              <div id="schedule-content" style="display:none">
-                <div class="schedule-viz" id="schedule-viz"></div>
-                <div class="schedule-cadence mt-16" id="schedule-cadence"></div>
-                <button class="btn btn-gold mt-16" onclick="saveDealSchedule()">Save Schedule</button>
+              <div class="health-item" id="health-openai">
+                <span class="health-dot unknown"></span><span class="health-name">OpenAI</span>
               </div>
+              <div class="health-item" id="health-gemini">
+                <span class="health-dot unknown"></span><span class="health-name">Gemini</span>
+              </div>
+              <div class="health-item" id="health-kaspr">
+                <span class="health-dot unknown"></span><span class="health-name">KASPR</span>
+              </div>
+              <div class="health-item" id="health-notion">
+                <span class="health-dot unknown"></span><span class="health-name">Notion</span>
+              </div>
+              <div class="health-item" id="health-gmail">
+                <span class="health-dot unknown"></span><span class="health-name">Gmail</span>
+              </div>
+              <div class="health-item" id="health-telegram">
+                <span class="health-dot unknown"></span><span class="health-name">Telegram</span>
+              </div>
+              <div class="health-item" id="health-serpapi">
+                <span class="health-dot unknown"></span><span class="health-name">SerpAPI</span>
+              </div>
+              <div class="health-item" id="health-apify">
+                <span class="health-dot unknown"></span><span class="health-name">Apify</span>
+              </div>
+              <div class="health-item" id="health-grok">
+                <span class="health-dot unknown"></span><span class="health-name">Grok</span>
+              </div>
+              <div class="health-item" id="health-millionverifier">
+                <span class="health-dot unknown"></span><span class="health-name">MillionVerifier</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Webhook Monitor (full width) -->
+          <div class="card card-full">
+            <div class="card-header">
+              <h2 class="card-title">Webhook Monitor</h2>
+              <button class="btn btn-ghost btn-sm" onclick="loadWebhookStatus()">&#8635;</button>
+            </div>
+            <div id="webhook-monitor-body" style="padding:0 24px 24px">
+              <div style="color:var(--text-dim);font-size:13px">Loading webhook status…</div>
             </div>
           </div>
 
@@ -1548,6 +1576,55 @@
           <h1 class="section-title">Train Your Agent</h1>
           <p style="color:var(--text-dim);font-size:13px;margin-top:4px">Guidance rules are injected into every LLM call in real time. Changes take effect on the next Roco cycle — no restart needed.</p>
         </div>
+
+        <details style="max-width:860px;margin:0 0 28px;background:#111113;border:1px solid rgba(201,168,76,0.18);border-radius:12px;overflow:hidden" open>
+          <summary style="cursor:pointer;list-style:none;padding:16px 20px;color:var(--text-bright);font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:space-between">
+            <span>Agent System Overview</span>
+            <span style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold)">Reference</span>
+          </summary>
+          <div style="padding:0 20px 20px">
+            <div style="margin-bottom:18px">
+              <div style="font-family:'Cormorant Garamond',serif;font-size:28px;color:#fff">Roco Agent System</div>
+              <div style="margin-top:6px;color:#8A8680;font-size:13px;line-height:1.6">Two agents are active. Four are planned for a future phase.</div>
+            </div>
+            <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:10px">Active Agents</div>
+            <div style="display:grid;gap:12px;margin-bottom:18px">
+              <div style="background:#111113;border:1px solid rgba(201,168,76,0.16);border-left:4px solid var(--gold);border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">SELECTOR</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(201,168,76,0.15);color:var(--gold);font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Active</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:6px">Role: Investor Scoring &amp; Ranking</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Evaluates every candidate investor against the deal brief. Scores each firm 0–100 across geography match, check size fit, sector alignment, investor type, and recent activity. Hard-rejects geography mismatches. Returns the ranked shortlist Roco uses to fill the 100-firm pipeline. Also reads agentic memory to apply learnings from previous cycles.</div>
+              </div>
+              <div style="background:#111113;border:1px solid rgba(201,168,76,0.16);border-left:4px solid var(--gold);border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">COMPOSER</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(201,168,76,0.15);color:var(--gold);font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Active</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:6px">Role: Justification &amp; Personalisation</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Writes the research justification and personalisation seeds for each firm selected by SELECTOR. Produces the "why this firm fits this deal" text visible on each firm card, and the personalisation context used when generating outreach copy. Reads weekly intelligence to apply copy direction that has been working.</div>
+              </div>
+            </div>
+            <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9ca3af;margin-bottom:10px">Planned Agents</div>
+            <div style="display:grid;gap:12px">
+              <div style="background:#111113;border:1px solid rgba(122,122,122,0.18);border-left:4px solid #4b5563;border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">IRIS</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(107,114,128,0.18);color:#9ca3af;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Coming Soon</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9ca3af;margin-bottom:6px">Role: Reply Intelligence &amp; Sentiment</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Monitors all inbound replies across email and LinkedIn. Classifies sentiment (interested / not interested / needs more info / out of mandate). Drafts the follow-up response for Dom's approval when someone replies positively. Flags firms that have gone cold.</div>
+              </div>
+              <div style="background:#111113;border:1px solid rgba(122,122,122,0.18);border-left:4px solid #4b5563;border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">SCOUT</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(107,114,128,0.18);color:#9ca3af;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Coming Soon</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9ca3af;margin-bottom:6px">Role: Batch Quality Review</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Reviews each batch of 20 firms before it goes to Dom for approval. Flags any that look like a poor fit — wrong geography, check size mismatch, inactive fund, duplicate. Provides an overall batch rating (Strong / Acceptable / Weak) with reasoning.</div>
+              </div>
+              <div style="background:#111113;border:1px solid rgba(122,122,122,0.18);border-left:4px solid #4b5563;border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">SAGE</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(107,114,128,0.18);color:#9ca3af;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Coming Soon</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9ca3af;margin-bottom:6px">Role: Weekly Intelligence &amp; Learning</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Runs every Monday at 9am. Analyses the past week's outreach performance — reply rates, acceptance rates, best sending times, which lists performed, which copy angles worked. Writes the weekly intelligence report and updates the intelligence digest that feeds back into SELECTOR and COMPOSER.</div>
+              </div>
+              <div style="background:#111113;border:1px solid rgba(122,122,122,0.18);border-left:4px solid #4b5563;border-radius:10px;padding:16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span style="font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:700;color:#fff">HERALD (future)</span></div><span style="padding:4px 8px;border-radius:999px;background:rgba(107,114,128,0.18);color:#9ca3af;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase">Coming Soon</span></div>
+                <div style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9ca3af;margin-bottom:6px">Role: Outreach Execution</div>
+                <div style="font-size:13px;color:#8A8680;line-height:1.6">What it does: Handles the actual sending layer — LinkedIn invites, DMs, and emails via Unipile. Manages rate limits, timing, and delivery confirmation. Currently handled directly by the orchestrator.</div>
+              </div>
+            </div>
+          </div>
+        </details>
 
         <!-- Tab switcher -->
         <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:28px;max-width:860px">
@@ -1741,6 +1818,23 @@
     </div>
   </div>
 </div>
+
+<!-- ── CONTACT SIDE PANEL ──────────────────────────────────────────────── -->
+<div id="contact-side-panel" style="
+  position:fixed;top:0;right:-520px;width:500px;height:100vh;
+  background:#0a0a0c;border-left:1px solid #1e1e1e;
+  z-index:1000;transition:right 0.28s cubic-bezier(0.4,0,0.2,1);
+  display:flex;flex-direction:column;overflow:hidden;
+">
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:18px 20px;border-bottom:1px solid #1a1a1a;flex-shrink:0">
+    <div id="contact-panel-name" style="font-size:16px;font-weight:600;color:#e5e7eb"></div>
+    <button onclick="closeContactPanel()" style="background:none;border:none;color:#6b7280;font-size:20px;cursor:pointer;line-height:1;padding:4px">&#215;</button>
+  </div>
+  <div id="contact-panel-body" style="flex:1;overflow-y:auto;padding:0"></div>
+</div>
+<div id="contact-panel-overlay" onclick="closeContactPanel()" style="
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:999;
+"></div>
 
 <script src="dashboard.js"></script>
 </body>
