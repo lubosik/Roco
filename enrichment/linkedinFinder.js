@@ -117,6 +117,12 @@ function validateLinkedInProfileUrl(url) {
   return canonical;
 }
 
+function hasEnoughIdentityContext(expected = {}) {
+  const nameTokens = tokenize(expected.name);
+  if (nameTokens.length < 2) return false;
+  return tokenize(expected.company).length > 0 || tokenize(expected.title).length > 0;
+}
+
 function buildFallbackPrompt({ name, company, title }) {
   return `Find the exact LinkedIn profile URL for this person.
 
@@ -329,11 +335,17 @@ export async function findLinkedInUrl({ name, company, title }) {
   if (!name || !String(name).trim()) return null;
 
   const expected = { name, company, title };
+  if (!hasEnoughIdentityContext(expected)) return null;
+
   const candidates = await searchCandidates(expected);
   const ranked = candidates
     .map(person => ({ person, score: scoreCandidate(person, expected) }))
-    .filter(entry => entry.score >= 8)
+    .filter(entry => entry.score >= 12)
     .sort((left, right) => right.score - left.score);
+
+  if (ranked.length >= 2 && (ranked[0].score - ranked[1].score) < 3) {
+    return null;
+  }
 
   for (const { person } of ranked.slice(0, 5)) {
     const verifiedUrl = await verifyCandidate(person, expected);

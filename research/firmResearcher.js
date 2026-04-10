@@ -9,6 +9,7 @@
 
 import { getSupabase } from '../core/supabase.js';
 import { pushActivity } from '../dashboard/server.js';
+import { sendTelegram } from '../approval/telegramBot.js';
 import {
   canonicalizeLinkedInProfileUrl,
   getLinkedInSearchParameters,
@@ -192,6 +193,55 @@ function findMatchingDecisionMaker(existingContacts = [], incoming = {}, firmNam
   return best;
 }
 
+function truncateList(items = [], limit = 4) {
+  return items
+    .filter(Boolean)
+    .slice(0, limit)
+    .join(', ');
+}
+
+async function notifyResearchOutcome(deal, summary = {}) {
+  const totalQueuedContacts = (summary.insertedContacts || 0) + (summary.enrichedContacts || 0);
+  const sampleFirms = truncateList(summary.sampleFirmNames || []);
+  const headline = summary.totalDistinctFirms > 0
+    ? `Firm research: ${summary.totalDistinctFirms} relevant firm${summary.totalDistinctFirms === 1 ? '' : 's'} found for ${deal.name}`
+    : `Firm research: no relevant firms found for ${deal.name}`;
+  const note = summary.totalDistinctFirms > 0
+    ? [
+        `${summary.newFirms || 0} added`,
+        `${summary.updatedFirms || 0} updated`,
+        `${summary.insertedContacts || 0} contact${summary.insertedContacts === 1 ? '' : 's'} added`,
+        `${summary.enrichedContacts || 0} discovered via follow-on contact research`,
+        sampleFirms ? `Examples: ${sampleFirms}` : null,
+      ].filter(Boolean).join(' · ')
+    : 'Searched CSV imports, grounded web research, and LinkedIn. Nothing strong enough to add automatically.';
+
+  pushActivity({
+    type: 'research',
+    action: headline,
+    note,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  const telegramMessage = summary.totalDistinctFirms > 0
+    ? [
+        `*Research update — ${deal.name}*`,
+        `Found ${summary.totalDistinctFirms} relevant firm${summary.totalDistinctFirms === 1 ? '' : 's'}.`,
+        `Added to campaign: ${summary.newFirms || 0}`,
+        `Updated existing firms: ${summary.updatedFirms || 0}`,
+        `New contacts queued: ${totalQueuedContacts}`,
+        sampleFirms ? `Examples: ${sampleFirms}` : null,
+      ].filter(Boolean).join('\n')
+    : [
+        `*Research update — ${deal.name}*`,
+        `I researched more firms because the pipeline needed support, but I did not find any firm I was confident enough to add.`,
+        `Checked: grounded web research, LinkedIn search, and CSV/imported data.`,
+      ].join('\n');
+
+  await sendTelegram(telegramMessage).catch(() => {});
+}
+
 /**
  * Main entry point — called immediately after deal is saved.
  * Runs all three firm-discovery streams and persists only firm-level data.
@@ -220,11 +270,21 @@ export async function runFirmResearch(deal) {
   console.log(`[FIRM RESEARCH] CSV: ${csvFirms.length} | AI research: ${researchedFirms.length} | LinkedIn: ${linkedinFirms.length}`);
 
   // Upsert all firms
-  const savedFirms = await upsertFirms(deal, csvFirms, researchedFirms, linkedinFirms);
+  const summary = await upsertFirms(deal, csvFirms, researchedFirms, linkedinFirms);
+  const savedFirms = summary.newFirms || 0;
   console.log(`[FIRM RESEARCH] ${savedFirms} firms saved to Supabase`);
+
+  let enrichedContacts = 0;
+  try {
+    enrichedContacts = await runFirmEnrichmentLoop(deal);
+  } catch (err) {
+    console.warn(`[FIRM RESEARCH] Follow-on contact discovery failed for ${deal.name}:`, err.message);
+  }
+  summary.enrichedContacts = enrichedContacts;
 
   pushActivity({ type: 'research', action: `Firm research complete — ${savedFirms} firms identified for ${deal.name}`, note: `Scoring and ranking in progress`, deal_name: deal.name, dealId: deal.id });
   sb.from('activity_log').insert({ deal_id: deal.id, event_type: 'RESEARCH_COMPLETE', summary: `${savedFirms} firms`, created_at: new Date().toISOString() }).then(null, () => {});
+  await notifyResearchOutcome(deal, summary);
 
   return savedFirms;
 }
@@ -899,7 +959,16 @@ Return ONLY a JSON array of strings, each being a LinkedIn search query targetin
 
 async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
   const sb = getSupabase();
-  if (!sb) return 0;
+  if (!sb) {
+    return {
+      totalDistinctFirms: 0,
+      newFirms: 0,
+      updatedFirms: 0,
+      insertedContacts: 0,
+      updatedContacts: 0,
+      sampleFirmNames: [],
+    };
+  }
 
   // Build a map: normalized firm name → merged data
   const firmMap = new Map();
@@ -959,6 +1028,10 @@ async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
   }
 
   let saved = 0;
+  let updatedFirms = 0;
+  let insertedContacts = 0;
+  let updatedContacts = 0;
+  const processedFirmNames = [];
   for (const [, firm] of firmMap) {
     // Skip generic role labels — not real firms
     if (isGenericFirm(firm.name)) {
@@ -996,12 +1069,14 @@ async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
       if (existing) {
         await sb.from('firms').update(firmData).eq('id', existing.id);
         firmId = existing.id;
+        updatedFirms++;
       } else {
         firmData.created_at = new Date().toISOString();
         const { data: inserted } = await sb.from('firms').insert(firmData).select('id').single();
         firmId = inserted?.id;
         saved++;
       }
+      if (firmId && !processedFirmNames.includes(firm.name)) processedFirmNames.push(firm.name);
 
       // Save LinkedIn candidates as pending contacts linked to this firm
       if (firmId && firm.candidates?.length) {
@@ -1025,6 +1100,7 @@ async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
             if (Object.keys(patch).length) {
               await sb.from('contacts').update(patch).eq('id', existingContact.id).then(null, () => {});
               Object.assign(existingContact, patch);
+              updatedContacts++;
             }
           } else {
             try {
@@ -1041,7 +1117,10 @@ async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
                 pipeline_stage: 'Researched',
                 created_at: new Date().toISOString(),
               }).select('id, name, email, linkedin_url, linkedin_provider_id, job_title, company_name').single();
-              if (inserted) (existingDealContacts || []).push(inserted);
+              if (inserted) {
+                (existingDealContacts || []).push(inserted);
+                insertedContacts++;
+              }
             } catch { /* non-fatal — contact may already exist */ }
           }
         }
@@ -1051,7 +1130,14 @@ async function upsertFirms(deal, csvFirms, grokFirms, linkedinFirms) {
     }
   }
 
-  return saved;
+  return {
+    totalDistinctFirms: processedFirmNames.length,
+    newFirms: saved,
+    updatedFirms,
+    insertedContacts,
+    updatedContacts,
+    sampleFirmNames: processedFirmNames.slice(0, 5),
+  };
 }
 
 // ── FIRM ENRICHMENT LOOP: Find contacts at each firm ──────────────────

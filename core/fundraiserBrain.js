@@ -39,6 +39,50 @@ function pickMeetingsNeeded(deal = {}, targetEquity = 5) {
   return Math.max(8, Math.ceil(targetEquity * 2));
 }
 
+function getDealLaunchDate(deal = {}, timezone = 'America/New_York') {
+  const candidates = [
+    deal.launched_at,
+    deal.launch_date,
+    deal.started_at,
+    deal.go_live_at,
+    deal.created_at,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const parsed = DateTime.fromISO(String(candidate), { zone: 'utc' }).setZone(timezone);
+    if (parsed.isValid) return parsed;
+  }
+  return DateTime.now().setZone(timezone);
+}
+
+function getTimingContext(deal = {}, metrics = {}) {
+  const timezone = getDealTimezone(deal);
+  const now = DateTime.now().setZone(timezone);
+  const launchDate = getDealLaunchDate(deal, timezone);
+  const rawDays = Math.max(0, Math.floor(now.startOf('day').diff(launchDate.startOf('day'), 'days').days));
+
+  let cursor = launchDate.startOf('day');
+  let businessDays = 0;
+  while (cursor <= now.startOf('day')) {
+    if (cursor.weekday <= 5) businessDays += 1;
+    cursor = cursor.plus({ days: 1 });
+  }
+
+  const totalOutboundToday = normalizeNumber(metrics.li_invites_today, 0)
+    + normalizeNumber(metrics.emails_sent_today, 0)
+    + normalizeNumber(metrics.dms_sent_today, 0);
+
+  return {
+    timezone,
+    now,
+    launchDate,
+    daysSinceLaunch: rawDays,
+    businessDaysSinceLaunch: Math.max(1, businessDays),
+    isWeekend: now.weekday >= 6,
+    totalOutboundToday,
+  };
+}
+
 export async function gatherCurrentMetrics(dealId) {
   const sb = getSupabase();
   if (!sb || !dealId) {
@@ -142,19 +186,47 @@ export function calculateGoalTracking(deal = {}, metrics = {}) {
   const meetingsNeeded = pickMeetingsNeeded(deal, targetEquity);
   const meetingsBooked = normalizeNumber(metrics.meetings_booked, 0);
   const firmsInPipeline = normalizeNumber(metrics.firms_in_pipeline, 0);
+  const liPending = normalizeNumber(metrics.li_pending, 0);
+  const totalReplies = normalizeNumber(metrics.total_replies, 0);
+  const timing = getTimingContext(deal, metrics);
+  const earlyLaunch = timing.businessDaysSinceLaunch <= 2;
+  const isFreshWeekend = timing.isWeekend && timing.businessDaysSinceLaunch <= 2;
+  const waitingForResponses = liPending >= 5 && totalReplies === 0 && timing.businessDaysSinceLaunch <= 4;
 
   let status = 'ON TRACK';
-  if (meetingsBooked <= 0 && firmsInPipeline < 10) status = 'CRITICAL';
+  let rationale = 'Pipeline and meeting pace are acceptable.';
+  if (meetingsBooked >= meetingsNeeded) {
+    status = 'ON TARGET';
+    rationale = 'Meeting target has already been reached.';
+  } else if (isFreshWeekend && firmsInPipeline >= 10) {
+    status = 'BUILDING';
+    rationale = 'The deal is newly live and it is the weekend, so reply latency is expected.';
+  } else if (earlyLaunch && (timing.totalOutboundToday > 0 || liPending > 0 || firmsInPipeline >= 10)) {
+    status = 'BUILDING';
+    rationale = 'The deal is still in its first working days, so outreach is still compounding.';
+  } else if (waitingForResponses) {
+    status = 'WAITING';
+    rationale = 'Outreach has already started and the team is still waiting for normal reply lag to clear.';
+  } else if (meetingsBooked <= 0 && firmsInPipeline < 10 && timing.businessDaysSinceLaunch > 3) {
+    status = 'CRITICAL';
+    rationale = 'There are too few active firms after the initial launch window.';
+  }
   else if (meetingsBooked < Math.max(2, Math.ceil(meetingsNeeded * 0.25))) status = 'BEHIND';
-  else if (meetingsBooked >= meetingsNeeded) status = 'ON TARGET';
+  else rationale = 'The deal needs more meetings to reach the current pace target.';
 
   return {
     status,
+    rationale,
     target_equity: targetEquity,
     meetings_needed: meetingsNeeded,
     meetings_booked: meetingsBooked,
     firms_in_pipeline: firmsInPipeline,
     progress_ratio: meetingsNeeded > 0 ? Number((meetingsBooked / meetingsNeeded).toFixed(2)) : 0,
+    launch_date: timing.launchDate.toISO(),
+    days_since_launch: timing.daysSinceLaunch,
+    business_days_since_launch: timing.businessDaysSinceLaunch,
+    is_weekend_local: timing.isWeekend,
+    total_outbound_today: timing.totalOutboundToday,
   };
 }
 
@@ -175,15 +247,16 @@ export async function runFundraiserReasoning(deal, context = {}, pushActivity = 
 
   const actionPlan = [
     `HONEST ASSESSMENT: ${deal?.name || 'Deal'} is ${goalAnalysis.status}.`,
+    `TIMING CONTEXT: Day ${goalAnalysis.days_since_launch + 1} since launch, ${goalAnalysis.business_days_since_launch} business day(s) in market${goalAnalysis.is_weekend_local ? ', and it is currently the weekend locally' : ''}.`,
     `TODAY'S 3 PRIORITIES: ${lowPipeline ? 'Expand the active pipeline' : 'Work the highest-conviction firms'}; convert warm conversations; keep approvals moving.`,
     `PATIENCE CHECK: ${normalizeNumber(metrics.firms_in_pipeline, 0)} firms active and ${normalizeNumber(metrics.li_pending, 0)} pending LinkedIn connections.`,
-    `WHAT DOM SHOULD KNOW: ${normalizeNumber(metrics.meetings_booked, 0)}/${goalAnalysis.meetings_needed} meetings booked against the current working target.`,
+    `WHAT DOM SHOULD KNOW: ${normalizeNumber(metrics.meetings_booked, 0)}/${goalAnalysis.meetings_needed} meetings booked against the current working target. ${goalAnalysis.rationale}`,
   ].join('\n\n');
 
   pushActivity({
     type: 'analysis',
     action: `Fundraiser reasoning: ${deal?.name || 'Deal'}`,
-    note: `${goalAnalysis.status} · ${normalizeNumber(metrics.firms_in_pipeline, 0)} firms active · ${normalizeNumber(metrics.meetings_booked, 0)} meetings booked`,
+    note: `${goalAnalysis.status} · day ${goalAnalysis.days_since_launch + 1} · ${normalizeNumber(metrics.firms_in_pipeline, 0)} firms active · ${normalizeNumber(metrics.meetings_booked, 0)} meetings booked`,
     deal_id: deal?.id || null,
   });
 

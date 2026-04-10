@@ -580,7 +580,7 @@ async function markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivit
     contact,
     type: 'warning',
     action: 'Could not find LinkedIn',
-    note: `${contact.name || 'Contact'}${linkedinUrl ? ` · ${linkedinUrl}` : ''}`,
+    note: `${contact.name || 'Contact'}${note ? ` · ${note}` : ''}`,
     eventType: 'LINKEDIN_INVITE_SKIPPED_NO_PROFILE',
     detail: {
       channel: 'linkedin_invite',
