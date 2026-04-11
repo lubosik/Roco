@@ -1607,11 +1607,8 @@ async function runDailyNewsScanCycle(deals) {
 async function runDailyActivityDigestCycle(deals) {
   const estNow = DateTime.now().setZone('America/New_York');
   const digestHour = Number(process.env.DAILY_ACTIVITY_DIGEST_HOUR_ET || 20);
-  const targetDate = estNow.hour >= digestHour
-    ? estNow.toISODate()
-    : estNow.minus({ days: 1 }).toISODate();
-  const hasReachedDigestWindow = estNow.hour >= digestHour || targetDate !== estNow.toISODate();
-  if (!hasReachedDigestWindow) return;
+  if (estNow.hour !== digestHour) return;
+  const targetDate = estNow.toISODate();
 
   const sb = getSupabase();
   if (sb && targetDate) {
@@ -1621,6 +1618,17 @@ async function runDailyActivityDigestCycle(deals) {
         .eq('log_date', targetDate)
         .limit(1);
       if (existingRows?.length) {
+        dailyActivityDigestState.set(targetDate, 'done');
+        return;
+      }
+    } catch {}
+
+    try {
+      const { data: legacyRows } = await sb.from('daily_activity_reports')
+        .select('id, report_date')
+        .eq('report_date', targetDate)
+        .limit(1);
+      if (legacyRows?.length) {
         dailyActivityDigestState.set(targetDate, 'done');
         return;
       }

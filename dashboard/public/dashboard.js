@@ -9018,7 +9018,7 @@ window.openDailyLog = async function(reportDate) {
     <div class="pend-c">
       <div class="pend-ico">${log.status === 'failed' ? '⚠' : '📋'}</div>
       <div class="pend-t">${log.status === 'failed' ? 'Daily Log Failed' : 'Daily Log Pending'}</div>
-      <div class="pend-s">${esc(log.raw_payload?.error || 'This daily log is not ready yet.')}</div>
+      <div class="pend-s">${esc(log.raw_payload?.error || log.raw_payload?.message || 'This daily log is not ready yet.')}</div>
     </div>` : `
     <div class="rpb">
       <div class="sec-lbl">Daily Summary</div>

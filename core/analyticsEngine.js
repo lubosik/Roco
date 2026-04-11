@@ -1225,30 +1225,16 @@ export async function persistDailyActivityReport(report) {
 export async function listDailyActivityReports(limit = 90) {
   const supabase = getSupabase();
   if (!supabase) return [];
-  const { data, error } = await supabase.from('daily_logs')
-    .select('*')
-    .order('log_date', { ascending: false })
-    .limit(limit * 12);
-  if (error) throw error;
-  const grouped = new Map();
-  for (const row of data || []) {
-    const key = row.log_date;
-    if (!grouped.has(key)) {
-      grouped.set(key, {
-        report_date: row.log_date,
-        headline: `Daily log · ${row.log_date}`,
-        executive_summary: row.telegram_voice_script || null,
-        voice_script: row.telegram_voice_script || null,
-        deals_covered: 0,
-        activity_count: 0,
-        status: 'generated',
-        deal_sections: [],
-      });
-    }
-    const agg = grouped.get(key);
-    agg.deals_covered += 1;
-    agg.activity_count += Array.isArray(row.activity_entries) ? row.activity_entries.length : 0;
-    agg.deal_sections.push({
+
+  const mapDailyLogRowToAggregate = row => ({
+    report_date: row.log_date,
+    headline: `Daily log · ${row.log_date}`,
+    executive_summary: row.telegram_voice_script || null,
+    voice_script: row.telegram_voice_script || null,
+    deals_covered: 1,
+    activity_count: Array.isArray(row.activity_entries) ? row.activity_entries.length : 0,
+    status: 'generated',
+    deal_sections: [{
       deal_id: row.deal_id,
       deal_name: row.deal_name,
       progress_status: null,
@@ -1263,9 +1249,89 @@ export async function listDailyActivityReports(limit = 90) {
       target_status: `${row.pending_approvals || 0} pending approvals`,
       next_move: Array.isArray(row.recommended_actions) ? row.recommended_actions[0] || '' : '',
       recommended_actions: row.recommended_actions || [],
+    }],
+  });
+
+  const mergeAggregates = (target, source) => ({
+    ...target,
+    headline: target.headline || source.headline || null,
+    executive_summary: target.executive_summary || source.executive_summary || null,
+    voice_script: target.voice_script || source.voice_script || null,
+    voice_name: target.voice_name || source.voice_name || null,
+    voice_note_sent_at: target.voice_note_sent_at || source.voice_note_sent_at || null,
+    raw_payload: target.raw_payload || source.raw_payload || null,
+    status: target.status === 'generated' ? 'generated' : source.status || target.status || 'pending',
+    deals_covered: Math.max(Number(target.deals_covered || 0), Number(source.deals_covered || 0)),
+    activity_count: Math.max(Number(target.activity_count || 0), Number(source.activity_count || 0)),
+    deal_sections: Array.isArray(target.deal_sections) && target.deal_sections.length
+      ? target.deal_sections
+      : (source.deal_sections || []),
+  });
+
+  const { data, error } = await supabase.from('daily_logs')
+    .select('*')
+    .order('log_date', { ascending: false })
+    .limit(limit * 12);
+  if (error) throw error;
+  const grouped = new Map();
+  for (const row of data || []) {
+    const key = row.log_date;
+    if (!grouped.has(key)) grouped.set(key, mapDailyLogRowToAggregate(row));
+    else {
+      const agg = grouped.get(key);
+      agg.deals_covered += 1;
+      agg.activity_count += Array.isArray(row.activity_entries) ? row.activity_entries.length : 0;
+      agg.deal_sections.push(mapDailyLogRowToAggregate(row).deal_sections[0]);
+    }
+  }
+
+  try {
+    const { data: legacyRows, error: legacyError } = await supabase.from('daily_activity_reports')
+      .select('*')
+      .order('report_date', { ascending: false })
+      .limit(limit);
+    if (legacyError) throw legacyError;
+    for (const row of legacyRows || []) {
+      const key = row.report_date;
+      if (!key) continue;
+      const legacyAggregate = {
+        report_date: key,
+        headline: row.headline || `Daily log · ${key}`,
+        executive_summary: row.executive_summary || row.voice_script || null,
+        voice_script: row.voice_script || row.executive_summary || null,
+        voice_name: row.voice_name || null,
+        voice_note_sent_at: row.voice_note_sent_at || null,
+        deals_covered: Number(row.deals_covered || (Array.isArray(row.deal_sections) ? row.deal_sections.length : 0) || 0),
+        activity_count: Number(row.activity_count || 0),
+        status: row.status || 'generated',
+        raw_payload: row.raw_payload || null,
+        deal_sections: Array.isArray(row.deal_sections) ? row.deal_sections : [],
+      };
+      grouped.set(key, grouped.has(key) ? mergeAggregates(grouped.get(key), legacyAggregate) : legacyAggregate);
+    }
+  } catch {}
+
+  const todayEt = DateTime.now().setZone(ANALYTICS_TIMEZONE).toISODate();
+  const digestHour = Number(process.env.DAILY_ACTIVITY_DIGEST_HOUR_ET || 20);
+  if (todayEt && !grouped.has(todayEt)) {
+    grouped.set(todayEt, {
+      report_date: todayEt,
+      headline: `Daily log · ${todayEt}`,
+      executive_summary: null,
+      voice_script: null,
+      deals_covered: 0,
+      activity_count: 0,
+      status: 'pending',
+      raw_payload: {
+        message: `This daily log will be generated automatically at ${digestHour}:00 PM ET.`,
+      },
+      deal_sections: [],
     });
   }
-  return [...grouped.values()].sort((a, b) => new Date(b.report_date) - new Date(a.report_date)).slice(0, limit);
+
+  return [...grouped.values()]
+    .sort((a, b) => new Date(b.report_date) - new Date(a.report_date))
+    .slice(0, limit);
 }
 
 async function fetchElevenLabsVoices() {
