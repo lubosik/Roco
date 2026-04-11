@@ -175,8 +175,13 @@ export async function sendTelegramVoiceNote(voiceInput, options = {}) {
   try {
     return await bot.sendVoice(chatId, voiceInput, options);
   } catch (err) {
-    error('Telegram voice note send failed', { err: err.message });
-    return null;
+    warn('Telegram voice note send failed, retrying as audio', { err: err.message });
+    try {
+      return await bot.sendAudio(chatId, voiceInput, options);
+    } catch (audioErr) {
+      error('Telegram voice note send failed', { err: audioErr.message });
+      return null;
+    }
   }
 }
 

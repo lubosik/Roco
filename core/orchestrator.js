@@ -1451,10 +1451,11 @@ async function runDailyActivityDigestCycle(deals) {
   if (sb && targetDate) {
     try {
       const { data: existingReport } = await sb.from('daily_activity_reports')
-        .select('report_date, sent_to_telegram_at, voice_note_sent_at')
+        .select('report_date, headline, executive_summary, voice_script, telegram_caption, sent_to_telegram_at, voice_note_sent_at, voice_name')
         .eq('report_date', targetDate)
         .maybeSingle();
-      if (existingReport?.sent_to_telegram_at) {
+      const voiceDeliveryPending = !!existingReport?.sent_to_telegram_at && !existingReport?.voice_note_sent_at;
+      if (existingReport?.sent_to_telegram_at && !voiceDeliveryPending) {
         dailyActivityDigestState.set(targetDate, 'done');
         return;
       }
@@ -1467,13 +1468,24 @@ async function runDailyActivityDigestCycle(deals) {
 
   try {
     const reportReference = DateTime.fromISO(`${targetDate}T20:05:00`, { zone: 'America/New_York' });
-    const report = await buildDailyActivityReport({ deals, reference: reportReference });
-    let sentVoiceAt = null;
-    let voiceName = null;
+    let existingReport = null;
+    if (sb && targetDate) {
+      const { data } = await sb.from('daily_activity_reports')
+        .select('*')
+        .eq('report_date', targetDate)
+        .maybeSingle();
+      existingReport = data || null;
+    }
 
-    await sendTelegram(
-      `🧾 *ROCO Daily Log*\n_${reportReference.toFormat('d LLL yyyy')} · ${report.timezone}_\n\n*${report.headline || 'Daily operating log'}*\n${report.executive_summary || 'Daily summary generated.'}`
-    ).catch(() => {});
+    const report = existingReport || await buildDailyActivityReport({ deals, reference: reportReference });
+    let sentVoiceAt = null;
+    let voiceName = existingReport?.voice_name || null;
+
+    if (!existingReport?.sent_to_telegram_at) {
+      await sendTelegram(
+        `🧾 *ROCO Daily Log*\n_${reportReference.toFormat('d LLL yyyy')} · ${report.timezone}_\n\n*${report.headline || 'Daily operating log'}*\n${report.executive_summary || 'Daily summary generated.'}`
+      ).catch(() => {});
+    }
 
     try {
       const voiceNote = await renderDailyVoiceNoteFromText(report.voice_script || report.executive_summary || '');
@@ -1486,6 +1498,12 @@ async function runDailyActivityDigestCycle(deals) {
           voiceName = voiceNote.voiceName || null;
         }
         if (fs.existsSync(voiceNote.filePath)) fs.unlinkSync(voiceNote.filePath);
+      } else {
+        pushActivity({
+          type: 'warning',
+          action: 'Daily voice log skipped',
+          note: 'No ElevenLabs voice note was generated for the daily report',
+        });
       }
     } catch (voiceErr) {
       pushActivity({
@@ -1497,8 +1515,8 @@ async function runDailyActivityDigestCycle(deals) {
 
     await persistDailyActivityReport({
       ...report,
-      sent_to_telegram_at: new Date().toISOString(),
-      voice_note_sent_at: sentVoiceAt,
+      sent_to_telegram_at: existingReport?.sent_to_telegram_at || new Date().toISOString(),
+      voice_note_sent_at: sentVoiceAt || existingReport?.voice_note_sent_at || null,
       voice_name: voiceName,
     }).catch(() => {});
 
@@ -1508,7 +1526,12 @@ async function runDailyActivityDigestCycle(deals) {
       note: `${report.deals_covered || 0} deal${report.deals_covered === 1 ? '' : 's'} · ${report.activity_count || 0} activity events`,
     });
 
-    dailyActivityDigestState.set(targetDate, 'done');
+    const voiceCompleted = !!(sentVoiceAt || existingReport?.voice_note_sent_at || !report.voice_script);
+    if (voiceCompleted) {
+      dailyActivityDigestState.set(targetDate, 'done');
+    } else {
+      dailyActivityDigestState.delete(targetDate);
+    }
   } catch (err) {
     dailyActivityDigestState.delete(targetDate);
     throw err;

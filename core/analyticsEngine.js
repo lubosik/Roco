@@ -8,16 +8,25 @@ import os from 'os';
 import path from 'path';
 import { DateTime } from 'luxon';
 import { getSupabase } from './supabase.js';
-import { calculateGoalTracking, gatherCurrentMetrics } from './fundraiserBrain.js';
+import { gatherCurrentMetrics } from './fundraiserBrain.js';
 
 const ANALYTICS_TIMEZONE = 'America/New_York';
-const anthropic = process.env.ANTHROPIC_API_KEY
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  : null;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY || null;
 const ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io/v1';
-const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
-const ELEVENLABS_DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb';
+
+function getAnthropicClient() {
+  return process.env.ANTHROPIC_API_KEY
+    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+    : null;
+}
+
+function getElevenLabsConfig() {
+  return {
+    apiKey: process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY || null,
+    modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2',
+    defaultVoiceId: process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb',
+    voiceName: process.env.ELEVENLABS_VOICE_NAME || 'Configured voice',
+  };
+}
 
 export function getAnalyticsWindow(reference = DateTime.now().setZone(ANALYTICS_TIMEZONE)) {
   const end = reference.endOf('minute');
@@ -360,6 +369,7 @@ function toPersistedAnalyticsRow(snapshot) {
 }
 
 async function requestAiRecommendations(analyticsData) {
+  const anthropic = getAnthropicClient();
   if (!anthropic) return null;
 
   const dataStr = JSON.stringify(analyticsData, null, 2);
@@ -661,7 +671,123 @@ function summarizeDailyActionCounts(entries = []) {
   }, {});
 }
 
-async function buildDailyDealSnapshots(deals = [], activityEntries = []) {
+async function fetchDailyConversationEntries(window) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+
+  const { data, error } = await supabase.from('conversation_messages')
+    .select('*')
+    .gte('created_at', safeIso(window.start))
+    .lte('created_at', safeIso(window.end))
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
+function countDealActivityEntries(entries = [], expectedType) {
+  return entries.reduce((sum, entry) => (
+    String(entry?.event_type || '').toUpperCase() === expectedType ? sum + 1 : sum
+  ), 0);
+}
+
+function countDealActivityPattern(entries = [], pattern) {
+  return entries.reduce((sum, entry) => (
+    pattern.test(String(entry?.event_type || '').toUpperCase()) ? sum + 1 : sum
+  ), 0);
+}
+
+function buildPerDealDailyMetrics(dealId, activityEntries = [], conversationEntries = []) {
+  const key = String(dealId || '');
+  const dealActivity = activityEntries.filter(entry => String(entry?.deal_id || '') === key);
+  const inbound = conversationEntries.filter(entry =>
+    String(entry?.deal_id || '') === key && String(entry?.direction || '').toLowerCase() === 'inbound'
+  );
+
+  return {
+    li_invites_today: countDealActivityEntries(dealActivity, 'LINKEDIN_INVITE_SENT'),
+    emails_sent_today: countDealActivityEntries(dealActivity, 'EMAIL_SENT'),
+    dms_sent_today: countDealActivityEntries(dealActivity, 'LINKEDIN_DM_SENT'),
+    enrichment_actions: countDealActivityPattern(dealActivity, /(ENRICH|RESEARCH_COMPLETE)/),
+    invite_failures: countDealActivityPattern(dealActivity, /LINKEDIN_INVITE_FAILED/),
+    missing_linkedin: countDealActivityPattern(dealActivity, /LINKEDIN_INVITE_SKIPPED_NO_PROFILE/),
+    provider_limit_deferrals: countDealActivityPattern(dealActivity, /LINKEDIN_INVITE_PROVIDER_LIMIT/),
+    total_replies: inbound.length,
+    email_replies: inbound.filter(entry => String(entry?.channel || '').toLowerCase() === 'email').length,
+    linkedin_replies: inbound.filter(entry => String(entry?.channel || '').toLowerCase() === 'linkedin_dm').length,
+    positive_replies: inbound.filter(entry =>
+      ['interested_send_materials', 'interested_schedule_call', 'meeting_booked_confirmed'].includes(String(entry?.intent || ''))
+    ).length,
+  };
+}
+
+function pickReportingTargetEquity(deal = {}) {
+  const candidates = [
+    deal.target_equity,
+    deal.raise_target,
+    deal.equity_target,
+    deal.target_amount,
+    deal.fundraising_target,
+  ];
+
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (!Number.isFinite(value) || value <= 0) continue;
+    if (value >= 1000) return Number((value / 1_000_000).toFixed(2));
+    return value;
+  }
+
+  return 2;
+}
+
+function pickReportingMeetingsNeeded(deal = {}, targetEquity = 2) {
+  const direct = Number(deal.meetings_needed || deal.meeting_goal || deal.target_meetings);
+  if (Number.isFinite(direct) && direct > 0 && direct < 500) return Math.round(direct);
+  return Math.max(8, Math.ceil(targetEquity * 15));
+}
+
+function buildDailyReportingGoal(deal, metrics, launchContext) {
+  const targetEquity = pickReportingTargetEquity(deal);
+  const meetingsNeeded = pickReportingMeetingsNeeded(deal, targetEquity);
+  const meetingsBooked = Number(metrics?.meetings_booked || 0);
+  const firmsInPipeline = Number(metrics?.firms_in_pipeline || 0);
+  const totalReplies = Number(metrics?.total_replies || 0);
+  const todayTouches = Number(metrics?.li_invites_today || 0) + Number(metrics?.emails_sent_today || 0) + Number(metrics?.dms_sent_today || 0);
+
+  let status = '🟡 BUILDING MOMENTUM';
+  if (launchContext?.days_since_launch <= 4 && (todayTouches > 0 || firmsInPipeline >= 20 || totalReplies > 0)) {
+    status = '🟡 EARLY LAUNCH — building pipeline';
+  } else if (meetingsBooked >= meetingsNeeded) {
+    status = '🟢 ON TRACK';
+  } else if (firmsInPipeline < 10 && launchContext?.days_since_launch > 4) {
+    status = '🔴 CRITICAL';
+  } else if (totalReplies > 0 || firmsInPipeline >= 40) {
+    status = '🟡 BUILDING MOMENTUM';
+  } else {
+    status = '🟠 BEHIND PLAN';
+  }
+
+  return {
+    status,
+    target_equity: targetEquity,
+    meetings_needed: meetingsNeeded,
+    meetings_booked: meetingsBooked,
+    meetings_gap: Math.max(0, meetingsNeeded - meetingsBooked),
+  };
+}
+
+function pickDailyNextMove(dealName, metrics = {}, highlights = []) {
+  if (Number(metrics.provider_limit_deferrals || 0) > 0 && Number(metrics.emails_sent_today || 0) === 0) {
+    return `keep outbound moving through email while LinkedIn throttling clears for ${dealName}`;
+  }
+  if (Number(metrics.missing_linkedin || 0) >= 3) {
+    return `skip unmatched LinkedIn profiles cleanly and keep the next valid contacts moving for ${dealName}`;
+  }
+  return highlights[0] || `keep ${dealName} moving toward the current target`;
+}
+
+async function buildDailyDealSnapshots(deals = [], activityEntries = [], conversationEntries = [], window = getDailyActivityWindow()) {
+  const supabase = getSupabase();
   const activityByDeal = new Map();
   for (const entry of activityEntries) {
     const dealId = entry.deal_id ? String(entry.deal_id) : null;
@@ -673,14 +799,28 @@ async function buildDailyDealSnapshots(deals = [], activityEntries = []) {
   const snapshots = [];
   for (const deal of deals) {
     if (!deal?.id) continue;
-    const metrics = await gatherCurrentMetrics(deal.id).catch(() => ({}));
-    const goal = calculateGoalTracking(deal, metrics);
+    const currentMetrics = await gatherCurrentMetrics(deal.id).catch(() => ({}));
+    let firmsInPipeline = Number(currentMetrics?.firms_in_pipeline || 0);
+    if (!firmsInPipeline && supabase) {
+      try {
+        const { count } = await supabase.from('batch_firms')
+          .select('id', { count: 'exact', head: true })
+          .eq('deal_id', deal.id);
+        firmsInPipeline = Number(count || 0);
+      } catch {}
+    }
+    const metrics = {
+      ...currentMetrics,
+      ...buildPerDealDailyMetrics(deal.id, activityEntries, conversationEntries),
+      firms_in_pipeline: firmsInPipeline,
+    };
     const entries = activityByDeal.get(String(deal.id)) || [];
     const highlights = entries
       .slice(0, 8)
       .map(entry => normalizeWhitespace(entry.action || entry.summary || entry.note || ''))
       .filter(Boolean);
-    const launchContext = describeLaunchWindow(deal, metrics);
+    const launchContext = describeLaunchWindow(deal, metrics, window.end);
+    const goal = buildDailyReportingGoal(deal, metrics, launchContext);
 
     snapshots.push({
       deal_id: deal.id,
@@ -696,7 +836,7 @@ async function buildDailyDealSnapshots(deals = [], activityEntries = []) {
           ? `increase outbound volume and unlock the next best contacts for ${deal.name}`
           : goal.status === 'BEHIND'
             ? `push the highest-conviction investors and convert activity into live conversations for ${deal.name}`
-            : highlights[0] || `keep ${deal.name} moving toward the ${goal.target_equity} million target`
+            : pickDailyNextMove(deal.name, metrics, highlights)
       ),
       activity_count: entries.length,
     });
@@ -772,10 +912,9 @@ function buildDailyGlobalMetrics(dealSnapshots = [], activityEntries = []) {
     firms_in_pipeline: 0,
   });
 
-  const activityCounts = summarizeDailyActionCounts(activityEntries);
-  totals.enrichment_actions = Number(activityCounts.enrichment || 0);
-  totals.invite_failures = (activityEntries || []).filter(entry => String(entry.event_type || '').includes('LINKEDIN_INVITE_FAILED')).length;
-  totals.missing_linkedin = (activityEntries || []).filter(entry => String(entry.event_type || '').includes('LINKEDIN_INVITE_SKIPPED_NO_PROFILE')).length;
+  totals.enrichment_actions = dealSnapshots.reduce((sum, snapshot) => sum + Number(snapshot?.metrics?.enrichment_actions || 0), 0);
+  totals.invite_failures = dealSnapshots.reduce((sum, snapshot) => sum + Number(snapshot?.metrics?.invite_failures || 0), 0);
+  totals.missing_linkedin = dealSnapshots.reduce((sum, snapshot) => sum + Number(snapshot?.metrics?.missing_linkedin || 0), 0);
   return totals;
 }
 
@@ -799,12 +938,12 @@ function sanitizeDailyReport(aiReport = {}) {
   };
 }
 
-function describeLaunchWindow(deal, metrics = {}) {
+function describeLaunchWindow(deal, metrics = {}, reference = DateTime.now().setZone(ANALYTICS_TIMEZONE)) {
   const timezone = getDealAnalyticsTimezone(deal);
   const createdAt = deal?.created_at ? DateTime.fromISO(deal.created_at, { zone: 'utc' }) : null;
   const launchDate = createdAt?.isValid ? createdAt.setZone(timezone) : null;
   const daysSinceLaunch = launchDate
-    ? Math.max(1, Math.ceil(DateTime.now().setZone(timezone).diff(launchDate, 'days').days))
+    ? Math.max(1, Math.ceil(reference.setZone(timezone).diff(launchDate, 'days').days))
     : null;
   const todayTouches = Number(metrics.li_invites_today || 0) + Number(metrics.emails_sent_today || 0) + Number(metrics.dms_sent_today || 0);
   const activePipeline = Number(metrics.firms_in_pipeline || 0);
@@ -880,6 +1019,7 @@ function buildPreviousReportContext(previousReport) {
 }
 
 async function buildAiDailyReport(window, activityEntries, dealSnapshots, previousReport = null) {
+  const anthropic = getAnthropicClient();
   if (!anthropic) throw new Error('Anthropic unavailable');
   const globalMetrics = buildDailyGlobalMetrics(dealSnapshots, activityEntries);
   const previousContext = buildPreviousReportContext(previousReport);
@@ -954,8 +1094,9 @@ Return ONLY valid JSON:
 export async function buildDailyActivityReport({ deals = [], reference = DateTime.now().setZone(ANALYTICS_TIMEZONE) } = {}) {
   const window = getDailyActivityWindow(reference);
   const activityEntries = await fetchDailyActivityEntries(window);
+  const conversationEntries = await fetchDailyConversationEntries(window).catch(() => []);
   const reportDeals = await fetchDealsForDailyLog(deals, activityEntries);
-  const dealSnapshots = await buildDailyDealSnapshots(reportDeals, activityEntries);
+  const dealSnapshots = await buildDailyDealSnapshots(reportDeals, activityEntries, conversationEntries, window);
   const previousReport = await fetchPreviousDailyActivityReport(window.reportDate).catch(() => null);
 
   let aiReport = null;
@@ -978,6 +1119,7 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
       ai_report: aiReport,
       deal_snapshots: dealSnapshots,
       action_counts: summarizeDailyActionCounts(activityEntries),
+      conversation_count: conversationEntries.length,
       previous_report: buildPreviousReportContext(previousReport),
     },
     activity_count: activityEntries.length,
@@ -1028,9 +1170,10 @@ export async function listDailyActivityReports(limit = 90) {
 }
 
 async function fetchElevenLabsVoices() {
-  if (!ELEVENLABS_API_KEY) return [];
+  const { apiKey } = getElevenLabsConfig();
+  if (!apiKey) return [];
   const response = await fetch(`${ELEVENLABS_BASE_URL}/voices`, {
-    headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+    headers: { 'xi-api-key': apiKey },
   });
   if (!response.ok) {
     const err = await response.text().catch(() => '');
@@ -1061,14 +1204,15 @@ function choosePreferredElevenLabsVoice(voices = []) {
 }
 
 async function synthesizeElevenLabsVoice(voiceId, text) {
+  const { apiKey, modelId } = getElevenLabsConfig();
   const response = await fetch(`${ELEVENLABS_BASE_URL}/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
     method: 'POST',
     headers: {
-      'xi-api-key': ELEVENLABS_API_KEY,
+      'xi-api-key': apiKey,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model_id: ELEVENLABS_MODEL_ID,
+      model_id: modelId,
       text: normalizeWhitespace(text).slice(0, 1150),
       voice_settings: {
         stability: 0.45,
@@ -1091,14 +1235,15 @@ async function synthesizeElevenLabsVoice(voiceId, text) {
 }
 
 export async function renderDailyVoiceNoteFromText(text) {
-  if (!ELEVENLABS_API_KEY || !normalizeWhitespace(text)) return null;
+  const config = getElevenLabsConfig();
+  if (!config.apiKey || !normalizeWhitespace(text)) return null;
 
   const attempts = [];
 
-  if (ELEVENLABS_DEFAULT_VOICE_ID) {
+  if (config.defaultVoiceId) {
     attempts.push({
-      voiceId: ELEVENLABS_DEFAULT_VOICE_ID,
-      voiceName: process.env.ELEVENLABS_VOICE_NAME || 'Configured voice',
+      voiceId: config.defaultVoiceId,
+      voiceName: config.voiceName,
     });
   }
 
