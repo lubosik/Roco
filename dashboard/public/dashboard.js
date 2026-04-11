@@ -8216,8 +8216,9 @@ function renderInvestorTable(rows, total, pages) {
       : (r._deal_count > 0
         ? `<button onclick="showInvestorDealHistory('${r.id}','${esc(r.name)}')" style="background:none;border:none;cursor:pointer;color:#6b7280;font-size:11px;padding:0">${r._deal_count} deal(s)</button>`
         : '<span style="color:#374151;font-size:11px">—</span>');
-    return `<tr>
-      <td><span style="font-weight:500;color:var(--text-bright)">${esc(r.name || '—')}</span><br><span style="font-size:11px;color:var(--text-muted)">${esc(r.hq_country || r.hq_location || '')}</span></td>
+    const rowClick = r.linked_contact_id ? `onclick="openContactSidePanel('${r.linked_contact_id}', null)" style="cursor:pointer"` : '';
+    return `<tr ${rowClick}>
+      <td><span style="font-weight:500;color:var(--text-bright)">${esc(r.name || '—')}</span><br><span style="font-size:11px;color:var(--text-muted)">${esc(r.hq_country || r.hq_location || '')}</span>${r.description ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.description)}</div>` : ''}</td>
       <td style="font-size:12px">${esc(r.investor_type || '—')}</td>
       <td>${getContactTypeBadge(r.contact_type, r.is_angel)}</td>
       <td style="font-size:12px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.preferred_industries || '')}">${esc((r.preferred_industries || '—').substring(0, 40))}</td>
@@ -9082,7 +9083,7 @@ async function loadMeetingTranscriptsPage() {
         <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px">
           <div>
             <div style="font-size:14px;color:var(--text-bright)">${esc(row.investor_name || 'Unknown investor')}</div>
-            <div style="font-size:12px;color:var(--text-dim)">${esc(row.deal_name || 'Unknown deal')}</div>
+            <div style="font-size:12px;color:var(--text-dim)">${esc(row.investor_email || row.investor_linkedin || 'Investor record')}</div>
           </div>
           <div style="text-align:right">
             <div style="font-size:12px;color:${Number(row.sentiment_score || 0) >= 8 ? '#4ade80' : Number(row.sentiment_score || 0) >= 5 ? '#fbbf24' : '#f87171'}">${row.sentiment_score ? `Sentiment ${row.sentiment_score}/10` : 'Pending analysis'}</div>
@@ -9099,7 +9100,6 @@ async function loadMeetingTranscriptsPage() {
 }
 
 async function openTranscriptUploadModal() {
-  const deals = Array.isArray(allDeals) && allDeals.length ? allDeals.filter(d => String(d.status || '').toLowerCase() === 'active') : await api('/api/deals');
   const modal = document.createElement('div');
   modal.id = 'transcript-upload-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:2000;display:flex;align-items:center;justify-content:center;padding:24px';
@@ -9112,36 +9112,35 @@ async function openTranscriptUploadModal() {
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
         <div>
-          <label class="form-label">Active Deal</label>
-          <select class="form-input" id="transcript-deal" onchange="loadTranscriptDealContacts(this.value)">
-            <option value="">Select deal</option>
-            ${(deals || []).filter(d => String(d.status || '').toLowerCase() === 'active').map(deal => `<option value="${esc(deal.id)}">${esc(deal.name)}</option>`).join('')}
-          </select>
-        </div>
-        <div>
           <label class="form-label">Investor Type</label>
           <select class="form-input" id="transcript-mode" onchange="toggleTranscriptInvestorMode()">
             <option value="existing">Existing investor</option>
             <option value="new">New investor</option>
           </select>
         </div>
+        <div>
+          <label class="form-label">Source File</label>
+          <input class="form-input" id="transcript-file" type="file" accept=".pdf,.doc,.docx,.txt,.md" />
+        </div>
       </div>
       <div id="transcript-existing-wrap" style="margin-top:16px">
         <label class="form-label">Existing Investor</label>
-        <input class="form-input" id="transcript-contact-search" placeholder="Search contact name or firm" oninput="filterTranscriptContacts(this.value)" />
+        <input class="form-input" id="transcript-contact-search" placeholder="Search database name, email, or firm" oninput="searchTranscriptExisting(this.value)" />
         <select class="form-input" id="transcript-contact" style="margin-top:8px"><option value="">Select contact</option></select>
       </div>
       <div id="transcript-new-wrap" style="display:none;margin-top:16px">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
           <div><label class="form-label">Name</label><input class="form-input" id="transcript-new-name" /></div>
           <div><label class="form-label">Email</label><input class="form-input" id="transcript-new-email" /></div>
+          <div><label class="form-label">Firm Name</label><input class="form-input" id="transcript-new-firm" /></div>
+          <div><label class="form-label">Category</label><select class="form-input" id="transcript-new-category"><option value="institutional">Institutional</option><option value="angel">Angel / UHNW</option><option value="athlete">Athlete / Creator</option><option value="family_office">Family Office</option></select></div>
           <div><label class="form-label">Phone</label><input class="form-input" id="transcript-new-phone" /></div>
           <div><label class="form-label">LinkedIn URL</label><input class="form-input" id="transcript-new-linkedin" /></div>
         </div>
       </div>
       <div style="margin-top:16px">
-        <label class="form-label">Transcript</label>
-        <textarea class="form-input" id="transcript-text" rows="14" style="min-height:260px"></textarea>
+        <label class="form-label">Transcript Text</label>
+        <textarea class="form-input" id="transcript-text" rows="14" style="min-height:260px" placeholder="Optional if you upload PDF/DOC/DOCX/TXT."></textarea>
       </div>
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px">
         <button class="btn btn-ghost" onclick="document.getElementById('transcript-upload-modal').remove()">Cancel</button>
@@ -9160,53 +9159,51 @@ window.toggleTranscriptInvestorMode = function() {
   if (newWrap) newWrap.style.display = mode === 'new' ? '' : 'none';
 };
 
-window.loadTranscriptDealContacts = async function(dealId) {
-  transcriptDealContacts = [];
+window.searchTranscriptExisting = async function(query) {
   const select = document.getElementById('transcript-contact');
   if (!select) return;
-  select.innerHTML = '<option value="">Loading contacts...</option>';
-  if (!dealId) {
+  const q = String(query || '').toLowerCase().trim();
+  if (!q) {
     select.innerHTML = '<option value="">Select contact</option>';
     return;
   }
+  select.innerHTML = '<option value="">Searching...</option>';
   try {
-    const rows = await api(`/api/pipeline?dealId=${encodeURIComponent(dealId)}`);
-    transcriptDealContacts = Array.isArray(rows) ? rows : (rows.contacts || []);
-    filterTranscriptContacts('');
+    const rows = await api(`/api/meeting-transcripts/search-existing?search=${encodeURIComponent(q)}`);
+    transcriptDealContacts = Array.isArray(rows) ? rows : [];
+    select.innerHTML = '<option value="">Select contact</option>' + transcriptDealContacts.map(row => `<option value="${esc(row.id)}">${esc(row.name || '—')} · ${esc(row.company_name || 'No firm')} · ${esc(row.email || 'no email')}</option>`).join('');
   } catch (err) {
     select.innerHTML = `<option value="">${esc(err.message)}</option>`;
   }
 };
 
-window.filterTranscriptContacts = function(query) {
-  const select = document.getElementById('transcript-contact');
-  if (!select) return;
-  const q = String(query || '').toLowerCase().trim();
-  const rows = transcriptDealContacts.filter(row => !q || String(row.name || '').toLowerCase().includes(q) || String(row.firm || row.company || '').toLowerCase().includes(q));
-  select.innerHTML = '<option value="">Select contact</option>' + rows.map(row => `<option value="${esc(row.id)}">${esc(row.name || '—')} · ${esc(row.firm || row.company || '—')}</option>`).join('');
-};
-
 window.submitTranscriptUpload = async function() {
-  const dealId = document.getElementById('transcript-deal')?.value;
   const mode = document.getElementById('transcript-mode')?.value || 'existing';
   const transcriptText = document.getElementById('transcript-text')?.value?.trim();
+  const transcriptFile = document.getElementById('transcript-file')?.files?.[0] || null;
   const contactId = document.getElementById('transcript-contact')?.value || null;
   const investorName = document.getElementById('transcript-new-name')?.value?.trim();
-  if (!dealId || !transcriptText || (mode === 'existing' && !contactId) || (mode === 'new' && !investorName)) {
-    showToast('Deal, investor, and transcript are required', 'error');
+  if ((!transcriptText && !transcriptFile) || (mode === 'existing' && !contactId) || (mode === 'new' && !investorName)) {
+    showToast('Investor and transcript file/text are required', 'error');
     return;
   }
   try {
-    await api('/api/meeting-transcripts', 'POST', {
-      deal_id: dealId,
-      investor_mode: mode,
-      contact_id: mode === 'existing' ? contactId : null,
-      investor_name: mode === 'new' ? investorName : null,
-      investor_email: document.getElementById('transcript-new-email')?.value?.trim() || null,
-      investor_phone: document.getElementById('transcript-new-phone')?.value?.trim() || null,
-      investor_linkedin: document.getElementById('transcript-new-linkedin')?.value?.trim() || null,
-      transcript_text: transcriptText,
-    });
+    const fd = new FormData();
+    fd.append('investor_mode', mode);
+    if (mode === 'existing') fd.append('contact_id', contactId);
+    if (mode === 'new') {
+      fd.append('investor_name', investorName);
+      fd.append('investor_email', document.getElementById('transcript-new-email')?.value?.trim() || '');
+      fd.append('investor_phone', document.getElementById('transcript-new-phone')?.value?.trim() || '');
+      fd.append('investor_linkedin', document.getElementById('transcript-new-linkedin')?.value?.trim() || '');
+      fd.append('investor_firm', document.getElementById('transcript-new-firm')?.value?.trim() || '');
+      fd.append('investor_category', document.getElementById('transcript-new-category')?.value || '');
+    }
+    if (transcriptText) fd.append('transcript_text', transcriptText);
+    if (transcriptFile) fd.append('file', transcriptFile);
+    const res = await fetch('/api/meeting-transcripts', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
     document.getElementById('transcript-upload-modal')?.remove();
     showToast('Transcript uploaded');
     loadMeetingTranscriptsPage();

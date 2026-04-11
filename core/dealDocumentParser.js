@@ -231,20 +231,7 @@ export async function parseDealDocument(filePath, filename, broadcastFn = null) 
   console.log(`[DEAL PARSER] Parsing: ${filename}`);
   broadcastFn?.('Reading document...');
 
-  const ext = path.extname(filename).toLowerCase();
-  let extractedText = '';
-
-  if (ext === '.pdf') {
-    const buffer = fs.readFileSync(filePath);
-    const data = await pdfParse(buffer);
-    extractedText = data.text;
-  } else if (ext === '.docx') {
-    const mammoth = (await import('mammoth')).default;
-    const result = await mammoth.extractRawText({ path: filePath });
-    extractedText = result.value;
-  } else {
-    extractedText = fs.readFileSync(filePath, 'utf-8');
-  }
+  const extractedText = await extractDocumentText(filePath, filename);
 
   broadcastFn?.('Document read — classifying deal...');
 
@@ -286,4 +273,19 @@ export async function parseDealDocument(filePath, filename, broadcastFn = null) 
       },
     };
   }
+}
+
+export async function extractDocumentText(filePath, filename) {
+  const ext = path.extname(filename).toLowerCase();
+  if (ext === '.pdf') {
+    const buffer = fs.readFileSync(filePath);
+    const data = await pdfParse(buffer);
+    return data.text;
+  }
+  if (ext === '.docx' || ext === '.doc') {
+    const mammoth = (await import('mammoth')).default;
+    const result = await mammoth.extractRawText({ path: filePath });
+    return result.value;
+  }
+  return fs.readFileSync(filePath, 'utf-8');
 }

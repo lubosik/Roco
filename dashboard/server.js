@@ -545,6 +545,11 @@ function normaliseTranscriptAnalysis(parsed = {}) {
   const followUps = asJsonArray(parsed.follow_up_actions || parsed.recommended_follow_up_actions);
   return {
     summary: String(parsed.summary || '').trim(),
+    investor_name: String(parsed.investor_name || parsed.name || '').trim(),
+    firm_name: String(parsed.firm_name || parsed.firm || parsed.company_name || '').trim(),
+    investor_type: String(parsed.investor_type || parsed.contact_type || '').trim(),
+    location: String(parsed.location || parsed.where_they_live || parsed.hq_location || '').trim(),
+    role_title: String(parsed.role_title || parsed.title || '').trim(),
     investment_thesis: String(parsed.investment_thesis || parsed.investor_thesis || '').trim(),
     sectors_of_interest: interests,
     cheque_size_range: String(parsed.cheque_size_range || parsed.cheque_size || '').trim(),
@@ -560,18 +565,58 @@ function normaliseTranscriptAnalysis(parsed = {}) {
   };
 }
 
-async function analyzeMeetingTranscript({ deal, transcriptText, investorName }) {
-  const prompt = `You are Roco. Analyse this meeting transcript. Extract: 1) investment preferences and thesis of this investor, 2) sectors and deal types they are interested in, 3) cheque size range if mentioned, 4) any AUM or fund size mentioned, 5) past investments or portfolio companies mentioned, 6) positive intent signals (things that suggest interest), 7) negative signals or objections, 8) overall sentiment score 1 to 10, 9) recommended follow-up actions. Return structured JSON.
+async function buildTranscriptAnalysisContext(sb, linkedContact = null) {
+  const [dealsRes, activityRes] = await Promise.all([
+    sb.from('deals').select('id, name, sector, geography, investor_profile, status').order('created_at', { ascending: false }).limit(12).then(result => result).catch(() => ({ data: [] })),
+    sb.from('activity_log').select('deal_id, event_type, summary, created_at').order('created_at', { ascending: false }).limit(40).then(result => result).catch(() => ({ data: [] })),
+  ]);
+  return {
+    active_deals: (dealsRes.data || []).map(deal => ({
+      id: deal.id,
+      name: deal.name,
+      sector: deal.sector,
+      geography: deal.geography,
+      investor_profile: deal.investor_profile || null,
+      status: deal.status,
+    })),
+    recent_activity: (activityRes.data || []).map(entry => ({
+      deal_id: entry.deal_id || null,
+      event_type: entry.event_type || null,
+      summary: entry.summary || null,
+      created_at: entry.created_at || null,
+    })),
+    existing_investor_record: linkedContact ? {
+      name: linkedContact.name || null,
+      firm_name: linkedContact.company_name || null,
+      title: linkedContact.job_title || null,
+      email: linkedContact.email || null,
+      linkedin_url: linkedContact.linkedin_url || null,
+      notes: linkedContact.notes || null,
+      investment_thesis: linkedContact.investment_thesis || null,
+      past_investments: linkedContact.past_investments || null,
+      intent_signals: linkedContact.intent_signals || null,
+    } : null,
+  };
+}
 
-DEAL
-${JSON.stringify({
-    deal_name: deal?.name || null,
-    sector: deal?.sector || null,
-    geography: deal?.geography || null,
-  }, null, 2)}
+async function analyzeMeetingTranscript({ transcriptText, investorName, linkedContact = null }) {
+  const sb = getSupabase();
+  const context = sb ? await buildTranscriptAnalysisContext(sb, linkedContact).catch(() => ({})) : {};
+  const prompt = `You are Roco. Analyse this meeting transcript in the context of the full fundraising dashboard.
 
-INVESTOR
-${investorName || 'Unknown investor'}
+GLOBAL CONTEXT
+${JSON.stringify(context, null, 2)}
+
+TASK
+1. Identify the investor's full name, firm name, title, location, and whether they appear to be an angel/UHNW, athlete, family office, VC, PE investor, or other investor type.
+2. Extract their investment preferences and thesis.
+3. Extract sectors, stages, cheque size, AUM or fund size, geography, lifestyle/personal details if clearly useful, and any past investments or portfolio companies mentioned.
+4. Extract positive intent signals, negative signals or objections, overall sentiment score 1 to 10, and concrete follow-up actions.
+5. If an existing investor record is present in context, reconcile against it and include any new information that should be merged in.
+6. Return structured JSON only.
+
+KNOWN INVESTOR LABEL
+${investorName || linkedContact?.name || 'Unknown investor'}
 
 TRANSCRIPT
 ${transcriptText}`;
@@ -589,6 +634,70 @@ function buildConversationHistoryEntry({ type, date, summary, sentiment = null }
     summary,
     sentiment,
   };
+}
+
+async function upsertTranscriptInvestorDatabaseRecord(sb, { analysis, contact, investorEmail, investorName, firmName }) {
+  if (!sb) return null;
+  const lookupEmail = String(investorEmail || contact?.email || '').trim();
+  const lookupName = String(investorName || analysis.investor_name || contact?.name || '').trim();
+  let existing = null;
+
+  if (lookupEmail) {
+    const { data } = await sb.from('investors_db')
+      .select('*')
+      .or(`email.eq.${lookupEmail},primary_contact_email.eq.${lookupEmail}`)
+      .limit(1)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    existing = data || null;
+  }
+  if (!existing && lookupName) {
+    const { data } = await sb.from('investors_db')
+      .select('*')
+      .ilike('name', lookupName)
+      .limit(1)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    existing = data || null;
+  }
+
+  const payload = {
+    name: lookupName || analysis.firm_name || firmName || 'Unknown investor',
+    email: lookupEmail || null,
+    primary_contact_email: lookupEmail || null,
+    investor_type: analysis.investor_type || existing?.investor_type || null,
+    contact_type: (analysis.investor_type || '').toLowerCase().includes('angel') || (analysis.investor_type || '').toLowerCase().includes('uhnw')
+      ? 'angel'
+      : existing?.contact_type || 'individual_at_firm',
+    is_angel: (analysis.investor_type || '').toLowerCase().includes('angel') || (analysis.investor_type || '').toLowerCase().includes('uhnw'),
+    preferred_industries: analysis.sectors_of_interest.join(', ') || existing?.preferred_industries || null,
+    description: [
+      analysis.summary,
+      analysis.firm_name ? `Firm: ${analysis.firm_name}` : (firmName ? `Firm: ${firmName}` : null),
+      analysis.role_title ? `Title: ${analysis.role_title}` : null,
+      analysis.location ? `Location: ${analysis.location}` : null,
+      analysis.investment_thesis ? `Thesis: ${analysis.investment_thesis}` : null,
+    ].filter(Boolean).join(' | ').slice(0, 2000),
+    enrichment_status: 'transcript_enriched',
+    hq_location: analysis.location || existing?.hq_location || null,
+    hq_country: analysis.location || existing?.hq_country || null,
+    last_investment_company: analysis.past_investments[0] || existing?.last_investment_company || null,
+    notes: [
+      analysis.cheque_size_range ? `Cheque size: ${analysis.cheque_size_range}` : null,
+      analysis.aum ? `AUM/Fund size: ${analysis.aum}` : null,
+      analysis.follow_up_actions.length ? `Follow-up: ${analysis.follow_up_actions.join('; ')}` : null,
+    ].filter(Boolean).join(' | ').slice(0, 2000),
+  };
+
+  let record = null;
+  if (existing?.id) {
+    const { data } = await sb.from('investors_db').update(payload).eq('id', existing.id).select('*').single().catch(() => ({ data: existing }));
+    record = data || existing;
+  } else {
+    const { data } = await sb.from('investors_db').insert(payload).select('*').single().catch(() => ({ data: null }));
+    record = data || null;
+  }
+  return record;
 }
 
 function mergeDealSettings(currentSettings, patch) {
@@ -3507,12 +3616,34 @@ function registerRoutes(app) {
     }
   });
 
-  app.post('/api/meeting-transcripts', async (req, res) => {
+  app.get('/api/meeting-transcripts/search-existing', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const search = String(req.query.search || '').trim();
+      if (!search) return res.json([]);
+      const { data, error: dbErr } = await sb.from('contacts')
+        .select('id, name, email, company_name, job_title, linkedin_url, investment_thesis, past_investments, intent_signals')
+        .or(`name.ilike.%${search}%,email.ilike.%${search}%,company_name.ilike.%${search}%`)
+        .order('updated_at', { ascending: false })
+        .limit(20);
+      if (dbErr) throw new Error(dbErr.message);
+      res.json(data || []);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/meeting-transcripts', (req, res, next) => {
+    fileUpload(req, res, (err) => {
+      if (err) return res.status(400).json({ error: err.message });
+      next();
+    });
+  }, async (req, res) => {
     try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
       const {
-        deal_id,
         investor_mode,
         contact_id,
         investor_name,
@@ -3520,12 +3651,19 @@ function registerRoutes(app) {
         investor_phone,
         investor_linkedin,
         transcript_text,
+        investor_firm,
+        investor_category,
       } = req.body || {};
-      if (!deal_id || !transcript_text || !(contact_id || investor_name)) {
-        return res.status(400).json({ error: 'deal_id, transcript_text, and investor identity are required' });
+      let transcriptBody = String(transcript_text || '').trim();
+      if (!transcriptBody && req.file?.path) {
+        const { extractDocumentText } = await import('../core/dealDocumentParser.js');
+        transcriptBody = String(await extractDocumentText(req.file.path, req.file.originalname)).trim();
+      }
+      if (!(contact_id || investor_name) || !transcriptBody) {
+        if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: 'Investor identity and transcript content are required' });
       }
 
-      const { data: deal } = await sb.from('deals').select('id, name, sector, geography').eq('id', deal_id).single();
       const isExistingInvestor = investor_mode !== 'new';
       let contact = null;
       if (isExistingInvestor && contact_id) {
@@ -3534,23 +3672,24 @@ function registerRoutes(app) {
       }
 
       const baseTranscript = {
-        deal_id,
+        deal_id: contact?.deal_id || null,
         contact_id: contact?.id || null,
         investor_name: contact?.name || investor_name,
         investor_email: contact?.email || investor_email || null,
         investor_phone: contact?.phone || investor_phone || null,
         investor_linkedin: contact?.linkedin_url || investor_linkedin || null,
         is_new_investor: !isExistingInvestor,
-        transcript_text,
+        transcript_text: transcriptBody,
       };
       const { data: insertedTranscript, error: insertErr } = await sb.from('meeting_transcripts').insert(baseTranscript).select('*').single();
       if (insertErr) throw new Error(insertErr.message);
 
       const analysis = await analyzeMeetingTranscript({
-        deal,
-        transcriptText: transcript_text,
+        transcriptText: transcriptBody,
         investorName: baseTranscript.investor_name,
+        linkedContact: contact,
       });
+      if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
 
       const historyEntry = buildConversationHistoryEntry({
         type: 'meeting',
@@ -3569,6 +3708,8 @@ function registerRoutes(app) {
           meeting_count: Number(contact.meeting_count || 0) + 1,
           last_meeting_date: new Date().toISOString(),
           conversation_history: [...existingHistory, historyEntry],
+          company_name: analysis.firm_name || contact.company_name || investor_firm || null,
+          job_title: analysis.role_title || contact.job_title || null,
           sector_focus: analysis.sectors_of_interest.join(', ') || contact.sector_focus || null,
           typical_cheque_size: analysis.cheque_size_range || contact.typical_cheque_size || null,
           pipeline_stage: 'Meeting Held',
@@ -3577,12 +3718,13 @@ function registerRoutes(app) {
         contact = data || contact;
       } else {
         const { data } = await sb.from('contacts').insert({
-          deal_id,
+          deal_id: null,
           name: investor_name,
           email: investor_email || null,
           phone: investor_phone || null,
           linkedin_url: investor_linkedin || null,
-          company_name: null,
+          company_name: analysis.firm_name || investor_firm || null,
+          job_title: analysis.role_title || null,
           aum: analysis.aum || null,
           investment_thesis: analysis.investment_thesis || null,
           past_investments: analysis.past_investments,
@@ -3592,10 +3734,22 @@ function registerRoutes(app) {
           conversation_history: [historyEntry],
           sector_focus: analysis.sectors_of_interest.join(', ') || null,
           typical_cheque_size: analysis.cheque_size_range || null,
+          notes: analysis.summary || null,
           pipeline_stage: 'Meeting Held',
         }).select('*').single();
         contact = data || null;
       }
+
+      const investorDbRecord = await upsertTranscriptInvestorDatabaseRecord(sb, {
+        analysis: {
+          ...analysis,
+          investor_type: analysis.investor_type || investor_category || null,
+        },
+        contact,
+        investorEmail: baseTranscript.investor_email,
+        investorName: analysis.investor_name || baseTranscript.investor_name,
+        firmName: analysis.firm_name || investor_firm || null,
+      });
 
       await sb.from('meeting_transcripts').update({
         contact_id: contact?.id || insertedTranscript.contact_id || null,
@@ -3615,9 +3769,11 @@ function registerRoutes(app) {
         success: true,
         transcript_id: insertedTranscript.id,
         contact_id: contact?.id || null,
+        investors_db_id: investorDbRecord?.id || null,
         analysis,
       });
     } catch (err) {
+      if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
       res.status(500).json({ error: err.message });
     }
   });
@@ -6339,7 +6495,7 @@ function registerRoutes(app) {
         'id, name, hq_country, hq_location, investor_type, contact_type, is_angel, preferred_industries, ' +
         'aum_millions, preferred_deal_size_min, preferred_deal_size_max, preferred_ebitda_min, preferred_ebitda_max, ' +
         'last_investment_date, last_investment_company, investments_last_12m, email, primary_contact_email, ' +
-        'investor_category, enrichment_status',
+        'investor_category, enrichment_status, description, notes',
         { count: 'planned' }
       );
       if (search) query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%,preferred_industries.ilike.%${search}%,hq_city.ilike.%${search}%`);
@@ -6357,8 +6513,27 @@ function registerRoutes(app) {
       const { data, error: dbErr, count } = await query;
       if (dbErr) throw new Error(dbErr.message);
 
+      const investors = data || [];
+      const contactLinks = new Map();
+      const emailsToMatch = investors
+        .map(row => String(row.email || row.primary_contact_email || '').trim())
+        .filter(Boolean);
+      if (emailsToMatch.length) {
+        const { data: linkedContacts } = await sb.from('contacts')
+          .select('id, email')
+          .in('email', emailsToMatch)
+          .then(result => result)
+          .catch(() => ({ data: [] }));
+        for (const row of linkedContacts || []) {
+          if (row.email) contactLinks.set(String(row.email).trim().toLowerCase(), row.id);
+        }
+      }
+
       res.json({
-        investors: data || [],
+        investors: investors.map(row => ({
+          ...row,
+          linked_contact_id: contactLinks.get(String(row.email || row.primary_contact_email || '').trim().toLowerCase()) || null,
+        })),
         total: count || 0,
         page: Number(page),
         limit: Number(limit),
