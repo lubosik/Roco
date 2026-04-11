@@ -52,6 +52,18 @@ const activityFeed = [];
 const MAX_FEED = 200;
 const campaignFirmLinkCache = new Map();
 const CAMPAIGN_FIRM_LINK_TTL_MS = 6 * 60 * 60 * 1000;
+const INVESTOR_DB_SUMMARY_TTL_MS = 5 * 60 * 1000;
+let investorDbSummaryCache = {
+  expiresAt: 0,
+  value: null,
+};
+
+function invalidateInvestorDbSummaryCache() {
+  investorDbSummaryCache = {
+    expiresAt: 0,
+    value: null,
+  };
+}
 
 function getActivityTimestamp(entry) {
   const raw = entry?.created_at || entry?.timestamp || entry?.createdAt || null;
@@ -832,6 +844,63 @@ async function getDealNameMap(sb, dealIds = []) {
   if (!sb || ids.length === 0) return {};
   const { data } = await sb.from('deals').select('id, name').in('id', ids);
   return Object.fromEntries((data || []).map(deal => [String(deal.id), deal.name || 'Unknown Project']));
+}
+
+async function buildInvestorDbSummary(sb) {
+  const { count: total, error: totalError } = await sb.from('investors_db')
+    .select('id', { count: 'exact', head: true });
+  if (totalError) throw new Error(totalError.message);
+
+  const PAGE_SIZE = 1000;
+  const byCategory = {};
+  const investorCountByListId = {};
+  let uncategorised = 0;
+  let from = 0;
+
+  while (true) {
+    const { data, error: pageError } = await sb.from('investors_db')
+      .select('investor_category, list_id')
+      .range(from, from + PAGE_SIZE - 1);
+    if (pageError) throw new Error(pageError.message);
+    if (!data?.length) break;
+
+    for (const row of data) {
+      const category = row.investor_category || 'Uncategorised';
+      byCategory[category] = (byCategory[category] || 0) + 1;
+      if (!row.investor_category) uncategorised += 1;
+      if (row.list_id) {
+        const key = String(row.list_id);
+        investorCountByListId[key] = (investorCountByListId[key] || 0) + 1;
+      }
+    }
+
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return {
+    total: total || 0,
+    uncategorised,
+    byCategory: Object.fromEntries(
+      Object.entries(byCategory).sort(([, a], [, b]) => b - a)
+    ),
+    investorCountByListId,
+    builtAt: new Date().toISOString(),
+  };
+}
+
+async function getInvestorDbSummary(sb, { forceRefresh = false } = {}) {
+  const now = Date.now();
+  if (!forceRefresh && investorDbSummaryCache.value && investorDbSummaryCache.expiresAt > now) {
+    return investorDbSummaryCache.value;
+  }
+
+  const summary = await buildInvestorDbSummary(sb);
+  investorDbSummaryCache = {
+    value: summary,
+    expiresAt: now + INVESTOR_DB_SUMMARY_TTL_MS,
+  };
+  return summary;
 }
 
 function normalizeContactIdentityValue(value) {
@@ -5837,33 +5906,28 @@ function registerRoutes(app) {
     try {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-      const { count: total } = await sb.from('investors_db')
-        .select('*', { count: 'exact', head: true });
-      // Paginate through all rows — Supabase caps at 1,000 per request
-      let allCats = [];
-      const PAGE = 1000;
-      let from = 0;
-      while (true) {
-        const { data, error: pgErr } = await sb.from('investors_db')
-          .select('investor_category')
-          .range(from, from + PAGE - 1);
-        if (pgErr || !data || data.length === 0) break;
-        allCats = allCats.concat(data);
-        if (data.length < PAGE) break;
-        from += PAGE;
-      }
-      const byCategory = {};
-      let uncategorised = 0;
-      allCats.forEach(r => {
-        const cat = r.investor_category || 'Uncategorised';
-        byCategory[cat] = (byCategory[cat] || 0) + 1;
-        if (!r.investor_category) uncategorised++;
+      const summary = await getInvestorDbSummary(sb);
+      res.json({
+        total: summary.total || 0,
+        by_category: summary.byCategory || {},
+        uncategorised: summary.uncategorised || 0,
+        generated_at: summary.builtAt,
+        cached: true,
       });
-      const sorted = Object.fromEntries(
-        Object.entries(byCategory).sort(([, a], [, b]) => b - a)
-      );
-      res.json({ total: total || 0, by_category: sorted, uncategorised });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+      const stale = investorDbSummaryCache.value;
+      if (stale) {
+        return res.json({
+          total: stale.total || 0,
+          by_category: stale.byCategory || {},
+          uncategorised: stale.uncategorised || 0,
+          generated_at: stale.builtAt,
+          cached: true,
+          stale: true,
+        });
+      }
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // POST /api/investors-db/import — upload XLSX and import to investors_db
@@ -5907,6 +5971,7 @@ function registerRoutes(app) {
         broadcastFn: (msg) => pushActivity({ type: 'research', action: msg, note: '' }),
       });
       fs.unlinkSync(req.file.path);
+      invalidateInvestorDbSummaryCache();
       res.json({ success: true, list_id: listId, list_name: listName, ...result });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -5952,11 +6017,12 @@ function registerRoutes(app) {
       } else if (req.query.type === 'investors') {
         query = query.neq('list_type', 'knowledge_base');
       }
-      const { data: lists } = await query;
-      const listsWithCounts = await Promise.all((lists || []).map(async list => {
-        const { count } = await sb.from('investors_db')
-          .select('*', { count: 'exact', head: true }).eq('list_id', list.id);
-        return { ...list, investor_count: count || 0 };
+      const { data: lists, error: listsError } = await query;
+      if (listsError) throw new Error(listsError.message);
+      const summary = await getInvestorDbSummary(sb);
+      const listsWithCounts = (lists || []).map(list => ({
+        ...list,
+        investor_count: summary.investorCountByListId?.[String(list.id)] ?? Number(list.investor_count || 0),
       }));
       res.json(listsWithCounts);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5972,7 +6038,13 @@ function registerRoutes(app) {
       const { search, type, country, enrichment, contact_type, page = 1, limit = 50 } = req.query;
       const offset = (Number(page) - 1) * Number(limit);
 
-      let query = sb.from('investors_db').select('*', { count: 'exact' });
+      let query = sb.from('investors_db').select(
+        'id, name, hq_country, hq_location, investor_type, contact_type, is_angel, preferred_industries, ' +
+        'aum_millions, preferred_deal_size_min, preferred_deal_size_max, preferred_ebitda_min, preferred_ebitda_max, ' +
+        'last_investment_date, last_investment_company, investments_last_12m, email, primary_contact_email, ' +
+        'investor_category, enrichment_status',
+        { count: 'planned' }
+      );
       if (search) query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%,preferred_industries.ilike.%${search}%,hq_city.ilike.%${search}%`);
       // Type filter: check both investor_category (e.g. "IndependentSponsor") and investor_type (e.g. "Family Office")
       if (type) query = query.or(`investor_category.ilike.%${type}%,investor_type.ilike.%${type}%`);
