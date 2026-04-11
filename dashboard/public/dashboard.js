@@ -603,19 +603,20 @@ function renderActivityFeed(elId, items) {
     const action = item.action || '';
     const note   = item.note || item.message || item.text || item.summary || '';
     const isThinking  = type === 'thinking';
+    const isExpandedType = isThinking || (type === 'research' && !!item.full_content);
     const fullContent = item.full_content || null;
-    // For thinking entries: show full_content when available; otherwise action
-    const displayText = isThinking && fullContent
+    const displayText = isExpandedType && fullContent
       ? fullContent
       : (action && note ? `${action} · ${note}` : (action || note || ''));
     const ts   = item.timestamp || item.createdAt || item.created_at;
     const deal = item.deal_name || item.deal;
-    return `<div class="feed-item${isThinking ? ' feed-item--thinking' : ''}">
+    return `<div class="feed-item${isExpandedType ? ' feed-item--thinking' : ''}">
       <span class="feed-time">${formatTime(ts)}</span>
       <span class="feed-badge ${badge.className}">${badge.label}</span>
       ${isThinking ? '<span class="feed-badge" style="background:rgba(167,139,250,0.15);color:#A78BFA;font-size:9px;padding:1px 5px">full reasoning</span>' : ''}
+      ${type === 'research' && fullContent ? '<span class="feed-badge" style="background:rgba(96,165,250,0.15);color:#60A5FA;font-size:9px;padding:1px 5px">research trace</span>' : ''}
       ${deal ? `<span class="feed-deal">${esc(deal)}</span>` : ''}
-      <span class="feed-text" style="${isThinking ? 'white-space:pre-wrap;display:block;margin-top:4px;' : ''}">${esc(displayText)}</span>
+      <span class="feed-text" style="${isExpandedType ? 'white-space:pre-wrap;display:block;margin-top:4px;' : ''}">${esc(displayText)}</span>
     </div>`;
   }).join('');
 }
@@ -630,7 +631,10 @@ function prependActivity(item) {
     const badge  = getActivityBadgeMeta(item);
     const action = item.action || '';
     const note   = item.note || item.message || item.text || item.summary || '';
-    const text   = action && note ? `${action} · ${note}` : (action || note || '');
+    const type   = String(item.type || item.event_type || item.activityType || 'system').toLowerCase();
+    const text   = type === 'research' && item.full_content
+      ? item.full_content
+      : (action && note ? `${action} · ${note}` : (action || note || ''));
     const ts     = item.timestamp || item.createdAt || item.created_at;
     const deal   = item.deal_name || item.deal;
     const div = document.createElement('div');
@@ -639,7 +643,7 @@ function prependActivity(item) {
       <span class="feed-time">${formatTime(ts)}</span>
       <span class="feed-badge ${badge.className}">${badge.label}</span>
       ${deal ? `<span class="feed-deal">${esc(deal)}</span>` : ''}
-      <span class="feed-text">${esc(text)}</span>
+      <span class="feed-text" style="${type === 'research' && item.full_content ? 'white-space:pre-wrap;display:block;margin-top:4px;' : ''}">${esc(text)}</span>
     `;
     const empty = overviewFeed.querySelector('.feed-empty');
     if (empty) empty.remove();
@@ -5488,10 +5492,12 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     const color = typeColors[type] || '#8A8680';
     const icon  = typeIcons[type] || '⚙️';
     const isThinking = type === 'thinking';
+    const isResearchTrace = type === 'research' && !!event.full_content;
+    const isExpandedType = isThinking || isResearchTrace;
     const ts    = new Date(event.created_at || event.timestamp).toLocaleString('en-US', {
       month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
     });
-    const mainText = isThinking && event.full_content
+    const mainText = isExpandedType && event.full_content
       ? event.full_content
       : (event.action || event.summary || '');
     const note  = event.note || event.detail || '';
@@ -5504,10 +5510,11 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
           <span style="font-size:10px;color:${color};font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">
             ${badge.label}${isThinking ? ' · full reasoning' : ''}
           </span>
+          ${isResearchTrace ? `<span style="font-size:10px;color:#60A5FA;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">research trace</span>` : ''}
         </div>
         <span style="font-size:10px;color:#3A3835;font-family:'DM Mono',monospace;white-space:nowrap;flex-shrink:0">${ts}</span>
       </div>
-      <div style="font-size:12px;color:#EDE9E3;line-height:1.6;margin-top:5px;word-break:break-word;${isThinking ? 'white-space:pre-wrap;' : ''}">
+      <div style="font-size:12px;color:#EDE9E3;line-height:1.6;margin-top:5px;word-break:break-word;${isExpandedType ? 'white-space:pre-wrap;' : ''}">
         ${esc(mainText)}
       </div>
       ${note ? `<div style="margin-top:3px;font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">${esc(note)}</div>` : ''}

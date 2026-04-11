@@ -200,6 +200,124 @@ function truncateList(items = [], limit = 4) {
     .join(', ');
 }
 
+function buildResearchReason(deal) {
+  return `Triggered because ${deal.name} is active and the pipeline needs fresh, deal-matched investors to keep outreach moving.`;
+}
+
+function buildResearchSearchLabel(deal) {
+  return [
+    `active investors for ${deal.name}`,
+    deal.sector || null,
+    deal.geography || null,
+  ].filter(Boolean).join(' · ');
+}
+
+function formatResearchFirmExamples(firms = [], limit = 5) {
+  return firms
+    .slice(0, limit)
+    .map((firm, index) => {
+      const score = Number.isFinite(Number(firm.match_score)) ? `score ${Number(firm.match_score)}` : null;
+      const rationale = firm.match_rationale || firm.investment_thesis || 'Relevant based on sector and deal fit.';
+      const evidence = Array.isArray(firm.past_investments) && firm.past_investments.length
+        ? `Evidence: ${firm.past_investments.slice(0, 3).join(', ')}`
+        : null;
+      return [
+        `${index + 1}. ${firm.name || 'Unknown firm'}${score ? ` (${score})` : ''}`,
+        `Why relevant: ${rationale}`,
+        evidence,
+      ].filter(Boolean).join('\n');
+    })
+    .join('\n\n');
+}
+
+function extractGeminiSources(data = {}) {
+  const chunks = data?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  return [...new Set(chunks
+    .map(chunk => chunk?.web?.uri || chunk?.retrievedContext?.uri || null)
+    .filter(Boolean))]
+    .slice(0, 6);
+}
+
+function extractGrokSources(data = {}) {
+  const urls = [];
+  for (const output of data?.output || []) {
+    for (const content of output?.content || []) {
+      for (const annotation of content?.annotations || []) {
+        if (annotation?.url) urls.push(annotation.url);
+      }
+    }
+  }
+  return [...new Set(urls)].slice(0, 6);
+}
+
+async function emitFirmResearchTrace({
+  deal,
+  provider,
+  query,
+  prompt,
+  firms = [],
+  sources = [],
+  status = 'completed',
+  errorMessage = '',
+  sendTelegramUpdate = false,
+}) {
+  const foundCount = firms.length;
+  const action = status === 'started'
+    ? `${provider}: finding active investors for ${deal.name}`
+    : status === 'failed'
+      ? `${provider}: research failed for ${deal.name}`
+      : `${provider}: ${foundCount} relevant firm${foundCount === 1 ? '' : 's'} found for ${deal.name}`;
+  const note = status === 'started'
+    ? [deal.sector || null, deal.geography || null].filter(Boolean).join(' · ')
+    : status === 'failed'
+      ? (errorMessage || 'No result returned')
+      : foundCount > 0
+        ? truncateList(firms.map(firm => firm.name).filter(Boolean), 3)
+        : 'No relevant firms found';
+  const fullContent = [
+    `Provider: ${provider}`,
+    `What it searched for: ${query || buildResearchSearchLabel(deal)}`,
+    `Why it searched: ${buildResearchReason(deal)}`,
+    prompt ? `Search brief: ${String(prompt).replace(/\s+/g, ' ').trim().slice(0, 900)}` : null,
+    status === 'failed'
+      ? `What it found: Search failed${errorMessage ? ` — ${errorMessage}` : ''}`
+      : `What it found: ${foundCount > 0 ? `${foundCount} relevant firm${foundCount === 1 ? '' : 's'}` : 'No relevant firms found'}`,
+    status === 'completed' && foundCount > 0 ? `Is it relevant: Yes — shortlisted to match ${deal.sector || 'the deal sector'}, ${deal.geography || 'the target geography'}, and the current deal profile.` : null,
+    status === 'completed' && foundCount === 0 ? 'Is it relevant: No confident matches were strong enough to add automatically.' : null,
+    status === 'completed' && foundCount > 0 ? `Results:\n${formatResearchFirmExamples(firms)}` : null,
+    status === 'completed' && sources.length ? `Sources:\n- ${sources.join('\n- ')}` : null,
+  ].filter(Boolean).join('\n\n');
+
+  pushActivity({
+    type: 'research',
+    action,
+    note,
+    full_content: fullContent,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  if (!sendTelegramUpdate || status === 'started') return;
+
+  const telegramMessage = [
+    `*Research trace — ${deal.name}*`,
+    `Provider: ${provider}`,
+    `Search: ${query || buildResearchSearchLabel(deal)}`,
+    `Why: ${buildResearchReason(deal)}`,
+    status === 'failed'
+      ? `Result: failed${errorMessage ? ` — ${errorMessage}` : ''}`
+      : `Result: ${foundCount > 0 ? `${foundCount} relevant firm${foundCount === 1 ? '' : 's'} found` : 'no relevant firms found'}`,
+    status === 'completed' && foundCount > 0
+      ? `Top matches:\n${firms.slice(0, 3).map((firm, index) => `${index + 1}. ${firm.name || 'Unknown'}${firm.match_rationale ? ` — ${firm.match_rationale}` : ''}`).join('\n')}`
+      : null,
+    status === 'completed' && sources.length
+      ? `Sources:\n${sources.slice(0, 3).join('\n')}`
+      : null,
+  ].filter(Boolean).join('\n');
+
+  await sendTelegram(telegramMessage).catch(() => {});
+}
+
 async function notifyResearchOutcome(deal, summary = {}) {
   const totalQueuedContacts = (summary.insertedContacts || 0) + (summary.enrichedContacts || 0);
   const sampleFirms = truncateList(summary.sampleFirmNames || []);
@@ -360,6 +478,14 @@ async function runGrokFirmResearch(deal) {
   console.log('[FIRM RESEARCH] Using Grok Responses API with web_search tool...');
 
   const prompt = buildFirmResearchPrompt(deal);
+  const query = buildResearchSearchLabel(deal);
+  await emitFirmResearchTrace({
+    deal,
+    provider: 'Grok web search',
+    query,
+    prompt,
+    status: 'started',
+  });
 
   try {
     const res = await fetch('https://api.x.ai/v1/responses', {
@@ -375,6 +501,15 @@ async function runGrokFirmResearch(deal) {
     if (!res.ok) {
       const err = await res.text().catch(() => '');
       console.warn(`[FIRM RESEARCH] Grok failed (${res.status}): ${err.substring(0, 150)}`);
+      await emitFirmResearchTrace({
+        deal,
+        provider: 'Grok web search',
+        query,
+        prompt,
+        status: 'failed',
+        errorMessage: `HTTP ${res.status}: ${err.substring(0, 150)}`,
+        sendTelegramUpdate: true,
+      });
       return [];
     }
 
@@ -383,15 +518,45 @@ async function runGrokFirmResearch(deal) {
     const outputMsg = (data.output || []).find(o => o.type === 'message');
     const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
     const firms = parseFirmResearchResults(text, grokModel);
+    const sources = extractGrokSources(data);
     if (firms.length > 0) {
       console.log(`[FIRM RESEARCH] Grok returned ${firms.length} firms`);
+      await emitFirmResearchTrace({
+        deal,
+        provider: 'Grok web search',
+        query,
+        prompt,
+        firms,
+        sources,
+        status: 'completed',
+        sendTelegramUpdate: true,
+      });
       return firms;
     }
 
     console.warn('[FIRM RESEARCH] Grok returned 0 firms');
+    await emitFirmResearchTrace({
+      deal,
+      provider: 'Grok web search',
+      query,
+      prompt,
+      firms: [],
+      sources,
+      status: 'completed',
+      sendTelegramUpdate: true,
+    });
     return [];
   } catch (err) {
     console.warn('[FIRM RESEARCH] Grok error:', err.message);
+    await emitFirmResearchTrace({
+      deal,
+      provider: 'Grok web search',
+      query,
+      prompt,
+      status: 'failed',
+      errorMessage: err.message,
+      sendTelegramUpdate: true,
+    });
     return [];
   }
 }
@@ -435,7 +600,15 @@ async function runGeminiFirmResearch(deal) {
   console.log('[FIRM RESEARCH] Using Gemini with google_search...');
 
   const prompt = buildFirmResearchPrompt(deal);
+  const query = buildResearchSearchLabel(deal);
   const keys = [GEMINI_KEY, GEMINI_FALLBACK].filter(Boolean);
+  await emitFirmResearchTrace({
+    deal,
+    provider: 'Gemini web search',
+    query,
+    prompt,
+    status: 'started',
+  });
 
   for (const key of keys) {
     for (const model of geminiModels) {
@@ -457,8 +630,19 @@ async function runGeminiFirmResearch(deal) {
           const data = await res.json();
           const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
           const firms = parseFirmResearchResults(text, `gemini/${model}`);
+          const sources = extractGeminiSources(data);
           if (firms.length > 0) {
             console.log(`[FIRM RESEARCH] Gemini (${model}) returned ${firms.length} firms`);
+            await emitFirmResearchTrace({
+              deal,
+              provider: `Gemini web search (${model})`,
+              query,
+              prompt,
+              firms,
+              sources,
+              status: 'completed',
+              sendTelegramUpdate: true,
+            });
             return firms;
           }
         } else {
@@ -472,6 +656,15 @@ async function runGeminiFirmResearch(deal) {
   }
 
   console.error('[FIRM RESEARCH] All Gemini models failed');
+  await emitFirmResearchTrace({
+    deal,
+    provider: 'Gemini web search',
+    query,
+    prompt,
+    firms: [],
+    status: 'completed',
+    sendTelegramUpdate: true,
+  });
   return [];
 }
 
