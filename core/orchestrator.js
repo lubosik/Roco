@@ -3838,27 +3838,20 @@ async function runApprovedOutreach(deal, batch, state, directives = null) {
 
   const globallyPaused = state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until);
   const inEmailWindow = isWithinEmailWindow(deal) && !globallyPaused;
-  if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
-  if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
-    await phaseFollowUps(deal, state);
-  } else if (directives?.allowFollowUps === false) {
-    pushDealStatusOnce(deal, `brain-followup-hold:${batch.id}:${directives.followUpReason || ''}`, {
-      type: 'system',
-      action: 'Brain hold: follow-ups paused this cycle',
-      note: `${deal.name} · ${directives.followUpReason || 'Reasoning directed Roco to wait before following up'}`,
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
-    await announceCycleDecision(deal, batch, 'followup_wait', directives.followUpReason || 'Reasoning directed Roco to wait before following up');
-  }
-  if (!inEmailWindow && !globallyPaused) {
-    pushDealStatusOnce(deal, `queue-build-only:${batch.id}`, {
-      type: 'system',
-      action: 'Queue build running outside send window',
-      note: `${deal.name} · Roco can still prepare approvals and fallbacks now; actual email sends will wait for the next configured window`,
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
+  if (inEmailWindow) {
+    if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
+    if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
+      await phaseFollowUps(deal, state);
+    } else if (directives?.allowFollowUps === false) {
+      pushDealStatusOnce(deal, `brain-followup-hold:${batch.id}:${directives.followUpReason || ''}`, {
+        type: 'system',
+        action: 'Brain hold: follow-ups paused this cycle',
+        note: `${deal.name} · ${directives.followUpReason || 'Reasoning directed Roco to wait before following up'}`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      await announceCycleDecision(deal, batch, 'followup_wait', directives.followUpReason || 'Reasoning directed Roco to wait before following up');
+    }
   }
 }
 
@@ -5632,6 +5625,8 @@ async function phaseLinkedInInvites(deal, state) {
   } catch (err) {
     warn(`[${deal.name}] Could not fetch pending LinkedIn invitations: ${err.message}`);
   }
+  const canQueueOutboundEmailFallback = isWithinEmailWindow(deal)
+    && !(state?.outreach_paused_until && isGloballyPaused(state.outreach_paused_until));
 
   for (const contact of contacts) {
     if (contactsInFlight.has(contact.id)) continue;
@@ -5653,14 +5648,14 @@ async function phaseLinkedInInvites(deal, state) {
         info(`[${deal.name}] ${contact.name} already connected — moved to DM queue`);
       } else if (outcome.status === 'missing_profile') {
         info(`[${deal.name}] ${contact.name} has no usable LinkedIn profile — logged and removed from invite queue`);
-        if (hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
+        if (canQueueOutboundEmailFallback && hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
           await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' }).catch(err => {
             warn(`[${deal.name}] Email fallback queue failed for ${contact.name}: ${err.message}`);
           });
         }
       } else if (outcome.status === 'deferred_provider_limit') {
         info(`[${deal.name}] ${contact.name} invite deferred after LinkedIn provider limit (${outcome.retryCount || 1}/3) until ${outcome.retryAt || 'later'}`);
-        if (hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
+        if (canQueueOutboundEmailFallback && hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
           await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' }).catch(err => {
             warn(`[${deal.name}] Provider-limit email fallback queue failed for ${contact.name}: ${err.message}`);
           });
