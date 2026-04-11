@@ -380,28 +380,32 @@ export async function handleLinkedInAcceptance(contact, deal, pushActivity, queu
   pushActivity({
     type:   'linkedin',
     action: `No existing LinkedIn conversation: ${contact.name}`,
-    note:   'Connection accepted · drafting DM approval',
+    note:   'Connection accepted · triggering opening LinkedIn DM workflow',
     deal_name: deal?.name || null,
     dealId: deal?.id || contact.deal_id || null,
   });
 
-  // No prior chat — draft now and queue for approval, even if the DM window is closed.
+  // No prior chat — trigger the opening DM workflow immediately.
   if (queueForApproval) {
     try {
-      await queueForApproval({
+      const workflowResult = await queueForApproval({
         contact,
         deal,
         channel: 'linkedin_dm',
         action: 'draft_for_approval',
         reason: within ? 'accepted_in_window' : 'accepted_outside_window',
       });
-      await queueLinkedInDM(contact.id);
+
+      if (workflowResult?.deferred) {
+        await queueLinkedInDM(contact.id);
+      }
+
       pushActivity({
         type:   'linkedin',
         action: `DM drafted for approval: ${contact.name}`,
         note:   within
-          ? 'Connection accepted → approval queued'
-          : 'Connection accepted outside window → approval queued, send will wait for DM window',
+          ? 'Connection accepted → opening LinkedIn DM queued for approval'
+          : 'Connection accepted outside window → DM queued for approval and will wait for the DM window after approval',
         deal_name: deal?.name || null,
         dealId: deal?.id || contact.deal_id || null,
       });

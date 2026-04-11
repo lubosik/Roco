@@ -6173,10 +6173,12 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
         edited_body: decision?.body || draft?.body || null,
         resolved_at: new Date().toISOString(),
       }).eq('id', decision.queueId);
-      await sb.from('contacts').update({
-        pipeline_stage: 'Email Approved',
-        updated_at: new Date().toISOString(),
-      }).eq('id', contact.id).catch(() => {});
+      try {
+        await sb.from('contacts').update({
+          pipeline_stage: 'Email Approved',
+          updated_at: new Date().toISOString(),
+        }).eq('id', contact.id);
+      } catch {}
     }
     info(`[${deal.name}] executeOutreach: outside ${channel} window for ${contact.name} — skipping this cycle`);
     return;

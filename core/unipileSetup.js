@@ -19,6 +19,47 @@ function headers() {
   };
 }
 
+function normalizeWebhookListResponse(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.webhooks)) return data.webhooks;
+  return [];
+}
+
+function sameWebhookTarget(existing, expectedUrl) {
+  return String(existing?.request_url || '').replace(/\/+$/, '') === String(expectedUrl || '').replace(/\/+$/, '');
+}
+
+function getWebhookId(existing) {
+  return existing?.id || existing?.webhook_id || existing?._id || null;
+}
+
+function getWebhookPath(url) {
+  try {
+    return new URL(String(url)).pathname.replace(/\/+$/, '');
+  } catch {
+    return String(url || '').replace(/^https?:\/\/[^/]+/i, '').replace(/\/+$/, '');
+  }
+}
+
+function isOldRocoWebhook(existing, expectedPath) {
+  const requestUrl = String(existing?.request_url || '');
+  return requestUrl.includes('76.13.44.185') && getWebhookPath(requestUrl) === expectedPath;
+}
+
+async function deleteWebhookById(id, name) {
+  const deleteRes = await fetch(`${getDSN()}/api/v1/webhooks/${id}`, {
+    method: 'DELETE',
+    headers: headers(),
+  });
+
+  if (!deleteRes.ok) {
+    const txt = await deleteRes.text();
+    throw new Error(`[UNIPILE SETUP] Failed to delete outdated webhook ${name}: ${txt.substring(0, 200)}`);
+  }
+}
+
 /**
  * Register (or update) Unipile webhooks so inbound messages are
  * forwarded to this server. Called once during startup.
@@ -85,7 +126,7 @@ export async function registerWebhooks(baseUrl) {
     const res = await fetch(`${getDSN()}/api/v1/webhooks`, { headers: headers() });
     if (res.ok) {
       const data = await res.json();
-      existing = data.items || data || [];
+      existing = normalizeWebhookListResponse(data);
     }
   } catch (err) {
     console.warn('[UNIPILE SETUP] Could not fetch existing webhooks:', err.message);
@@ -93,13 +134,25 @@ export async function registerWebhooks(baseUrl) {
 
   for (const wh of webhooks) {
     try {
-      // Check if a webhook with the same name already exists
-      const match = existing.find(e => e.name === wh.name || e.request_url === wh.request_url);
+      const expectedPath = getWebhookPath(wh.request_url);
+      const matches = existing.filter(e => e.name === wh.name || getWebhookPath(e.request_url) === expectedPath);
+      const currentMatch = matches.find(e => sameWebhookTarget(e, wh.request_url));
 
-      if (match) {
-        // Unipile doesn't support PATCH — if URL matches we're done; otherwise skip silently
-        console.log(`[UNIPILE SETUP] Webhook exists: ${wh.name} → ${match.request_url}`);
+      if (currentMatch) {
+        console.log(`[UNIPILE SETUP] Webhook exists: ${wh.name} → ${currentMatch.request_url}`);
         continue;
+      }
+
+      const outdatedMatches = matches.filter(e => !sameWebhookTarget(e, wh.request_url) || isOldRocoWebhook(e, expectedPath));
+      for (const outdated of outdatedMatches) {
+        const webhookId = getWebhookId(outdated);
+        if (!webhookId) {
+          console.warn(`[UNIPILE SETUP] Webhook ${outdated.name || wh.name} has outdated URL (${outdated.request_url}) but no id was returned, so it could not be replaced automatically`);
+          continue;
+        }
+
+        await deleteWebhookById(webhookId, outdated.name || wh.name);
+        console.log(`[UNIPILE SETUP] Deleted outdated webhook: ${outdated.name || wh.name} → ${outdated.request_url}`);
       }
 
       // Create fresh

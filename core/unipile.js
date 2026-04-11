@@ -559,6 +559,10 @@ async function markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivit
     linkedin_url: null,
     linkedin_provider_id: null,
     linkedin_public_id: null,
+    linkedin_connected: false,
+    pending_linkedin_dm: false,
+    invite_sent_at: null,
+    invite_accepted_at: null,
     notes: appendNote(contact?.notes, note),
   };
 

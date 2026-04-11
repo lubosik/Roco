@@ -24,10 +24,17 @@ function getServerBaseUrl(port) {
   const explicit = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL;
   if (explicit) return explicit.replace(/\/+$/, '');
 
+  const railwayStaticUrl = String(process.env.RAILWAY_STATIC_URL || '').trim();
+  if (railwayStaticUrl) {
+    return railwayStaticUrl.startsWith('http')
+      ? railwayStaticUrl.replace(/\/+$/, '')
+      : `https://${railwayStaticUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
+  }
+
   const railwayDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
   if (railwayDomain) return `https://${railwayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
 
-  return `http://76.13.44.185:${port}`;
+  return 'https://roco-production.up.railway.app';
 }
 
 async function validateEnv() {

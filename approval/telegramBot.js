@@ -409,9 +409,11 @@ export async function sendPriorChatForApproval({ contactName, firm, dealName, su
     const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
     const sb = getSupabase();
     if (sb && approvalId) {
-      await sb.from('approval_queue').update({
-        telegram_msg_id: sent.message_id,
-      }).eq('id', approvalId).catch(() => {});
+      try {
+        await sb.from('approval_queue').update({
+          telegram_msg_id: sent.message_id,
+        }).eq('id', approvalId);
+      } catch {}
     }
     await bot.editMessageReplyMarkup(buildPriorChatKeyboard(approvalId), {
       chat_id: chatId, message_id: sent.message_id,
@@ -895,7 +897,7 @@ async function handleCallbackQuery(query) {
         summary: `Conversation manually closed for ${approval.name}`,
         detail: { channel: ra.channel, source: 'telegram_reply_approval' },
         created_at: new Date().toISOString(),
-      }).catch(() => {});
+      }).then(() => {}, () => {});
     }
     if (sb && ra?.queueItemId) {
       await sb.from('approval_queue').update({

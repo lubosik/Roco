@@ -167,11 +167,76 @@ function sanitizeApprovalText(text) {
     .trim();
 }
 
-async function logWebhookReceipt(eventType, payload) {
+function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
+  const normalizedType = String(
+    eventType || payload?.type || payload?.event_type || payload?.event || 'unknown'
+  ).toLowerCase();
+  const event = payload?.data || payload || {};
+  const sourceLabel = String(source || 'unipile').replace(/[_-]+/g, ' ').trim() || 'unipile';
+
+  if (['mail_received', 'email.received', 'email_received'].includes(normalizedType)) {
+    const fromEmail = event?.from_attendee?.identifier || event?.from_email || event?.from?.email || event?.from || '';
+    const fromName = event?.from_attendee?.display_name || event?.from_name || '';
+    const subject = event?.subject || '';
+    const preview = truncateInline(extractUnipileEmailBody(event), 120);
+    return {
+      type: 'webhook',
+      action: `Webhook received: ${sourceLabel} email`,
+      note: [
+        fromName || fromEmail || 'unknown sender',
+        subject ? `"${truncateInline(subject, 90)}"` : null,
+        preview || null,
+      ].filter(Boolean).join(' · '),
+      meta: { event_type: normalizedType, source: sourceLabel },
+    };
+  }
+
+  if (['message_received', 'message.created'].includes(normalizedType)) {
+    const fromName = event?.sender?.attendee_name || event?.sender_name || event?.attendee_name || '';
+    const fromProviderId = event?.sender?.attendee_provider_id || event?.sender_id || event?.attendee_id || '';
+    const preview = truncateInline(extractUnipileMessageText(event), 120);
+    return {
+      type: 'webhook',
+      action: `Webhook received: LinkedIn message`,
+      note: [
+        fromName || fromProviderId || 'unknown sender',
+        preview || null,
+      ].filter(Boolean).join(' · '),
+      meta: { event_type: normalizedType, source: sourceLabel },
+    };
+  }
+
+  if (['new_relation', 'connection_request_accepted'].includes(normalizedType)) {
+    const name = event?.user_full_name || event?.attendee?.name || '';
+    const publicId = event?.user_public_identifier || '';
+    const profileUrl = event?.user_profile_url || '';
+    return {
+      type: 'webhook',
+      action: `Webhook received: LinkedIn acceptance`,
+      note: [
+        name || publicId || profileUrl || 'unknown person',
+      ].filter(Boolean).join(' · '),
+      meta: { event_type: normalizedType, source: sourceLabel },
+    };
+  }
+
+  return {
+    type: 'webhook',
+    action: `Webhook received: ${normalizedType || 'unknown'}`,
+    note: [
+      `source ${sourceLabel}`,
+      event?.account_id || payload?.account_id || null,
+    ].filter(Boolean).join(' · '),
+    meta: { event_type: normalizedType, source: sourceLabel },
+  };
+}
+
+async function logWebhookReceipt(eventType, payload, source = 'unipile') {
   await insertWebhookLogRecord({
     event_type: eventType || 'unknown',
     payload: payload || {},
   });
+  pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
 }
 
 async function insertWebhookLogRecord(record = {}) {
@@ -329,10 +394,11 @@ function computeBackfilledScheduledFollowUpAt(contact, deal, sequence) {
 }
 
 async function processUnipileMessageEvent(event) {
-  insertWebhookLogRecord({
-    event_type: event?.type || event?.event_type || 'unknown',
-    payload: event,
-  }).catch(() => {});
+  logWebhookReceipt(
+    event?.type || event?.event_type || 'unknown',
+    event,
+    'unipile_messages'
+  ).catch(() => {});
 
   const payload = event?.data || event || {};
   let eventType = (event?.type || event?.event_type || '').toLowerCase();
@@ -360,8 +426,23 @@ async function processUnipileMessageEvent(event) {
   console.log('[WEBHOOKS/UNIPILE] Received event:', eventType);
 
   if (['message_received', 'message.created'].includes(eventType)) {
-    await handleLiMsg(event, pushActivity, { draftContextualReply });
-    return;
+    const message = payload?.data || payload;
+    const fromProvId = message?.sender?.attendee_provider_id || message?.sender_id || message?.attendee_id || '';
+    const fromName = message?.sender?.attendee_name || message?.sender_name || message?.attendee_name || '';
+    const bodyText = message?.message || message?.text || message?.body || '';
+    const chatId = message?.chat_id || message?.conversation_id || '';
+    const messageId = message?.id || message?.message_id || '';
+
+    await queueInboundWithDebounce({
+      fromUrn: fromProvId,
+      fromName,
+      bodyText,
+      chatId,
+      messageId,
+      channel: 'linkedin',
+      raw: message,
+    });
+    return 'linkedin';
   }
 
   if (['new_relation', 'connection_request_accepted'].includes(eventType)) {
@@ -542,7 +623,9 @@ async function hydrateLinkedInConversationHistory(sb, contact, dealId = null) {
   }
 
   if (inserts.length > 0) {
-    await sb.from('conversation_messages').insert(inserts).catch(() => {});
+    try {
+      await sb.from('conversation_messages').insert(inserts);
+    } catch {}
     let query = sb.from('conversation_messages')
       .select('*')
       .eq('contact_id', contact.id)
@@ -665,7 +748,9 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
   }
 
   if (inserts.length > 0) {
-    await sb.from('conversation_messages').insert(inserts).catch(() => {});
+    try {
+      await sb.from('conversation_messages').insert(inserts);
+    } catch {}
     let query = sb.from('conversation_messages')
       .select('*')
       .eq('contact_id', contact.id)
@@ -1029,34 +1114,12 @@ function truncateInline(value, max = 140) {
 }
 
 export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
+  const payload = await buildLinkedInDmDraftPayload(contactId, { body });
+  if (!payload) return null;
+
+  const { contact, messageBody, researchSummary } = payload;
   const sb = getSupabase();
-  if (!sb || !contactId) return null;
-
-  const { data: contact } = await sb.from('contacts')
-    .select('*, deals!contacts_deal_id_fkey(*)')
-    .eq('id', contactId)
-    .single();
-  if (!contact || !contact.linkedin_provider_id) return null;
-
-  let firmResearch = null;
-  if (contact.firm_id) {
-    const { data } = await sb.from('firms')
-      .select('aum, past_investments, investment_thesis, thesis, match_rationale, justification')
-      .eq('id', contact.firm_id)
-      .maybeSingle()
-      .catch(() => ({ data: null }));
-    firmResearch = data || null;
-  }
-
-  const enrichedContact = {
-    ...contact,
-    past_investments: contact.past_investments || firmResearch?.past_investments || '',
-    investment_thesis: contact.investment_thesis || firmResearch?.investment_thesis || firmResearch?.thesis || '',
-    aum_fund_size: contact.aum_fund_size || firmResearch?.aum || '',
-    why_this_firm: firmResearch?.match_rationale || firmResearch?.justification || '',
-    match_rationale: firmResearch?.match_rationale || '',
-    justification: firmResearch?.justification || '',
-  };
+  if (!sb) return null;
 
   const { data: existingRows } = await sb.from('approval_queue')
     .select('id, status')
@@ -1068,23 +1131,6 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     await reloadPendingInvestorApprovals().catch(() => {});
     return existingRows[0];
   }
-
-  const conversationHistory = await loadLinkedInConversationContext(contact);
-
-  const draft = body
-    ? { body }
-    : await draftLinkedInDM(buildLinkedInDraftContactPage(enrichedContact), null, 'intro', {
-        deal: contact.deals || null,
-        conversationHistory,
-      });
-  const messageBody = String(draft?.body || '').trim();
-  if (!messageBody) return null;
-
-  const researchSummary = [
-    conversationHistory.length ? `${conversationHistory.length} prior LinkedIn message(s) loaded` : null,
-    contact.notes ? truncateInline(contact.notes, 140) : null,
-    enrichedContact.why_this_firm ? truncateInline(enrichedContact.why_this_firm, 180) : null,
-  ].filter(Boolean).join(' · ') || null;
 
   const { data: row, error } = await sb.from('approval_queue').insert([{
     contact_id:        contact.id,
@@ -1114,6 +1160,60 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   });
   notifyQueueUpdated();
   return row;
+}
+
+async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
+  const sb = getSupabase();
+  if (!sb || !contactId) return null;
+
+  const { data: contact } = await sb.from('contacts')
+    .select('*, deals!contacts_deal_id_fkey(*)')
+    .eq('id', contactId)
+    .single();
+  if (!contact || !contact.linkedin_provider_id) return null;
+
+  let firmResearch = null;
+  if (contact.firm_id) {
+    const { data } = await sb.from('firms')
+      .select('aum, past_investments, investment_thesis, thesis, match_rationale, justification')
+      .eq('id', contact.firm_id)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    firmResearch = data || null;
+  }
+
+  const enrichedContact = {
+    ...contact,
+    past_investments: contact.past_investments || firmResearch?.past_investments || '',
+    investment_thesis: contact.investment_thesis || firmResearch?.investment_thesis || firmResearch?.thesis || '',
+    aum_fund_size: contact.aum_fund_size || firmResearch?.aum || '',
+    why_this_firm: firmResearch?.match_rationale || firmResearch?.justification || '',
+    match_rationale: firmResearch?.match_rationale || '',
+    justification: firmResearch?.justification || '',
+  };
+
+  const conversationHistory = await loadLinkedInConversationContext(contact);
+
+  const draft = body
+    ? { body }
+    : await draftLinkedInDM(buildLinkedInDraftContactPage(enrichedContact), null, 'intro', {
+        deal: contact.deals || null,
+        conversationHistory,
+      });
+  const messageBody = String(draft?.body || '').trim();
+  if (!messageBody) return null;
+
+  const researchSummary = [
+    conversationHistory.length ? `${conversationHistory.length} prior LinkedIn message(s) loaded` : null,
+    contact.notes ? truncateInline(contact.notes, 140) : null,
+    enrichedContact.why_this_firm ? truncateInline(enrichedContact.why_this_firm, 180) : null,
+  ].filter(Boolean).join(' · ') || null;
+
+  return {
+    contact,
+    messageBody,
+    researchSummary,
+  };
 }
 
 export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, queueItem = null }) {
@@ -1409,7 +1509,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
-      await logWebhookReceipt(event?.type || 'mail_received', event);
+      await logWebhookReceipt(event?.type || 'mail_received', event, 'gmail');
       console.log('[WEBHOOK/GMAIL] Received event:', event?.type || 'unknown');
 
       // Unipile sends a wrapper with type + payload
@@ -1436,7 +1536,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
-      await logWebhookReceipt(event?.event || event?.type || 'mail_received', event);
+      await logWebhookReceipt(event?.event || event?.type || 'mail_received', event, 'outlook');
       console.log('[WEBHOOK/OUTLOOK] Received event:', event?.event || event?.type || 'unknown');
 
       const payload   = event?.data || event;
@@ -6573,18 +6673,19 @@ async function processRocoBatchedReply(batch) {
   await sb?.from(contactTable).update({ reply_channel: channel })
     .eq('id', contact.id);
 
-  // Log to conversation_messages table (investor outreach only)
+  // Log every inbound turn individually so the per-contact thread stays exact.
   if (mode === 'investor_outreach' && contact?.id) {
-    const msgToLog = messages[0];
-    await logConversationMessage({
-      contactId:        contact.id,
-      dealId:           deal?.id || null,
-      direction:        'inbound',
-      channel,
-      subject:          msgToLog?.subject || null,
-      body:             combinedContent,
-      unipileMessageId: msgToLog?.messageId || null,
-    }).catch(() => {});
+    for (const msg of messages) {
+      await logConversationMessage({
+        contactId:        contact.id,
+        dealId:           deal?.id || null,
+        direction:        'inbound',
+        channel,
+        subject:          msg?.subject || null,
+        body:             msg.content,
+        unipileMessageId: msg?.messageId || null,
+      }).catch(() => {});
+    }
   }
 
   // Load conversation history — prefer conversation_messages table, fall back to activity_log
@@ -6671,15 +6772,16 @@ async function processRocoBatchedReply(batch) {
           channel,
           message_preview:  combinedContent.substring(0, 100),
           intent:           intent.intent_key,
-          intent_category:  intent.category,
+          intent_category:  classification.sentiment || intent.category,
+          sentiment:        classification.sentiment || intent.category,
           action_taken:     intent.suggested_action,
         }).catch(() => {});
 
-        // Stamp last_intent on contact for pipeline sentiment display
+        // Stamp the latest intent + sentiment for pipeline display.
         if (sb) {
           await sb.from('contacts').update({
             last_intent:       intent.intent_key,
-            last_intent_label: intent.category,
+            last_intent_label: classification.sentiment || intent.category,
           }).eq('id', contact.id);
         }
 
@@ -6771,7 +6873,7 @@ async function processRocoBatchedReply(batch) {
     dealId: deal?.id,
   });
 
-  // Queue each reply for Telegram approval
+  // Queue each drafted reply for approval. Sending only happens after approval.
   for (let i = 0; i < (classification.messages_to_send || []).length; i++) {
     const reply = classification.messages_to_send[i];
     if (!reply?.body?.trim()) continue;
@@ -6782,39 +6884,50 @@ async function processRocoBatchedReply(batch) {
       continue;
     }
 
-    // Deduplication check
     if (await isDuplicateReplyApproval(contact.id, channel === 'linkedin' ? 'linkedin_dm' : 'email_reply')) {
       console.log(`[REPLY] Duplicate suppressed for ${contact.name}`);
       continue;
     }
 
     const { data: queued } = await sb?.from('approval_queue').insert({
-      deal_id:         deal?.id || null,
-      candidate_id:    contact.id,
-      campaign_id:     campaign?.id || null,
+      deal_id:            deal?.id || null,
+      candidate_id:       contact.id,
+      campaign_id:        campaign?.id || null,
       company_contact_id: mode === 'company_sourcing' ? contact.id : null,
-      message_type:    channel === 'linkedin' ? 'linkedin_dm' : 'email_reply',
-      outreach_mode:   mode === 'investor_outreach' ? 'investor' : 'company_sourcing',
+      message_type:       channel === 'linkedin' ? 'linkedin_dm' : 'email_reply',
+      outreach_mode:      mode === 'investor_outreach' ? 'investor' : 'company_sourcing',
       channel,
-      message_text:    reply.body,
-      subject_a:       reply.subject || null,
-      reply_to_id:     threadId || null,
-      status:          'pending',
+      message_text:       reply.body,
+      subject_a:          reply.subject || null,
+      reply_to_id:        threadId || null,
+      status:             'pending',
     }).select().single() || { data: null };
 
-    if (queued) {
+    if (queued?.id) {
       const label = (classification.messages_to_send.length > 1)
         ? `Reply ${i + 1}/${classification.messages_to_send.length}: ${reply.reply_to_context || ''}`
         : null;
 
-      await sendReplyForApproval(queued.id, contact, reply.body, contextName, channel, threadId, emailAccountId).catch(() => {});
+      await sendReplyForApproval(
+        queued.id,
+        contact,
+        reply.body,
+        contextName,
+        channel,
+        threadId,
+        emailAccountId
+      ).catch(() => {});
 
       await sb?.from('activity_log').insert({
         deal_id:    deal?.id || null,
         contact_id: contact.id,
         event_type: 'REPLY_QUEUED',
         summary:    `[${contextName}]: Reply drafted for ${contact.name} — awaiting approval`,
-        detail:     label ? { label } : null,
+        detail:     {
+          label: label || null,
+          intent: classification.intent,
+          sentiment: classification.sentiment,
+        },
       }).catch(() => {});
     }
   }
