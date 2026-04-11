@@ -74,6 +74,30 @@ function hasUsableEmail(email) {
   return !!value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+async function persistOutboundEmailRecord({ sb, deal, contact, subject, result, stage, status = 'sent', errorMessage = null }) {
+  if (!sb || !deal?.id || !contact?.id || !hasUsableEmail(contact?.email)) return;
+  try {
+    await sb.from('emails').insert({
+      deal_id: deal.id,
+      contact_id: contact.id,
+      to_email: contact.email,
+      subject: subject || null,
+      status,
+      direction: 'outbound',
+      sent_at: status === 'sent' ? new Date().toISOString() : null,
+      error_message: errorMessage || null,
+      provider_id: result?.providerId || null,
+      thread_id: result?.threadId || null,
+      message_id: result?.messageId || result?.emailId || null,
+      metadata: {
+        stage: stage || null,
+        account_id: result?.accountId || null,
+        channel: 'email',
+      },
+    });
+  } catch {}
+}
+
 function isLinkedInStageLabel(stage) {
   const value = String(stage || '').trim().toLowerCase();
   return value === 'linkedin dm'
@@ -3814,20 +3838,27 @@ async function runApprovedOutreach(deal, batch, state, directives = null) {
 
   const globallyPaused = state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until);
   const inEmailWindow = isWithinEmailWindow(deal) && !globallyPaused;
-  if (inEmailWindow) {
-    if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
-    if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
-      await phaseFollowUps(deal, state);
-    } else if (directives?.allowFollowUps === false) {
-      pushDealStatusOnce(deal, `brain-followup-hold:${batch.id}:${directives.followUpReason || ''}`, {
-        type: 'system',
-        action: 'Brain hold: follow-ups paused this cycle',
-        note: `${deal.name} · ${directives.followUpReason || 'Reasoning directed Roco to wait before following up'}`,
-        deal_name: deal.name,
-        dealId: deal.id,
-      });
-      await announceCycleDecision(deal, batch, 'followup_wait', directives.followUpReason || 'Reasoning directed Roco to wait before following up');
-    }
+  if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
+  if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
+    await phaseFollowUps(deal, state);
+  } else if (directives?.allowFollowUps === false) {
+    pushDealStatusOnce(deal, `brain-followup-hold:${batch.id}:${directives.followUpReason || ''}`, {
+      type: 'system',
+      action: 'Brain hold: follow-ups paused this cycle',
+      note: `${deal.name} · ${directives.followUpReason || 'Reasoning directed Roco to wait before following up'}`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+    await announceCycleDecision(deal, batch, 'followup_wait', directives.followUpReason || 'Reasoning directed Roco to wait before following up');
+  }
+  if (!inEmailWindow && !globallyPaused) {
+    pushDealStatusOnce(deal, `queue-build-only:${batch.id}`, {
+      type: 'system',
+      action: 'Queue build running outside send window',
+      note: `${deal.name} · Roco can still prepare approvals and fallbacks now; actual email sends will wait for the next configured window`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
   }
 }
 
@@ -5622,8 +5653,18 @@ async function phaseLinkedInInvites(deal, state) {
         info(`[${deal.name}] ${contact.name} already connected — moved to DM queue`);
       } else if (outcome.status === 'missing_profile') {
         info(`[${deal.name}] ${contact.name} has no usable LinkedIn profile — logged and removed from invite queue`);
+        if (hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
+          await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' }).catch(err => {
+            warn(`[${deal.name}] Email fallback queue failed for ${contact.name}: ${err.message}`);
+          });
+        }
       } else if (outcome.status === 'deferred_provider_limit') {
         info(`[${deal.name}] ${contact.name} invite deferred after LinkedIn provider limit (${outcome.retryCount || 1}/3) until ${outcome.retryAt || 'later'}`);
+        if (hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
+          await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' }).catch(err => {
+            warn(`[${deal.name}] Provider-limit email fallback queue failed for ${contact.name}: ${err.message}`);
+          });
+        }
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
       }
@@ -5958,6 +5999,15 @@ async function phaseOutreach(deal, state) {
         }).catch(() => {});
 
         await setConversationState(contact.id, /follow/i.test(String(item.stage || '')) ? 'follow_up_sent' : 'intro_sent').catch(() => {});
+        await persistOutboundEmailRecord({
+          sb,
+          deal,
+          contact,
+          subject,
+          result: emailResult,
+          stage: item.stage,
+          status: 'sent',
+        });
 
         pushActivity({
           type: 'email',
@@ -5986,6 +6036,19 @@ async function phaseOutreach(deal, state) {
 
         sendTelegram(`✅ *Email sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subject ? `\nSubject: _${sanitizeOutreach(subject)}_` : ''}`).catch(() => {});
       } catch (err) {
+        try {
+          const { data: failedContact } = await sb.from('contacts').select('id, email').eq('id', item.contact_id).maybeSingle();
+          await persistOutboundEmailRecord({
+            sb,
+            deal,
+            contact: { id: item.contact_id, email: failedContact?.email || item.contact_email || null },
+            subject: item.approved_subject || item.subject_a || item.subject || '',
+            result: null,
+            stage: item.stage,
+            status: 'failed',
+            errorMessage: String(err.message || err).slice(0, 500),
+          });
+        } catch {}
         await sb.from('approval_queue').update({
           status: 'approved_waiting_for_window',
           edit_instructions: `Send retry pending: ${String(err.message || err).slice(0, 160)}`,
@@ -6449,6 +6512,17 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
         sent_at: new Date().toISOString(),
         approved_subject: decision?.subject || draft?.subject || null,
       }).eq('id', decision.queueId);
+    }
+    if (channel === 'email') {
+      await persistOutboundEmailRecord({
+        sb,
+        deal,
+        contact,
+        subject: decision?.subject || draft?.subject || null,
+        result,
+        stage,
+        status: 'sent',
+      });
     }
   }
 

@@ -476,11 +476,14 @@ async function processUnipileMessageEvent(event) {
 }
 
 function getConfiguredServerBaseUrl() {
-  const explicit = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL;
-  if (explicit) return explicit.replace(/\/+$/, '');
-
   const railwayDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
   if (railwayDomain) return `https://${railwayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
+
+  const explicit = String(process.env.PUBLIC_URL || process.env.SERVER_BASE_URL || '').trim();
+  if (explicit) {
+    const normalized = explicit.replace(/\/+$/, '');
+    return /^https?:\/\//i.test(normalized) ? normalized : `https://${normalized.replace(/^\/+/, '')}`;
+  }
 
   return '';
 }
@@ -2264,7 +2267,10 @@ export function initDashboard(state) {
         }
       } catch {}
     }
-    if (!serverBaseUrl) serverBaseUrl = `http://76.13.44.185:${port}`;
+    if (!serverBaseUrl) {
+      console.warn('[BOOT] LinkedIn webhook recreation skipped: no Railway/public base URL configured');
+      return;
+    }
     recreateLinkedInWebhooks(serverBaseUrl).catch(err =>
       console.warn('[BOOT] LinkedIn webhook recreation failed:', err.message)
     );
