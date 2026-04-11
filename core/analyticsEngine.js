@@ -849,8 +849,10 @@ function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previo
   const actionCounts = summarizeDailyActionCounts(activityEntries);
   const globalMetrics = buildDailyGlobalMetrics(dealSnapshots, activityEntries);
   const headline = `Daily operating log for ${DateTime.fromISO(`${window.reportDate}T12:00:00`, { zone: ANALYTICS_TIMEZONE }).toFormat('d LLL yyyy')}`;
+  const thinPipeline = Number(globalMetrics.firms_in_pipeline || 0) < 20;
   const dealSections = dealSnapshots.map(snapshot => ({
     deal_name: snapshot.deal_name,
+    deal_id: snapshot.deal_id,
     progress_status: snapshot.reporting_status || snapshot.goal_status,
     summary: sanitizeNarrationText(
       `${snapshot.deal_name} is ${snapshot.reporting_status || snapshot.goal_status}. `
@@ -866,6 +868,7 @@ function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previo
     ].map(sanitizeNarrationText).filter(Boolean),
     target_status: buildDealStatusLine(snapshot),
     next_move: snapshot.next_move,
+    recommended_actions: buildRecommendedActionsForSnapshot(snapshot),
   }));
   const previousContext = buildPreviousReportContext(previousReport);
   const executiveSummary = dealSections.length
@@ -873,6 +876,7 @@ function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previo
         `I sent ${globalMetrics.linkedin_invites} LinkedIn invites, ${globalMetrics.emails_sent} emails, and ${globalMetrics.linkedin_dms} LinkedIn DMs across ${dealSections.length} active deals today. `
         + `I logged ${globalMetrics.enrichment_actions} enrichment actions, kept ${globalMetrics.firms_in_pipeline} firms active in the pipeline, and have ${globalMetrics.meetings_booked} meetings booked so far. `
         + `${previousContext ? `Compared with ${previousContext.report_date}, today I built on the prior log and kept the active work moving forward. ` : ''}`
+        + `${thinPipeline ? 'We need to feed more firms into the top of funnel tomorrow. ' : ''}`
         + `Tomorrow I need to keep the approved outreach moving and convert the strongest active conversations into replies.`
       )
     : 'No active deal work was logged today.';
@@ -881,7 +885,7 @@ function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previo
     headline,
     executive_summary: executiveSummary,
     telegram_caption: `Daily log ready · ${activityEntries.length} activity events · ${dealSections.length} deal${dealSections.length === 1 ? '' : 's'} covered`,
-    voice_script: sanitizeNarrationText(`Hey Dom, here is what I got through today. ${executiveSummary} ${dealSections.map(section => `${section.deal_name}: ${section.summary} Next I will focus on ${section.next_move}.`).join(' ')}`).slice(0, 1100),
+    voice_script: sanitizeNarrationText(`Hey Dom, here is what I got through today. ${executiveSummary} ${dealSections.map(section => `${section.deal_name}: ${section.summary} Next I will focus on ${section.next_move}.`).join(' ')}${thinPipeline ? ' We need to feed more firms into the top of funnel tomorrow.' : ''}`).slice(0, 1100),
     deal_sections: dealSections,
     raw_context: {
       action_counts: actionCounts,
@@ -928,14 +932,41 @@ function sanitizeDailyReport(aiReport = {}) {
     voice_script: sanitizeNarrationText(aiReport.voice_script || '').slice(0, 1150),
     deal_sections: dealSections.map(section => ({
       ...section,
+      deal_id: section.deal_id || null,
       deal_name: sanitizeNarrationText(section.deal_name || ''),
       progress_status: sanitizeNarrationText(section.progress_status || ''),
       summary: sanitizeNarrationText(section.summary || ''),
       key_actions: Array.isArray(section.key_actions) ? section.key_actions.map(item => sanitizeNarrationText(item)).filter(Boolean).slice(0, 4) : [],
       target_status: sanitizeNarrationText(section.target_status || ''),
       next_move: sanitizeNarrationText(section.next_move || ''),
+      recommended_actions: Array.isArray(section.recommended_actions)
+        ? section.recommended_actions.map(item => sanitizeNarrationText(item)).filter(Boolean).slice(0, 6)
+        : [],
     })),
   };
+}
+
+function buildRecommendedActionsForSnapshot(snapshot = {}) {
+  const actions = [];
+  const metrics = snapshot.metrics || {};
+  const dealName = snapshot.deal_name || 'this deal';
+
+  if (Number(metrics.firms_in_pipeline || 0) < 20) {
+    actions.push(`Research 20 more firms for ${dealName}`);
+  }
+  if (Number(metrics.positive_replies || 0) > 0) {
+    actions.push(`Follow up with ${Math.min(5, Number(metrics.positive_replies || 0))} warm contacts in ${dealName}`);
+  }
+  if (Number(metrics.total_replies || 0) === 0 && Number(metrics.emails_sent_today || 0) + Number(metrics.li_invites_today || 0) > 0) {
+    actions.push(`Expand LinkedIn search for ${dealName} and add a fresh investor angle tomorrow`);
+  }
+  if (Number(metrics.pending_approvals || 0) > 0) {
+    actions.push(`Clear ${metrics.pending_approvals} pending approvals for ${dealName}`);
+  }
+  if (!actions.length && snapshot.next_move) {
+    actions.push(snapshot.next_move);
+  }
+  return actions.slice(0, 6);
 }
 
 function describeLaunchWindow(deal, metrics = {}, reference = DateTime.now().setZone(ANALYTICS_TIMEZONE)) {
@@ -990,14 +1021,22 @@ function buildDealStatusLine(snapshot) {
 async function fetchPreviousDailyActivityReport(reportDate) {
   const supabase = getSupabase();
   if (!supabase || !reportDate) return null;
-  const { data, error } = await supabase.from('daily_activity_reports')
-    .select('*')
-    .lt('report_date', reportDate)
-    .order('report_date', { ascending: false })
+  const { data, error } = await supabase.from('daily_logs')
+    .select('log_date, deal_name, telegram_voice_script, recommended_actions')
+    .lt('log_date', reportDate)
+    .order('log_date', { ascending: false })
     .limit(1)
     .maybeSingle();
   if (error) throw error;
-  return data || null;
+  if (!data) return null;
+  return {
+    report_date: data.log_date || null,
+    executive_summary: data.telegram_voice_script || '',
+    deal_sections: [{
+      deal_name: data.deal_name || '',
+      next_move: Array.isArray(data.recommended_actions) ? data.recommended_actions[0] || '' : '',
+    }],
+  };
 }
 
 function buildPreviousReportContext(previousReport) {
@@ -1058,6 +1097,7 @@ Every deal snapshot includes launch timing. Use it. If a deal launched only 1-3 
 Only call a deal behind or critical if the operating facts support that judgment beyond normal early outreach lag.
 Compare today against the previous daily log when one exists. Reference what changed since yesterday in natural language.
 State what matters tomorrow: the next focus, the blocker, and what action will help the deal catch up if it is behind.
+If the combined active pipeline across all deals is below 20 firms, include this exact sentence in the voice script: "we need to feed more firms into the top of funnel tomorrow."
 Never include URLs, provider IDs, LinkedIn slugs, raw API paths, or literal raw error payloads.
 Never read out contact profile links or opaque IDs.
 Do not enumerate long lists of contact names or firms. Use at most two concrete examples total, and only if they materially help the summary.
@@ -1076,7 +1116,8 @@ Return ONLY valid JSON:
       "summary": "2-3 sentence summary",
       "key_actions": ["...", "..."],
       "target_status": "short target line",
-      "next_move": "next best action"
+      "next_move": "next best action",
+      "recommended_actions": ["specific action for tomorrow"]
     }
   ]
 }`;
@@ -1109,6 +1150,7 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
 
   return {
     report_date: window.reportDate,
+    log_date: window.reportDate,
     timezone: window.timezone,
     headline: aiReport.headline || `Daily operating log · ${window.reportDate}`,
     executive_summary: aiReport.executive_summary || null,
@@ -1119,6 +1161,7 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
       ai_report: aiReport,
       deal_snapshots: dealSnapshots,
       action_counts: summarizeDailyActionCounts(activityEntries),
+      activity_entries: activityEntries,
       conversation_count: conversationEntries.length,
       previous_report: buildPreviousReportContext(previousReport),
     },
@@ -1131,42 +1174,98 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
 export async function persistDailyActivityReport(report) {
   const supabase = getSupabase();
   if (!supabase || !report?.report_date) return null;
+  const reportDate = report.log_date || report.report_date;
+  const sections = Array.isArray(report.deal_sections) ? report.deal_sections : [];
+  const snapshotsByDealId = new Map(
+    (report.raw_payload?.deal_snapshots || [])
+      .filter(snapshot => snapshot?.deal_id)
+      .map(snapshot => [String(snapshot.deal_id), snapshot])
+  );
+  const activityByDealId = new Map();
+  for (const entry of report.raw_payload?.activity_entries || []) {
+    const key = String(entry?.deal_id || '');
+    if (!key) continue;
+    if (!activityByDealId.has(key)) activityByDealId.set(key, []);
+    activityByDealId.get(key).push(entry);
+  }
 
-  const row = {
-    report_date: report.report_date,
-    timezone: report.timezone || ANALYTICS_TIMEZONE,
-    headline: report.headline || null,
-    executive_summary: report.executive_summary || null,
-    voice_script: report.voice_script || null,
-    telegram_caption: report.telegram_caption || null,
-    deal_sections: report.deal_sections || [],
-    raw_payload: report.raw_payload || {},
-    activity_count: Number(report.activity_count || 0),
-    deals_covered: Number(report.deals_covered || 0),
-    status: report.status || 'generated',
-    voice_name: report.voice_name || null,
-    sent_to_telegram_at: report.sent_to_telegram_at || null,
-    voice_note_sent_at: report.voice_note_sent_at || null,
-    updated_at: new Date().toISOString(),
-  };
+  const rows = sections
+    .filter(section => section?.deal_id)
+    .map(section => {
+      const snapshot = snapshotsByDealId.get(String(section.deal_id)) || {};
+      const metrics = snapshot.metrics || {};
+      return {
+        log_date: reportDate,
+        deal_id: section.deal_id,
+        deal_name: section.deal_name || snapshot.deal_name || null,
+        total_firms_researched: Number(snapshot.activity_count || 0),
+        total_firms_active: Number(metrics.firms_in_pipeline || 0),
+        firms_added_today: Number(metrics.enrichment_actions || 0),
+        emails_sent_today: Number(metrics.emails_sent_today || 0),
+        linkedin_sent_today: Number(metrics.li_invites_today || 0) + Number(metrics.dms_sent_today || 0),
+        replies_received_today: Number(metrics.total_replies || 0),
+        positive_replies_today: Number(metrics.positive_replies || 0),
+        meetings_booked_today: Number(metrics.meetings_booked || 0),
+        pending_approvals: Number(metrics.pending_approvals || 0),
+        recommended_actions: section.recommended_actions || buildRecommendedActionsForSnapshot(snapshot),
+        actions_implemented: report.actions_implemented === true,
+        telegram_voice_script: report.voice_script || report.executive_summary || null,
+        activity_entries: activityByDealId.get(String(section.deal_id)) || [],
+      };
+    });
 
-  const { data, error } = await supabase.from('daily_activity_reports')
-    .upsert(row, { onConflict: 'report_date' })
-    .select()
-    .single();
+  if (!rows.length) return [];
+  const { data, error } = await supabase.from('daily_logs')
+    .upsert(rows, { onConflict: 'log_date,deal_id' })
+    .select('*');
   if (error) throw error;
-  return data;
+  return data || [];
 }
 
 export async function listDailyActivityReports(limit = 90) {
   const supabase = getSupabase();
   if (!supabase) return [];
-  const { data, error } = await supabase.from('daily_activity_reports')
+  const { data, error } = await supabase.from('daily_logs')
     .select('*')
-    .order('report_date', { ascending: false })
-    .limit(limit);
+    .order('log_date', { ascending: false })
+    .limit(limit * 12);
   if (error) throw error;
-  return data || [];
+  const grouped = new Map();
+  for (const row of data || []) {
+    const key = row.log_date;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        report_date: row.log_date,
+        headline: `Daily log · ${row.log_date}`,
+        executive_summary: row.telegram_voice_script || null,
+        voice_script: row.telegram_voice_script || null,
+        deals_covered: 0,
+        activity_count: 0,
+        status: 'generated',
+        deal_sections: [],
+      });
+    }
+    const agg = grouped.get(key);
+    agg.deals_covered += 1;
+    agg.activity_count += Array.isArray(row.activity_entries) ? row.activity_entries.length : 0;
+    agg.deal_sections.push({
+      deal_id: row.deal_id,
+      deal_name: row.deal_name,
+      progress_status: null,
+      summary: [
+        `${row.total_firms_active || 0} active firms`,
+        `${row.emails_sent_today || 0} emails`,
+        `${row.linkedin_sent_today || 0} LinkedIn sends`,
+        `${row.replies_received_today || 0} replies`,
+        `${row.meetings_booked_today || 0} meetings`,
+      ].join(' · '),
+      key_actions: row.recommended_actions || [],
+      target_status: `${row.pending_approvals || 0} pending approvals`,
+      next_move: Array.isArray(row.recommended_actions) ? row.recommended_actions[0] || '' : '',
+      recommended_actions: row.recommended_actions || [],
+    });
+  }
+  return [...grouped.values()].sort((a, b) => new Date(b.report_date) - new Date(a.report_date)).slice(0, limit);
 }
 
 async function fetchElevenLabsVoices() {

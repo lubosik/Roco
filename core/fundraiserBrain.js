@@ -94,6 +94,7 @@ export async function gatherCurrentMetrics(dealId) {
       firms_in_pipeline: 0,
       meetings_booked: 0,
       total_replies: 0,
+      pending_approvals: 0,
       hours_since_last_li_invite: null,
     };
   }
@@ -106,6 +107,7 @@ export async function gatherCurrentMetrics(dealId) {
     contactsRes,
     activityRes,
     msgRes,
+    pendingApprovalsRes,
   ] = await Promise.all([
     sb.from('contacts')
       .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, linkedin_connected, meeting_booked_at')
@@ -119,11 +121,16 @@ export async function gatherCurrentMetrics(dealId) {
       .select('direction, channel, received_at')
       .eq('deal_id', dealId)
       .eq('direction', 'inbound'),
+    sb.from('approval_queue')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_id', dealId)
+      .eq('status', 'pending'),
   ]);
 
   const contacts = contactsRes.data || [];
   const activities = activityRes.data || [];
   const inboundMessages = msgRes.data || [];
+  const pendingApprovals = Number(pendingApprovalsRes.count || 0);
 
   const liInvitesToday = contacts.filter(row => {
     const sentAt = row.invite_sent_at || null;
@@ -176,6 +183,7 @@ export async function gatherCurrentMetrics(dealId) {
     firms_in_pipeline: firmsInPipeline,
     meetings_booked: meetingsBooked,
     total_replies: totalReplies,
+    pending_approvals: pendingApprovals,
     hours_since_last_li_invite: hoursSinceLastLiInvite,
     activity_events_today: activities.length,
   };
@@ -261,17 +269,4 @@ export async function runFundraiserReasoning(deal, context = {}, pushActivity = 
   });
 
   return { directives, goalAnalysis, actionPlan };
-}
-
-export async function sendMorningBrief(deal, actionPlan, goalAnalysis, metrics, sendTelegram) {
-  if (typeof sendTelegram !== 'function') return;
-  const message = [
-    `*Morning Brief — ${deal?.name || 'Deal'}*`,
-    `Status: ${goalAnalysis?.status || 'IN PROGRESS'}`,
-    `Pipeline: ${normalizeNumber(metrics?.firms_in_pipeline, 0)} firms active`,
-    `Meetings: ${normalizeNumber(metrics?.meetings_booked, 0)}/${normalizeNumber(goalAnalysis?.meetings_needed, 0)}`,
-    '',
-    String(actionPlan || '').slice(0, 1200),
-  ].join('\n');
-  await sendTelegram(message);
 }

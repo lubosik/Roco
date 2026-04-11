@@ -2,6 +2,7 @@ import { getSupabase } from './supabase.js';
 import { sendTelegram } from '../approval/telegramBot.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import Anthropic from '@anthropic-ai/sdk';
+import { DateTime } from 'luxon';
 
 const GROK_API_KEY = process.env.GROK_API_KEY || process.env.XAI_API_KEY;
 const GROK_BASE = 'https://api.x.ai/v1';
@@ -72,6 +73,68 @@ function buildNewsDedupKey(item) {
   const firm = normalizeNewsText(item?.firm_name || 'market');
   const event = normalizeNewsText(item?.news_event || item?.reason || '').slice(0, 120);
   return `${firm}|${event}`;
+}
+
+function buildSpecificGrokQueries(deal) {
+  const sector = String(deal?.sector || 'private capital').trim();
+  const geography = String(deal?.target_geography || deal?.geography || 'United States').trim();
+  const investorProfile = String(deal?.investor_profile || deal?.target_investor_profile || 'family offices private equity independent sponsors').trim();
+  const description = String(deal?.description || deal?.deal_description || '').trim();
+  const monthLabel = DateTime.now().setZone('America/New_York').toFormat('LLLL yyyy');
+  const year = DateTime.now().setZone('America/New_York').year;
+
+  return [
+    `${investorProfile} investments ${sector} ${year}`,
+    `${sector} investor activity ${geography} ${monthLabel}`,
+    `${deal?.raise_type || deal?.deal_type || 'growth capital'} ${sector} investors ${geography} ${year}`,
+    `${sector} acquisitions fundraise family office private equity ${geography} ${year}`,
+    description ? `${description.slice(0, 90)} investors ${geography} ${monthLabel}` : null,
+  ].filter(Boolean).slice(0, 5);
+}
+
+function simplifyGrokQuery(query) {
+  return String(query || '')
+    .replace(/\b(family offices?|private equity|independent sponsors?)\b/gi, 'investors')
+    .replace(/\b(lower middle market|growth capital|growth equity)\b/gi, 'investments')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function executeGrokNewsQueries(deal, queries = [], pushActivity) {
+  const rawResults = [];
+  for (const query of queries) {
+    let result = await grokWebSearch(
+      query,
+      'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
+      1100
+    );
+    let retryQuery = null;
+    if (!result) {
+      retryQuery = simplifyGrokQuery(query);
+      if (retryQuery && retryQuery !== query) {
+        result = await grokWebSearch(
+          retryQuery,
+          'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
+          900
+        );
+      }
+    }
+    rawResults.push({
+      query,
+      retry_query: retryQuery,
+      success: !!result,
+      raw_result: result || `Query failed for: ${query}`,
+    });
+    if (!result) {
+      pushActivity?.({
+        type: 'warning',
+        action: 'News scan query failed',
+        note: `${deal.name} · ${query.slice(0, 140)}`,
+        deal_id: deal.id,
+      });
+    }
+  }
+  return rawResults;
 }
 
 export async function grokWebSearch(query, systemContext = '', maxTokens = 1000) {
@@ -274,13 +337,7 @@ Maximum 8 findings. Always include at least 3 items — use general sector conte
 
 async function reviewDealNewsWithClaude(deal, searchPayload, operatingContext) {
   const findings = safeArray(searchPayload?.findings).map(normalizeDealLead);
-  if (!findings.length) {
-    return {
-      telegram_summary: `${deal.name}: no credible investor-news developments met the relevance bar today.`,
-      qualified_leads: [],
-      rejected_findings: [],
-    };
-  }
+  const rawResults = safeArray(searchPayload?.raw_results);
 
   const prompt = `You are ROCO's investment-news reviewer.
 
@@ -302,43 +359,38 @@ RAW SEARCH OUTPUT
 ${JSON.stringify(searchPayload, null, 2)}
 
 TASK
-1. Filter the findings to only the firms that should realistically be added to this deal's pipeline now.
-2. Use the operating context to avoid weak duplicates.
-3. Produce a concise operator-ready summary for Telegram.
+1. Summarise the key market developments, investor activity, and relevant news for this deal.
+2. Filter the findings to only the firms that should realistically be added to this deal's pipeline now.
+3. Use the operating context to avoid weak duplicates.
+4. Never say there is no data. Synthesize what is available from the raw search results.
 
 Return ONLY valid JSON:
 {
-  "telegram_summary": "3-5 sentence enterprise summary",
-  "qualified_leads": [
+  "summary": "3-5 sentence operator summary",
+  "is_relevant": true,
+  "notes": "short note on why this matters",
+  "recommended_investors": [
     {
-      "firm_name": "...",
-      "news_event": "...",
-      "why_relevant": "...",
-      "urgency": "high OR medium",
-      "source_hint": "...",
-      "source_url": "https://...",
-      "published_at": "YYYY-MM-DD",
-      "investor_type": "...",
-      "hq_country": "...",
-      "relevance_score": 1-10,
-      "recommended_action": "add_to_pipeline_now OR monitor_only",
-      "match_reasons": ["...", "..."]
+      "name": "person name or null",
+      "firm": "firm name",
+      "reason": "why this investor should be added"
     }
   ],
-  "rejected_findings": [
-    {
-      "firm_name": "...",
-      "reason": "why this should not be added now"
-    }
-  ]
+  "telegram_summary": "clean digest paragraph"
 }
-Maximum 5 qualified leads.`;
+Maximum 5 recommended investors.`;
 
   if (!anthropic) {
     return {
-      telegram_summary: `${deal.name}: ${findings.length} investor-news signal${findings.length === 1 ? '' : 's'} identified. ${findings.slice(0, 3).map(lead => `${lead.firm_name} is relevant because ${truncate(lead.why_relevant, 80)}`).join(' ')}`,
-      qualified_leads: findings.filter(lead => lead.relevance_score >= 7).slice(0, 5),
-      rejected_findings: [],
+      summary: `${deal.name}: ${findings.length || rawResults.length} market signal${(findings.length || rawResults.length) === 1 ? '' : 's'} reviewed for this sector today.`,
+      is_relevant: findings.length > 0,
+      notes: findings.length ? 'Fresh investor activity was identified.' : 'Market context was reviewed even though source data was sparse.',
+      recommended_investors: findings.filter(lead => lead.relevance_score >= 7).slice(0, 5).map(lead => ({
+        name: null,
+        firm: lead.firm_name,
+        reason: lead.why_relevant || lead.news_event,
+      })),
+      telegram_summary: `${deal.name}: ${findings.length || rawResults.length} investor or market signal${(findings.length || rawResults.length) === 1 ? '' : 's'} reviewed. ${findings.slice(0, 2).map(lead => `${lead.firm_name} looks relevant because ${truncate(lead.why_relevant, 80)}`).join(' ')}`.trim(),
     };
   }
 
@@ -350,87 +402,111 @@ Maximum 5 qualified leads.`;
     });
     const json = extractJSONObject(response.content?.[0]?.text || '');
     return {
+      summary: String(json?.summary || '').trim() || `${deal.name}: investor-news scan completed.`,
+      is_relevant: json?.is_relevant !== false,
+      notes: String(json?.notes || '').trim(),
+      recommended_investors: safeArray(json?.recommended_investors).map(item => ({
+        name: String(item?.name || '').trim() || null,
+        firm: String(item?.firm || '').trim(),
+        reason: String(item?.reason || '').trim(),
+      })).filter(item => item.firm && item.reason),
       telegram_summary: String(json?.telegram_summary || '').trim() || `${deal.name}: investor-news scan completed.`,
-      qualified_leads: safeArray(json?.qualified_leads).map(normalizeDealLead).filter(lead => lead.firm_name && lead.why_relevant),
-      rejected_findings: safeArray(json?.rejected_findings),
     };
   } catch (err) {
     console.warn('[NEWS REVIEW]', err.message);
     return {
-      telegram_summary: `${deal.name}: investor-news scan completed with ${findings.length} candidate signal${findings.length === 1 ? '' : 's'}. Claude review failed, so Roco kept the highest-scoring items only.`,
-      qualified_leads: findings.filter(lead => lead.relevance_score >= 7).slice(0, 5),
-      rejected_findings: [],
+      summary: `${deal.name}: investor-news scan completed with ${findings.length || rawResults.length} candidate signal${(findings.length || rawResults.length) === 1 ? '' : 's'}.`,
+      is_relevant: findings.length > 0,
+      notes: 'Claude review failed, so Roco kept the strongest raw findings only.',
+      recommended_investors: findings.filter(lead => lead.relevance_score >= 7).slice(0, 5).map(lead => ({
+        name: null,
+        firm: lead.firm_name,
+        reason: lead.why_relevant || lead.news_event,
+      })),
+      telegram_summary: `${deal.name}: investor-news scan completed with ${findings.length || rawResults.length} candidate signal${(findings.length || rawResults.length) === 1 ? '' : 's'}. Claude review failed, so the strongest raw findings were kept.`,
     };
   }
 }
 
 export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity) {
   if (!deal?.id || !GROK_API_KEY) {
-    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [] };
+    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: '', recommendedInvestors: [] };
   }
 
   const operatingContext = await gatherDealOperatingContext(deal);
-  const query = buildDealNewsSearchPrompt(deal, portfolioDeals, operatingContext);
-  const result = await grokWebSearch(
-    query,
-    'You are a buy-side research analyst. Search the live web, cross-check sources, and return only valid JSON.',
-    1400
-  );
-
-  if (!result) {
-    return {
-      leads: [],
-      summary: `${deal.name}: no usable search output returned from Grok.`,
-      rawSummary: '',
-      rejectedFindings: [],
-    };
-  }
+  const queryPlan = buildSpecificGrokQueries(deal);
+  const grokRawResults = await executeGrokNewsQueries(deal, queryPlan, pushActivity);
+  const successfulResults = grokRawResults.filter(item => item.success && item.raw_result).map(item => item.raw_result);
 
   let searchPayload = null;
-  try {
-    searchPayload = extractJSONObject(result);
-  } catch (err) {
-    pushActivity?.({
-      type: 'error',
-      action: 'News scan parse failed',
-      note: `${deal.name} · ${err.message?.slice(0, 100)}`,
-      deal_id: deal.id,
-    });
-    return {
-      leads: [],
-      summary: `${deal.name}: Grok search returned malformed JSON.`,
-      rawSummary: '',
-      rejectedFindings: [],
+  if (successfulResults.length) {
+    const query = buildDealNewsSearchPrompt(deal, portfolioDeals, operatingContext) + `\n\nRAW RESULT SNAPSHOTS\n${successfulResults.map((result, index) => `QUERY ${index + 1}\n${result}`).join('\n\n')}`;
+    const result = await grokWebSearch(
+      query,
+      'You are a buy-side research analyst. Search the live web, cross-check sources, and return only valid JSON.',
+      1400
+    );
+    try {
+      searchPayload = result ? extractJSONObject(result) : null;
+    } catch (err) {
+      pushActivity?.({
+        type: 'error',
+        action: 'News scan parse failed',
+        note: `${deal.name} · ${err.message?.slice(0, 100)}`,
+        deal_id: deal.id,
+      });
+    }
+  }
+
+  if (!searchPayload) {
+    searchPayload = {
+      search_summary: `${deal.name}: searched ${queryPlan.length} specific investor and market queries for ${deal.sector || 'this sector'}.`,
+      findings: [],
+      raw_results: grokRawResults,
     };
+  } else {
+    searchPayload.raw_results = grokRawResults;
   }
 
   const review = await reviewDealNewsWithClaude(deal, searchPayload, operatingContext);
   const recentKeys = new Set(
     safeArray(operatingContext.recent_news_items).map(item => buildNewsDedupKey(item))
   );
-  const dedupedLeads = safeArray(review.qualified_leads)
+  const leadKeys = new Set(recentKeys);
+  const findingKeys = new Set(recentKeys);
+  const dedupedLeads = safeArray(searchPayload?.findings)
     .map(normalizeDealLead)
     .filter(lead => {
       const key = buildNewsDedupKey(lead);
-      if (!key || recentKeys.has(key)) return false;
-      recentKeys.add(key);
+      if (!key || leadKeys.has(key)) return false;
+      leadKeys.add(key);
       return lead.firm_name && lead.why_relevant;
-    });
+    })
+    .filter(lead => safeArray(review.recommended_investors).some(item => normalizeNewsText(item.firm) === normalizeNewsText(lead.firm_name)))
+    .map(lead => ({
+      ...lead,
+      recommended_action: 'add_to_pipeline_now',
+    }));
   const dedupedFindings = safeArray(searchPayload?.findings)
     .map(normalizeDealLead)
     .filter(item => {
       const key = buildNewsDedupKey(item);
-      if (!key || recentKeys.has(key)) return false;
-      recentKeys.add(key);
+      if (!key || findingKeys.has(key)) return false;
+      findingKeys.add(key);
       return Boolean(item.news_event || item.why_relevant);
     });
 
   return {
     leads: dedupedLeads,
-    summary: review.telegram_summary,
+    summary: review.telegram_summary || review.summary,
     rawSummary: String(searchPayload?.search_summary || '').trim(),
-    rejectedFindings: safeArray(review.rejected_findings),
+    rejectedFindings: [],
     allFindings: dedupedFindings,
+    grokQueries: queryPlan,
+    grokRawResults,
+    isRelevant: review.is_relevant !== false,
+    notes: review.notes || '',
+    recommendedInvestors: review.recommended_investors || [],
   };
 }
 

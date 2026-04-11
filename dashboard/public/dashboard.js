@@ -87,6 +87,9 @@ const CAMPAIGN_FIRMS_PER_PAGE = 20;
 let dealBriefEditMode = false;
 let currentParsedDeal = null;
 let currentDocumentId = null;
+let investorProfileContactId = null;
+let investorProfileDealId = null;
+let transcriptDealContacts = [];
 
 /* ─── INIT ───────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
@@ -151,6 +154,8 @@ function navigate(hash) {
     case 'queue':      loadQueue();      break;
     case 'activity':   loadActivity();   break;
     case 'analytics':       loadAnalyticsPage();   break;
+    case 'transcripts':     loadMeetingTranscriptsPage(); break;
+    case 'investor-profile': loadInvestorProfilePage(); break;
     case 'archive':         loadArchive();         break;
     case 'sourcing':        loadSourcingCampaigns(); break;
     case 'sourcing-launch': /* form loads statically */ break;
@@ -1929,6 +1934,8 @@ async function openContactSidePanel(contactId, dealId = null) {
   if (!panel) return;
 
   _sidePanelContactId = contactId;
+  investorProfileContactId = contactId;
+  investorProfileDealId = dealId || null;
   panel.style.right = '0';
   if (overlay) overlay.style.display = 'block';
   if (nameEl) nameEl.textContent = 'Loading…';
@@ -1936,124 +1943,124 @@ async function openContactSidePanel(contactId, dealId = null) {
 
   try {
     const qs = dealId ? `?dealId=${encodeURIComponent(dealId)}` : '';
-    const data = await api(`/api/contacts/${contactId}/conversation${qs}`);
+    const data = await api(`/api/contacts/${contactId}/investor-card${qs}`);
     if (_sidePanelContactId !== contactId) return; // navigated away
-    if (nameEl) nameEl.textContent = data.contact?.name || '—';
+    if (nameEl) nameEl.textContent = data.contact?.name || 'Investor';
     if (bodyEl) renderSidePanelBody(bodyEl, data);
   } catch {
     if (bodyEl) bodyEl.innerHTML = '<div style="padding:24px;color:#e05c5c">Failed to load contact.</div>';
   }
 }
 
+async function openInvestorProfilePage(contactId, dealId = null) {
+  investorProfileContactId = contactId;
+  investorProfileDealId = dealId || null;
+  window.location.hash = '#investor-profile';
+}
+
+async function loadInvestorProfilePage() {
+  const container = document.getElementById('investor-profile-container');
+  if (!container) return;
+  if (!investorProfileContactId) {
+    container.innerHTML = '<div class="card" style="padding:32px;color:var(--text-dim)">No investor selected yet.</div>';
+    return;
+  }
+  container.innerHTML = '<div class="card" style="padding:32px;color:var(--text-dim)">Loading investor profile...</div>';
+  try {
+    const qs = investorProfileDealId ? `?dealId=${encodeURIComponent(investorProfileDealId)}` : '';
+    const data = await api(`/api/contacts/${investorProfileContactId}/investor-card${qs}`);
+    const contact = data.contact || {};
+    const history = Array.isArray(data.history) ? data.history : [];
+    container.innerHTML = `
+      <div class="section-header">
+        <h1 class="section-title">${esc(contact.name || 'Investor Profile')}</h1>
+        <button class="btn btn-ghost btn-sm" onclick="openContactSidePanel('${esc(contact.id)}','${esc(investorProfileDealId || contact.deal_id || '')}')">Open Side Panel</button>
+      </div>
+      <div class="card" style="padding:24px">
+        <div style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:24px">
+          <div>
+            <div style="font-size:14px;color:#9ca3af;margin-bottom:8px">${esc(contact.job_title || '—')} · ${esc(contact.company_name || '—')}</div>
+            ${contact.linkedin_url ? `<div style="margin-bottom:8px"><a href="${esc(contact.linkedin_url)}" target="_blank" rel="noopener" style="color:#60a5fa">LinkedIn profile</a></div>` : ''}
+            ${contact.email ? `<div style="margin-bottom:8px;color:#4ade80">${esc(contact.email)}</div>` : ''}
+            ${contact.phone ? `<div style="margin-bottom:8px;color:#cbd5e1">${esc(contact.phone)}</div>` : ''}
+            ${contact.investment_thesis ? `<div style="margin-top:20px"><div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px">Investment Thesis</div><div style="font-size:13px;color:#cbd5e1;line-height:1.7">${esc(contact.investment_thesis)}</div></div>` : ''}
+          </div>
+          <div>
+            ${contact.aum_display ? `<div style="margin-bottom:12px"><div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px">AUM</div><div style="font-size:13px;color:#e5e7eb">${esc(contact.aum_display)}</div></div>` : ''}
+            ${contact.cheque_size_range ? `<div style="margin-bottom:12px"><div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px">Cheque Size</div><div style="font-size:13px;color:#e5e7eb">${esc(contact.cheque_size_range)}</div></div>` : ''}
+            ${contact.sectors_of_interest?.length ? `<div style="margin-bottom:12px"><div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px">Sectors</div><div style="display:flex;flex-wrap:wrap;gap:6px">${contact.sectors_of_interest.map(item => `<span style="padding:3px 8px;border:1px solid var(--border);border-radius:999px;font-size:11px">${esc(item)}</span>`).join('')}</div></div>` : ''}
+            ${contact.past_investments_list?.length ? `<div><div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px">Past Investments</div><div style="display:flex;flex-wrap:wrap;gap:6px">${contact.past_investments_list.map(item => `<span style="padding:3px 8px;border-radius:999px;background:rgba(96,165,250,0.12);color:#93c5fd;font-size:11px">${esc(item)}</span>`).join('')}</div></div>` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="card mt-24" style="padding:24px">
+        <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.12em;margin-bottom:12px">Conversation History</div>
+        ${history.length ? history.map(item => `<div style="padding:12px 0;border-bottom:1px solid var(--border)"><div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:4px"><span style="color:#e5e7eb">${esc(item.type || 'Interaction')}</span><span style="color:#6b7280;font-size:12px">${item.date ? new Date(item.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</span></div><div style="color:#9ca3af;font-size:13px;line-height:1.6">${esc(item.summary || 'No summary available.')}</div></div>`).join('') : '<div style="color:#6b7280">No interactions recorded yet.</div>'}
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="card" style="padding:32px;color:#ef4444">Failed to load investor profile: ${esc(err.message)}</div>`;
+  }
+}
+
 function closeContactPanel() {
   const panel   = document.getElementById('contact-side-panel');
   const overlay = document.getElementById('contact-panel-overlay');
-  if (panel)   panel.style.right = '-520px';
+  if (panel)   panel.style.right = '-440px';
   if (overlay) overlay.style.display = 'none';
   _sidePanelContactId = null;
 }
 
 function renderSidePanelBody(el, data) {
-  const { contact, messages, intentHistory } = data;
-  if (!contact) { el.innerHTML = '<div style="padding:24px;color:var(--text-dim)">No contact data.</div>'; return; }
-  const projectName = data.selectedDealName || contact.dealName || '';
-  const effectiveMessages = Array.isArray(messages) && messages.length
-    ? messages
-    : [buildFallbackConversationMessage(contact)].filter(Boolean);
-  const deals = Array.isArray(data.deals) ? data.deals : [];
+  const contact = data.contact;
+  const history = Array.isArray(data.history) ? data.history : [];
+  if (!contact) {
+    el.innerHTML = '<div style="padding:24px;color:var(--text-dim)">No contact data.</div>';
+    return;
+  }
 
-  const field = (label, value, href) => value ? `
-    <div style="margin-bottom:14px">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:3px">${label}</div>
-      ${href
-        ? `<a href="${esc(href)}" target="_blank" style="color:var(--accent);font-size:13px">${esc(value)}</a>`
-        : `<div style="color:#e5e7eb;font-size:13px">${esc(value)}</div>`}
-    </div>` : '';
-
-  const stageBadge = contact.pipeline_stage
-    ? `<span style="padding:3px 10px;border-radius:3px;font-size:11px;font-family:'DM Mono',monospace;background:rgba(212,168,71,0.1);color:#d4a847">${esc(contact.pipeline_stage)}</span>`
-    : '';
-  const sentimentBdg = contact.last_intent
-    ? sentimentBadge(contact.last_intent_label, contact.last_intent, contact.conversation_state)
+  const sentiment = Number(contact.transcript_sentiment || 0);
+  const sentimentBadgeHtml = sentiment
+    ? `<span style="padding:4px 10px;border-radius:999px;font-size:10px;font-family:'DM Mono',monospace;background:${sentiment >= 8 ? 'rgba(74,222,128,0.14)' : sentiment >= 5 ? 'rgba(251,191,36,0.14)' : 'rgba(248,113,113,0.14)'};color:${sentiment >= 8 ? '#4ade80' : sentiment >= 5 ? '#fbbf24' : '#f87171'}">Sentiment ${sentiment}/10</span>`
     : '';
 
-  // Contact info section
-  const infoHtml = `
+  el.innerHTML = `
     <div style="padding:20px;border-bottom:1px solid #1a1a1a">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">${stageBadge}${sentimentBdg}</div>
-      ${projectName ? `<div style="margin-bottom:16px;padding:8px 10px;background:#141414;border:1px solid #262626;border-radius:6px;color:#d4a847;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-family:'DM Mono',monospace">Project ${esc(projectName)}</div>` : ''}
-      ${field('Email', contact.email, `mailto:${contact.email}`)}
-      ${field('Phone', contact.phone)}
-      ${field('LinkedIn', contact.linkedin_url ? 'View profile' : null, contact.linkedin_url)}
-      ${field('Title', contact.job_title)}
-      ${field('Firm', contact.company_name)}
-      ${field('Score', contact.investor_score ? `${contact.investor_score}/100` : null)}
-    </div>`;
-
-  const dealsHtml = deals.length ? `
-    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Deals</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px">
-        ${deals.map(d => `<span style="padding:4px 10px;border-radius:4px;font-size:11px;font-family:'DM Mono',monospace;background:${d.status === 'ACTIVE' ? 'rgba(212,168,71,0.12)' : '#1a1a1a'};color:${d.status === 'ACTIVE' ? '#d4a847' : '#9ca3af'};border:1px solid ${d.status === 'ACTIVE' ? 'rgba(212,168,71,0.28)' : '#2a2a2a'}">${esc(d.dealName || '—')}</span>`).join('')}
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px">
+        <div>
+          <div style="font-size:18px;color:#e5e7eb;font-weight:600">${esc(contact.name || '—')}</div>
+          <div style="font-size:12px;color:#9ca3af">${esc(contact.job_title || '—')}</div>
+          <div style="font-size:12px;color:#6b7280">${esc(contact.company_name || '—')}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+          ${contact.pipeline_stage ? `<span style="padding:4px 10px;border-radius:999px;font-size:10px;font-family:'DM Mono',monospace;background:rgba(212,168,71,0.12);color:#d4a847">${esc(contact.pipeline_stage)}</span>` : ''}
+          ${sentimentBadgeHtml}
+        </div>
       </div>
-    </div>` : '';
-
-  // Firm research from batch_firms
-  const fr = data.firmResearch;
-  const pastInv = Array.isArray(fr?.past_investments) ? fr.past_investments.slice(0, 6) : [];
-  const firmHtml = fr ? `
-    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Firm Research</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
-        ${fr.score ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:2px">Score</div><div style="font-size:13px;color:#d4a847;font-family:'DM Mono',monospace">${fr.score}/100</div></div>` : ''}
-        ${fr.aum ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:2px">AUM</div><div style="font-size:13px;color:#e5e7eb">${esc(fr.aum)}</div></div>` : ''}
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;color:#cbd5e1">
+        ${contact.linkedin_url ? `<a href="${esc(contact.linkedin_url)}" target="_blank" rel="noopener" style="color:#60a5fa">LinkedIn profile</a>` : ''}
+        ${contact.email ? `<a href="mailto:${esc(contact.email)}" style="color:#4ade80">${esc(contact.email)}</a>` : ''}
+        ${contact.phone ? `<div>${esc(contact.phone)}</div>` : ''}
       </div>
-      ${fr.thesis ? `<div style="margin-bottom:12px"><div style="font-size:10px;color:#6b7280;margin-bottom:4px">Investment Thesis</div><p style="color:#9ca3af;font-size:12px;line-height:1.6;margin:0">${esc(fr.thesis.slice(0,500))}${fr.thesis.length>500?'…':''}</p></div>` : ''}
-      ${fr.justification ? `<div style="margin-bottom:12px"><div style="font-size:10px;color:#6b7280;margin-bottom:4px">Why This Firm</div><p style="color:#9ca3af;font-size:12px;line-height:1.6;margin:0;font-style:italic">${esc(fr.justification.slice(0,400))}${fr.justification.length>400?'…':''}</p></div>` : ''}
-      ${pastInv.length ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:6px">Past Investments</div><div style="display:flex;flex-wrap:wrap;gap:5px">${pastInv.map(inv=>`<span style="padding:2px 8px;background:#1a1a2a;border:1px solid #2a2a3a;border-radius:3px;font-size:10px;color:#9ca3af;font-family:'DM Mono',monospace">${esc(typeof inv==='string'?inv:(inv.company||inv.name||''))}</span>`).join('')}</div></div>` : ''}
-    </div>` : (contact.notes ? `
-    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:8px">Notes</div>
-      <p style="color:#9ca3af;font-size:12px;line-height:1.65;margin:0">${esc(contact.notes)}</p>
-    </div>` : '');
-
-  // Conversation history
-  const msgHtml = `
-    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">
-        Conversation${projectName ? ` — ${esc(projectName)}` : ''} (${effectiveMessages.length} message${effectiveMessages.length !== 1 ? 's' : ''})
+      <div style="margin-top:16px">
+        <a href="#investor-profile" onclick="event.preventDefault(); openInvestorProfilePage('${esc(contact.id)}','${esc(investorProfileDealId || contact.deal_id || '')}')" style="color:#60a5fa;font-size:12px">View full profile</a>
       </div>
-      ${effectiveMessages.length ? `<div style="display:flex;flex-direction:column;gap:10px">
-        ${effectiveMessages.map(m => {
-          const isOut = m.direction === 'outbound';
-          const ts = m.timestamp ? new Date(m.timestamp).toLocaleDateString('en-GB', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '';
-          const intentTag = m.intent ? `<span style="background:rgba(255,255,255,0.07);padding:1px 6px;border-radius:2px;font-size:9px;font-family:'DM Mono',monospace"> ${esc(m.intent.replace(/_/g,' '))}</span>` : '';
-          const fallbackTag = m.isFallback ? `<span style="background:rgba(212,168,71,0.08);padding:1px 6px;border-radius:2px;font-size:9px;font-family:'DM Mono',monospace;color:#d4a847">state fallback</span>` : '';
-          return `<div style="display:flex;flex-direction:column;align-items:${isOut ? 'flex-end' : 'flex-start'}">
-            <div style="max-width:90%;background:${isOut ? 'rgba(212,168,71,0.08)' : 'rgba(255,255,255,0.04)'};border:1px solid ${isOut ? 'rgba(212,168,71,0.2)' : '#1e1e1e'};padding:10px 14px;border-radius:8px;line-height:1.55;font-size:12px;color:#d1d5db">
-              ${m.subject ? `<div style="font-size:10px;color:#6b7280;margin-bottom:6px;font-family:'DM Mono',monospace">Subject: ${esc(m.subject)}</div>` : ''}
-              ${esc(m.body || '')}
-            </div>
-            <div style="font-size:10px;color:#4a4a4a;margin-top:3px">${isOut ? 'Roco' : esc(contact.name || 'Investor')} · ${esc(m.channel || '')} · ${ts}${intentTag}${fallbackTag}</div>
-          </div>`;
-        }).join('')}
-      </div>` : `<div style="color:#4a4a4a;font-size:12px">No messages yet${projectName ? ` for ${esc(projectName)}` : ''}.</div>`}
-    </div>`;
-
-  // Intent timeline
-  const intentHtml = intentHistory.length ? `
+    </div>
+    <div style="padding:20px;border-bottom:1px solid #1a1a1a">
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Profile</div>
+      <div style="display:grid;grid-template-columns:1fr;gap:12px">
+        ${contact.aum_display ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:3px">AUM</div><div style="font-size:13px;color:#e5e7eb">${esc(contact.aum_display)}</div></div>` : ''}
+        ${contact.investment_thesis ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:3px">Investment Thesis</div><div style="font-size:13px;color:#cbd5e1;line-height:1.6">${esc(contact.investment_thesis)}</div></div>` : ''}
+        ${contact.sectors_of_interest?.length ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:6px">Sectors of Interest</div><div style="display:flex;flex-wrap:wrap;gap:6px">${contact.sectors_of_interest.map(item => `<span style="padding:3px 8px;border-radius:999px;background:#17171b;color:#cbd5e1;font-size:10px;border:1px solid #24242a">${esc(item)}</span>`).join('')}</div></div>` : ''}
+        ${contact.cheque_size_range ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:3px">Cheque Size</div><div style="font-size:13px;color:#e5e7eb">${esc(contact.cheque_size_range)}</div></div>` : ''}
+        ${contact.past_investments_list?.length ? `<div><div style="font-size:10px;color:#6b7280;margin-bottom:6px">Past Investments</div><div style="display:flex;flex-wrap:wrap;gap:6px">${contact.past_investments_list.map(item => `<span style="padding:3px 8px;border-radius:999px;background:rgba(96,165,250,0.12);color:#93c5fd;font-size:10px;border:1px solid rgba(96,165,250,0.2)">${esc(item)}</span>`).join('')}</div></div>` : ''}
+      </div>
+    </div>
     <div style="padding:20px">
-      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:10px">Intent Timeline</div>
-      <div style="display:flex;flex-direction:column;gap:6px">
-        ${intentHistory.slice().reverse().slice(0, 12).map(h => `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:#111;border-radius:4px">
-            <span style="font-size:12px;color:#d1d5db">${esc((h.intent || '').replace(/_/g,' '))}</span>
-            <span style="font-size:10px;color:#4a4a4a;font-family:'DM Mono',monospace">${new Date(h.timestamp).toLocaleDateString('en-GB',{day:'numeric',month:'short'})}</span>
-          </div>`).join('')}
-      </div>
-    </div>` : '';
-
-  el.innerHTML = infoHtml + dealsHtml + firmHtml + msgHtml + intentHtml;
+      <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.12em;font-family:'DM Mono',monospace;margin-bottom:12px">Conversation History</div>
+      ${history.length ? `<div style="display:flex;flex-direction:column;gap:10px">${history.map(item => `<div style="padding:12px 14px;border:1px solid #1f1f24;border-radius:10px;background:#111217"><div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:6px"><span style="font-size:11px;color:#e5e7eb">${esc(item.type || 'Interaction')}</span><span style="font-size:10px;color:#6b7280">${item.date ? new Date(item.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</span></div><div style="font-size:12px;color:#9ca3af;line-height:1.55">${esc(item.summary || 'No summary available.')}</div></div>`).join('')}</div>` : `<div style="color:#6b7280;font-size:12px">No interactions recorded yet.</div>`}
+    </div>
+  `;
 }
 
 // Also fetch firm research (AUM, EBITDA, thesis) and inject into the panel
@@ -4697,6 +4704,7 @@ async function skipRankedContact(contactId, btn) {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function openProspectDrawer(contactId, dealId) {
+  return openContactSidePanel(contactId, dealId || null);
   let drawer = document.getElementById('prospect-drawer');
   if (!drawer) {
     drawer = document.createElement('div');
@@ -9046,6 +9054,165 @@ window.openDailyLog = async function(reportDate) {
     </div>`;
 
   document.body.appendChild(ov);
+};
+
+async function loadMeetingTranscriptsPage() {
+  const container = document.getElementById('transcripts-main-container');
+  if (!container) return;
+  container.innerHTML = `
+    <div class="section-header">
+      <h1 class="section-title">Meeting Transcripts</h1>
+      <button class="btn btn-gold btn-sm" onclick="openTranscriptUploadModal()">Upload Transcript</button>
+    </div>
+    <div class="card" style="padding:24px">
+      <div id="transcripts-list" style="color:var(--text-dim)">Loading transcripts...</div>
+    </div>
+  `;
+
+  try {
+    const rows = await api('/api/meeting-transcripts');
+    const list = document.getElementById('transcripts-list');
+    if (!list) return;
+    if (!Array.isArray(rows) || !rows.length) {
+      list.innerHTML = '<div style="color:var(--text-dim)">No transcripts uploaded yet.</div>';
+      return;
+    }
+    list.innerHTML = rows.map(row => `
+      <div style="padding:16px 0;border-bottom:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px">
+          <div>
+            <div style="font-size:14px;color:var(--text-bright)">${esc(row.investor_name || 'Unknown investor')}</div>
+            <div style="font-size:12px;color:var(--text-dim)">${esc(row.deal_name || 'Unknown deal')}</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:12px;color:${Number(row.sentiment_score || 0) >= 8 ? '#4ade80' : Number(row.sentiment_score || 0) >= 5 ? '#fbbf24' : '#f87171'}">${row.sentiment_score ? `Sentiment ${row.sentiment_score}/10` : 'Pending analysis'}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${row.created_at ? new Date(row.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</div>
+          </div>
+        </div>
+        <div style="font-size:13px;color:#cbd5e1;line-height:1.6">${esc(row.summary || 'No summary saved yet.')}</div>
+      </div>
+    `).join('');
+  } catch (err) {
+    const list = document.getElementById('transcripts-list');
+    if (list) list.innerHTML = `<div style="color:#ef4444">Failed to load transcripts: ${esc(err.message)}</div>`;
+  }
+}
+
+async function openTranscriptUploadModal() {
+  const deals = Array.isArray(allDeals) && allDeals.length ? allDeals.filter(d => String(d.status || '').toLowerCase() === 'active') : await api('/api/deals');
+  const modal = document.createElement('div');
+  modal.id = 'transcript-upload-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:2000;display:flex;align-items:center;justify-content:center;padding:24px';
+  modal.onclick = e => { if (e.target === modal) modal.remove(); };
+  modal.innerHTML = `
+    <div style="width:100%;max-width:760px;max-height:88vh;overflow-y:auto;background:#0b0b0d;border:1px solid #1f1f24;border-radius:16px;padding:24px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <h3 style="margin:0;color:#e5e7eb;font-size:20px">Upload Transcript</h3>
+        <button onclick="document.getElementById('transcript-upload-modal').remove()" style="background:none;border:none;color:#6b7280;font-size:22px;cursor:pointer">×</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div>
+          <label class="form-label">Active Deal</label>
+          <select class="form-input" id="transcript-deal" onchange="loadTranscriptDealContacts(this.value)">
+            <option value="">Select deal</option>
+            ${(deals || []).filter(d => String(d.status || '').toLowerCase() === 'active').map(deal => `<option value="${esc(deal.id)}">${esc(deal.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="form-label">Investor Type</label>
+          <select class="form-input" id="transcript-mode" onchange="toggleTranscriptInvestorMode()">
+            <option value="existing">Existing investor</option>
+            <option value="new">New investor</option>
+          </select>
+        </div>
+      </div>
+      <div id="transcript-existing-wrap" style="margin-top:16px">
+        <label class="form-label">Existing Investor</label>
+        <input class="form-input" id="transcript-contact-search" placeholder="Search contact name or firm" oninput="filterTranscriptContacts(this.value)" />
+        <select class="form-input" id="transcript-contact" style="margin-top:8px"><option value="">Select contact</option></select>
+      </div>
+      <div id="transcript-new-wrap" style="display:none;margin-top:16px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+          <div><label class="form-label">Name</label><input class="form-input" id="transcript-new-name" /></div>
+          <div><label class="form-label">Email</label><input class="form-input" id="transcript-new-email" /></div>
+          <div><label class="form-label">Phone</label><input class="form-input" id="transcript-new-phone" /></div>
+          <div><label class="form-label">LinkedIn URL</label><input class="form-input" id="transcript-new-linkedin" /></div>
+        </div>
+      </div>
+      <div style="margin-top:16px">
+        <label class="form-label">Transcript</label>
+        <textarea class="form-input" id="transcript-text" rows="14" style="min-height:260px"></textarea>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px">
+        <button class="btn btn-ghost" onclick="document.getElementById('transcript-upload-modal').remove()">Cancel</button>
+        <button class="btn btn-gold" onclick="submitTranscriptUpload()">Submit</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+window.toggleTranscriptInvestorMode = function() {
+  const mode = document.getElementById('transcript-mode')?.value || 'existing';
+  const existingWrap = document.getElementById('transcript-existing-wrap');
+  const newWrap = document.getElementById('transcript-new-wrap');
+  if (existingWrap) existingWrap.style.display = mode === 'existing' ? '' : 'none';
+  if (newWrap) newWrap.style.display = mode === 'new' ? '' : 'none';
+};
+
+window.loadTranscriptDealContacts = async function(dealId) {
+  transcriptDealContacts = [];
+  const select = document.getElementById('transcript-contact');
+  if (!select) return;
+  select.innerHTML = '<option value="">Loading contacts...</option>';
+  if (!dealId) {
+    select.innerHTML = '<option value="">Select contact</option>';
+    return;
+  }
+  try {
+    const rows = await api(`/api/pipeline?dealId=${encodeURIComponent(dealId)}`);
+    transcriptDealContacts = Array.isArray(rows) ? rows : (rows.contacts || []);
+    filterTranscriptContacts('');
+  } catch (err) {
+    select.innerHTML = `<option value="">${esc(err.message)}</option>`;
+  }
+};
+
+window.filterTranscriptContacts = function(query) {
+  const select = document.getElementById('transcript-contact');
+  if (!select) return;
+  const q = String(query || '').toLowerCase().trim();
+  const rows = transcriptDealContacts.filter(row => !q || String(row.name || '').toLowerCase().includes(q) || String(row.firm || row.company || '').toLowerCase().includes(q));
+  select.innerHTML = '<option value="">Select contact</option>' + rows.map(row => `<option value="${esc(row.id)}">${esc(row.name || '—')} · ${esc(row.firm || row.company || '—')}</option>`).join('');
+};
+
+window.submitTranscriptUpload = async function() {
+  const dealId = document.getElementById('transcript-deal')?.value;
+  const mode = document.getElementById('transcript-mode')?.value || 'existing';
+  const transcriptText = document.getElementById('transcript-text')?.value?.trim();
+  const contactId = document.getElementById('transcript-contact')?.value || null;
+  const investorName = document.getElementById('transcript-new-name')?.value?.trim();
+  if (!dealId || !transcriptText || (mode === 'existing' && !contactId) || (mode === 'new' && !investorName)) {
+    showToast('Deal, investor, and transcript are required', 'error');
+    return;
+  }
+  try {
+    await api('/api/meeting-transcripts', 'POST', {
+      deal_id: dealId,
+      investor_mode: mode,
+      contact_id: mode === 'existing' ? contactId : null,
+      investor_name: mode === 'new' ? investorName : null,
+      investor_email: document.getElementById('transcript-new-email')?.value?.trim() || null,
+      investor_phone: document.getElementById('transcript-new-phone')?.value?.trim() || null,
+      investor_linkedin: document.getElementById('transcript-new-linkedin')?.value?.trim() || null,
+      transcript_text: transcriptText,
+    });
+    document.getElementById('transcript-upload-modal')?.remove();
+    showToast('Transcript uploaded');
+    loadMeetingTranscriptsPage();
+  } catch (err) {
+    showToast(`Transcript upload failed: ${err.message}`, 'error');
+  }
 };
 
 function onDbFileSelected(input) {

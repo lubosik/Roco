@@ -26,6 +26,7 @@ import { sendEmailReply, sendLinkedInReply, sendEmail, listEmails, listWebhooks,
 import { getApiHealth, startHealthChecks } from '../core/apiFallback.js';
 import { info, error } from '../core/logger.js';
 import { aiComplete } from '../core/aiClient.js';
+import { haikuComplete } from '../core/aiClient.js';
 import {
   loadSessionState, saveSessionState,
   getAllDeals, getActiveDeals, getDeal, createDeal, updateDeal,
@@ -510,6 +511,84 @@ function normalizeMetadataArray(value) {
     return trimmed.split(',').map(v => v.trim()).filter(Boolean);
   }
   return [];
+}
+
+function parseLooseJsonObject(text) {
+  const match = String(text || '').match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function asJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [trimmed];
+    } catch {
+      return trimmed.split(',').map(item => item.trim()).filter(Boolean);
+    }
+  }
+  return value ? [value] : [];
+}
+
+function normaliseTranscriptAnalysis(parsed = {}) {
+  const interests = asJsonArray(parsed.investment_interests || parsed.sectors_of_interest || parsed.interests);
+  const intentSignals = asJsonArray(parsed.intent_signals || parsed.positive_intent_signals);
+  const objections = asJsonArray(parsed.negative_signals || parsed.objections);
+  const followUps = asJsonArray(parsed.follow_up_actions || parsed.recommended_follow_up_actions);
+  return {
+    summary: String(parsed.summary || '').trim(),
+    investment_thesis: String(parsed.investment_thesis || parsed.investor_thesis || '').trim(),
+    sectors_of_interest: interests,
+    cheque_size_range: String(parsed.cheque_size_range || parsed.cheque_size || '').trim(),
+    aum: String(parsed.aum || parsed.fund_size || '').trim(),
+    past_investments: asJsonArray(parsed.past_investments || parsed.portfolio_companies),
+    investment_interests: interests,
+    intent_signals: [...intentSignals, ...objections.map(item => `Objection: ${item}`)].filter(Boolean),
+    positive_intent_signals: intentSignals,
+    negative_signals: objections,
+    sentiment_score: Math.max(1, Math.min(10, Number(parsed.sentiment_score || parsed.sentiment || 5) || 5)),
+    follow_up_actions: followUps,
+    raw: parsed,
+  };
+}
+
+async function analyzeMeetingTranscript({ deal, transcriptText, investorName }) {
+  const prompt = `You are Roco. Analyse this meeting transcript. Extract: 1) investment preferences and thesis of this investor, 2) sectors and deal types they are interested in, 3) cheque size range if mentioned, 4) any AUM or fund size mentioned, 5) past investments or portfolio companies mentioned, 6) positive intent signals (things that suggest interest), 7) negative signals or objections, 8) overall sentiment score 1 to 10, 9) recommended follow-up actions. Return structured JSON.
+
+DEAL
+${JSON.stringify({
+    deal_name: deal?.name || null,
+    sector: deal?.sector || null,
+    geography: deal?.geography || null,
+  }, null, 2)}
+
+INVESTOR
+${investorName || 'Unknown investor'}
+
+TRANSCRIPT
+${transcriptText}`;
+
+  const rawText = await haikuComplete(prompt, { maxTokens: 1200 });
+  const parsed = parseLooseJsonObject(rawText);
+  if (!parsed) throw new Error('Transcript analysis JSON parse failed');
+  return normaliseTranscriptAnalysis(parsed);
+}
+
+function buildConversationHistoryEntry({ type, date, summary, sentiment = null }) {
+  return {
+    type,
+    date,
+    summary,
+    sentiment,
+  };
 }
 
 function mergeDealSettings(currentSettings, patch) {
@@ -3275,6 +3354,90 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  app.get('/api/contacts/:id/investor-card', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const requestedDealId = String(req.query.dealId || '').trim() || null;
+
+      const { data: contact, error: contactErr } = await sb.from('contacts')
+        .select('*')
+        .eq('id', req.params.id)
+        .single();
+      if (contactErr) throw new Error(contactErr.message);
+
+      const [dealMap, messagesRes, emailsRes, transcriptsRes] = await Promise.all([
+        getDealNameMap(sb, [requestedDealId, contact.deal_id]),
+        sb.from('conversation_messages')
+          .select('direction, channel, body, subject, sent_at, received_at, intent')
+          .eq('contact_id', req.params.id)
+          .order('sent_at', { ascending: true })
+          .then(result => result)
+          .catch(() => ({ data: [] })),
+        sb.from('emails')
+          .select('*')
+          .eq('contact_id', req.params.id)
+          .order('created_at', { ascending: true })
+          .then(result => result)
+          .catch(() => ({ data: [] })),
+        sb.from('meeting_transcripts')
+          .select('*')
+          .eq('contact_id', req.params.id)
+          .order('created_at', { ascending: true })
+          .then(result => result)
+          .catch(() => ({ data: [] })),
+      ]);
+
+      const transcripts = transcriptsRes.data || [];
+      const transcriptSentiment = transcripts.length ? transcripts[transcripts.length - 1].sentiment_score : null;
+      const history = [];
+
+      for (const msg of messagesRes.data || []) {
+        history.push({
+          type: String(msg.channel || 'email').includes('linkedin') ? 'LinkedIn' : 'Email',
+          date: msg.sent_at || msg.received_at || null,
+          summary: String(msg.subject || msg.body || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+        });
+      }
+
+      for (const email of emailsRes.data || []) {
+        history.push({
+          type: 'Email',
+          date: email.sent_at || email.created_at || null,
+          summary: String(email.subject || email.body || email.content || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+        });
+      }
+
+      for (const transcript of transcripts) {
+        history.push({
+          type: 'Meeting',
+          date: transcript.created_at || null,
+          summary: String(transcript.summary || transcript.transcript_text || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+          sentiment: transcript.sentiment_score || null,
+        });
+      }
+
+      history.sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+
+      res.json({
+        contact: {
+          ...contact,
+          deal_name: dealMap[String(requestedDealId || contact.deal_id || '')] || null,
+          transcript_sentiment: transcriptSentiment,
+          sectors_of_interest: asJsonArray(contact.sector_focus),
+          cheque_size_range: contact.typical_cheque_size || null,
+          aum_display: contact.aum || contact.aum_fund_size || null,
+          past_investments_list: asJsonArray(contact.past_investments),
+          intent_signals_list: asJsonArray(contact.intent_signals),
+        },
+        history,
+        transcripts,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/contacts/:id/conversation — full conversation history for prospect drawer
   app.get('/api/contacts/:id/conversation', async (req, res) => {
     try {
@@ -3320,6 +3483,140 @@ function registerRoutes(app) {
       }).catch(() => {});
 
       res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/meeting-transcripts', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const { data, error: dbErr } = await sb.from('meeting_transcripts')
+        .select('id, created_at, deal_id, contact_id, investor_name, investor_email, investor_phone, investor_linkedin, summary, sentiment_score, follow_up_actions, is_new_investor')
+        .order('created_at', { ascending: false })
+        .limit(200);
+      if (dbErr) throw new Error(dbErr.message);
+      const dealMap = await getDealNameMap(sb, (data || []).map(row => row.deal_id));
+      res.json((data || []).map(row => ({
+        ...row,
+        deal_name: dealMap[String(row.deal_id || '')] || null,
+      })));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/meeting-transcripts', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const {
+        deal_id,
+        investor_mode,
+        contact_id,
+        investor_name,
+        investor_email,
+        investor_phone,
+        investor_linkedin,
+        transcript_text,
+      } = req.body || {};
+      if (!deal_id || !transcript_text || !(contact_id || investor_name)) {
+        return res.status(400).json({ error: 'deal_id, transcript_text, and investor identity are required' });
+      }
+
+      const { data: deal } = await sb.from('deals').select('id, name, sector, geography').eq('id', deal_id).single();
+      const isExistingInvestor = investor_mode !== 'new';
+      let contact = null;
+      if (isExistingInvestor && contact_id) {
+        const { data } = await sb.from('contacts').select('*').eq('id', contact_id).single();
+        contact = data || null;
+      }
+
+      const baseTranscript = {
+        deal_id,
+        contact_id: contact?.id || null,
+        investor_name: contact?.name || investor_name,
+        investor_email: contact?.email || investor_email || null,
+        investor_phone: contact?.phone || investor_phone || null,
+        investor_linkedin: contact?.linkedin_url || investor_linkedin || null,
+        is_new_investor: !isExistingInvestor,
+        transcript_text,
+      };
+      const { data: insertedTranscript, error: insertErr } = await sb.from('meeting_transcripts').insert(baseTranscript).select('*').single();
+      if (insertErr) throw new Error(insertErr.message);
+
+      const analysis = await analyzeMeetingTranscript({
+        deal,
+        transcriptText: transcript_text,
+        investorName: baseTranscript.investor_name,
+      });
+
+      const historyEntry = buildConversationHistoryEntry({
+        type: 'meeting',
+        date: new Date().toISOString(),
+        summary: analysis.summary || analysis.follow_up_actions[0] || 'Meeting transcript processed',
+        sentiment: analysis.sentiment_score,
+      });
+
+      if (contact) {
+        const existingHistory = asJsonArray(contact.conversation_history);
+        const updatePayload = {
+          aum: analysis.aum || contact.aum || null,
+          investment_thesis: analysis.investment_thesis || contact.investment_thesis || null,
+          past_investments: analysis.past_investments,
+          intent_signals: analysis.intent_signals,
+          meeting_count: Number(contact.meeting_count || 0) + 1,
+          last_meeting_date: new Date().toISOString(),
+          conversation_history: [...existingHistory, historyEntry],
+          sector_focus: analysis.sectors_of_interest.join(', ') || contact.sector_focus || null,
+          typical_cheque_size: analysis.cheque_size_range || contact.typical_cheque_size || null,
+          pipeline_stage: 'Meeting Held',
+        };
+        const { data } = await sb.from('contacts').update(updatePayload).eq('id', contact.id).select('*').single();
+        contact = data || contact;
+      } else {
+        const { data } = await sb.from('contacts').insert({
+          deal_id,
+          name: investor_name,
+          email: investor_email || null,
+          phone: investor_phone || null,
+          linkedin_url: investor_linkedin || null,
+          company_name: null,
+          aum: analysis.aum || null,
+          investment_thesis: analysis.investment_thesis || null,
+          past_investments: analysis.past_investments,
+          intent_signals: analysis.intent_signals,
+          meeting_count: 1,
+          last_meeting_date: new Date().toISOString(),
+          conversation_history: [historyEntry],
+          sector_focus: analysis.sectors_of_interest.join(', ') || null,
+          typical_cheque_size: analysis.cheque_size_range || null,
+          pipeline_stage: 'Meeting Held',
+        }).select('*').single();
+        contact = data || null;
+      }
+
+      await sb.from('meeting_transcripts').update({
+        contact_id: contact?.id || insertedTranscript.contact_id || null,
+        summary: analysis.summary || null,
+        investment_interests: analysis.investment_interests,
+        intent_signals: analysis.intent_signals,
+        sentiment_score: analysis.sentiment_score,
+        follow_up_actions: analysis.follow_up_actions,
+        raw_analysis: analysis.raw,
+      }).eq('id', insertedTranscript.id);
+
+      await sendTelegram(
+        `Transcript processed for ${baseTranscript.investor_name}. Sentiment: ${analysis.sentiment_score}/10. ${analysis.positive_intent_signals.length} intent signals extracted. ${analysis.follow_up_actions.length} follow-up actions identified.`
+      ).catch(() => {});
+
+      res.json({
+        success: true,
+        transcript_id: insertedTranscript.id,
+        contact_id: contact?.id || null,
+        analysis,
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

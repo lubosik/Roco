@@ -47,7 +47,7 @@ import { haikuComplete } from './aiClient.js';
 import { pushActivity, queueLinkedInDmApproval, sendApprovedLinkedInDM } from '../dashboard/server.js';
 import { info, warn, error } from './logger.js';
 import { ORCHESTRATOR_INTERVAL_MS } from '../config/constants.js';
-import { runFundraiserReasoning, gatherCurrentMetrics, sendMorningBrief } from './fundraiserBrain.js';
+import { runFundraiserReasoning, gatherCurrentMetrics } from './fundraiserBrain.js';
 import { writeMemory } from './rocoMemory.js';
 import { searchInvestorsWithGrok, scanInvestorNewsForDeal, saveDealNewsLeads, scanGeneralInvestorSignals, storeGeneralInvestorSignals, buildDealNewsScan, summarizePortfolioNewsDigest, scrapePublicInvestorDirectories } from './newsScanner.js';
 import { buildDailyActivityReport, persistDailyActivityReport, renderDailyVoiceNoteFromText } from './analyticsEngine.js';
@@ -241,6 +241,7 @@ const ACTIVE_MONITORING_STAGES = ['Email Approved', 'DM Approved', 'Email Sent',
 const lastDealStatusActivity = new Map();
 const dailyNewsScanState = new Map();
 const dailyActivityDigestState = new Map();
+const dailyLogRecommendationState = new Map();
 const approvedBatchTopUpState = new Map();
 const dealCycleLocks = new Set();
 const reasoningTelegramState = new Map();
@@ -248,6 +249,96 @@ const decisionTelegramState = new Map();
 
 // Contacts currently in the approval flow — prevents duplicate approval drafts per cycle
 const contactsInFlight = new Set();
+
+function normalizeActionLabel(value) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+async function implementPendingDailyLogActions(deals = []) {
+  const sb = getSupabase();
+  if (!sb || !Array.isArray(deals) || !deals.length) return;
+
+  const todayEt = DateTime.now().setZone('America/New_York').toISODate();
+  if (!todayEt || dailyLogRecommendationState.get(todayEt)) return;
+
+  const yesterdayEt = DateTime.now().setZone('America/New_York').minus({ days: 1 }).toISODate();
+  const { data: rows, error } = await sb.from('daily_logs')
+    .select('id, deal_id, deal_name, recommended_actions, actions_implemented')
+    .eq('log_date', yesterdayEt)
+    .eq('actions_implemented', false);
+  if (error || !rows?.length) {
+    dailyLogRecommendationState.set(todayEt, true);
+    return;
+  }
+
+  const dealMap = new Map(deals.map(deal => [String(deal.id), deal]));
+
+  for (const row of rows) {
+    const deal = dealMap.get(String(row.deal_id || ''));
+    if (!deal) continue;
+    const actions = Array.isArray(row.recommended_actions) ? row.recommended_actions.filter(Boolean) : [];
+    if (!actions.length) {
+      await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).catch(() => {});
+      continue;
+    }
+
+    for (const action of actions) {
+      await implementRecommendedActionForDeal(deal, action).catch(err => {
+        pushActivity({
+          type: 'warning',
+          action: 'Daily log recommendation failed',
+          note: `${deal.name} · ${String(action || '').slice(0, 120)} · ${err.message?.slice(0, 100) || 'unknown error'}`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
+      });
+    }
+
+    await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).catch(() => {});
+  }
+
+  dailyLogRecommendationState.set(todayEt, true);
+}
+
+async function implementRecommendedActionForDeal(deal, action) {
+  const normalized = normalizeActionLabel(action);
+  if (!normalized) return;
+
+  if (normalized.startsWith('research ') || normalized.includes('top of funnel') || normalized.includes('expand linkedin search')) {
+    await triggerAutoFeedForDeal(deal, { reason: 'daily_log_recommendation', requestedCount: 24 });
+    return;
+  }
+
+  if (normalized.startsWith('follow up with')) {
+    pushActivity({
+      type: 'system',
+      action: 'Daily log recommendation queued warm follow-ups',
+      note: `${deal.name} · ${String(action).slice(0, 160)}`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+    return;
+  }
+
+  if (normalized.startsWith('clear ') && normalized.includes('pending approvals')) {
+    pushActivity({
+      type: 'system',
+      action: 'Daily log recommendation noted approval backlog',
+      note: `${deal.name} · ${String(action).slice(0, 160)}`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+    return;
+  }
+
+  pushActivity({
+    type: 'system',
+    action: 'Daily log recommendation acknowledged',
+    note: `${deal.name} · ${String(action).slice(0, 160)}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+}
 
 /** Remove all contacts belonging to a deal from the in-flight set on deal close. */
 export function clearDealFromFlight(dealId) {
@@ -482,6 +573,7 @@ async function runCycle(state) {
   // Phase A: Investor outreach deals (existing)
   try {
     const deals = await getActiveDeals();
+    await implementPendingDailyLogActions(deals);
     await runDailyNewsScanCycle(deals);
     await runDailyActivityDigestCycle(deals);
 
@@ -1199,10 +1291,28 @@ async function isApprovedForOutreach(dealId) {
 async function getExcludedFirmNames(dealId) {
   const sb = getSupabase();
   if (!sb) return new Set();
-  const { data } = await sb.from('batch_firms')
-    .select('firm_name')
-    .eq('deal_id', dealId);
-  return new Set((data || []).map(f => (f.firm_name || '').toLowerCase().trim()).filter(Boolean));
+  const [batchRes, contactRes, exclusionRes] = await Promise.all([
+    sb.from('batch_firms').select('firm_name').eq('deal_id', dealId).then(result => result).catch(() => ({ data: [] })),
+    sb.from('contacts').select('company_name').eq('deal_id', dealId).then(result => result).catch(() => ({ data: [] })),
+    sb.from('firm_exclusion_list').select('company_name, deal_id, deal_status').then(result => result).catch(() => ({ data: [] })),
+  ]);
+
+  const names = new Set();
+  for (const row of batchRes.data || []) {
+    const name = normalizeFirmName(row?.firm_name);
+    if (name) names.add(name);
+  }
+  for (const row of contactRes.data || []) {
+    const name = normalizeFirmName(row?.company_name);
+    if (name) names.add(name);
+  }
+  for (const row of exclusionRes.data || []) {
+    const name = normalizeFirmName(row?.company_name);
+    if (!name) continue;
+    const status = normalizeActionLabel(row?.deal_status);
+    if (status === 'active' || status === 'paused') names.add(name);
+  }
+  return names;
 }
 
 async function updateBatchResearchCount(batchId) {
@@ -1308,7 +1418,7 @@ async function addNewsLeadsToBatch(deal, leads) {
       source_list: 'Grok Daily News Scan',
       firm_researched: true,
       enrichment_status: 'pending',
-      status: 'pending',
+      status: 'to_research',
       created_at: new Date().toISOString(),
     }).select('id, firm_name, thesis, aum').single();
 
@@ -1348,9 +1458,47 @@ async function addNewsLeadsToBatch(deal, leads) {
   return { added, skipped, batch };
 }
 
+async function triggerAutoFeedForDeal(deal, { reason = 'pipeline_depth', requestedCount = 24 } = {}) {
+  const sb = getSupabase();
+  if (!sb || !deal?.id) return { researched: 0, added: 0, skipped: 0 };
+
+  const autoFeedKey = `${deal.id}:${DateTime.now().setZone('America/New_York').toISODate()}:${reason}`;
+  if (approvedBatchTopUpState.get(autoFeedKey)) {
+    return { researched: 0, added: 0, skipped: 0 };
+  }
+
+  const batch = await ensureBatchExists(deal);
+  if (!batch || batch.status !== 'researching') return { researched: 0, added: 0, skipped: 0 };
+
+  const before = await updateBatchResearchCount(batch.id);
+  const needed = Math.max(20, Math.min(30, requestedCount));
+  await researchNextFirms(deal, batch, needed, before);
+  const after = await updateBatchResearchCount(batch.id);
+  const added = Math.max(0, after - before);
+  const researched = needed;
+  const skipped = Math.max(0, researched - added);
+
+  approvedBatchTopUpState.set(autoFeedKey, true);
+  await sb.from('activity_log').insert({
+    deal_id: deal.id,
+    event_type: 'PIPELINE_AUTO_FEED',
+    summary: `Auto-feed triggered for ${deal.name}: researched ${researched} new firms, ${added} added after deduplication, ${skipped} skipped (already in pipeline).`,
+    created_at: new Date().toISOString(),
+  }).catch(() => {});
+  pushActivity({
+    type: 'pipeline',
+    action: `Auto-feed triggered for ${deal.name}: researched ${researched} new firms, ${added} added after deduplication, ${skipped} skipped (already in pipeline).`,
+    note: reason,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+  return { researched, added, skipped };
+}
+
 async function runDailyNewsScanCycle(deals) {
   const estNow = DateTime.now().setZone('America/New_York');
   if (estNow.hour !== 7) return;
+  const sb = getSupabase();
 
   const todayKey = estNow.toISODate();
   const existingState = dailyNewsScanState.get(todayKey);
@@ -1368,6 +1516,24 @@ async function runDailyNewsScanCycle(deals) {
         const leads = Array.isArray(scanResult?.leads) ? scanResult.leads : [];
         await saveDealNewsLeads(deal.id, leads).catch(() => {});
         const pipelineResult = await addNewsLeadsToBatch(deal, leads).catch(() => ({ added: 0, skipped: leads.length, batch: null }));
+        const actionsTaken = [];
+        if (pipelineResult.added > 0) {
+          actionsTaken.push(`Added ${pipelineResult.added} recommended investors to research queue`);
+        }
+        if (sb) {
+          await sb.from('news_scans').insert({
+            deal_id: deal.id,
+            deal_name: deal.name,
+            sector: deal.sector || null,
+            grok_queries: scanResult.grokQueries || [],
+            grok_raw_results: scanResult.grokRawResults || [],
+            claude_summary: scanResult.summary || scanResult.notes || '',
+            is_relevant_to_deal: scanResult.isRelevant === true,
+            recommended_new_investors: scanResult.recommendedInvestors || [],
+            actions_taken: actionsTaken,
+            telegram_digest: scanResult.summary || '',
+          }).catch(() => {});
+        }
 
         const allFindings = Array.isArray(scanResult?.allFindings) ? scanResult.allFindings : [];
         const rejectedFindings = Array.isArray(scanResult?.rejectedFindings) ? scanResult.rejectedFindings : [];
@@ -1450,12 +1616,11 @@ async function runDailyActivityDigestCycle(deals) {
   const sb = getSupabase();
   if (sb && targetDate) {
     try {
-      const { data: existingReport } = await sb.from('daily_activity_reports')
-        .select('report_date, headline, executive_summary, voice_script, telegram_caption, sent_to_telegram_at, voice_note_sent_at, voice_name')
-        .eq('report_date', targetDate)
-        .maybeSingle();
-      const voiceDeliveryPending = !!existingReport?.sent_to_telegram_at && !existingReport?.voice_note_sent_at;
-      if (existingReport?.sent_to_telegram_at && !voiceDeliveryPending) {
+      const { data: existingRows } = await sb.from('daily_logs')
+        .select('id, log_date, deal_id, telegram_voice_script')
+        .eq('log_date', targetDate)
+        .limit(1);
+      if (existingRows?.length) {
         dailyActivityDigestState.set(targetDate, 'done');
         return;
       }
@@ -1468,24 +1633,9 @@ async function runDailyActivityDigestCycle(deals) {
 
   try {
     const reportReference = DateTime.fromISO(`${targetDate}T20:05:00`, { zone: 'America/New_York' });
-    let existingReport = null;
-    if (sb && targetDate) {
-      const { data } = await sb.from('daily_activity_reports')
-        .select('*')
-        .eq('report_date', targetDate)
-        .maybeSingle();
-      existingReport = data || null;
-    }
-
-    const report = existingReport || await buildDailyActivityReport({ deals, reference: reportReference });
+    const report = await buildDailyActivityReport({ deals, reference: reportReference });
     let sentVoiceAt = null;
-    let voiceName = existingReport?.voice_name || null;
-
-    if (!existingReport?.sent_to_telegram_at) {
-      await sendTelegram(
-        `🧾 *ROCO Daily Log*\n_${reportReference.toFormat('d LLL yyyy')} · ${report.timezone}_\n\n*${report.headline || 'Daily operating log'}*\n${report.executive_summary || 'Daily summary generated.'}`
-      ).catch(() => {});
-    }
+    let voiceName = null;
 
     try {
       const voiceNote = await renderDailyVoiceNoteFromText(report.voice_script || report.executive_summary || '');
@@ -1515,9 +1665,9 @@ async function runDailyActivityDigestCycle(deals) {
 
     await persistDailyActivityReport({
       ...report,
-      sent_to_telegram_at: existingReport?.sent_to_telegram_at || new Date().toISOString(),
-      voice_note_sent_at: sentVoiceAt || existingReport?.voice_note_sent_at || null,
       voice_name: voiceName,
+      actions_implemented: false,
+      voice_note_sent_at: sentVoiceAt || null,
     }).catch(() => {});
 
     pushActivity({
@@ -1526,7 +1676,7 @@ async function runDailyActivityDigestCycle(deals) {
       note: `${report.deals_covered || 0} deal${report.deals_covered === 1 ? '' : 's'} · ${report.activity_count || 0} activity events`,
     });
 
-    const voiceCompleted = !!(sentVoiceAt || existingReport?.voice_note_sent_at || !report.voice_script);
+    const voiceCompleted = !!(sentVoiceAt || !report.voice_script);
     if (voiceCompleted) {
       dailyActivityDigestState.set(targetDate, 'done');
     } else {
@@ -3815,9 +3965,6 @@ async function archiveExhaustedFirms(dealId) {
   }
 }
 
-// Track morning brief per deal per day
-const morningBriefSentToday = new Map();
-
 function normalizeWhitespace(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
@@ -3912,18 +4059,9 @@ async function runDealCycle(deal, state) {
       logBrainExecutionDecision(deal, brainDirectives);
     }
 
-    // ── Morning brief at 9am EST ─────────────────────────────────────────────
-    const nowEST = Number(new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }));
-    const todayKey = `${deal.id}:${new Date().toISOString().split('T')[0]}`;
-    if (nowEST === 9 && !morningBriefSentToday.get(todayKey)) {
-      morningBriefSentToday.set(todayKey, true);
-      sendMorningBrief(deal, brainResult.actionPlan, brainResult.goalAnalysis, metrics, sendTelegram).catch(err =>
-        console.warn('[MORNING BRIEF]', err.message)
-      );
-      pushActivity({ type: 'system', action: `Morning brief sent: ${brainResult.goalAnalysis.status}`, note: `${deal.name} · ${metrics.firms_in_pipeline || 0}/100 firms`, deal_id: deal.id });
+    if (Number(metrics?.firms_in_pipeline || 0) < 25) {
+      await triggerAutoFeedForDeal(deal, { reason: 'pipeline_depth', requestedCount: 24 }).catch(() => {});
     }
-
-    // ── News scan at 7am EST ─────────────────────────────────────────────────
   } catch (brainErr) {
     console.warn('[FUNDRAISER BRAIN] Cycle reasoning failed:', brainErr.message);
   }

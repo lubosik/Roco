@@ -62,6 +62,10 @@
         <span class="nav-icon">&#128200;</span>
         <span class="nav-label">Analytics</span>
       </a>
+      <a href="#transcripts" class="nav-item" data-view="transcripts">
+        <span class="nav-icon">&#127908;</span>
+        <span class="nav-label">Meeting Transcripts</span>
+      </a>
       <a href="#sourcing" class="nav-item" data-view="sourcing">
         <span class="nav-icon">&#128269;</span>
         <span class="nav-label">Sourcing Campaigns</span>
@@ -945,6 +949,14 @@
         <div id="analytics-main-container"></div>
       </section>
 
+      <section id="view-transcripts" class="view-section hidden">
+        <div id="transcripts-main-container"></div>
+      </section>
+
+      <section id="view-investor-profile" class="view-section hidden">
+        <div id="investor-profile-container"></div>
+      </section>
+
       <!-- ══════════════════════════════════ SOURCING CAMPAIGNS ══════════════════════════════════ -->
       <section id="view-sourcing" class="view-section hidden">
         <div class="section-header">
@@ -1821,7 +1833,7 @@
 
 <!-- ── CONTACT SIDE PANEL ──────────────────────────────────────────────── -->
 <div id="contact-side-panel" style="
-  position:fixed;top:0;right:-520px;width:500px;height:100vh;
+  position:fixed;top:0;right:-440px;width:420px;height:100vh;
   background:#0a0a0c;border-left:1px solid #1e1e1e;
   z-index:1000;transition:right 0.28s cubic-bezier(0.4,0,0.2,1);
   display:flex;flex-direction:column;overflow:hidden;
