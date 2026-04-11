@@ -252,6 +252,36 @@ async function logWebhookReceipt(eventType, payload, source = 'unipile') {
   pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
 }
 
+function getTelegramBotId() {
+  return String(process.env.TELEGRAM_BOT_TOKEN || '').split(':')[0].trim();
+}
+
+function looksLikeOperationalEcho(text) {
+  const value = String(text || '').toLowerCase();
+  if (!value) return false;
+  return value.includes('roco - email ready for approval')
+    || value.includes('roco — email ready for approval')
+    || value.includes('roco - linkedin dm ready for approval')
+    || value.includes('roco — linkedin dm ready for approval')
+    || value.includes('linkedin message received from:')
+    || value.includes('instant reply sent')
+    || value.includes('approved via dashboard');
+}
+
+function shouldSuppressInboundWebhookMessage({ fromName, fromUrn, bodyText, payload }) {
+  const botId = getTelegramBotId();
+  const senderName = String(fromName || '').trim();
+  const senderUrn = String(fromUrn || '').trim();
+  const text = String(bodyText || '').trim();
+  const raw = payload || {};
+
+  if (!text) return true;
+  if (raw?.is_sender === true || raw?.is_self === true || raw?.sender?.is_self === true) return true;
+  if (botId && (senderName === botId || senderUrn === botId)) return true;
+  if (looksLikeOperationalEcho(text)) return true;
+  return false;
+}
+
 async function insertWebhookLogRecord(record = {}) {
   try {
     const sb = getSupabase();
@@ -407,12 +437,6 @@ function computeBackfilledScheduledFollowUpAt(contact, deal, sequence) {
 }
 
 async function processUnipileMessageEvent(event) {
-  logWebhookReceipt(
-    event?.type || event?.event_type || 'unknown',
-    event,
-    'unipile_messages'
-  ).catch(() => {});
-
   const payload = event?.data || event || {};
   let eventType = (event?.type || event?.event_type || '').toLowerCase();
 
@@ -446,6 +470,16 @@ async function processUnipileMessageEvent(event) {
     const chatId = message?.chat_id || message?.conversation_id || '';
     const messageId = message?.id || message?.message_id || '';
 
+    if (shouldSuppressInboundWebhookMessage({ fromName, fromUrn: fromProvId, bodyText, payload: message })) {
+      await insertWebhookLogRecord({
+        event_type: eventType || 'message_received',
+        payload: event || {},
+      }).catch(() => {});
+      return 'suppressed';
+    }
+
+    await logWebhookReceipt(eventType || 'message_received', event, 'unipile_messages').catch(() => {});
+
     await queueInboundWithDebounce({
       fromUrn: fromProvId,
       fromName,
@@ -459,6 +493,7 @@ async function processUnipileMessageEvent(event) {
   }
 
   if (['new_relation', 'connection_request_accepted'].includes(eventType)) {
+    await logWebhookReceipt(eventType, event, 'unipile_messages').catch(() => {});
     const queueForApproval = async ({ contact, reason }) => {
       if (!contact?.id) return null;
       return queueLinkedInDmApproval(contact.id, { reason });
@@ -468,9 +503,14 @@ async function processUnipileMessageEvent(event) {
   }
 
   if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
+    await logWebhookReceipt(eventType, event, 'unipile_messages').catch(() => {});
     return 'email';
   }
 
+  await insertWebhookLogRecord({
+    event_type: eventType || 'unknown',
+    payload: event || {},
+  }).catch(() => {});
   console.log('[WEBHOOKS/UNIPILE] Unhandled event type:', eventType);
   return null;
 }
@@ -7911,6 +7951,18 @@ async function draftInstantReply({ contact, originalEmail, inboundBody, classifi
 async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyText, threadId, messageId, channel, threadField, emailAccountId }) {
   if (!bodyText && !fromEmail && !fromUrn) return;
   const normalizedEmail = normalizeInboundEmail(fromEmail);
+  if (shouldSuppressInboundWebhookMessage({
+    fromName,
+    fromUrn,
+    bodyText,
+    payload: {
+      from_email: normalizedEmail,
+      sender_id: fromUrn,
+      sender_name: fromName,
+    },
+  })) {
+    return;
+  }
   console.log(`[INBOUND/${channel.toUpperCase()}] Reply from ${normalizedEmail || fromName} on thread ${threadId}`);
 
   const sb = getSupabase();
@@ -7987,6 +8039,10 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
   }
 
   console.log(`[INBOUND/${channel.toUpperCase()}] Classified as: ${classification.intent}`);
+
+  if (classification.intent === 'AUTO_REPLY') {
+    return;
+  }
 
   if (['INTERESTED', 'WANTS_MORE_INFO', 'MEETING_REQUEST', 'POSITIVE'].includes(classification.intent)) {
     const replyContact = contact || { email: fromEmail, name: fromName };
