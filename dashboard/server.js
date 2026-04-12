@@ -7255,7 +7255,8 @@ function registerRoutes(app) {
       if (emailCandidates.length) {
         const { data } = await sb.from('contacts')
           .select('*, deals(*)')
-          .in('email', emailCandidates)
+          .or(emailCandidates.map(email => `email.ilike.${email}`).join(','))
+          .limit(20)
           .then(result => result)
           .catch(() => ({ data: [] }));
         linkedContacts = data || [];
@@ -7279,8 +7280,40 @@ function registerRoutes(app) {
         });
       }
 
-      const primaryContact = linkedContacts[0] || null;
-      const linkedContactIds = linkedContacts.map(row => row.id).filter(Boolean);
+      const transcriptLookupClauses = [
+        emailCandidates.map(email => `investor_email.ilike.${email}`).join(','),
+        investor.name ? `investor_name.ilike.${investor.name}` : '',
+      ].filter(Boolean).join(',');
+      if (transcriptLookupClauses) {
+        const { data } = await sb.from('meeting_transcripts')
+          .select('contact_id')
+          .or(transcriptLookupClauses)
+          .not('contact_id', 'is', null)
+          .limit(100)
+          .then(result => result)
+          .catch(() => ({ data: [] }));
+        const transcriptContactIds = [...new Set((data || []).map(row => row.contact_id).filter(Boolean))];
+        if (transcriptContactIds.length) {
+          const { data: transcriptContacts } = await sb.from('contacts')
+            .select('*, deals(*)')
+            .in('id', transcriptContactIds)
+            .limit(20)
+            .then(result => result)
+            .catch(() => ({ data: [] }));
+          linkedContacts = [...linkedContacts, ...(transcriptContacts || [])];
+        }
+      }
+
+      const uniqueLinkedContacts = [];
+      const seenLinkedContactIds = new Set();
+      for (const row of linkedContacts) {
+        if (!row?.id || seenLinkedContactIds.has(row.id)) continue;
+        seenLinkedContactIds.add(row.id);
+        uniqueLinkedContacts.push(row);
+      }
+
+      const primaryContact = uniqueLinkedContacts[0] || null;
+      const linkedContactIds = uniqueLinkedContacts.map(row => row.id).filter(Boolean);
 
       const [dealHistoryRes, messagesRes, emailsRes, transcriptsRes] = await Promise.all([
         sb.from('investor_deal_history')
@@ -7320,7 +7353,7 @@ function registerRoutes(app) {
       const dealHistory = dealHistoryRes.data || [];
       const dealMap = await getDealNameMap(sb, [
         ...dealHistory.map(row => row.deal_id),
-        ...linkedContacts.map(row => row.deal_id),
+        ...uniqueLinkedContacts.map(row => row.deal_id),
         ...((messagesRes.data || []).map(row => row.deal_id)),
         ...((emailsRes.data || []).map(row => row.deal_id)),
         ...((transcriptsRes.data || []).map(row => row.deal_id)),
