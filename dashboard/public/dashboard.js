@@ -1960,6 +1960,32 @@ async function openContactSidePanel(contactId, dealId = null) {
   }
 }
 
+async function openInvestorDatabaseSidePanel(investorsDbId) {
+  const panel   = document.getElementById('contact-side-panel');
+  const overlay = document.getElementById('contact-panel-overlay');
+  const nameEl  = document.getElementById('contact-panel-name');
+  const bodyEl  = document.getElementById('contact-panel-body');
+  if (!panel) return;
+
+  const panelKey = `investor-db:${investorsDbId}`;
+  _sidePanelContactId = panelKey;
+  investorProfileContactId = null;
+  investorProfileDealId = null;
+  panel.style.right = '0';
+  if (overlay) overlay.style.display = 'block';
+  if (nameEl) nameEl.textContent = 'Loading…';
+  if (bodyEl) bodyEl.innerHTML = '<div style="padding:24px;color:var(--text-dim)">Loading investor…</div>';
+
+  try {
+    const data = await api(`/api/investors-db/${investorsDbId}/profile`);
+    if (_sidePanelContactId !== panelKey) return;
+    if (nameEl) nameEl.textContent = data.contact?.name || 'Investor';
+    if (bodyEl) renderSidePanelBody(bodyEl, data);
+  } catch {
+    if (bodyEl) bodyEl.innerHTML = '<div style="padding:24px;color:#e05c5c">Failed to load investor.</div>';
+  }
+}
+
 async function openInvestorProfilePage(contactId, dealId = null) {
   investorProfileContactId = contactId;
   investorProfileDealId = dealId || null;
@@ -2051,7 +2077,9 @@ function renderSidePanelBody(el, data) {
         ${contact.phone ? `<div>${esc(contact.phone)}</div>` : ''}
       </div>
       <div style="margin-top:16px">
-        <a href="#investor-profile" onclick="event.preventDefault(); openInvestorProfilePage('${esc(contact.id)}','${esc(investorProfileDealId || contact.deal_id || '')}')" style="color:#60a5fa;font-size:12px">View full profile</a>
+        ${contact.linked_contact_id || (!contact.is_database_record && contact.id)
+          ? `<a href="#investor-profile" onclick="event.preventDefault(); openInvestorProfilePage('${esc(contact.linked_contact_id || contact.id)}','${esc(investorProfileDealId || contact.deal_id || '')}')" style="color:#60a5fa;font-size:12px">View full profile</a>`
+          : `<span style="color:#6b7280;font-size:12px">Database-only profile</span>`}
       </div>
     </div>
     <div style="padding:20px;border-bottom:1px solid #1a1a1a">
@@ -8236,11 +8264,11 @@ function renderInvestorTable(rows, total, pages) {
       : (r.last_investment_company ? esc(r.last_investment_company).substring(0, 25) : '—');
     const activity12m = r.investments_last_12m != null ? r.investments_last_12m : '—';
     const dealCell = r._active_deal
-      ? `<button onclick="showInvestorDealHistory('${r.id}','${esc(r.name)}')" style="background:none;border:none;cursor:pointer;color:#60a5fa;font-size:11px;padding:0">${esc(r._active_deal)}</button>`
+      ? `<button onclick="event.stopPropagation();showInvestorDealHistory('${r.id}','${esc(r.name)}')" style="background:none;border:none;cursor:pointer;color:#60a5fa;font-size:11px;padding:0">${esc(r._active_deal)}</button>`
       : (r._deal_count > 0
-        ? `<button onclick="showInvestorDealHistory('${r.id}','${esc(r.name)}')" style="background:none;border:none;cursor:pointer;color:#6b7280;font-size:11px;padding:0">${r._deal_count} deal(s)</button>`
+        ? `<button onclick="event.stopPropagation();showInvestorDealHistory('${r.id}','${esc(r.name)}')" style="background:none;border:none;cursor:pointer;color:#6b7280;font-size:11px;padding:0">${r._deal_count} deal(s)</button>`
         : '<span style="color:#374151;font-size:11px">—</span>');
-    const rowClick = r.linked_contact_id ? `onclick="openContactSidePanel('${r.linked_contact_id}', null)" style="cursor:pointer"` : '';
+    const rowClick = `onclick="openInvestorDatabaseSidePanel('${r.id}')" style="cursor:pointer"`;
     return `<tr ${rowClick}>
       <td><span style="font-weight:500;color:var(--text-bright)">${esc(r.name || '—')}</span><br><span style="font-size:11px;color:var(--text-muted)">${esc(r.hq_country || r.hq_location || '')}</span>${r.description ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.description)}</div>` : ''}</td>
       <td style="font-size:12px">${esc(r.investor_type || '—')}</td>

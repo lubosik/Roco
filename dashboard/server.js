@@ -7237,6 +7237,167 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  app.get('/api/investors-db/:id/profile', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+
+      const { data: investor, error: investorErr } = await sb.from('investors_db')
+        .select('*')
+        .eq('id', req.params.id)
+        .single();
+      if (investorErr) throw new Error(investorErr.message);
+
+      const emailCandidates = [...new Set([
+        String(investor.email || '').trim().toLowerCase(),
+        String(investor.primary_contact_email || '').trim().toLowerCase(),
+      ].filter(Boolean))];
+
+      let linkedContacts = [];
+      if (emailCandidates.length) {
+        const { data } = await sb.from('contacts')
+          .select('*, deals(*)')
+          .in('email', emailCandidates)
+          .then(result => result)
+          .catch(() => ({ data: [] }));
+        linkedContacts = data || [];
+      }
+
+      if (!linkedContacts.length && investor.name) {
+        const { data } = await sb.from('contacts')
+          .select('*, deals(*)')
+          .ilike('name', investor.name)
+          .limit(10)
+          .then(result => result)
+          .catch(() => ({ data: [] }));
+        linkedContacts = (data || []).filter(row => {
+          if (!investor.name) return false;
+          const sameFirm = investor.name && investor.name && (
+            !investor.firm_name ||
+            String(row.company_name || '').toLowerCase().includes(String(investor.firm_name || '').toLowerCase()) ||
+            String(investor.firm_name || '').toLowerCase().includes(String(row.company_name || '').toLowerCase())
+          );
+          return sameFirm;
+        });
+      }
+
+      const primaryContact = linkedContacts[0] || null;
+      const linkedContactIds = linkedContacts.map(row => row.id).filter(Boolean);
+
+      const [dealHistoryRes, messagesRes, emailsRes, transcriptsRes] = await Promise.all([
+        sb.from('investor_deal_history')
+          .select('*')
+          .eq('investors_db_id', req.params.id)
+          .order('added_at', { ascending: false })
+          .then(result => result)
+          .catch(() => ({ data: [] })),
+        linkedContactIds.length
+          ? sb.from('conversation_messages')
+              .select('contact_id, deal_id, direction, channel, body, subject, sent_at, received_at, intent')
+              .in('contact_id', linkedContactIds)
+              .limit(250)
+              .then(result => result)
+              .catch(() => ({ data: [] }))
+          : Promise.resolve({ data: [] }),
+        linkedContactIds.length
+          ? sb.from('emails')
+              .select('contact_id, deal_id, subject, body, content, sent_at, created_at')
+              .in('contact_id', linkedContactIds)
+              .limit(250)
+              .then(result => result)
+              .catch(() => ({ data: [] }))
+          : Promise.resolve({ data: [] }),
+        sb.from('meeting_transcripts')
+          .select('*')
+          .or([
+            emailCandidates.map(email => `investor_email.ilike.${email}`).join(','),
+            investor.name ? `investor_name.ilike.${investor.name}` : '',
+            linkedContactIds.length ? `contact_id.in.(${linkedContactIds.join(',')})` : '',
+          ].filter(Boolean).join(','))
+          .limit(100)
+          .then(result => result)
+          .catch(() => ({ data: [] })),
+      ]);
+
+      const dealHistory = dealHistoryRes.data || [];
+      const dealMap = await getDealNameMap(sb, [
+        ...dealHistory.map(row => row.deal_id),
+        ...linkedContacts.map(row => row.deal_id),
+        ...((messagesRes.data || []).map(row => row.deal_id)),
+        ...((emailsRes.data || []).map(row => row.deal_id)),
+        ...((transcriptsRes.data || []).map(row => row.deal_id)),
+      ]);
+
+      const transcripts = transcriptsRes.data || [];
+      const history = [];
+
+      for (const item of dealHistory) {
+        history.push({
+          type: 'Deal',
+          date: item.added_at || null,
+          summary: `${dealMap[String(item.deal_id || '')] || 'Unknown deal'} · ${item.status || 'added to history'}`,
+        });
+      }
+      for (const msg of messagesRes.data || []) {
+        history.push({
+          type: String(msg.channel || 'email').includes('linkedin') ? 'LinkedIn' : 'Email',
+          date: msg.sent_at || msg.received_at || null,
+          summary: String(msg.subject || msg.body || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+        });
+      }
+      for (const email of emailsRes.data || []) {
+        history.push({
+          type: 'Email',
+          date: email.sent_at || email.created_at || null,
+          summary: String(email.subject || email.body || email.content || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+        });
+      }
+      for (const transcript of transcripts) {
+        history.push({
+          type: 'Meeting',
+          date: transcript.created_at || null,
+          summary: String(transcript.summary || transcript.transcript_text || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+          sentiment: transcript.sentiment_score || null,
+        });
+      }
+
+      history.sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+
+      res.json({
+        contact: {
+          id: investor.id,
+          name: investor.name || primaryContact?.name || 'Unknown investor',
+          linked_contact_id: primaryContact?.id || null,
+          is_database_record: true,
+          company_name: investor.firm_name || primaryContact?.company_name || null,
+          job_title: primaryContact?.job_title || investor.role_title || null,
+          linkedin_url: primaryContact?.linkedin_url || investor.linkedin_url || null,
+          email: investor.email || investor.primary_contact_email || primaryContact?.email || null,
+          phone: primaryContact?.phone || null,
+          pipeline_stage: primaryContact?.pipeline_stage || 'Database Record',
+          conversation_state: primaryContact?.conversation_state || null,
+          transcript_sentiment: transcripts.length ? transcripts[transcripts.length - 1].sentiment_score : null,
+          sectors_of_interest: asJsonArray(investor.preferred_industries),
+          cheque_size_range: [
+            investor.preferred_deal_size_min != null ? `$${investor.preferred_deal_size_min}M` : null,
+            investor.preferred_deal_size_max != null ? `$${investor.preferred_deal_size_max}M` : null,
+          ].filter(Boolean).join(' - ') || (primaryContact?.typical_cheque_size || null),
+          aum_display: investor.aum_millions ? `$${Number(investor.aum_millions).toLocaleString()}M` : (primaryContact?.aum || primaryContact?.aum_fund_size || null),
+          past_investments_list: asJsonArray(primaryContact?.past_investments || investor.last_investment_company),
+          investment_thesis: primaryContact?.investment_thesis || investor.description || null,
+          notes: primaryContact?.notes || investor.description || null,
+          source: 'Database',
+          created_at: investor.created_at || primaryContact?.created_at || null,
+          deal_name: dealHistory.length ? (dealMap[String(dealHistory[0].deal_id || '')] || null) : null,
+        },
+        history,
+        transcripts,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ─── DEAL DOCUMENT PARSING ────────────────────────────────────────────────
 
   // POST /api/deals/parse-document — upload PDF/DOCX, parse with Kimi, return structured info
