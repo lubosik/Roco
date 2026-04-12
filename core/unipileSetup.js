@@ -27,6 +27,30 @@ function normalizeWebhookListResponse(data) {
   return [];
 }
 
+function normalizeAccountIds(existing) {
+  if (Array.isArray(existing?.account_ids)) return existing.account_ids.map(String);
+  if (existing?.account_id) return [String(existing.account_id)];
+  return [];
+}
+
+function normalizeEvents(existing) {
+  return (existing?.events || []).map(event => String(event || '').trim()).filter(Boolean).sort();
+}
+
+function sameAccountScope(existing, expectedAccountIds = []) {
+  const actual = normalizeAccountIds(existing).sort();
+  const expected = (expectedAccountIds || []).map(String).filter(Boolean).sort();
+  if (!expected.length) return actual.length === 0;
+  return actual.length === expected.length && actual.every((id, idx) => id === expected[idx]);
+}
+
+function sameWebhookConfig(existing, expected) {
+  const sameSource = String(existing?.source || '').trim() === String(expected?.source || '').trim();
+  const sameEvents = JSON.stringify(normalizeEvents(existing)) === JSON.stringify(normalizeEvents(expected));
+  const sameScope = sameAccountScope(existing, expected?.account_ids || []);
+  return sameSource && sameEvents && sameScope;
+}
+
 function sameWebhookTarget(existing, expectedUrl) {
   return String(existing?.request_url || '').replace(/\/+$/, '') === String(expectedUrl || '').replace(/\/+$/, '');
 }
@@ -83,6 +107,8 @@ export async function registerWebhooks(baseUrl) {
       request_url: `${baseUrl}/webhook/unipile/gmail`,
       source: 'email',
       events: ['mail_received'],
+      format: 'json',
+      enabled: true,
       account_ids: [getGmailAcct()].filter(Boolean),
       headers: [
         { key: 'Content-Type', value: 'application/json' },
@@ -93,6 +119,8 @@ export async function registerWebhooks(baseUrl) {
       request_url: `${baseUrl}/webhook/unipile/outlook`,
       source: 'email',
       events: ['mail_received'],
+      format: 'json',
+      enabled: true,
       account_ids: [getOutlookAcct()].filter(Boolean),
       headers: [
         { key: 'Content-Type', value: 'application/json' },
@@ -103,7 +131,9 @@ export async function registerWebhooks(baseUrl) {
       request_url: `${baseUrl}/webhooks/unipile/messages`,
       source: 'messaging',
       events: ['message_received'],
-      account_id: getLiAcct(),
+      format: 'json',
+      enabled: true,
+      account_ids: [getLiAcct()].filter(Boolean),
       headers: [
         { key: 'Content-Type', value: 'application/json' },
       ],
@@ -113,7 +143,9 @@ export async function registerWebhooks(baseUrl) {
       request_url: `${baseUrl}/webhooks/unipile/messages`,
       source: 'users',
       events: ['new_relation'],
-      account_id: getLiAcct(),
+      format: 'json',
+      enabled: true,
+      account_ids: [getLiAcct()].filter(Boolean),
       headers: [
         { key: 'Content-Type', value: 'application/json' },
       ],
@@ -136,14 +168,18 @@ export async function registerWebhooks(baseUrl) {
     try {
       const expectedPath = getWebhookPath(wh.request_url);
       const matches = existing.filter(e => e.name === wh.name || getWebhookPath(e.request_url) === expectedPath);
-      const currentMatch = matches.find(e => sameWebhookTarget(e, wh.request_url));
+      const currentMatch = matches.find(e => sameWebhookTarget(e, wh.request_url) && sameWebhookConfig(e, wh));
 
       if (currentMatch) {
         console.log(`[UNIPILE SETUP] Webhook exists: ${wh.name} → ${currentMatch.request_url}`);
         continue;
       }
 
-      const outdatedMatches = matches.filter(e => !sameWebhookTarget(e, wh.request_url) || isOldRocoWebhook(e, expectedPath));
+      const outdatedMatches = matches.filter(e =>
+        !sameWebhookTarget(e, wh.request_url) ||
+        !sameWebhookConfig(e, wh) ||
+        isOldRocoWebhook(e, expectedPath)
+      );
       for (const outdated of outdatedMatches) {
         const webhookId = getWebhookId(outdated);
         if (!webhookId) {

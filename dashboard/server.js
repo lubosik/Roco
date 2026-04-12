@@ -8,7 +8,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DateTime } from 'luxon';
-import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals } from '../approval/telegramBot.js';
+import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals, dismissPendingApproval } from '../approval/telegramBot.js';
 import { getInvestorGuidance, getSourcingGuidance, saveInvestorGuidance, saveSourcingGuidance, buildGuidanceBlock } from '../services/guidanceService.js';
 import { invalidateCache as invalidateAgentContext } from '../core/agentContext.js';
 import { getSupabase } from '../core/supabase.js';
@@ -247,7 +247,13 @@ function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
 async function logWebhookReceipt(eventType, payload, source = 'unipile') {
   await insertWebhookLogRecord({
     event_type: eventType || 'unknown',
-    payload: payload || {},
+    payload: {
+      ...(payload || {}),
+      __roco_meta: {
+        ...((payload && payload.__roco_meta) || {}),
+        source,
+      },
+    },
   });
   pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
 }
@@ -331,6 +337,32 @@ async function listRecentWebhookLogs(limit = 200) {
   } catch {
     return [];
   }
+}
+
+function isTruthyEnvFlag(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function getConfiguredUnipileAccountIds() {
+  return {
+    gmail: String(process.env.UNIPILE_GMAIL_ACCOUNT_ID || '').trim(),
+    outlook: String(process.env.UNIPILE_OUTLOOK_ACCOUNT_ID || '').trim(),
+    linkedin: String(process.env.UNIPILE_LINKEDIN_ACCOUNT_ID || '').trim(),
+  };
+}
+
+function matchesConfiguredAccount(payload, expectedAccountId) {
+  const actual = String(payload?.account_id || payload?.data?.account_id || '').trim();
+  if (!expectedAccountId) return true;
+  return !!actual && actual === String(expectedAccountId).trim();
+}
+
+function isReplyMessageType(value) {
+  return ['email_reply', 'linkedin_reply'].includes(String(value || '').trim().toLowerCase());
+}
+
+function getReplyActivityBadge(channel) {
+  return channel === 'linkedin' ? 'linkedin_reply' : 'email_reply';
 }
 
 function isEmptyWebhookPayload(event) {
@@ -504,7 +536,8 @@ async function processUnipileMessageEvent(event) {
 
   if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
     await logWebhookReceipt(eventType, event, 'unipile_messages').catch(() => {});
-    return 'email';
+    console.warn('[WEBHOOKS/UNIPILE] Email event reached LinkedIn webhook endpoint; ignoring until webhook config is corrected');
+    return 'ignored_email';
   }
 
   await insertWebhookLogRecord({
@@ -1729,6 +1762,171 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
   return result;
 }
 
+export async function sendApprovedReply({ queueId = null, queueItem = null, forceSend = false, bodyOverride = null } = {}) {
+  const sb = getSupabase();
+  if (!sb) throw new Error('Database unavailable');
+
+  let item = queueItem || null;
+  if (!item && queueId) {
+    const { data } = await sb.from('approval_queue')
+      .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, approved_subject, subject_a, subject, stage, channel, message_type, reply_to_id, resolved_at')
+      .eq('id', queueId)
+      .single();
+    item = data || null;
+  }
+  if (!item) throw new Error('Reply approval not found');
+
+  const contactId = item.contact_id || item.candidate_id || null;
+  const channel = String(item.channel || (String(item.message_type || '').includes('linkedin') ? 'linkedin' : 'email')).toLowerCase();
+  const isLinkedInReply = channel === 'linkedin';
+  const bodyToSend = sanitizeApprovalText(bodyOverride || item.edited_body || item.body || '');
+  if (!bodyToSend) throw new Error('Reply body is empty');
+
+  let contact = null;
+  if (contactId) {
+    try {
+      const { data } = await sb.from('contacts')
+        .select('id, name, company_name, email, deal_id, unipile_chat_id')
+        .eq('id', contactId)
+        .single();
+      contact = data || null;
+    } catch {}
+  }
+
+  const dealId = item.deal_id || contact?.deal_id || null;
+  let deal = null;
+  if (dealId) {
+    try {
+      const { data } = await sb.from('deals').select('*').eq('id', dealId).single();
+      deal = data || null;
+    } catch {}
+  }
+
+  if (!forceSend && deal && !isWithinChannelWindow(deal, isLinkedInReply ? 'linkedin_dm' : 'email')) {
+    if (queueId) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        edited_body: bodyToSend || null,
+        approved_subject: !isLinkedInReply ? sanitizeApprovalText(item.approved_subject || item.subject_a || item.subject || 'our conversation') : null,
+        resolved_at: new Date().toISOString(),
+      }).eq('id', queueId);
+    }
+    pushActivity({
+      type: isLinkedInReply ? 'linkedin' : 'email',
+      activity_badge: getReplyActivityBadge(channel),
+      action: `${isLinkedInReply ? 'LinkedIn reply received' : 'Email reply received'}: ${contact?.name || item.contact_name || 'Contact'}`,
+      note: `${truncateInline(bodyToSend, 120)} · waiting for ${isLinkedInReply ? 'LinkedIn' : 'email'} window${deal ? (getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : '') : ''}`,
+      deal_name: deal?.name || null,
+      dealId,
+    });
+    notifyQueueUpdated();
+    return { deferred: true, nextOpen: deal ? (getWindowStatus(deal).nextOpen || null) : null };
+  }
+
+  if (queueId) {
+    const { data: claimed } = await sb.from('approval_queue').update({
+      status: 'sending',
+      edited_body: bodyToSend || null,
+      approved_subject: !isLinkedInReply ? sanitizeApprovalText(item.approved_subject || item.subject_a || item.subject || 'our conversation') : null,
+      resolved_at: new Date().toISOString(),
+    }).eq('id', queueId)
+      .in('status', ['pending', 'approved', 'approved_waiting_for_window'])
+      .select('id')
+      .maybeSingle();
+    if (!claimed?.id) return { skipped: true, reason: 'queue_not_claimed' };
+  }
+
+  const sentAt = new Date().toISOString();
+  if (isLinkedInReply) {
+    const chatId = item.reply_to_id || contact?.unipile_chat_id || null;
+    if (!chatId) throw new Error('No LinkedIn chat available for reply');
+    const result = await sendLinkedInReply({ chatId, message: bodyToSend });
+
+    if (queueId) {
+      await sb.from('approval_queue').update({
+        status: 'sent',
+        sent_at: sentAt,
+        edited_body: bodyToSend || null,
+      }).eq('id', queueId);
+    }
+
+    if (contactId) {
+      await sb.from('contacts').update({
+        pipeline_stage: 'In Conversation',
+        last_outreach_at: sentAt,
+        updated_at: sentAt,
+      }).eq('id', contactId);
+      await sb.from('conversation_messages').insert({
+        contact_id: contactId,
+        deal_id: dealId,
+        direction: 'outbound',
+        channel: 'linkedin_dm',
+        body: bodyToSend,
+        sent_at: sentAt,
+      }).catch(() => {});
+    }
+
+    pushActivity({
+      type: 'linkedin',
+      action: `LinkedIn reply sent: ${contact?.name || item.contact_name || 'Contact'}`,
+      note: `${truncateInline(bodyToSend, 120)}${contact?.company_name || item.firm ? ` · ${contact?.company_name || item.firm}` : ''}`,
+      deal_name: deal?.name || null,
+      dealId,
+    });
+    notifyQueueUpdated();
+    return { sent: true, sentAt, messageId: result?.messageId || null, chatId };
+  }
+
+  const toEmail = contact?.email || item.contact_email || null;
+  if (!toEmail) throw new Error('No email address found for reply');
+  const subject = sanitizeApprovalText(item.approved_subject || item.subject_a || item.subject || 'our conversation');
+  const result = await sendEmailReply({
+    to: toEmail,
+    toName: contact?.name || item.contact_name || '',
+    subject,
+    body: bodyToSend,
+    replyToProviderId: item.reply_to_id || null,
+    accountId: null,
+  });
+
+  if (queueId) {
+    await sb.from('approval_queue').update({
+      status: 'sent',
+      sent_at: sentAt,
+      approved_subject: subject || null,
+      edited_body: bodyToSend || null,
+    }).eq('id', queueId);
+  }
+
+  if (contactId) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'In Conversation',
+      last_outreach_at: sentAt,
+      last_email_sent_at: sentAt,
+      updated_at: sentAt,
+    }).eq('id', contactId);
+    await sb.from('conversation_messages').insert({
+      contact_id: contactId,
+      deal_id: dealId,
+      direction: 'outbound',
+      channel: 'email',
+      body: bodyToSend,
+      subject,
+      sent_at: sentAt,
+    }).catch(() => {});
+  }
+
+  pushActivity({
+    type: 'email',
+    action: `Email reply sent: ${contact?.name || item.contact_name || 'Contact'}`,
+    note: `${truncateInline(bodyToSend, 120)}${contact?.company_name || item.firm ? ` · ${contact?.company_name || item.firm}` : ''}`,
+    deal_name: deal?.name || null,
+    dealId,
+  });
+  notifyQueueUpdated();
+  return { sent: true, sentAt, threadId: result?.threadId || null, messageId: result?.emailId || null };
+}
+
 // ─────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────
@@ -1802,6 +2000,38 @@ export function initDashboard(state) {
     }
   });
 
+  app.get('/api/admin/webhook-logs', requireAuth, async (req, res) => {
+    try {
+      const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
+      const logs = await listRecentWebhookLogs(limit);
+      const items = logs.map(log => {
+        const payload = log.payload || {};
+        const event = payload.data || payload;
+        return {
+          received_at: log.received_at || null,
+          event_type: log.event_type || null,
+          account_id: payload.account_id || event.account_id || null,
+          source: payload.__roco_meta?.source || null,
+          webhook_name: payload.webhook_name || event.webhook_name || null,
+          message_id: payload.message_id || event.message_id || event.id || null,
+          chat_id: payload.chat_id || event.chat_id || event.conversation_id || null,
+          subject: event.subject || null,
+          preview: truncateInline(
+            extractUnipileMessageText(event) ||
+            extractUnipileEmailBody(event) ||
+            event.user_full_name ||
+            '',
+            200,
+          ),
+          payload,
+        };
+      });
+      res.json(items);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ─── Unipile webhooks — no Basic Auth (Unipile calls these from their servers) ───
 
   // POST /webhook/unipile/gmail — inbound Gmail replies via Unipile
@@ -1814,6 +2044,11 @@ export function initDashboard(state) {
 
       // Unipile sends a wrapper with type + payload
       const payload = event?.data || event;
+      const { gmail: gmailAccountId } = getConfiguredUnipileAccountIds();
+      if (!matchesConfiguredAccount(payload, gmailAccountId)) {
+        console.warn('[WEBHOOK/GMAIL] Ignoring event for unexpected account_id:', payload?.account_id || event?.account_id || 'unknown');
+        return;
+      }
       const fromEmail   = payload?.from_attendee?.identifier || payload?.from_email || '';
       const fromName    = payload?.from_attendee?.display_name || payload?.from_name || '';
       const subject     = payload?.subject || '';
@@ -1841,6 +2076,11 @@ export function initDashboard(state) {
 
       const payload   = event?.data || event;
       const eventType = payload?.event || event?.event || '';
+      const { outlook: configuredOutlookAccountId } = getConfiguredUnipileAccountIds();
+      if (!matchesConfiguredAccount(payload, configuredOutlookAccountId)) {
+        console.warn('[WEBHOOK/OUTLOOK] Ignoring event for unexpected account_id:', payload?.account_id || event?.account_id || 'unknown');
+        return;
+      }
 
       // Only process inbound emails (ignore sent/moved)
       if (eventType && eventType !== 'mail_received') return;
@@ -2155,6 +2395,24 @@ export function initDashboard(state) {
         console.warn('[WEBHOOKS/UNIPILE] Empty request body — likely provider validation ping');
         return;
       }
+      const payload = event?.data || event || {};
+      const eventType = String(event?.type || event?.event_type || event?.event || '').toLowerCase();
+      const { linkedin: linkedinAccountId } = getConfiguredUnipileAccountIds();
+      const isLinkedInEvent =
+        ['message_received', 'message.created', 'new_relation', 'connection_request_accepted'].includes(eventType) ||
+        Boolean(payload?.sender?.attendee_provider_id || payload?.user_provider_id || payload?.user_public_identifier);
+
+      if (isLinkedInEvent && !matchesConfiguredAccount(payload, linkedinAccountId)) {
+        await logWebhookReceipt(eventType || 'unknown', {
+          ...event,
+          __roco_meta: {
+            ...(event?.__roco_meta || {}),
+            ignored_reason: 'unexpected_linkedin_account',
+          },
+        }, 'unipile_messages').catch(() => {});
+        console.warn('[WEBHOOKS/UNIPILE] Ignoring LinkedIn event for unexpected account_id:', payload?.account_id || event?.account_id || 'unknown');
+        return;
+      }
       const mode = await processUnipileMessageEvent(event);
       if (mode === 'email') {
         const sb = getSupabase();
@@ -2316,8 +2574,12 @@ export function initDashboard(state) {
     );
   })();
 
-  // Start inbox polling fallback (60-second interval, catches missed webhooks)
-  startInboxMonitor(handleLiMsg, pushActivity, { draftContextualReply });
+  // Default to webhook-only mode to avoid resurfacing historical chat messages as new replies.
+  if (isTruthyEnvFlag(process.env.ENABLE_UNIPILE_INBOX_MONITOR)) {
+    startInboxMonitor(handleLiMsg, pushActivity, { draftContextualReply });
+  } else {
+    console.log('[INBOX MONITOR] Disabled — webhook-only mode is active');
+  }
 
   // Register Telegram webhook for inline button callbacks
   import('../core/telegram.js').then(m => m.registerTelegramWebhook()).catch(e => console.warn('[TELEGRAM] Webhook reg error:', e.message));
@@ -2790,11 +3052,11 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (sb) {
         const { data: sbItems, error: sbErr } = await sb.from('approval_queue')
-          .select('id, contact_id, contact_name, contact_email, firm, stage, body, message_type, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode')
+          .select('id, contact_id, candidate_id, contact_name, contact_email, firm, stage, body, message_type, channel, reply_to_id, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode')
           .in('status', ['pending'])
           .order('created_at', { ascending: true });
         if (sbErr) console.warn('[/api/queue] Supabase query error:', sbErr.message);
-        const LINKEDIN_STAGES = ['LinkedIn DM', 'prior_chat_review'];
+        const LINKEDIN_STAGES = ['LinkedIn DM', 'LinkedIn Reply', 'prior_chat_review'];
         const looksLikeEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
         const missingEmailIds = [];
         const contactIdsToHydrate = [...new Set((sbItems || [])
@@ -2813,7 +3075,8 @@ function registerRoutes(app) {
         }
 
         const sbMapped = (sbItems || []).flatMap(r => {
-          const isLinkedIn = LINKEDIN_STAGES.includes(r.stage) || r.message_type === 'prior_chat_review';
+          const isReply = isReplyMessageType(r.message_type);
+          const isLinkedIn = LINKEDIN_STAGES.includes(r.stage) || r.message_type === 'prior_chat_review' || r.message_type === 'linkedin_reply' || r.channel === 'linkedin';
           const resolvedEmail = r.contact_email || contactEmailMap[r.contact_id] || null;
           if (!isLinkedIn && !looksLikeEmail(resolvedEmail)) {
             missingEmailIds.push(r.id);
@@ -2826,9 +3089,10 @@ function registerRoutes(app) {
             stage:           r.stage,
             body:            r.edited_body || r.body || '',
             message_type:    r.message_type || null,
-            channel:         isLinkedIn ? 'linkedin' : 'email',
+            isReply,
+            channel:         r.channel || (isLinkedIn ? 'linkedin' : 'email'),
             queuedAt:        r.created_at,
-            contact_id:      r.contact_id,
+            contact_id:      r.contact_id || r.candidate_id,
             subjectA:        r.subject_a || null,
             subjectB:        r.subject_b || null,
             score:           r.score ?? contactScoreMap[r.contact_id] ?? null,
@@ -2852,7 +3116,7 @@ function registerRoutes(app) {
 
         for (const item of inMemory) {
           const queueKey = item.queueId ? `q:${item.queueId}` : null;
-          const localKey = item.id ? `i:${item.id}` : null;
+          const localKey = item.telegramMsgId ? `i:${item.telegramMsgId}` : null;
           if (queueKey) seenQueueIds.add(queueKey);
           if (localKey) seenLocalIds.add(localKey);
           merged.push(item);
@@ -2930,12 +3194,50 @@ function registerRoutes(app) {
 
   // POST /api/approve — approve an email from dashboard
   app.post('/api/approve', async (req, res) => {
-    const { id, subjectChoice, editedBody, subject } = req.body;
+    const { id, subjectChoice, editedBody, subject, sendNow = false } = req.body;
     if (!id) return res.status(400).json({ error: 'id required' });
+
+    const sb = getSupabase();
+
+    let sbItem = null;
+    if (sb) {
+      try {
+        const { data } = await sb.from('approval_queue')
+          .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
+          .eq('id', id)
+          .in('status', ['pending', 'approved_waiting_for_window'])
+          .maybeSingle();
+        sbItem = data || null;
+      } catch {}
+    }
+
+    if (sbItem && isReplyMessageType(sbItem.message_type)) {
+      try {
+        await dismissPendingApproval(id).catch(() => {});
+        const result = await sendApprovedReply({
+          queueId: sbItem.id,
+          queueItem: sbItem,
+          forceSend: !!sendNow,
+          bodyOverride: editedBody || sbItem.edited_body || sbItem.body || '',
+        });
+        return res.json({
+          success: true,
+          deferred: !!result?.deferred,
+          message: result?.deferred
+            ? (result?.nextOpen
+                ? `Reply approved and waiting for the sending window (${result.nextOpen})`
+                : 'Reply approved and waiting for the sending window')
+            : 'Reply sent',
+        });
+      } catch (err) {
+        console.error('[/api/approve] Reply send error:', err.message);
+        return res.status(500).json({ error: 'Send failed: ' + err.message });
+      }
+    }
 
     // Find the approval to get contact info before resolving
     const pending = getPendingApprovals();
-    const item = pending.find(p => String(p.id) === String(id));
+    const item = pending.find(p => String(p.id) === String(id) || String(p.queueId || '') === String(id));
 
     const resolved = resolveApprovalFromDashboard(
       id,
@@ -2946,30 +3248,31 @@ function registerRoutes(app) {
 
     if (!resolved) {
       // Fall back: check Supabase for a LinkedIn DM queue item (webhook-triggered, not in-memory)
-      const sb = getSupabase();
       if (sb) {
-        let sbItem = null;
+        let queueItem = sbItem;
         try {
-          const { data } = await sb.from('approval_queue')
-            .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject')
-            .eq('id', id)
-            .eq('status', 'pending')
-            .single();
-          sbItem = data;
+          if (!queueItem) {
+            const { data } = await sb.from('approval_queue')
+              .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
+              .eq('id', id)
+              .eq('status', 'pending')
+              .single();
+            queueItem = data;
+          }
         } catch { /* not found or not pending */ }
 
-        if (sbItem?.contact_id && sbItem?.stage === 'LinkedIn DM') {
+        if (queueItem?.contact_id && queueItem?.stage === 'LinkedIn DM') {
           try {
-            const text = sanitizeApprovalText(editedBody || sbItem.edited_body || sbItem.body || '');
+            const text = sanitizeApprovalText(editedBody || queueItem.edited_body || queueItem.body || '');
             await sb.from('contacts').update({
               pipeline_stage: 'DM Approved',
               updated_at: new Date().toISOString(),
-            }).eq('id', sbItem.contact_id);
+            }).eq('id', queueItem.contact_id);
             const sendResult = await sendApprovedLinkedInDM({
-              contactId: sbItem.contact_id,
+              contactId: queueItem.contact_id,
               text,
-              queueId: sbItem.id,
-              queueItem: sbItem,
+              queueId: queueItem.id,
+              queueItem,
             });
             if (sendResult?.deferred) {
               return res.json({
@@ -2988,14 +3291,14 @@ function registerRoutes(app) {
         }
 
         // Email approval (INTRO or other email stages) — send via Unipile Gmail
-        if (sbItem?.contact_id) {
+        if (queueItem?.contact_id) {
           try {
             // Look up contact email if not stored directly on the queue item
-            let toEmail = sbItem.contact_email;
+            let toEmail = queueItem.contact_email;
             if (!toEmail) {
               let contactRow = null;
               try {
-                const result = await sb.from('contacts').select('email, name').eq('id', sbItem.contact_id).single();
+                const result = await sb.from('contacts').select('email, name').eq('id', queueItem.contact_id).single();
                 contactRow = result?.data || null;
               } catch {
                 contactRow = null;
@@ -3006,34 +3309,34 @@ function registerRoutes(app) {
               return res.status(400).json({ error: 'No email address found for this contact — cannot send' });
             }
 
-            const chosenSubject = subjectChoice === 'b' ? sbItem.subject_b : (sbItem.subject_a || sbItem.subject || '');
+            const chosenSubject = subjectChoice === 'b' ? queueItem.subject_b : (queueItem.subject_a || queueItem.subject || '');
             const finalSubject  = editedBody ? chosenSubject : (chosenSubject || '');
-            const bodyToSend    = sanitizeApprovalText(editedBody || sbItem.edited_body || sbItem.body || '');
+            const bodyToSend    = sanitizeApprovalText(editedBody || queueItem.edited_body || queueItem.body || '');
             await sb.from('contacts').update({
               pipeline_stage: 'Email Approved',
               updated_at: new Date().toISOString(),
-            }).eq('id', sbItem.contact_id);
+            }).eq('id', queueItem.contact_id);
 
-            const sendResult = await sendEmail({ to: toEmail, toName: sbItem.contact_name || '', subject: finalSubject, body: bodyToSend });
+            const sendResult = await sendEmail({ to: toEmail, toName: queueItem.contact_name || '', subject: finalSubject, body: bodyToSend });
 
             try {
               await sb.from('approval_queue').update({
                 status:           'sent',
                 sent_at:          new Date().toISOString(),
                 approved_subject: finalSubject,
-              }).eq('id', sbItem.id);
+              }).eq('id', queueItem.id);
             } catch {}
 
             try {
               await sb.from('contacts').update({
                 pipeline_stage:     'Email Sent',
                 last_email_sent_at: new Date().toISOString(),
-              }).eq('id', sbItem.contact_id);
+              }).eq('id', queueItem.contact_id);
             } catch {}
 
             try {
               await sb.from('conversation_messages').insert({
-                contact_id:  sbItem.contact_id,
+                contact_id:  queueItem.contact_id,
                 direction:   'outbound',
                 channel:     'email',
                 body:        bodyToSend,
@@ -3045,7 +3348,7 @@ function registerRoutes(app) {
             // Log to activity_log so email sent metrics increment
             let contactForLog = null;
             try {
-              const result = await sb.from('contacts').select('deal_id').eq('id', sbItem.contact_id).single();
+              const result = await sb.from('contacts').select('deal_id').eq('id', queueItem.contact_id).single();
               contactForLog = result?.data || null;
             } catch {
               contactForLog = null;
@@ -3057,7 +3360,7 @@ function registerRoutes(app) {
                   .eq('id', contactForLog.deal_id)
                   .maybeSingle();
                 const sequence = await getSequenceForDealFromServer(sb, contactForLog.deal_id);
-                const stageLabel = String(sbItem?.stage || '').toLowerCase();
+                const stageLabel = String(queueItem?.stage || '').toLowerCase();
                 const followUpMatch = stageLabel.match(/follow[- ]up\s*(\d+)/i);
                 const followUpNumber = followUpMatch ? Number(followUpMatch[1] || 1) : 0;
                 const nextFollowUpPlan = getNextFollowUpPlanForChannel(sequence, dealRow || null, 'email', followUpNumber);
@@ -3073,12 +3376,12 @@ function registerRoutes(app) {
                   last_outreach_at:   sentAt,
                   follow_up_count:    followUpNumber,
                   follow_up_due_at:   nextFollowUpDueAt,
-                }).eq('id', sbItem.contact_id);
+                }).eq('id', queueItem.contact_id);
 
                 await sb.from('activity_log').insert({
                   deal_id:    contactForLog.deal_id,
                   event_type: 'EMAIL_SENT',
-                  summary:    `Email sent to ${sbItem.contact_name || ''} at ${sbItem.firm || ''}`,
+                  summary:    `Email sent to ${queueItem.contact_name || ''} at ${queueItem.firm || ''}`,
                   detail:     {
                     channel: 'email',
                     account_id: sendResult?.accountId || null,
@@ -3094,8 +3397,8 @@ function registerRoutes(app) {
 
             pushActivity({
               type:   'email',
-              action: `Email sent: ${sbItem.contact_name || ''}`,
-              note:   `${sbItem.firm || ''} · ${finalSubject}`,
+              action: `Email sent: ${queueItem.contact_name || ''}`,
+              note:   `${queueItem.firm || ''} · ${finalSubject}`,
             });
             return res.json({ success: true, message: 'Email sent' });
           } catch (err) {
@@ -7136,6 +7439,15 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText
     }
 
     const timer = setTimeout(() => flushReplyBatch(batchKey), REPLY_DEBOUNCE_MS);
+    const contextLabel = ctx.deal?.name || ctx.campaign?.name || null;
+    pushActivity({
+      type: 'reply',
+      activity_badge: getReplyActivityBadge(channel),
+      action: `${channel === 'linkedin' ? 'LinkedIn reply received' : 'Email reply received'}: ${ctx.contact.name}`,
+      note: `${truncateInline(bodyText, 100)}${contextLabel ? ` · ${contextLabel}` : ''}`,
+      dealId: ctx.deal?.id || null,
+      deal_name: ctx.deal?.name || null,
+    });
     replyDebounceMap.set(batchKey, {
       timer,
       contact:   ctx.contact,
@@ -7455,14 +7767,6 @@ async function processRocoBatchedReply(batch) {
     return;
   }
 
-  // Push to activity feed
-  pushActivity({
-    type:   'reply',
-    action: `${contact.name} replied`,
-    note:   `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent} · "${combinedContent.substring(0, 80)}"`,
-    dealId: deal?.id,
-  });
-
   // Queue each drafted reply for approval. Sending only happens after approval.
   for (let i = 0; i < (classification.messages_to_send || []).length; i++) {
     const reply = classification.messages_to_send[i];
@@ -7474,20 +7778,23 @@ async function processRocoBatchedReply(batch) {
       continue;
     }
 
-    if (await isDuplicateReplyApproval(contact.id, channel === 'linkedin' ? 'linkedin_dm' : 'email_reply')) {
+    if (await isDuplicateReplyApproval(contact.id, channel === 'linkedin' ? 'linkedin_reply' : 'email_reply')) {
       console.log(`[REPLY] Duplicate suppressed for ${contact.name}`);
       continue;
     }
 
     const { data: queued } = await sb?.from('approval_queue').insert({
       deal_id:            deal?.id || null,
+      contact_id:         contact.id,
       candidate_id:       contact.id,
       campaign_id:        campaign?.id || null,
       company_contact_id: mode === 'company_sourcing' ? contact.id : null,
-      message_type:       channel === 'linkedin' ? 'linkedin_dm' : 'email_reply',
+      message_type:       channel === 'linkedin' ? 'linkedin_reply' : 'email_reply',
       outreach_mode:      mode === 'investor_outreach' ? 'investor' : 'company_sourcing',
       channel,
+      stage:              channel === 'linkedin' ? 'LinkedIn Reply' : 'Email Reply',
       message_text:       reply.body,
+      body:               reply.body,
       subject_a:          reply.subject || null,
       reply_to_id:        threadId || null,
       status:             'pending',

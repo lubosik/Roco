@@ -5222,6 +5222,10 @@ function renderQueueCard(item) {
   const id      = item.id || item._id;
   const name    = esc(item.name || item.firstName || '—');
   const firm    = esc(item.firm || item.company || '');
+  const stageValue = String(item.stage || '').toLowerCase();
+  const channelValue = String(item.channel || '').toLowerCase();
+  const messageType = String(item.message_type || '').toLowerCase();
+  const isReply = !!item.isReply || messageType === 'email_reply' || messageType === 'linkedin_reply' || stageValue.includes('reply');
 
   // Prior chat review — amber card with Proceed/Skip
   if (item.message_type === 'prior_chat_review') {
@@ -5256,6 +5260,13 @@ function renderQueueCard(item) {
   const hasAB   = !!subB;
   const body    = esc(item.body || item.emailBody || '');
 
+  const approveButtons = isReply
+    ? `
+      <button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>
+      <button class="btn btn-gold btn-sm" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', true)">&#9889; SEND NOW</button>
+    `
+    : `<button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>`;
+
   return `<div class="queue-card" id="qcard-${id}">
     <div class="queue-card-header">
       <div>
@@ -5276,7 +5287,7 @@ function renderQueueCard(item) {
       <div class="queue-preview">${body}</div>
     </div>
     <div class="queue-actions">
-      <button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}')">&#10003; APPROVE</button>
+      ${approveButtons}
       <button class="btn btn-ghost btn-sm" onclick="previewQueueItem('${id}')">&#128065; PREVIEW</button>
       <button class="btn btn-ghost btn-sm" onclick="editApproval('${id}')">&#9998; EDIT</button>
       <button class="btn btn-danger btn-sm" onclick="skipApproval('${id}')">SKIP</button>
@@ -5356,11 +5367,11 @@ function switchQueueTab(tab, btn) {
   document.getElementById('qpanel-linkedin')?.classList.toggle('hidden', tab !== 'linkedin');
 }
 
-async function approveEmail(id, variant, _unused) {
+async function approveEmail(id, variant, _unused, sendNow = false) {
   const subjects   = window._qSubjects?.[id] || {};
   const subject    = subjects[variant] || subjects.a || '';
   try {
-    await api('/api/approve', 'POST', { id, variant, subject });
+    await api('/api/approve', 'POST', { id, variant, subject, sendNow });
     document.getElementById(`qcard-${id}`)?.remove();
     await loadQueue();
   } catch (err) { alert(`Approve failed: ${err.message}`); }
@@ -5486,12 +5497,12 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
 
   const typeColors = {
     thinking: '#A78BFA', research: '#60A5FA', email: '#C9A84C',
-    linkedin: '#4ADE80', accepted: '#A78BFA', reply: '#C084FC', system: '#8A8680',
+    linkedin: '#4ADE80', accepted: '#A78BFA', relation: '#f59e0b', reply: '#C084FC', linkedin_reply: '#38bdf8', email_reply: '#a78bfa', system: '#8A8680',
     error: '#F87171', analysis: '#4ADE80', excluded: '#6b7280',
   };
   const typeIcons = {
     thinking: '🧠', research: '🔍', email: '📧', linkedin: '💼',
-    accepted: '✓', reply: '↩️', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
+    accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
   };
 
   const eventsHtml = (events || []).map(event => {
@@ -7158,7 +7169,10 @@ function getActivityBadgeMeta(item) {
   const className = normalizedExplicitBadge || typeToBadge(item?.type || item?.event_type || item?.activityType);
   const labels = {
     accepted: 'Accepted',
+    relation: 'New Relation',
     reply: 'Replied',
+    linkedin_reply: 'LinkedIn Reply',
+    email_reply: 'Email Reply',
     invite: 'Invite',
     dm: 'DM',
     linkedin: 'LinkedIn',

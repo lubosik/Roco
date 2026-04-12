@@ -44,7 +44,7 @@ import { researchFirmOnly, findDecisionMakers } from '../research/firmResearcher
 import { runDealResearch } from '../research/dealResearcher.js'; // legacy fallback
 import { queryInvestorDatabase, batchScoreInvestors as batchScoreInvestors } from './investorDatabaseQuery.js';
 import { haikuComplete } from './aiClient.js';
-import { pushActivity, queueLinkedInDmApproval, sendApprovedLinkedInDM } from '../dashboard/server.js';
+import { pushActivity, queueLinkedInDmApproval, sendApprovedLinkedInDM, sendApprovedReply } from '../dashboard/server.js';
 import { info, warn, error } from './logger.js';
 import { ORCHESTRATOR_INTERVAL_MS } from '../config/constants.js';
 import { runFundraiserReasoning, gatherCurrentMetrics } from './fundraiserBrain.js';
@@ -5894,21 +5894,37 @@ async function phaseOutreach(deal, state) {
     }
 
     const { data: approvedDms } = await sb.from('approval_queue')
-      .select('id, contact_id, contact_name, firm, body, edited_body, deal_id, deal_name, resolved_at')
+      .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, deal_id, deal_name, resolved_at, message_type, channel, reply_to_id, stage')
       .eq('deal_id', deal.id)
       .eq('stage', 'LinkedIn DM')
       .in('status', ['approved', 'approved_waiting_for_window'])
       .order('resolved_at', { ascending: true })
       .limit(10);
 
-    for (const item of approvedDms || []) {
+    const { data: approvedLinkedInReplies } = await sb.from('approval_queue')
+      .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, deal_id, deal_name, resolved_at, message_type, channel, reply_to_id, stage')
+      .eq('deal_id', deal.id)
+      .eq('message_type', 'linkedin_reply')
+      .in('status', ['approved', 'approved_waiting_for_window'])
+      .order('resolved_at', { ascending: true })
+      .limit(10);
+
+    for (const item of [...(approvedLinkedInReplies || []), ...(approvedDms || [])]) {
       try {
-        await sendApprovedLinkedInDM({
-          contactId: item.contact_id,
-          text: item.edited_body || item.body || '',
-          queueId: item.id,
-          queueItem: item,
-        });
+        if (item.message_type === 'linkedin_reply') {
+          await sendApprovedReply({
+            queueId: item.id,
+            queueItem: item,
+            forceSend: false,
+          });
+        } else {
+          await sendApprovedLinkedInDM({
+            contactId: item.contact_id,
+            text: item.edited_body || item.body || '',
+            queueId: item.id,
+            queueItem: item,
+          });
+        }
       } catch (err) {
         warn(`[OUTREACH] Failed to send approved LinkedIn DM for ${item.contact_name || item.contact_id}: ${err.message}`);
       }
@@ -5922,13 +5938,25 @@ async function phaseOutreach(deal, state) {
     }
 
     const { data: approvedEmails } = await sb.from('approval_queue')
-      .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage')
+      .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
       .eq('deal_id', deal.id)
       .in('status', ['approved', 'approved_waiting_for_window'])
       .order('resolved_at', { ascending: true })
       .limit(10);
 
     for (const item of approvedEmails || []) {
+      if (item.message_type === 'email_reply') {
+        try {
+          await sendApprovedReply({
+            queueId: item.id,
+            queueItem: item,
+            forceSend: false,
+          });
+        } catch (err) {
+          warn(`[OUTREACH] Failed to send approved email reply for ${item.contact_name || item.contact_id}: ${err.message}`);
+        }
+        continue;
+      }
       if (isLinkedInStageLabel(item.stage)) continue;
       if (!item.contact_id) continue;
 

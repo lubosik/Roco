@@ -447,7 +447,7 @@ function buildKeyboard(msgId) {
 function buildLinkedInDMKeyboard(msgId) {
   return {
     inline_keyboard: [
-      [{ text: '✓ Approve & Send', callback_data: `sa:${msgId}` }],
+      [{ text: '✓ Approve', callback_data: `sa:${msgId}` }],
       [
         { text: '✏ Edit', callback_data: `ed:${msgId}` },
         { text: 'Manual', callback_data: `lm:${msgId}` },
@@ -468,7 +468,7 @@ function buildReloadedApprovalKeyboard(msgId, hasSubjects = false) {
           [{ text: '✗ Skip', callback_data: `sk:${msgId}` }],
         ]
       : [
-          [{ text: '✓ Approve & Send', callback_data: `sa:${msgId}` }],
+          [{ text: '✓ Approve', callback_data: `sa:${msgId}` }],
           [
             { text: 'Manual', callback_data: `lm:${msgId}` },
             { text: 'Close',  callback_data: `lc:${msgId}` },
@@ -500,7 +500,8 @@ function buildReplyKeyboard(msgId) {
   return {
     inline_keyboard: [
       [
-        { text: '✓ Approve & Send', callback_data: `ra:${msgId}` },
+        { text: '✓ Approve', callback_data: `rq:${msgId}` },
+        { text: '⚡ Send Now', callback_data: `ra:${msgId}` },
         { text: '✏ Edit',           callback_data: `re:${msgId}` },
       ],
       [
@@ -531,6 +532,8 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
     '```',
     String(replyBody || '').substring(0, 600),
     '```',
+    ``,
+    `_Approve = respect sending window. Send Now = bypass window._`,
   ].join('\n');
 
   try {
@@ -815,36 +818,38 @@ async function handleCallbackQuery(query) {
       { parse_mode: 'Markdown' }
     );
 
-  } else if (action === 'ra') {
-    // Reply approve — send via Unipile
+  } else if (action === 'rq' || action === 'ra') {
+    // Reply approve — either queue for window or bypass it immediately
     const ra = approval.replyApproval;
     if (!ra) { await bot.sendMessage(chatId, '⚠ Missing reply data.'); return; }
     try {
-      const { sendEmailReply, sendLinkedInReply } = await import('../integrations/unipileClient.js');
-      let sent = null;
-      if (ra.channel === 'linkedin') {
-        sent = await sendLinkedInReply({ chatId: ra.replyToId, message: ra.replyBody });
-      } else {
-        sent = await sendEmailReply({
-          to:                ra.contactEmail,
-          toName:            approval.name,
-          subject:           `Re: our conversation`,
-          body:              ra.replyBody,
-          replyToProviderId: ra.replyToId || null,
-          accountId:         ra.emailAccountId || null,
-        });
-      }
-      const sb = getSupabase();
-      if (sb && ra.queueItemId) {
-        await sb.from('approval_queue').update({
-          status:  'sent',
-          sent_at: new Date().toISOString(),
-        }).eq('id', ra.queueItemId);
-      }
+      const { sendApprovedReply } = await import('../dashboard/server.js');
+      const sendNow = action === 'ra';
+      const result = await sendApprovedReply({
+        queueId: ra.queueItemId || null,
+        queueItem: {
+          id: ra.queueItemId || null,
+          contact_id: ra.contactId || null,
+          contact_name: approval.name,
+          contact_email: ra.contactEmail || null,
+          firm: approval.firm || null,
+          body: ra.replyBody,
+          edited_body: ra.replyBody,
+          channel: ra.channel,
+          message_type: ra.channel === 'linkedin' ? 'linkedin_reply' : 'email_reply',
+          reply_to_id: ra.replyToId || null,
+        },
+        forceSend: sendNow,
+        bodyOverride: ra.replyBody,
+      });
       await clearTelegramApprovalControls(msgId);
       pendingApprovals.delete(msgId);
-      const ch = ra.channel === 'linkedin' ? 'LinkedIn' : 'Email';
-      await bot.sendMessage(chatId, `✅ Reply sent to *${approval.name}* via ${ch}${sent ? '' : ' (send may have failed — check logs)'}`, { parse_mode: 'Markdown' });
+      if (result?.deferred) {
+        await bot.sendMessage(chatId, `✅ Reply approved for *${approval.name}* and queued for the next sending window${result?.nextOpen ? ` (${result.nextOpen})` : ''}.`, { parse_mode: 'Markdown' });
+      } else {
+        const ch = ra.channel === 'linkedin' ? 'LinkedIn' : 'Email';
+        await bot.sendMessage(chatId, `✅ Reply sent to *${approval.name}* via ${ch}.`, { parse_mode: 'Markdown' });
+      }
     } catch (err) {
       await bot.sendMessage(chatId, `⚠ Send failed: ${err.message}`);
     }
@@ -1811,13 +1816,16 @@ export function getPendingApprovals() {
       || null;
     if (!isLinkedIn && !looksLikeEmail(contactEmail)) return [];
     return [{
-      id,
+      id: a.queueId || id,
+      telegramMsgId: id,
       queueId: a.queueId || null,
       name: a.name,
       firm: a.firm,
       score: a.score,
       stage: a.stage,
       channel: isLinkedIn ? 'linkedin' : 'email',
+      message_type: a.isReply ? (isLinkedIn ? 'linkedin_reply' : 'email_reply') : null,
+      isReply: !!a.isReply,
       subject: a.emailDraft?.subject,
       alternativeSubject: a.emailDraft?.alternativeSubject,
       body: a.emailDraft?.body,
@@ -1826,6 +1834,27 @@ export function getPendingApprovals() {
       queuedAt: a.queuedAt || new Date().toISOString(),
     }];
   });
+}
+
+export async function dismissPendingApproval(id) {
+  const numId = Number(id);
+  let matchedKey = pendingApprovals.has(numId) ? numId : (pendingApprovals.has(String(id)) ? String(id) : null);
+
+  if (matchedKey == null) {
+    for (const [key, approval] of pendingApprovals.entries()) {
+      if (String(approval.queueId || '') === String(id)) {
+        matchedKey = key;
+        break;
+      }
+    }
+  }
+
+  if (matchedKey == null) return null;
+  const approval = pendingApprovals.get(matchedKey);
+  await clearTelegramApprovalControls(matchedKey).catch(() => {});
+  pendingApprovals.delete(matchedKey);
+  editLoops.delete(approval?.contactPage?.id);
+  return { key: matchedKey, approval };
 }
 
 export async function updateApprovalDraftFromDashboard(id, { body = null, subject = null } = {}) {
@@ -2260,10 +2289,18 @@ async function handlePriorChatCallback(chatId, decision, approvalId) {
 
 export function resolveApprovalFromDashboard(id, action, subject, editedBody) {
   const numId = Number(id);
-  const approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
+  let approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
+  let key = pendingApprovals.has(numId) ? numId : (pendingApprovals.has(String(id)) ? String(id) : null);
+  if (!approval) {
+    for (const [entryKey, entry] of pendingApprovals.entries()) {
+      if (String(entry.queueId || '') === String(id)) {
+        approval = entry;
+        key = entryKey;
+        break;
+      }
+    }
+  }
   if (!approval) return false;
-
-  const key = pendingApprovals.has(numId) ? numId : String(id);
   clearTelegramApprovalControls(key).catch(() => {});
   pendingApprovals.delete(key);
 

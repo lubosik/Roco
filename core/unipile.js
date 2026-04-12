@@ -264,7 +264,9 @@ export async function recreateLinkedInWebhooks(serverBaseUrl) {
     source:      'messaging',
     events:      ['message_received'],
     request_url: targetUrl,
-    account_id:  creds.linkedinAccountId,
+    format:      'json',
+    enabled:     true,
+    account_ids: [creds.linkedinAccountId].filter(Boolean),
     headers:     [{ key: 'Content-Type', value: 'application/json' }],
   }});
 
@@ -273,7 +275,9 @@ export async function recreateLinkedInWebhooks(serverBaseUrl) {
     source:      'users',
     events:      ['new_relation'],
     request_url: targetUrl,
-    account_id:  creds.linkedinAccountId,
+    format:      'json',
+    enabled:     true,
+    account_ids: [creds.linkedinAccountId].filter(Boolean),
     headers:     [{ key: 'Content-Type', value: 'application/json' }],
   }});
 

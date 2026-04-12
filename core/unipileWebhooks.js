@@ -74,6 +74,15 @@ function normalizeRelation(raw) {
       data.user?.linkedin_url ||
       data.relation?.profile_url ||
       '',
+    headline:
+      data.headline ||
+      data.user_headline ||
+      data.job_title ||
+      data.occupation ||
+      data.user?.headline ||
+      data.user?.job_title ||
+      data.relation?.headline ||
+      '',
   };
 }
 
@@ -172,9 +181,9 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
 
   pushActivity({
     type: 'reply',
-    activity_badge: 'replied',
-    action: `LinkedIn replied: ${contact.name}`,
-    note: `Matched to deal ${getDealName(contact)}${contact.company_name ? ` · ${contact.company_name}` : ''}`,
+    activity_badge: 'linkedin_reply',
+    action: `LinkedIn reply received: ${contact.name}`,
+    note: `${String(payload.text || '').trim().slice(0, 100)}${getDealName(contact) ? ` · ${getDealName(contact)}` : ''}`,
     dealId: contact.deal_id,
     deal_name: getDealName(contact),
   });
@@ -506,12 +515,22 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   pushActivity({
     type:   'linkedin',
-    activity_badge: 'accepted',
-    action: `LinkedIn accepted: ${contact.name} at ${contact.company_name || ''}`,
-    note:   `Matched to deal ${getDealName(contact)}`,
+    activity_badge: 'relation',
+    action: `New relation: ${contact.name}`,
+    note:   [
+      getDealName(contact),
+      payload.headline || contact.job_title || '',
+    ].filter(Boolean).join(' · '),
     dealId: contact.deal_id,
     deal_name: getDealName(contact),
   });
+
+  try {
+    const { sendTelegram } = await import('../approval/telegramBot.js');
+    await sendTelegram(
+      `🟧 *New relation*\n\n${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}\nDeal: ${getDealName(contact)}${(payload.headline || contact.job_title) ? `\n${payload.headline || contact.job_title}` : ''}`
+    );
+  } catch {}
 
   console.log(`[UNIPILE/REL] ${contact.name} accepted LinkedIn invite — running acceptance flow`);
 
