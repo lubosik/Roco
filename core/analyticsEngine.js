@@ -685,6 +685,22 @@ async function fetchDailyConversationEntries(window) {
   return data || [];
 }
 
+async function fetchDailySentEmailEntries(window) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+
+  const { data, error } = await supabase.from('emails')
+    .select('id, deal_id, contact_id, sent_at, status, direction')
+    .eq('status', 'sent')
+    .eq('direction', 'outbound')
+    .gte('sent_at', safeIso(window.start))
+    .lte('sent_at', safeIso(window.end))
+    .order('sent_at', { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
 function countDealActivityEntries(entries = [], expectedType) {
   return entries.reduce((sum, entry) => (
     String(entry?.event_type || '').toUpperCase() === expectedType ? sum + 1 : sum
@@ -697,17 +713,32 @@ function countDealActivityPattern(entries = [], pattern) {
   ), 0);
 }
 
-function buildPerDealDailyMetrics(dealId, activityEntries = [], conversationEntries = []) {
+function buildPerDealDailyMetrics(dealId, activityEntries = [], conversationEntries = [], sentEmailEntries = [], currentMetrics = {}) {
   const key = String(dealId || '');
   const dealActivity = activityEntries.filter(entry => String(entry?.deal_id || '') === key);
+  const dealEmails = sentEmailEntries.filter(entry => String(entry?.deal_id || '') === key);
+  const outbound = conversationEntries.filter(entry =>
+    String(entry?.deal_id || '') === key && String(entry?.direction || '').toLowerCase() === 'outbound'
+  );
   const inbound = conversationEntries.filter(entry =>
     String(entry?.deal_id || '') === key && String(entry?.direction || '').toLowerCase() === 'inbound'
   );
 
+  const emailActivityCount = countDealActivityEntries(dealActivity, 'EMAIL_SENT');
+  const emailConversationCount = outbound.filter(entry => String(entry?.channel || '').toLowerCase() === 'email').length;
+  const emailTableCount = dealEmails.length;
+
+  const liInviteActivityCount = countDealActivityEntries(dealActivity, 'LINKEDIN_INVITE_SENT');
+  const liInviteCurrentCount = Number(currentMetrics?.li_invites_today || 0);
+
+  const dmActivityCount = countDealActivityEntries(dealActivity, 'LINKEDIN_DM_SENT');
+  const dmConversationCount = outbound.filter(entry => String(entry?.channel || '').toLowerCase() === 'linkedin_dm').length;
+  const dmCurrentCount = Number(currentMetrics?.dms_sent_today || 0);
+
   return {
-    li_invites_today: countDealActivityEntries(dealActivity, 'LINKEDIN_INVITE_SENT'),
-    emails_sent_today: countDealActivityEntries(dealActivity, 'EMAIL_SENT'),
-    dms_sent_today: countDealActivityEntries(dealActivity, 'LINKEDIN_DM_SENT'),
+    li_invites_today: Math.max(liInviteActivityCount, liInviteCurrentCount),
+    emails_sent_today: Math.max(emailActivityCount, emailConversationCount, emailTableCount, Number(currentMetrics?.emails_sent_today || 0)),
+    dms_sent_today: Math.max(dmActivityCount, dmConversationCount, dmCurrentCount),
     enrichment_actions: countDealActivityPattern(dealActivity, /(ENRICH|RESEARCH_COMPLETE)/),
     invite_failures: countDealActivityPattern(dealActivity, /LINKEDIN_INVITE_FAILED/),
     missing_linkedin: countDealActivityPattern(dealActivity, /LINKEDIN_INVITE_SKIPPED_NO_PROFILE/),
@@ -786,7 +817,7 @@ function pickDailyNextMove(dealName, metrics = {}, highlights = []) {
   return highlights[0] || `keep ${dealName} moving toward the current target`;
 }
 
-async function buildDailyDealSnapshots(deals = [], activityEntries = [], conversationEntries = [], window = getDailyActivityWindow()) {
+async function buildDailyDealSnapshots(deals = [], activityEntries = [], conversationEntries = [], sentEmailEntries = [], window = getDailyActivityWindow()) {
   const supabase = getSupabase();
   const activityByDeal = new Map();
   for (const entry of activityEntries) {
@@ -811,7 +842,7 @@ async function buildDailyDealSnapshots(deals = [], activityEntries = [], convers
     }
     const metrics = {
       ...currentMetrics,
-      ...buildPerDealDailyMetrics(deal.id, activityEntries, conversationEntries),
+      ...buildPerDealDailyMetrics(deal.id, activityEntries, conversationEntries, sentEmailEntries, currentMetrics),
       firms_in_pipeline: firmsInPipeline,
     };
     const entries = activityByDeal.get(String(deal.id)) || [];
@@ -1136,8 +1167,9 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
   const window = getDailyActivityWindow(reference);
   const activityEntries = await fetchDailyActivityEntries(window);
   const conversationEntries = await fetchDailyConversationEntries(window).catch(() => []);
+  const sentEmailEntries = await fetchDailySentEmailEntries(window).catch(() => []);
   const reportDeals = await fetchDealsForDailyLog(deals, activityEntries);
-  const dealSnapshots = await buildDailyDealSnapshots(reportDeals, activityEntries, conversationEntries, window);
+  const dealSnapshots = await buildDailyDealSnapshots(reportDeals, activityEntries, conversationEntries, sentEmailEntries, window);
   const previousReport = await fetchPreviousDailyActivityReport(window.reportDate).catch(() => null);
 
   let aiReport = null;
@@ -1162,6 +1194,7 @@ export async function buildDailyActivityReport({ deals = [], reference = DateTim
       deal_snapshots: dealSnapshots,
       action_counts: summarizeDailyActionCounts(activityEntries),
       activity_entries: activityEntries,
+      sent_email_entries: sentEmailEntries,
       conversation_count: conversationEntries.length,
       previous_report: buildPreviousReportContext(previousReport),
     },
