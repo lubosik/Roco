@@ -211,21 +211,30 @@ export async function getLinkedInSearchParameters({ type, keywords, service = 'C
 /**
  * Send a new email via Unipile using the explicitly selected mailbox when provided.
  */
-export async function sendEmail({ to, toName, subject, body, fromName, accountId }) {
+export async function sendEmail({ to, toName, subject, body, fromName, accountId, trackingLabel = null, trackOpens = true, trackLinks = true }) {
   const resolvedAccount = accountId || getEmailAcct();
-  const result = await api('POST', '/emails', {
+  const payload = {
     account_id: resolvedAccount,
     subject,
     body: formatEmailHtml(body),
     to: [{ display_name: toName || '', identifier: to }],
     from: { display_name: fromName || 'Dom' },
-  });
+  };
+  if (trackOpens || trackLinks) {
+    payload.tracking_options = {
+      opens: !!trackOpens,
+      links: !!trackLinks,
+      label: trackingLabel || undefined,
+    };
+  }
+  const result = await api('POST', '/emails', payload);
   return {
     success: true,
     accountId: resolvedAccount,
     emailId: result.id || result.provider_id || null,
     providerId: result.provider_id || null,
     threadId: result.thread_id || null,
+    trackingLabel: trackingLabel || null,
     to,
     raw: result,
   };
@@ -234,22 +243,31 @@ export async function sendEmail({ to, toName, subject, body, fromName, accountId
 /**
  * Reply on an existing Gmail thread.
  */
-export async function sendEmailReply({ to, toName, subject, body, replyToProviderId, accountId }) {
+export async function sendEmailReply({ to, toName, subject, body, replyToProviderId, accountId, trackingLabel = null, trackOpens = true, trackLinks = true }) {
   // accountId can be explicitly passed so replies stay on the same mailbox the inbound came from.
   const resolvedAccount = accountId || getEmailAcct();
-  const result = await api('POST', '/emails', {
+  const payload = {
     account_id: resolvedAccount,
     subject: subject?.startsWith('Re:') ? subject : `Re: ${subject}`,
     body: formatEmailHtml(body),
     to: [{ display_name: toName || '', identifier: to }],
     reply_to: replyToProviderId,
-  });
+  };
+  if (trackOpens || trackLinks) {
+    payload.tracking_options = {
+      opens: !!trackOpens,
+      links: !!trackLinks,
+      label: trackingLabel || undefined,
+    };
+  }
+  const result = await api('POST', '/emails', payload);
   return {
     success: true,
     accountId: resolvedAccount,
     emailId: result.id || result.provider_id || null,
     providerId: result.provider_id || null,
     threadId: result.thread_id || null,
+    trackingLabel: trackingLabel || null,
     to,
     raw: result,
   };

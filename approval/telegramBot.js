@@ -1951,7 +1951,13 @@ async function executeReloadedApproval(item, decision) {
     }
   } catch {}
 
-  const sendResult = await sendEmail({ to: toEmail, toName: item.contact_name || '', subject: approvedSubject, body: bodyToSend });
+  const sendResult = await sendEmail({
+    to: toEmail,
+    toName: item.contact_name || '',
+    subject: approvedSubject,
+    body: bodyToSend,
+    trackingLabel: `deal:${dealId || 'none'}|contact:${item.contact_id || 'none'}|stage:${String(item.stage || 'email').toLowerCase().replace(/\s+/g, '_')}`,
+  });
 
   await sb.from('approval_queue').update({
     status: 'sent',

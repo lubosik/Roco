@@ -233,6 +233,20 @@ function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
     };
   }
 
+  if (['mail_opened', 'mail_link_clicked'].includes(normalizedType)) {
+    const label = event?.label || '';
+    const detail = event?.url ? truncateInline(event.url, 80) : null;
+    return {
+      type: 'webhook',
+      action: `Webhook received: ${normalizedType === 'mail_link_clicked' ? 'email click' : 'email open'}`,
+      note: [
+        label || event?.tracking_id || 'unlabeled tracking event',
+        detail,
+      ].filter(Boolean).join(' · '),
+      meta: { event_type: normalizedType, source: sourceLabel },
+    };
+  }
+
   return {
     type: 'webhook',
     action: `Webhook received: ${normalizedType || 'unknown'}`,
@@ -363,6 +377,113 @@ function isReplyMessageType(value) {
 
 function getReplyActivityBadge(channel) {
   return channel === 'linkedin' ? 'linkedin_reply' : 'email_reply';
+}
+
+function buildEmailTrackingLabel({ dealId = null, contactId = null, stage = 'email' } = {}) {
+  const normalizedStage = String(stage || 'email').trim().toLowerCase().replace(/\s+/g, '_');
+  return `deal:${dealId || 'none'}|contact:${contactId || 'none'}|stage:${normalizedStage}`;
+}
+
+function parseEmailTrackingLabel(label) {
+  const result = {};
+  for (const part of String(label || '').split('|')) {
+    const [key, value] = part.split(':');
+    if (key && value) result[key] = value;
+  }
+  return result;
+}
+
+function getEmailTrackingBadge(eventType) {
+  return eventType === 'mail_link_clicked' ? 'email_clicked' : 'email_opened';
+}
+
+function getEmailTrackingAction(eventType, contactName) {
+  return `${eventType === 'mail_link_clicked' ? 'Email clicked' : 'Email opened'}: ${contactName || 'Contact'}`;
+}
+
+async function findTrackedEmailRecord(sb, payload) {
+  const labelBits = parseEmailTrackingLabel(payload?.label || '');
+  if (labelBits.deal && labelBits.contact) {
+    try {
+      const { data } = await sb.from('emails')
+        .select('id, deal_id, contact_id, to_email, subject, status, message_id, provider_id, metadata')
+        .eq('deal_id', labelBits.deal)
+        .eq('contact_id', labelBits.contact)
+        .eq('status', 'sent')
+        .order('sent_at', { ascending: false })
+        .limit(10);
+      const rows = data || [];
+      const matched = rows.find(row =>
+        String(row.message_id || '') === String(payload?.email_id || '') ||
+        String(row.provider_id || '') === String(payload?.email_id || '')
+      );
+      if (matched) return matched;
+      if (rows.length) return rows[0];
+    } catch {}
+  }
+
+  for (const field of ['message_id', 'provider_id']) {
+    const value = String(payload?.email_id || '').trim();
+    if (!value) continue;
+    try {
+      const { data } = await sb.from('emails')
+        .select('id, deal_id, contact_id, to_email, subject, status, message_id, provider_id, metadata')
+        .eq(field, value)
+        .eq('status', 'sent')
+        .limit(1)
+        .maybeSingle();
+      if (data) return data;
+    } catch {}
+  }
+
+  return null;
+}
+
+async function findActiveTrackedDealContext(sb, trackedEmail) {
+  if (!sb || !trackedEmail?.deal_id) return null;
+
+  const { data: contact } = await sb.from('contacts')
+    .select('id, name, email, company_name, job_title, deal_id, deals!contacts_deal_id_fkey(id, name, status)')
+    .eq('id', trackedEmail.contact_id)
+    .maybeSingle()
+    .catch(() => ({ data: null }));
+
+  const deal = contact?.deals || null;
+  if (!contact?.id || String(deal?.status || '').toUpperCase() !== 'ACTIVE') return null;
+  return { contact, deal };
+}
+
+function mergeTrackedEmailMetadata(existingMetadata, payload, trackedEmail) {
+  const metadata = {
+    ...(existingMetadata && typeof existingMetadata === 'object' ? existingMetadata : {}),
+  };
+  const eventType = String(payload?.event || '').trim().toLowerCase();
+  const now = payload?.date || new Date().toISOString();
+  const alreadyOpened = Number(metadata.opens_count || 0) > 0;
+  const alreadyClicked = Number(metadata.clicks_count || 0) > 0;
+
+  metadata.tracking_label = metadata.tracking_label || payload?.label || null;
+  metadata.last_tracking_event = eventType || null;
+  metadata.last_tracking_event_at = now;
+  metadata.last_tracking_id = payload?.tracking_id || metadata.last_tracking_id || null;
+  metadata.last_tracking_event_id = payload?.event_id || metadata.last_tracking_event_id || null;
+  metadata.last_tracking_email_id = payload?.email_id || trackedEmail?.message_id || metadata.last_tracking_email_id || null;
+
+  if (eventType === 'mail_link_clicked') {
+    metadata.clicks_count = Number(metadata.clicks_count || 0) + 1;
+    metadata.first_clicked_at = metadata.first_clicked_at || now;
+    metadata.last_clicked_at = now;
+    metadata.last_clicked_url = payload?.url || metadata.last_clicked_url || null;
+  } else {
+    metadata.opens_count = Number(metadata.opens_count || 0) + 1;
+    metadata.first_opened_at = metadata.first_opened_at || now;
+    metadata.last_opened_at = now;
+  }
+
+  return {
+    metadata,
+    isFirstEvent: eventType === 'mail_link_clicked' ? !alreadyClicked : !alreadyOpened,
+  };
 }
 
 function isEmptyWebhookPayload(event) {
@@ -1887,6 +2008,11 @@ export async function sendApprovedReply({ queueId = null, queueItem = null, forc
     body: bodyToSend,
     replyToProviderId: item.reply_to_id || null,
     accountId: null,
+    trackingLabel: buildEmailTrackingLabel({
+      dealId,
+      contactId,
+      stage: item.stage || item.message_type || 'email_reply',
+    }),
   });
 
   if (queueId) {
@@ -2106,6 +2232,89 @@ export function initDashboard(state) {
       });
     } catch (err) {
       console.error('[WEBHOOK/OUTLOOK] Error:', err.message);
+    }
+  });
+
+  // POST /webhook/unipile/email-tracking — outbound email opens/clicks via Unipile
+  app.post('/webhook/unipile/email-tracking', express.json(), async (req, res) => {
+    res.json({ ok: true });
+    try {
+      const event = req.body;
+      const payload = event?.data || event || {};
+      const eventType = String(payload?.event || event?.event || event?.type || '').trim().toLowerCase();
+      const { gmail: gmailAccountId, outlook: outlookAccountId } = getConfiguredUnipileAccountIds();
+
+      await insertWebhookLogRecord({
+        event_type: eventType || 'mail_opened',
+        payload: {
+          ...(event || {}),
+          __roco_meta: {
+            ...((event && event.__roco_meta) || {}),
+            source: 'email_tracking',
+          },
+        },
+      }).catch(() => {});
+
+      if (!['mail_opened', 'mail_link_clicked'].includes(eventType)) return;
+      if (!matchesConfiguredAccount(payload, gmailAccountId) && !matchesConfiguredAccount(payload, outlookAccountId)) {
+        console.warn('[WEBHOOK/EMAIL-TRACKING] Ignoring event for unexpected account_id:', payload?.account_id || event?.account_id || 'unknown');
+        return;
+      }
+
+      const sb = getSupabase();
+      if (!sb) return;
+
+      const trackedEmail = await findTrackedEmailRecord(sb, payload);
+      if (!trackedEmail) {
+        console.log('[WEBHOOK/EMAIL-TRACKING] No outbound email match for tracking event:', payload?.tracking_id || payload?.email_id || 'unknown');
+        return;
+      }
+
+      const context = await findActiveTrackedDealContext(sb, trackedEmail);
+      if (!context?.deal?.id || !context?.contact?.id) {
+        console.log('[WEBHOOK/EMAIL-TRACKING] Matched email is not tied to an active deal:', trackedEmail.id);
+        return;
+      }
+
+      const { metadata, isFirstEvent } = mergeTrackedEmailMetadata(trackedEmail.metadata, payload, trackedEmail);
+      await sb.from('emails').update({ metadata }).eq('id', trackedEmail.id);
+
+      if (!isFirstEvent) return;
+
+      const badge = getEmailTrackingBadge(eventType);
+      const contactName = context.contact.name || trackedEmail.to_email || 'Contact';
+      const snippet = eventType === 'mail_link_clicked'
+        ? truncateInline(payload?.url || payload?.label || 'Tracked link clicked', 120)
+        : truncateInline(trackedEmail.subject || payload?.label || trackedEmail.to_email || 'Tracked email opened', 120);
+
+      pushActivity({
+        type: 'email',
+        activity_badge: badge,
+        action: getEmailTrackingAction(eventType, contactName),
+        note: [
+          context.deal.name || null,
+          context.contact.company_name || null,
+          snippet || null,
+        ].filter(Boolean).join(' · '),
+        dealId: context.deal.id,
+        deal_name: context.deal.name || null,
+      });
+
+      await sbLogActivity({
+        dealId: context.deal.id,
+        contactId: context.contact.id,
+        eventType: eventType === 'mail_link_clicked' ? 'EMAIL_CLICKED' : 'EMAIL_OPENED',
+        summary: `${contactName} ${eventType === 'mail_link_clicked' ? 'clicked a tracked link' : 'opened a tracked email'}`,
+        detail: {
+          email_id: payload?.email_id || null,
+          tracking_id: payload?.tracking_id || null,
+          event_id: payload?.event_id || null,
+          url: payload?.url || null,
+          label: payload?.label || null,
+        },
+      }).catch(() => {});
+    } catch (err) {
+      console.error('[WEBHOOK/EMAIL-TRACKING] Error:', err.message);
     }
   });
 
@@ -3253,7 +3462,7 @@ function registerRoutes(app) {
         try {
           if (!queueItem) {
             const { data } = await sb.from('approval_queue')
-              .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
+              .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
               .eq('id', id)
               .eq('status', 'pending')
               .single();
@@ -3317,7 +3526,17 @@ function registerRoutes(app) {
               updated_at: new Date().toISOString(),
             }).eq('id', queueItem.contact_id);
 
-            const sendResult = await sendEmail({ to: toEmail, toName: queueItem.contact_name || '', subject: finalSubject, body: bodyToSend });
+            const sendResult = await sendEmail({
+              to: toEmail,
+              toName: queueItem.contact_name || '',
+              subject: finalSubject,
+              body: bodyToSend,
+              trackingLabel: buildEmailTrackingLabel({
+                dealId: queueItem.deal_id || null,
+                contactId: queueItem.contact_id || null,
+                stage: queueItem.stage || 'email',
+              }),
+            });
 
             try {
               await sb.from('approval_queue').update({
@@ -5067,19 +5286,22 @@ function registerRoutes(app) {
 
       const [
         { data: contacts },
-        { count: emailsSentCount },
+        { data: emailRows },
         { count: emailRepliesCount },
         { count: firmsCount },
       ] = await Promise.all([
         sb.from('contacts').select('pipeline_stage, invite_sent_at, outreach_channel').eq('deal_id', req.params.id),
-        sb.from('emails').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id).eq('status', 'sent'),
+        sb.from('emails').select('id, metadata').eq('deal_id', req.params.id).eq('status', 'sent'),
         sb.from('replies').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
         sb.from('batch_firms').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
       ]);
       const all = contacts || [];
+      const outboundEmails = emailRows || [];
 
-      const emailsSent      = emailsSentCount || 0;
+      const emailsSent      = outboundEmails.length;
       const emailReplies    = emailRepliesCount || 0;
+      const emailsOpened    = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.opens_count || 0) > 0 ? 1 : 0), 0);
+      const emailsClicked   = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.clicks_count || 0) > 0 ? 1 : 0), 0);
       const invitesSent     = all.filter(hasLinkedInInviteHistory).length;
       const activePendingInvites = all.filter(hasActivePendingLinkedInInvite).length;
       const invitesAccepted = all.filter(hasLinkedInAccepted).length;
@@ -5099,6 +5321,10 @@ function registerRoutes(app) {
         dmResponseRate:     dmsSent > 0 ? Math.round((dmResponses / dmsSent) * 100) : 0,
         emailsSent,
         emailReplies,
+        emailsOpened,
+        emailOpenRate:      emailsSent > 0 ? Math.round((emailsOpened / emailsSent) * 100) : 0,
+        emailsClicked,
+        emailClickRate:     emailsSent > 0 ? Math.round((emailsClicked / emailsSent) * 100) : 0,
         emailResponseRate:  emailsSent > 0 ? Math.round((emailReplies / emailsSent) * 100) : 0,
         totalResponses:     emailReplies + dmResponses,
         firms:              firmsCount || 0,

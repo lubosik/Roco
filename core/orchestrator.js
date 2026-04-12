@@ -93,6 +93,9 @@ async function persistOutboundEmailRecord({ sb, deal, contact, subject, result, 
         stage: stage || null,
         account_id: result?.accountId || null,
         channel: 'email',
+        tracking_label: result?.trackingLabel || null,
+        opens_count: 0,
+        clicks_count: 0,
       },
     });
   } catch {}
@@ -5983,6 +5986,7 @@ async function phaseOutreach(deal, state) {
           subject,
           body,
           accountId: deal?.sending_account_id || null,
+          trackingLabel: `deal:${deal.id}|contact:${contact.id}|stage:${String(item.stage || 'email').toLowerCase().replace(/\s+/g, '_')}`,
         });
 
         const nextFollowUpPlan = await getNextFollowUpPlanForChannel(deal, 'email', /follow/i.test(String(item.stage || '')) ? 1 : 0);

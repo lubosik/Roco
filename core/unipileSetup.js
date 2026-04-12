@@ -27,9 +27,17 @@ function normalizeWebhookListResponse(data) {
   return [];
 }
 
+function normalizeAccountIdValue(value) {
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (value && typeof value === 'object') {
+    return String(value.account_id || value.id || value.value || value.accountId || '').trim();
+  }
+  return '';
+}
+
 function normalizeAccountIds(existing) {
-  if (Array.isArray(existing?.account_ids)) return existing.account_ids.map(String);
-  if (existing?.account_id) return [String(existing.account_id)];
+  if (Array.isArray(existing?.account_ids)) return existing.account_ids.map(normalizeAccountIdValue).filter(Boolean);
+  if (existing?.account_id) return [normalizeAccountIdValue(existing.account_id)].filter(Boolean);
   return [];
 }
 
@@ -119,6 +127,30 @@ export async function registerWebhooks(baseUrl) {
       request_url: `${baseUrl}/webhook/unipile/outlook`,
       source: 'email',
       events: ['mail_received'],
+      format: 'json',
+      enabled: true,
+      account_ids: [getOutlookAcct()].filter(Boolean),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
+    },
+    {
+      name: 'roco_gmail_tracking',
+      request_url: `${baseUrl}/webhook/unipile/email-tracking`,
+      source: 'email_tracking',
+      events: ['mail_opened', 'mail_link_clicked'],
+      format: 'json',
+      enabled: true,
+      account_ids: [getGmailAcct()].filter(Boolean),
+      headers: [
+        { key: 'Content-Type', value: 'application/json' },
+      ],
+    },
+    {
+      name: 'roco_outlook_tracking',
+      request_url: `${baseUrl}/webhook/unipile/email-tracking`,
+      source: 'email_tracking',
+      events: ['mail_opened', 'mail_link_clicked'],
       format: 'json',
       enabled: true,
       account_ids: [getOutlookAcct()].filter(Boolean),

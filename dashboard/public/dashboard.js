@@ -1560,9 +1560,11 @@ async function loadDealTabOverview(id, deal) {
       ${stat(fmt(m.totalContacts || 0), 'Total Contacts', 'totalContacts')}
     </div>
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Email</div>
-    <div class="deal-stats" style="grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
+    <div class="deal-stats" style="grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:24px">
       ${stat(fmt(m.emailsSent || 0), 'Emails Sent', 'emailsSent')}
       ${stat(fmt(m.emailReplies != null ? m.emailReplies : (m.emailResponses || 0)), 'Replies', 'emailReplies')}
+      ${stat(fmt(m.emailsOpened || 0), 'Opened', 'emailsOpened', m.emailOpenRate != null ? m.emailOpenRate + '% open rate' : '')}
+      ${stat(fmt(m.emailsClicked || 0), 'Clicked', 'emailsClicked', m.emailClickRate != null ? m.emailClickRate + '% click rate' : '')}
       ${stat(m.emailResponseRate != null ? m.emailResponseRate + '%' : '—', 'Response Rate', 'emailResponseRate')}
     </div>
     <div style="margin-bottom:6px;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">LinkedIn</div>
@@ -1599,7 +1601,11 @@ async function patchDealOverviewInPlace(id, deal = null) {
     totalContacts: fmt(m.totalContacts || 0),
     emailsSent: fmt(m.emailsSent || 0),
     emailReplies: fmt(m.emailReplies != null ? m.emailReplies : (m.emailResponses || 0)),
+    emailsOpened: fmt(m.emailsOpened || 0),
+    emailsClicked: fmt(m.emailsClicked || 0),
     emailResponseRate: m.emailResponseRate != null ? `${m.emailResponseRate}%` : '—',
+    emailOpenRate: m.emailOpenRate != null ? `${m.emailOpenRate}%` : '',
+    emailClickRate: m.emailClickRate != null ? `${m.emailClickRate}%` : '',
     invitesSent: fmt(m.invitesSent || 0),
     invitesAccepted: fmt(m.invitesAccepted || 0),
     dmsSent: fmt(m.dmsSent || 0),
@@ -1607,6 +1613,8 @@ async function patchDealOverviewInPlace(id, deal = null) {
     dmResponseRate: m.dmResponseRate != null ? `${m.dmResponseRate}%` : '—',
   };
   const subvalues = {
+    emailsOpened: m.emailOpenRate != null ? `${m.emailOpenRate}% open rate` : '',
+    emailsClicked: m.emailClickRate != null ? `${m.emailClickRate}% click rate` : '',
     invitesSent: m.activePendingInvites != null ? `${fmt(m.activePendingInvites)} active pending` : '',
     invitesAccepted: m.acceptanceRate != null ? `${m.acceptanceRate}% rate` : '',
   };
@@ -5497,12 +5505,12 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
 
   const typeColors = {
     thinking: '#A78BFA', research: '#60A5FA', email: '#C9A84C',
-    linkedin: '#4ADE80', accepted: '#A78BFA', relation: '#f59e0b', reply: '#C084FC', linkedin_reply: '#38bdf8', email_reply: '#a78bfa', system: '#8A8680',
+    linkedin: '#4ADE80', accepted: '#A78BFA', relation: '#f59e0b', reply: '#C084FC', linkedin_reply: '#38bdf8', email_reply: '#a78bfa', email_opened: '#ec4899', email_clicked: '#f472b6', system: '#8A8680',
     error: '#F87171', analysis: '#4ADE80', excluded: '#6b7280',
   };
   const typeIcons = {
     thinking: '🧠', research: '🔍', email: '📧', linkedin: '💼',
-    accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
+    accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', email_opened: '👁️', email_clicked: '🔗', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
   };
 
   const eventsHtml = (events || []).map(event => {
@@ -7173,6 +7181,8 @@ function getActivityBadgeMeta(item) {
     reply: 'Replied',
     linkedin_reply: 'LinkedIn Reply',
     email_reply: 'Email Reply',
+    email_opened: 'Email Opened',
+    email_clicked: 'Email Clicked',
     invite: 'Invite',
     dm: 'DM',
     linkedin: 'LinkedIn',

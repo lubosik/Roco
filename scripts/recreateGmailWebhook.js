@@ -36,9 +36,17 @@ function normalizeWebhookList(data) {
   return [];
 }
 
+function normalizeAccountIdValue(value) {
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (value && typeof value === 'object') {
+    return String(value.account_id || value.id || value.value || value.accountId || '').trim();
+  }
+  return '';
+}
+
 function normalizeAccountIds(webhook) {
-  if (Array.isArray(webhook?.account_ids)) return webhook.account_ids.map(String);
-  if (webhook?.account_id) return [String(webhook.account_id)];
+  if (Array.isArray(webhook?.account_ids)) return webhook.account_ids.map(normalizeAccountIdValue).filter(Boolean);
+  if (webhook?.account_id) return [normalizeAccountIdValue(webhook.account_id)].filter(Boolean);
   return [];
 }
 
@@ -49,6 +57,7 @@ function isRocoWebhook(webhook) {
     || url.includes('/webhooks/unipile/messages')
     || url.includes('/webhook/unipile/gmail')
     || url.includes('/webhook/unipile/outlook')
+    || url.includes('/webhook/unipile/email-tracking')
     || url.includes('/webhook/unipile/linkedin');
 }
 
@@ -98,6 +107,24 @@ const desiredWebhooks = [
     request_url: `${BASE_URL}/webhook/unipile/outlook`,
     source: 'email',
     events: ['mail_received'],
+    format: 'json',
+    enabled: true,
+    account_ids: [ACCOUNT_IDS.outlook].filter(Boolean),
+  },
+  {
+    name: 'roco_gmail_tracking',
+    request_url: `${BASE_URL}/webhook/unipile/email-tracking`,
+    source: 'email_tracking',
+    events: ['mail_opened', 'mail_link_clicked'],
+    format: 'json',
+    enabled: true,
+    account_ids: [ACCOUNT_IDS.gmail].filter(Boolean),
+  },
+  {
+    name: 'roco_outlook_tracking',
+    request_url: `${BASE_URL}/webhook/unipile/email-tracking`,
+    source: 'email_tracking',
+    events: ['mail_opened', 'mail_link_clicked'],
     format: 'json',
     enabled: true,
     account_ids: [ACCOUNT_IDS.outlook].filter(Boolean),
