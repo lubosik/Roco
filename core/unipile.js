@@ -261,6 +261,7 @@ export async function recreateLinkedInWebhooks(serverBaseUrl) {
 
   // LinkedIn message events
   await request('POST', '/webhooks', { body: {
+    name:        'roco_linkedin_messages',
     source:      'messaging',
     events:      ['message_received'],
     request_url: targetUrl,
@@ -272,6 +273,7 @@ export async function recreateLinkedInWebhooks(serverBaseUrl) {
 
   // LinkedIn connection accepted events
   await request('POST', '/webhooks', { body: {
+    name:        'roco_linkedin_relations',
     source:      'users',
     events:      ['new_relation'],
     request_url: targetUrl,
