@@ -874,16 +874,14 @@ async function upsertTranscriptInvestorDatabaseRecord(sb, { analysis, contact, i
       analysis.role_title ? `Title: ${analysis.role_title}` : null,
       analysis.location ? `Location: ${analysis.location}` : null,
       analysis.investment_thesis ? `Thesis: ${analysis.investment_thesis}` : null,
+      analysis.cheque_size_range ? `Cheque size: ${analysis.cheque_size_range}` : null,
+      analysis.aum ? `AUM/Fund size: ${analysis.aum}` : null,
+      analysis.follow_up_actions.length ? `Follow-up: ${analysis.follow_up_actions.join('; ')}` : null,
     ].filter(Boolean).join(' | ').slice(0, 2000),
     enrichment_status: 'transcript_enriched',
     hq_location: analysis.location || existing?.hq_location || null,
     hq_country: analysis.location || existing?.hq_country || null,
     last_investment_company: analysis.past_investments[0] || existing?.last_investment_company || null,
-    notes: [
-      analysis.cheque_size_range ? `Cheque size: ${analysis.cheque_size_range}` : null,
-      analysis.aum ? `AUM/Fund size: ${analysis.aum}` : null,
-      analysis.follow_up_actions.length ? `Follow-up: ${analysis.follow_up_actions.join('; ')}` : null,
-    ].filter(Boolean).join(' | ').slice(0, 2000),
   };
 
   let record = null;
