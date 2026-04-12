@@ -7101,7 +7101,7 @@ function registerRoutes(app) {
         'id, name, hq_country, hq_location, investor_type, contact_type, is_angel, preferred_industries, ' +
         'aum_millions, preferred_deal_size_min, preferred_deal_size_max, preferred_ebitda_min, preferred_ebitda_max, ' +
         'last_investment_date, last_investment_company, investments_last_12m, email, primary_contact_email, ' +
-        'investor_category, enrichment_status, description, notes',
+        'investor_category, enrichment_status, description',
         { count: 'planned' }
       );
       if (search) query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%,preferred_industries.ilike.%${search}%,hq_city.ilike.%${search}%`);
