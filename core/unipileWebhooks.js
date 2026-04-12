@@ -90,6 +90,14 @@ function getDealName(contact) {
   return contact?.deals?.name || contact?.deal_name || 'Unknown deal';
 }
 
+function buildLinkedInIdentityClauses(payload) {
+  const clauses = [];
+  if (payload?.provider_id) clauses.push(`linkedin_provider_id.eq.${payload.provider_id}`);
+  if (payload?.profile_url) clauses.push(`linkedin_url.eq.${payload.profile_url}`);
+  if (payload?.public_identifier) clauses.push(`linkedin_url.ilike.%${payload.public_identifier}%`);
+  return [...new Set(clauses)].filter(Boolean);
+}
+
 // ── CONTACT MATCHING ──────────────────────────────────────────────────────────
 
 async function findContact(sb, payload) {
@@ -456,17 +464,19 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
   // Look up contact by linkedin_provider_id
   let contact = null;
   {
-    const orClauses = [`linkedin_provider_id.eq.${payload.provider_id}`];
-    if (payload.profile_url) orClauses.push(`linkedin_url.eq.${payload.profile_url}`);
-    else if (payload.public_identifier) orClauses.push(`linkedin_url.ilike.%${payload.public_identifier}%`);
+    const orClauses = buildLinkedInIdentityClauses(payload);
 
-    try {
-      const { data } = await sb.from('contacts')
-        .select('*, deals!contacts_deal_id_fkey(*)')
-        .or(orClauses.join(','))
-        .limit(1).single();
-      contact = data;
-    } catch {}
+    if (orClauses.length) {
+      try {
+        const { data } = await sb.from('contacts')
+          .select('*, deals!contacts_deal_id_fkey(*)')
+          .or(orClauses.join(','))
+          .limit(10);
+        const candidates = data || [];
+        const activeCandidates = candidates.filter(row => String(row?.deals?.status || row?.deal_status || '').toUpperCase() === 'ACTIVE');
+        contact = activeCandidates[0] || candidates[0] || null;
+      } catch {}
+    }
   }
 
   if (!contact) {

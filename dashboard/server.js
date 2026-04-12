@@ -1297,6 +1297,37 @@ function normalizeContactIdentityValue(value) {
     .replace(/\/+$/, '');
 }
 
+function extractLinkedInIdentityCandidates(value) {
+  const normalized = normalizeContactIdentityValue(value);
+  if (!normalized) return [];
+
+  const candidates = new Set([normalized]);
+  const slugMatch = normalized.match(/linkedin\.com\/in\/([^/?#]+)/i);
+  if (slugMatch?.[1]) candidates.add(slugMatch[1].toLowerCase());
+  const tail = normalized.split('/').filter(Boolean).pop();
+  if (tail && tail !== 'in') candidates.add(tail.toLowerCase());
+  return [...candidates].filter(Boolean);
+}
+
+function rankMatchedInvestorContact(contact, { requireActiveDeal = false } = {}) {
+  let score = 0;
+  const dealStatus = String(contact?.deals?.status || contact?.deal_status || '').toUpperCase();
+  if (dealStatus === 'ACTIVE') score += 100;
+  else if (requireActiveDeal) score -= 100;
+  if (contact?.unipile_chat_id) score += 25;
+  if (contact?.linkedin_provider_id) score += 20;
+  if (contact?.email) score += 15;
+  score += new Date(contact?.updated_at || contact?.last_reply_at || contact?.last_outreach_at || 0).getTime() / 1e13;
+  return score;
+}
+
+function pickBestInvestorContact(candidates = [], options = {}) {
+  const filtered = candidates.filter(Boolean).filter(contact => !options.requireActiveDeal || String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE');
+  const pool = filtered.length ? filtered : candidates.filter(Boolean);
+  if (!pool.length) return null;
+  return [...pool].sort((a, b) => rankMatchedInvestorContact(b, options) - rankMatchedInvestorContact(a, options))[0] || null;
+}
+
 function getContactIdentityKeys(contact) {
   const keys = [];
   const email = normalizeContactIdentityValue(contact?.email);
@@ -7704,16 +7735,30 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
   // Investor outreach — check contacts table
   try {
     if (channel === 'linkedin' && chatId) {
-      const { data } = await sb.from('contacts').select('*, deals(*)').eq('unipile_chat_id', chatId).limit(1).maybeSingle();
-      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+      const { data } = await sb.from('contacts').select('*, deals(*)').eq('unipile_chat_id', chatId).limit(5);
+      const contact = pickBestInvestorContact(data || [], { requireActiveDeal: true });
+      if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
     }
     if (channel === 'linkedin' && (fromUrn || contactKey)) {
-      const { data } = await sb.from('contacts').select('*, deals(*)').eq('linkedin_provider_id', fromUrn || contactKey).limit(1).maybeSingle();
-      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+      const providerOrIdentity = fromUrn || contactKey;
+      const { data: providerMatches } = await sb.from('contacts').select('*, deals(*)').eq('linkedin_provider_id', providerOrIdentity).limit(5);
+      const providerContact = pickBestInvestorContact(providerMatches || [], { requireActiveDeal: true });
+      if (providerContact) return { contact: providerContact, deal: providerContact.deals || null, campaign: null, mode: 'investor_outreach' };
+
+      const identityCandidates = extractLinkedInIdentityCandidates(providerOrIdentity);
+      for (const identity of identityCandidates) {
+        const { data: linkedinMatches } = await sb.from('contacts')
+          .select('*, deals(*)')
+          .ilike('linkedin_url', `%${identity}%`)
+          .limit(10);
+        const linkedinContact = pickBestInvestorContact(linkedinMatches || [], { requireActiveDeal: true });
+        if (linkedinContact) return { contact: linkedinContact, deal: linkedinContact.deals || null, campaign: null, mode: 'investor_outreach' };
+      }
     }
     if (channel === 'email' && fromEmail) {
-      const { data } = await sb.from('contacts').select('*, deals(*)').ilike('email', fromEmail).limit(1).maybeSingle();
-      if (data) return { contact: data, deal: data.deals || null, campaign: null, mode: 'investor_outreach' };
+      const { data } = await sb.from('contacts').select('*, deals(*)').ilike('email', fromEmail).limit(10);
+      const contact = pickBestInvestorContact(data || [], { requireActiveDeal: true });
+      if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
     }
     if (channel === 'email' && threadId) {
       const { data: emailThread } = await sb.from('emails')
@@ -7736,7 +7781,7 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
         .maybeSingle();
       if (priorReply?.contact_id) {
         const contact = await fetchInvestorContactById(priorReply.contact_id);
-        if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
+        if (contact && String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE') return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
       }
     }
   } catch {}
