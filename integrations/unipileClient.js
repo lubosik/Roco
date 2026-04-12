@@ -320,20 +320,46 @@ function formatEmailHtml(text) {
 /**
  * Retrieve a LinkedIn profile by URL to get richer data for message construction.
  */
-export async function retrieveLinkedInProfile(linkedinUrl) {
+export async function retrieveLinkedInProfile(identifier, options = {}) {
   try {
-    const resolved = await resolveLinkedInProfile(linkedinUrl);
-    if (!resolved) return null;
-    const result = resolved.raw || {};
+    const id = getLinkedInIdentifier(identifier);
+    if (!id) return null;
+    const query = new URLSearchParams({
+      account_id: options.accountId || getLiAcct(),
+      notify: options.notify ? 'true' : 'false',
+    });
+    const sections = Array.isArray(options.linkedinSections) && options.linkedinSections.length
+      ? options.linkedinSections
+      : ['experience_preview', 'skills_preview', 'education_preview'];
+    for (const section of sections) query.append('linkedin_sections', section);
+    if (options.linkedinApi) query.set('linkedin_api', options.linkedinApi);
+
+    const result = await api('GET', `/users/${encodeURIComponent(id)}?${query.toString()}`);
+    const profile = result?.profile || result?.user || result || {};
+    const canonicalUrl = canonicalizeLinkedInProfileUrl(
+      profile.public_profile_url || profile.profile_url || profile.linkedin_url || identifier,
+    );
+    const positions = Array.isArray(profile.experience) ? profile.experience : (Array.isArray(profile.positions) ? profile.positions : []);
+    const currentRole = positions[0] || null;
+    const skills = Array.isArray(profile.skills)
+      ? profile.skills.map(item => typeof item === 'string' ? item : item?.name).filter(Boolean)
+      : [];
+    const emails = Array.isArray(profile.contact_info?.emails) ? profile.contact_info.emails.filter(Boolean) : [];
     return {
-      provider_id: resolved.providerId,
-      public_id: resolved.publicId,
-      headline: result.headline || null,
-      summary: result.summary || null,
-      current_company: result.positions?.[0]?.company_name || null,
-      current_title: result.positions?.[0]?.title || null,
-      location: result.location || result.geo || null,
-      connections: result.connections_count || null,
+      provider_id: profile.provider_id || profile.id || null,
+      public_id: profile.public_identifier || profile.public_id || profile.username || extractSlug(canonicalUrl) || null,
+      headline: profile.headline || null,
+      summary: profile.summary || null,
+      current_company: currentRole?.company_name || currentRole?.company || null,
+      current_title: currentRole?.title || null,
+      location: profile.location || profile.geo || null,
+      connections: profile.connections_count || null,
+      experience: positions.slice(0, 3),
+      skills: skills.slice(0, 8),
+      education: Array.isArray(profile.education) ? profile.education.slice(0, 2) : [],
+      emails,
+      linkedin_url: canonicalUrl,
+      raw: profile,
     };
   } catch (err) {
     // Profile retrieval is best-effort — don't throw

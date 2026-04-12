@@ -226,6 +226,74 @@ export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = nu
   }
 }
 
+export async function claudeWebSearch(
+  prompt,
+  {
+    maxTokens = 700,
+    maxUses = 3,
+    model = 'claude-haiku-4-5-20251001',
+    systemPrompt = null,
+    allowedDomains = null,
+    blockedDomains = null,
+    userLocation = null,
+  } = {},
+) {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicKey) throw new Error('ANTHROPIC_API_KEY not set');
+  if (sonnetCB.isOpen()) throw new Error('Claude web search unavailable: Sonnet circuit breaker open');
+
+  try {
+    const text = await sonnetSem.run(() => withRetry(async () => {
+      const tool = {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: Math.min(Math.max(Number(maxUses) || 1, 1), 5),
+      };
+      if (Array.isArray(allowedDomains) && allowedDomains.length) tool.allowed_domains = allowedDomains;
+      if (Array.isArray(blockedDomains) && blockedDomains.length) tool.blocked_domains = blockedDomains;
+      if (userLocation) tool.user_location = userLocation;
+
+      const body = {
+        model,
+        max_tokens: Math.min(maxTokens, 4096),
+        messages: [{ role: 'user', content: prompt }],
+        tools: [tool],
+      };
+      if (systemPrompt) body.system = systemPrompt;
+
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        const e = new Error(`Claude web search ${res.status}: ${errBody.substring(0, 200)}`);
+        e.status = res.status;
+        throw e;
+      }
+
+      const data = await res.json();
+      const combined = Array.isArray(data.content)
+        ? data.content.filter(item => item?.type === 'text').map(item => item.text || '').filter(Boolean).join('\n').trim()
+        : '';
+      if (!combined) throw new Error('Claude web search returned empty response');
+      return combined;
+    }, 'Claude web search'));
+
+    sonnetCB.recordSuccess();
+    return text;
+  } catch (err) {
+    sonnetCB.recordFailure();
+    throw err;
+  }
+}
+
 // ── Grok via xAI API (live web access for per-investor research) ──────────────
 export async function grokResearch(prompt, { maxTokens = 1000 } = {}) {
   const apiKey = process.env.XAI_API_KEY || process.env.GROK_API_KEY;

@@ -25,8 +25,7 @@ import {
 import { sendEmailReply, sendLinkedInReply, sendEmail, listEmails, listWebhooks, listSentInvitations } from '../integrations/unipileClient.js';
 import { getApiHealth, startHealthChecks } from '../core/apiFallback.js';
 import { info, error } from '../core/logger.js';
-import { aiComplete } from '../core/aiClient.js';
-import { haikuComplete } from '../core/aiClient.js';
+import { aiComplete, haikuComplete, claudeWebSearch } from '../core/aiClient.js';
 import {
   loadSessionState, saveSessionState,
   getAllDeals, getActiveDeals, getDeal, createDeal, updateDeal,
@@ -8369,8 +8368,7 @@ function detectResearchNeeded(content) {
 }
 
 async function conductMidConversationResearch(content, contact, deal, campaign, mode, contextName) {
-  const key = process.env.GROK_API_KEY;
-  if (!key) return '';
+  if (!process.env.ANTHROPIC_API_KEY) return '';
   try {
     const sector = deal?.sector || campaign?.target_sector || 'the relevant sector';
     const ctxDesc = mode === 'investor_outreach'
@@ -8379,19 +8377,18 @@ async function conductMidConversationResearch(content, contact, deal, campaign, 
 
     const prompt = `A contact named ${contact.name} has asked this during an investment conversation:\n"${content}"\n\nContext: ${ctxDesc}\n\nUse web search to find 3-5 specific, accurate, current facts that would help answer this question in a confident, informed way. Be specific — cite real market data, comparable deals, or recent news where possible.\n\nReturn a concise factual paragraph only — no preamble, no explanation.`;
 
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({
-        model:  'grok-4.1-fast',
-        input:  [{ role: 'user', content: prompt }],
-        tools:  [{ type: 'web_search' }],
-      }),
+    const text = await claudeWebSearch(prompt, {
+      maxTokens: 500,
+      maxUses: 2,
+      systemPrompt: 'Use web search when needed. Return a concise factual paragraph only with concrete, current information.',
+      userLocation: {
+        type: 'approximate',
+        city: 'New York',
+        region: 'New York',
+        country: 'US',
+        timezone: 'America/New_York',
+      },
     });
-    if (!res.ok) throw new Error(`Grok ${res.status}`);
-    const data = await res.json();
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '';
 
     const sb = getSupabase();
     await sb?.from('activity_log').insert({

@@ -28,6 +28,7 @@ import {
   sendEmail as unipileSendEmail,
   listSentInvitations,
   canonicalizeLinkedInProfileUrl,
+  retrieveLinkedInProfile,
 } from '../integrations/unipileClient.js';
 import { enrichFirmViaLinkedIn, processLinkedInInvite } from './unipile.js';
 import { sendEmailForApproval, sendLinkedInDMForApproval, sendTelegram, sendTelegramVoiceNote } from '../approval/telegramBot.js';
@@ -4640,138 +4641,7 @@ async function phaseArchive(deal, state) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function phasePersonResearch(deal, batch) {
-  const sb = getSupabase();
-  if (!sb) return;
-
-  // Fetch unresearched contacts — NULL notes are excluded by SQL NOT LIKE (NULL != pattern = NULL = falsy),
-  // so we fetch a wider batch without the notes filter and apply it in JS instead.
-  // Include all case variants — DB may have 'RESEARCHED' (uppercase) from bulk imports
-  const { data: allCandidates } = await sb.from('contacts')
-    .select('*')
-    .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Researched', 'RESEARCHED', 'researched', 'Enriched', 'ENRICHED', 'enriched', 'Ranked', 'RANKED', 'ranked'])
-    .order('created_at', { ascending: true })
-    .limit(80);
-
-  // Filter and prioritize in JS so we only spend live-search budget on contacts
-  // that are missing core fields, inside the current batch, or otherwise eligible.
-  const candidates = (allCandidates || [])
-    .filter(c => shouldResearchContact(c, deal, batch))
-    .sort((a, b) => {
-      const aBatch = isContactInsideBatch(a, batch) ? 1 : 0;
-      const bBatch = isContactInsideBatch(b, batch) ? 1 : 0;
-      if (aBatch !== bBatch) return bBatch - aBatch;
-      const aMissing = contactNeedsCoreResearch(a) ? 1 : 0;
-      const bMissing = contactNeedsCoreResearch(b) ? 1 : 0;
-      if (aMissing !== bMissing) return bMissing - aMissing;
-      return Number(b.investor_score || 0) - Number(a.investor_score || 0);
-    })
-    .slice(0, 5);
-
-  if (!candidates.length) {
-    info(`[${deal.name}] phasePersonResearch: no eligible candidates`);
-    return;
-  }
-
-  for (const contact of candidates) {
-    pushActivity({
-      type: 'research',
-      action: 'Researching',
-      note: `${contact.name}${contact.company_name ? ` — ${contact.company_name}` : ''}`,
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
-    info(`[research] Person research: ${contact.name}: ${deal.name}`);
-
-    let result = null;
-    try {
-      result = await researchPerson({ contact, deal });
-    } catch (err) {
-      const msg = err.isQuota
-        ? `⚠ Quota exhausted — Grok & Gemini keys rate-limited or out of credits. Check billing.`
-        : `⚠ Research API error: ${err.message}`;
-      pushActivity({ type: 'error', action: `Research failed: ${contact.name}`, note: msg, deal_name: deal.name, dealId: deal.id });
-      warn(`[PERSON RESEARCH] Error for ${contact.name}: ${err.message}`);
-      await sb.from('contacts').update({
-        notes: (contact.notes ? contact.notes + '\n' : '') + '[PERSON_RESEARCH_FAILED] API error',
-      }).eq('id', contact.id);
-      continue; // move to next contact, don't abort the whole batch
-    }
-
-    const updates = {};
-    if (result) {
-      updates.person_researched = true;
-      if (result.job_title)    updates.job_title    = result.job_title;
-      if (result.company_name && !contact.company_name) updates.company_name = result.company_name;
-      if (result.firm_aum)     updates.aum_fund_size = result.firm_aum;
-      if (result.typical_cheque) updates.typical_cheque_size = result.typical_cheque;
-      if (result.sector_focus) updates.sector_focus = result.sector_focus;
-      if (result.geography)    updates.geography    = result.geography;
-      if (result.past_investments) updates.past_investments = result.past_investments;
-      if (result.investment_thesis) updates.investment_thesis = result.investment_thesis;
-      // Update contact_type if research confirms a different classification
-      if (result.contact_type_confirmed) {
-        updates.contact_type = result.contact_type_confirmed === 'angel' ? 'individual' : result.contact_type_confirmed;
-        updates.is_angel     = result.contact_type_confirmed === 'angel';
-      }
-
-      const parts = [];
-      if (result.firm_description)  parts.push(result.firm_description);
-      if (result.investment_thesis) parts.push(`Thesis: ${result.investment_thesis}`);
-      if (result.investment_stage)  parts.push(`Stage: ${result.investment_stage}`);
-      if (result.typical_cheque)    parts.push(`Cheque: ${result.typical_cheque}`);
-      if (result.firm_aum)          parts.push(`AUM: ${result.firm_aum}`);
-      if (result.geography)         parts.push(`Geography: ${result.geography}`);
-      if (result.sector_focus)      parts.push(`Focus: ${result.sector_focus}`);
-      if (result.past_investments)  parts.push(`Portfolio: ${result.past_investments}`);
-      if (result.recent_news)       parts.push(`News: ${result.recent_news}`);
-
-      const research = parts.length ? parts.join(' | ') : '';
-      updates.notes = (contact.notes ? contact.notes + '\n' : '') +
-        `[PERSON_RESEARCHED] ${research}`.substring(0, 2000);
-    } else {
-      updates.notes = (contact.notes ? contact.notes + '\n' : '') + '[PERSON_RESEARCHED] No data found';
-    }
-
-    await sb.from('contacts').update(updates).eq('id', contact.id);
-
-    // ── Write research back to investors_db so future deals reuse it ──
-    if (contact.investors_db_id && result) {
-      try {
-        const dbUpdates = { last_researched_at: new Date().toISOString(), person_researched: true };
-        if (result.job_title)         dbUpdates.decision_maker_title = result.job_title;
-        if (result.past_investments)  dbUpdates.past_investments = result.past_investments;
-        if (result.investment_thesis) dbUpdates.investment_thesis = result.investment_thesis;
-        if (result.typical_cheque)    dbUpdates.typical_cheque_size = result.typical_cheque;
-        if (result.firm_aum)          dbUpdates.aum_millions = parseFloat(result.firm_aum.replace(/[^0-9.]/g, '')) || undefined;
-        if (result.geography)         dbUpdates.preferred_geographies = result.geography;
-        if (result.sector_focus)      dbUpdates.preferred_industries  = result.sector_focus;
-        if (result.contact_type_confirmed) {
-          dbUpdates.contact_type = result.contact_type_confirmed;
-          dbUpdates.is_angel = result.contact_type_confirmed === 'angel';
-        }
-        const noteParts = [];
-        if (result.firm_description)  noteParts.push(result.firm_description);
-        if (result.investment_thesis) noteParts.push(`Thesis: ${result.investment_thesis}`);
-        if (result.recent_news)       noteParts.push(`News: ${result.recent_news}`);
-        if (noteParts.length)         dbUpdates.research_notes = noteParts.join(' | ').substring(0, 2000);
-        await sb.from('investors_db').update(dbUpdates).eq('id', contact.investors_db_id);
-        console.log(`[RESEARCH PERSIST] Saved research for ${contact.company_name || contact.name} → investors_db`);
-      } catch (e) { console.warn(`[RESEARCH PERSIST] investors_db write-back failed: ${e.message}`); }
-    }
-
-    pushActivity({
-      type: 'research',
-      action: result ? `Researched: ${contact.name}` : `No data: ${contact.name}`,
-      note: result
-        ? `${contact.company_name || result.company_name || ''}${result.confidence ? ` — ${result.confidence} confidence` : ''}`
-        : `${contact.company_name || ''} — no data found`,
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
-    info(`[research] Researched: ${contact.name}${result ? ` (${result.confidence || '?'} confidence)` : ' — no data'}: ${deal.name}`);
-    await sleep(2000); // brief gap between contacts to avoid Gemini rate limits
-  }
+  info(`[${deal.name}] phasePersonResearch: skipped by policy — use firm research + LinkedIn profile retrieval instead`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4804,6 +4674,32 @@ async function verifyEmailWithMillionVerifier(email) {
     console.warn(`[ENRICH] MillionVerifier error for ${email}: ${err.message} — treating as valid`);
     return { valid: true, apiError: true };
   }
+}
+
+async function buildDraftLinkedInProfileContext(contactPage) {
+  const identifier = contactPage?.linkedin_provider_id || contactPage?.linkedin_url || null;
+  if (!identifier) return '';
+
+  const profile = await retrieveLinkedInProfile(identifier).catch(() => null);
+  if (!profile) return '';
+
+  const experience = Array.isArray(profile.experience)
+    ? profile.experience
+      .map(role => [role?.title, role?.company_name || role?.company].filter(Boolean).join(' at '))
+      .filter(Boolean)
+      .slice(0, 2)
+      .join('; ')
+    : '';
+  const skills = Array.isArray(profile.skills) ? profile.skills.slice(0, 5).join(', ') : '';
+
+  return [
+    `LinkedIn headline: ${profile.headline || 'Not available'}`,
+    `LinkedIn summary: ${String(profile.summary || '').slice(0, 260) || 'Not available'}`,
+    `Current role: ${[profile.current_title, profile.current_company].filter(Boolean).join(' at ') || 'Not available'}`,
+    `Location: ${profile.location || 'Not available'}`,
+    experience ? `Recent experience: ${experience}` : null,
+    skills ? `Skills: ${skills}` : null,
+  ].filter(Boolean).join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6964,6 +6860,7 @@ async function draftEmailWithTemplate(contactPage, research, stage, deal, editIn
     sector_focus:     contactPage.sector_focus || contactPage.preferred_industries || '',
     geography:        contactPage.geography || contactPage.hq_country || '',
   };
+  const linkedinProfileContext = await buildDraftLinkedInProfileContext(contactPage);
 
   // Fetch template — if found, fill base variables then pass to Sonnet for personalisation
   const template = await fetchTemplate(templateType, deal?.id, contactPage.id);
@@ -6999,6 +6896,7 @@ Investment thesis: ${contactForTemplate.investment_thesis || research?.approachA
 Sector focus: ${contactForTemplate.sector_focus || ''}
 Geography: ${contactForTemplate.geography || ''}
 ${research?.approachAngle ? `Approach angle: ${research.approachAngle.substring(0, 200)}` : ''}
+${linkedinProfileContext ? `LinkedIn profile context:\n${linkedinProfileContext}\n` : ''}
 
 DEAL: ${deal?.name || ''} | ${deal?.sector || ''} | £${Number(deal?.target_amount || 0).toLocaleString()}
 Description: ${(deal?.description || '').substring(0, 150)}

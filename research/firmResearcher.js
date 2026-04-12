@@ -89,6 +89,29 @@ function normalizeFirmIdentity(value) {
     .trim();
 }
 
+async function findStoredFirmResearchByName(firmName) {
+  const sb = getSupabase();
+  const normalizedTarget = normalizeFirmIdentity(firmName);
+  if (!sb || !normalizedTarget) return null;
+
+  const { data: rows } = await sb.from('firms')
+    .select('id, name, firm_type, website, geography_focus, sector_focus, cheque_size, aum, past_investments, investment_thesis, match_rationale, updated_at, created_at')
+    .ilike('name', firmName)
+    .order('updated_at', { ascending: false })
+    .limit(5);
+
+  const match = (rows || []).find(row => normalizeFirmIdentity(row.name) === normalizedTarget) || null;
+  if (!match) return null;
+
+  const hasUsefulResearch = !!(
+    hasFirmResearchValue(match.aum)
+    || hasFirmResearchValue(match.past_investments)
+    || hasFirmResearchValue(match.investment_thesis)
+    || hasFirmResearchValue(match.match_rationale)
+  );
+  return hasUsefulResearch ? match : null;
+}
+
 function arePrefixNameVariants(leftName, rightName) {
   const left = String(leftName || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
   const right = String(rightName || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
@@ -862,6 +885,24 @@ export async function researchFirmOnly(investor, deal) {
     return buildFirmDataFromDB(investor, deal);
   }
 
+  const storedFirm = await findStoredFirmResearchByName(firmName).catch(() => null);
+  if (storedFirm) {
+    return buildFirmDataFromDB({
+      firm_name: storedFirm.name,
+      name: storedFirm.name,
+      investor_type: storedFirm.firm_type,
+      description: storedFirm.investment_thesis || storedFirm.match_rationale || null,
+      thesis: storedFirm.investment_thesis || null,
+      past_investments: storedFirm.past_investments || [],
+      aum: storedFirm.aum || null,
+      preferred_geographies: storedFirm.geography_focus || null,
+      geography_focus: storedFirm.geography_focus || null,
+      preferred_industries: storedFirm.sector_focus || null,
+      sector_focus: storedFirm.sector_focus || null,
+      justification: storedFirm.match_rationale || null,
+    }, deal);
+  }
+
   const config = getResearchConfig();
 
   if (config.primaryProvider === 'grok') {
@@ -1480,30 +1521,60 @@ export async function findDecisionMakers(firm, deal) {
 
 async function getStoredDecisionMakersForFirm(firm) {
   const sb = getSupabase();
-  if (!sb || !firm?.investor_id) return [];
+  if (!sb) return [];
+
+  const firmName = firm?.firm_name || firm?.name || '';
+  const normalizedFirm = normalizeFirmIdentity(firmName);
+  const collected = [];
+
+  if (firm?.investor_id) {
+    try {
+      const { data: investor } = await sb.from('investors_db')
+        .select('decision_maker_name, primary_contact_name, primary_contact_title, decision_maker_linkedin, linkedin_url, email, primary_contact_email')
+        .eq('id', firm.investor_id)
+        .maybeSingle();
+
+      const name = investor?.decision_maker_name || investor?.primary_contact_name || null;
+      if (name) {
+        collected.push({
+          full_name: name,
+          title: investor.primary_contact_title || null,
+          linkedin_url: null,
+          linkedin_provider_id: null,
+          email: investor.email || investor.primary_contact_email || null,
+          source: 'investors_db',
+        });
+      }
+    } catch (err) {
+      console.warn(`[FIRM RESEARCH] Stored decision-maker lookup failed for ${firmName}:`, err.message);
+    }
+  }
+
+  if (!normalizedFirm) return collected;
 
   try {
-    const { data: investor } = await sb.from('investors_db')
-      .select('decision_maker_name, primary_contact_name, primary_contact_title, decision_maker_linkedin, linkedin_url, email, primary_contact_email')
-      .eq('id', firm.investor_id)
-      .maybeSingle();
+    const { data: priorContacts } = await sb.from('contacts')
+      .select('name, job_title, linkedin_url, linkedin_provider_id, email, company_name')
+      .ilike('company_name', firmName)
+      .not('name', 'is', null)
+      .limit(12);
 
-    const name = investor?.decision_maker_name || investor?.primary_contact_name || null;
-    if (!name) return [];
-
-    return [{
-      full_name: name,
-      title: investor.primary_contact_title || null,
-      // Legacy stored LinkedIn URLs are not trusted here. The dedicated finder verifies them later.
-      linkedin_url: null,
-      linkedin_provider_id: null,
-      email: investor.email || investor.primary_contact_email || null,
-      source: 'investors_db',
-    }];
+    for (const person of (priorContacts || [])) {
+      if (normalizeFirmIdentity(person.company_name) !== normalizedFirm) continue;
+      collected.push({
+        full_name: person.name,
+        title: person.job_title || null,
+        linkedin_url: canonicalizeLinkedInProfileUrl(person.linkedin_url),
+        linkedin_provider_id: person.linkedin_provider_id || null,
+        email: person.email || null,
+        source: 'contacts_db',
+      });
+    }
   } catch (err) {
-    console.warn(`[FIRM RESEARCH] Stored decision-maker lookup failed for ${firm?.firm_name || firm?.name}:`, err.message);
-    return [];
+    console.warn(`[FIRM RESEARCH] Prior contact lookup failed for ${firmName}:`, err.message);
   }
+
+  return dedupeDecisionMakers(collected).slice(0, 4);
 }
 
 function normalizeSearchText(value) {
@@ -1711,8 +1782,14 @@ Return ONLY a valid JSON array. If you cannot find real LinkedIn URLs, set linke
   let people = [];
   let modelUsed = null;
 
+  const storedPeople = await getStoredDecisionMakersForFirm(firm).catch(() => []);
+  if (storedPeople.length > 0) {
+    people = storedPeople;
+    modelUsed = 'stored_contacts';
+  }
+
   // Try Grok first (Responses API with web_search tool)
-  if (grokKey) {
+  if (people.length === 0 && grokKey) {
     try {
       const res = await fetch('https://api.x.ai/v1/responses', {
         method: 'POST',

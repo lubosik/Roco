@@ -12,6 +12,7 @@ import { getSupabase } from '../core/supabase.js';
 import { getContactProp } from '../crm/notionContacts.js';
 import { info, warn } from '../core/logger.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
+import { retrieveLinkedInProfile } from '../integrations/unipileClient.js';
 
 const LINKEDIN_SYSTEM_PROMPT = `You are Dom's writing assistant for LinkedIn messages. Dom raises capital for private deals. You produce the FINAL, send-ready LinkedIn message exactly as Dom would send it.
 
@@ -145,6 +146,32 @@ function buildContactContext(contactPage, researchData) {
   };
 }
 
+async function buildProfileContext(contactPage) {
+  const identifier = contactPage?.linkedin_provider_id || contactPage?.linkedin_url || null;
+  if (!identifier) return '';
+
+  const profile = await retrieveLinkedInProfile(identifier).catch(() => null);
+  if (!profile) return '';
+
+  const experience = Array.isArray(profile.experience)
+    ? profile.experience
+      .map(role => [role?.title, role?.company_name || role?.company].filter(Boolean).join(' at '))
+      .filter(Boolean)
+      .slice(0, 2)
+      .join('; ')
+    : '';
+  const skills = Array.isArray(profile.skills) ? profile.skills.slice(0, 5).join(', ') : '';
+
+  return [
+    `LinkedIn headline: ${profile.headline || 'Not available'}`,
+    `LinkedIn summary: ${clip(profile.summary, 260) || 'Not available'}`,
+    `Current role: ${[profile.current_title, profile.current_company].filter(Boolean).join(' at ') || 'Not available'}`,
+    `Location: ${profile.location || 'Not available'}`,
+    experience ? `Recent experience: ${experience}` : null,
+    skills ? `Skills: ${skills}` : null,
+  ].filter(Boolean).join('\n');
+}
+
 function formatConversationHistory(history = [], firstName = 'Them') {
   const rows = (history || [])
     .filter(item => item && (item.text || item.body || item.message))
@@ -188,6 +215,7 @@ export async function draftLinkedInDM(contactPage, researchData = null, type = '
   const firm = contact.company_name || 'their firm';
   const deal = options.deal || getDeal();
   const maxChars = type === 'connection_request' ? 300 : 1000;
+  const linkedinProfileContext = await buildProfileContext(contactPage);
 
   const template = await getLinkedInTemplate(
     type,
@@ -219,6 +247,7 @@ Sector focus: ${contact.sector_focus || 'Not on record'}
 Geography: ${contact.geography || 'Not on record'}
 Cheque size / AUM: ${contact.typical_cheque_size || contact.aum || 'Not on record'}
 Notes / CRM context: ${clip(contact.notes, 260) || 'None'}
+${linkedinProfileContext ? `LinkedIn profile context:\n${linkedinProfileContext}` : ''}
 
 FULL DEAL CONTEXT:
 ${buildDealBrief(deal)}
