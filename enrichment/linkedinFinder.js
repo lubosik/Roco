@@ -199,7 +199,7 @@ async function tryGrokFallback(prompt) {
         'Authorization': `Bearer ${key}`,
       },
       body: JSON.stringify({
-        model: process.env.RESEARCH_GROK_MODEL || 'grok-4-latest',
+        model: process.env.RESEARCH_GROK_MODEL || 'grok-4.1-fast',
         input: [{ role: 'user', content: prompt }],
         tools: [{ type: 'web_search' }],
       }),

@@ -14,7 +14,7 @@ const DEFAULT_GEMINI_MODELS = [
   'gemini-2.5-pro',
 ];
 
-const DEFAULT_GROK_MODEL = 'grok-4-latest';
+const DEFAULT_GROK_MODEL = 'grok-4.1-fast';
 
 function boolFromEnv(value, fallback = false) {
   if (value == null || value === '') return fallback;

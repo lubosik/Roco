@@ -41,7 +41,7 @@ function getResearchConfig() {
       .slice(0, 5)
       .concat(['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'])
       .filter((model, index, all) => all.indexOf(model) === index),
-    grokModel: process.env.RESEARCH_FIRM_GROK_MODEL || 'grok-4',
+    grokModel: process.env.RESEARCH_FIRM_GROK_MODEL || 'grok-4.1-fast',
   };
 }
 

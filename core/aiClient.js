@@ -234,13 +234,13 @@ export async function grokResearch(prompt, { maxTokens = 1000 } = {}) {
   return gptSem.run(() => withRetry(async () => {
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
     const response = await client.chat.completions.create({
-      model: 'grok-3',
+      model: 'grok-4.1-fast',
       messages: [{ role: 'user', content: prompt }],
       max_tokens: maxTokens,
       temperature: 0.2,
     });
     return response.choices?.[0]?.message?.content || '';
-  }, 'Grok-3'));
+  }, 'Grok-4.1-fast'));
 }
 
 // ── GPT-5.4 via OpenAI Responses API (outreach drafting) ─────────────────────
