@@ -9089,32 +9089,59 @@ async function loadMeetingTranscriptsPage() {
       <h1 class="section-title">Meeting Transcripts</h1>
       <button class="btn btn-gold btn-sm" onclick="openTranscriptUploadModal()">Upload Transcript</button>
     </div>
-    <div class="card" style="padding:24px">
-      <div id="transcripts-list" style="color:var(--text-dim)">Loading transcripts...</div>
+    <div class="card" style="padding:28px;border-radius:22px;background:linear-gradient(180deg,rgba(18,20,26,.96),rgba(11,12,16,.98));border:1px solid rgba(212,168,71,.14);box-shadow:0 28px 80px rgba(0,0,0,.28)">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:18px;flex-wrap:wrap;margin-bottom:22px">
+        <div>
+          <div style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);margin-bottom:8px">Transcript Archive</div>
+          <div style="font-size:13px;color:var(--text-dim);max-width:760px;line-height:1.7">Every uploaded meeting transcript is saved to the historical log and remains available here for follow-up context, investor memory, and deal review.</div>
+        </div>
+        <div id="transcripts-summary" style="padding:12px 16px;border-radius:16px;background:rgba(212,168,71,.08);border:1px solid rgba(212,168,71,.16);font-size:12px;color:var(--text-dim)">Loading history...</div>
+      </div>
+      <div id="transcripts-list" style="color:var(--text-dim)"></div>
     </div>
   `;
 
   try {
     const rows = await api('/api/meeting-transcripts');
     const list = document.getElementById('transcripts-list');
+    const summary = document.getElementById('transcripts-summary');
     if (!list) return;
+    if (summary) {
+      summary.innerHTML = `<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:4px">Saved Entries</div><div style="font-size:22px;color:var(--text-bright);font-family:'DM Mono',monospace">${fmt((rows || []).length)}</div>`;
+    }
     if (!Array.isArray(rows) || !rows.length) {
-      list.innerHTML = '<div style="color:var(--text-dim)">No transcripts uploaded yet.</div>';
+      list.innerHTML = '<div style="color:var(--text-dim);padding:32px 0;font-size:13px">No transcripts uploaded yet.</div>';
       return;
     }
     list.innerHTML = rows.map(row => `
-      <div style="padding:16px 0;border-bottom:1px solid var(--border)">
-        <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px">
-          <div>
-            <div style="font-size:14px;color:var(--text-bright)">${esc(row.investor_name || 'Unknown investor')}</div>
-            <div style="font-size:12px;color:var(--text-dim)">${esc(row.investor_email || row.investor_linkedin || 'Investor record')}</div>
+      <div style="padding:22px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+        <div style="display:flex;justify-content:space-between;gap:20px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
+          <div style="min-width:260px;flex:1">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+              <div style="font-size:16px;color:var(--text-bright);font-weight:600">${esc(row.investor_name || 'Unknown investor')}</div>
+              <span style="padding:4px 9px;border-radius:999px;background:${row.is_new_investor ? 'rgba(34,197,94,.12)' : 'rgba(96,165,250,.12)'};border:1px solid ${row.is_new_investor ? 'rgba(34,197,94,.2)' : 'rgba(96,165,250,.2)'};font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:${row.is_new_investor ? '#86efac' : '#93c5fd'}">${row.is_new_investor ? 'New Investor' : 'Existing Investor'}</span>
+              ${row.deal_name ? `<span style="padding:4px 9px;border-radius:999px;background:rgba(212,168,71,.1);border:1px solid rgba(212,168,71,.18);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--gold)">${esc(row.deal_name)}</span>` : ''}
+            </div>
+            <div style="font-size:12px;color:var(--text-dim);line-height:1.7">${esc(row.investor_email || row.investor_linkedin || row.investor_phone || 'Investor record')}</div>
           </div>
-          <div style="text-align:right">
+          <div style="text-align:right;min-width:160px">
             <div style="font-size:12px;color:${Number(row.sentiment_score || 0) >= 8 ? '#4ade80' : Number(row.sentiment_score || 0) >= 5 ? '#fbbf24' : '#f87171'}">${row.sentiment_score ? `Sentiment ${row.sentiment_score}/10` : 'Pending analysis'}</div>
             <div style="font-size:11px;color:var(--text-dim)">${row.created_at ? new Date(row.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</div>
           </div>
         </div>
-        <div style="font-size:13px;color:#cbd5e1;line-height:1.6">${esc(row.summary || 'No summary saved yet.')}</div>
+        <div style="display:grid;grid-template-columns:minmax(0,1.7fr) minmax(240px,1fr);gap:18px;align-items:start">
+          <div style="padding:18px;border-radius:16px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06)">
+            <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:8px">Summary</div>
+            <div style="font-size:13px;color:#d8dee9;line-height:1.8">${esc(row.summary || 'No summary saved yet.')}</div>
+            ${row.transcript_text ? `<div style="margin-top:14px;font-size:12px;color:var(--text-dim);line-height:1.7">${esc(String(row.transcript_text).replace(/\s+/g, ' ').trim().slice(0, 260))}${String(row.transcript_text).length > 260 ? '…' : ''}</div>` : ''}
+          </div>
+          <div style="padding:18px;border-radius:16px;background:rgba(212,168,71,.05);border:1px solid rgba(212,168,71,.12)">
+            <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:10px">Follow Up Actions</div>
+            ${(Array.isArray(row.follow_up_actions) && row.follow_up_actions.length)
+              ? row.follow_up_actions.slice(0, 4).map(action => `<div style="font-size:12px;color:#d8dee9;line-height:1.7;margin-bottom:8px">• ${esc(action)}</div>`).join('')
+              : '<div style="font-size:12px;color:var(--text-dim)">No follow-up actions saved.</div>'}
+          </div>
+        </div>
       </div>
     `).join('');
   } catch (err) {
@@ -9129,44 +9156,74 @@ async function openTranscriptUploadModal() {
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:2000;display:flex;align-items:center;justify-content:center;padding:24px';
   modal.onclick = e => { if (e.target === modal) modal.remove(); };
   modal.innerHTML = `
-    <div style="width:100%;max-width:760px;max-height:88vh;overflow-y:auto;background:#0b0b0d;border:1px solid #1f1f24;border-radius:16px;padding:24px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-        <h3 style="margin:0;color:#e5e7eb;font-size:20px">Upload Transcript</h3>
-        <button onclick="document.getElementById('transcript-upload-modal').remove()" style="background:none;border:none;color:#6b7280;font-size:22px;cursor:pointer">×</button>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div style="width:100%;max-width:920px;max-height:88vh;overflow-y:auto;background:linear-gradient(180deg,#0b0d11,#090a0d);border:1px solid rgba(212,168,71,.14);border-radius:24px;padding:30px;box-shadow:0 36px 90px rgba(0,0,0,.4)">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:24px">
         <div>
-          <label class="form-label">Investor Type</label>
-          <select class="form-input" id="transcript-mode" onchange="toggleTranscriptInvestorMode()">
-            <option value="existing">Existing investor</option>
-            <option value="new">New investor</option>
-          </select>
+          <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);margin-bottom:10px">Meeting Memory</div>
+          <h3 style="margin:0;color:#f8fafc;font-size:24px;font-weight:500">Upload Transcript</h3>
+          <div style="margin-top:8px;color:var(--text-dim);font-size:13px;line-height:1.7;max-width:620px">Save every investor meeting into the transcript archive, enrich the investor record, and keep the full historical context available for future outreach and follow-up.</div>
         </div>
-        <div>
-          <label class="form-label">Source File</label>
-          <input class="form-input" id="transcript-file" type="file" accept=".pdf,.doc,.docx,.txt,.md" />
+        <button onclick="document.getElementById('transcript-upload-modal').remove()" style="background:none;border:none;color:#6b7280;font-size:24px;cursor:pointer;line-height:1">×</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1.15fr .85fr;gap:18px;margin-bottom:18px">
+        <div style="padding:18px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)">
+          <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:12px">Investor Source</div>
+          <input type="hidden" id="transcript-mode" value="existing" />
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px">
+            <button type="button" id="transcript-mode-existing-btn" onclick="setTranscriptInvestorMode('existing')" style="padding:15px 16px;border-radius:16px;border:1px solid rgba(96,165,250,.24);background:rgba(96,165,250,.12);color:#dbeafe;text-align:left;cursor:pointer">
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#93c5fd;margin-bottom:6px">Existing Investor</div>
+              <div style="font-size:13px;line-height:1.6;color:#cbd5e1">Link this transcript to someone already in the pipeline or database.</div>
+            </button>
+            <button type="button" id="transcript-mode-new-btn" onclick="setTranscriptInvestorMode('new')" style="padding:15px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02);color:#cbd5e1;text-align:left;cursor:pointer">
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#86efac;margin-bottom:6px">New Investor</div>
+              <div style="font-size:13px;line-height:1.6;color:var(--text-dim)">Create a fresh investor record from this meeting and save it into history.</div>
+            </button>
+          </div>
+        </div>
+        <div style="padding:18px;border-radius:18px;background:rgba(212,168,71,.05);border:1px solid rgba(212,168,71,.14)">
+          <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:12px">Source Material</div>
+          <label style="display:block;padding:16px;border-radius:16px;border:1px dashed rgba(212,168,71,.26);background:rgba(255,255,255,.02);cursor:pointer">
+            <div style="font-size:13px;color:#e5e7eb;margin-bottom:6px">Upload transcript file</div>
+            <div style="font-size:12px;color:var(--text-dim);line-height:1.6">PDF, DOC, DOCX, TXT or Markdown. You can also paste the transcript manually below.</div>
+            <input class="form-input" id="transcript-file" type="file" accept=".pdf,.doc,.docx,.txt,.md" style="margin-top:14px" />
+          </label>
         </div>
       </div>
-      <div id="transcript-existing-wrap" style="margin-top:16px">
-        <label class="form-label">Existing Investor</label>
-        <input class="form-input" id="transcript-contact-search" placeholder="Search database name, email, or firm" oninput="searchTranscriptExisting(this.value)" />
-        <select class="form-input" id="transcript-contact" style="margin-top:8px"><option value="">Select contact</option></select>
-      </div>
-      <div id="transcript-new-wrap" style="display:none;margin-top:16px">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-          <div><label class="form-label">Name</label><input class="form-input" id="transcript-new-name" /></div>
-          <div><label class="form-label">Email</label><input class="form-input" id="transcript-new-email" /></div>
-          <div><label class="form-label">Firm Name</label><input class="form-input" id="transcript-new-firm" /></div>
-          <div><label class="form-label">Category</label><select class="form-input" id="transcript-new-category"><option value="institutional">Institutional</option><option value="angel">Angel / UHNW</option><option value="athlete">Athlete / Creator</option><option value="family_office">Family Office</option></select></div>
-          <div><label class="form-label">Phone</label><input class="form-input" id="transcript-new-phone" /></div>
-          <div><label class="form-label">LinkedIn URL</label><input class="form-input" id="transcript-new-linkedin" /></div>
+      <div id="transcript-existing-wrap" style="margin-top:10px;padding:22px;border-radius:20px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06)">
+        <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px">
+          <div>
+            <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);margin-bottom:8px">Existing Investor</div>
+            <div style="font-size:13px;color:var(--text-dim)">Search by name, firm, or email and attach the meeting to the existing person record.</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr;gap:14px">
+          <div>
+            <label class="form-label" style="margin-bottom:8px;display:block">Search</label>
+            <input class="form-input" id="transcript-contact-search" placeholder="Search database name, email, or firm" oninput="searchTranscriptExisting(this.value)" />
+          </div>
+          <div>
+            <label class="form-label" style="margin-bottom:8px;display:block">Select Investor</label>
+            <select class="form-input" id="transcript-contact"><option value="">Select contact</option></select>
+          </div>
         </div>
       </div>
-      <div style="margin-top:16px">
-        <label class="form-label">Transcript Text</label>
-        <textarea class="form-input" id="transcript-text" rows="14" style="min-height:260px" placeholder="Optional if you upload PDF/DOC/DOCX/TXT."></textarea>
+      <div id="transcript-new-wrap" style="display:none;margin-top:10px;padding:22px;border-radius:20px;background:rgba(34,197,94,.035);border:1px solid rgba(34,197,94,.12)">
+        <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#86efac;margin-bottom:8px">New Investor Record</div>
+        <div style="font-size:13px;color:var(--text-dim);margin-bottom:16px;line-height:1.7">Create a fresh investor profile from this meeting. The transcript analysis will enrich the contact and investor database record after upload.</div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px">
+          <div><label class="form-label" style="margin-bottom:8px;display:block">Name</label><input class="form-input" id="transcript-new-name" /></div>
+          <div><label class="form-label" style="margin-bottom:8px;display:block">Email</label><input class="form-input" id="transcript-new-email" /></div>
+          <div><label class="form-label" style="margin-bottom:8px;display:block">Firm Name</label><input class="form-input" id="transcript-new-firm" /></div>
+          <div><label class="form-label" style="margin-bottom:8px;display:block">Category</label><select class="form-input" id="transcript-new-category"><option value="institutional">Institutional</option><option value="angel">Angel / UHNW</option><option value="athlete">Athlete / Creator</option><option value="family_office">Family Office</option></select></div>
+          <div><label class="form-label" style="margin-bottom:8px;display:block">Phone</label><input class="form-input" id="transcript-new-phone" /></div>
+          <div><label class="form-label" style="margin-bottom:8px;display:block">LinkedIn URL</label><input class="form-input" id="transcript-new-linkedin" /></div>
+        </div>
       </div>
-      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px">
+      <div style="margin-top:18px;padding:22px;border-radius:20px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06)">
+        <label class="form-label" style="margin-bottom:10px;display:block">Transcript Text</label>
+        <textarea class="form-input" id="transcript-text" rows="14" style="min-height:280px;line-height:1.75" placeholder="Optional if you upload PDF/DOC/DOCX/TXT."></textarea>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:12px;margin-top:22px;padding-top:18px;border-top:1px solid rgba(255,255,255,.06)">
         <button class="btn btn-ghost" onclick="document.getElementById('transcript-upload-modal').remove()">Cancel</button>
         <button class="btn btn-gold" onclick="submitTranscriptUpload()">Submit</button>
       </div>
@@ -9175,12 +9232,26 @@ async function openTranscriptUploadModal() {
   document.body.appendChild(modal);
 }
 
+window.setTranscriptInvestorMode = function(mode) {
+  const input = document.getElementById('transcript-mode');
+  if (input) input.value = mode;
+  window.toggleTranscriptInvestorMode();
+};
+
 window.toggleTranscriptInvestorMode = function() {
   const mode = document.getElementById('transcript-mode')?.value || 'existing';
   const existingWrap = document.getElementById('transcript-existing-wrap');
   const newWrap = document.getElementById('transcript-new-wrap');
+  const existingBtn = document.getElementById('transcript-mode-existing-btn');
+  const newBtn = document.getElementById('transcript-mode-new-btn');
   if (existingWrap) existingWrap.style.display = mode === 'existing' ? '' : 'none';
   if (newWrap) newWrap.style.display = mode === 'new' ? '' : 'none';
+  if (existingBtn) existingBtn.style.cssText = mode === 'existing'
+    ? 'padding:15px 16px;border-radius:16px;border:1px solid rgba(96,165,250,.24);background:rgba(96,165,250,.12);color:#dbeafe;text-align:left;cursor:pointer'
+    : 'padding:15px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02);color:#cbd5e1;text-align:left;cursor:pointer';
+  if (newBtn) newBtn.style.cssText = mode === 'new'
+    ? 'padding:15px 16px;border-radius:16px;border:1px solid rgba(34,197,94,.22);background:rgba(34,197,94,.1);color:#dcfce7;text-align:left;cursor:pointer'
+    : 'padding:15px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02);color:#cbd5e1;text-align:left;cursor:pointer';
 };
 
 window.searchTranscriptExisting = async function(query) {

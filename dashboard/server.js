@@ -4201,7 +4201,7 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
       const { data, error: dbErr } = await sb.from('meeting_transcripts')
-        .select('id, created_at, deal_id, contact_id, investor_name, investor_email, investor_phone, investor_linkedin, summary, sentiment_score, follow_up_actions, is_new_investor')
+        .select('id, created_at, deal_id, contact_id, investor_name, investor_email, investor_phone, investor_linkedin, summary, transcript_text, sentiment_score, follow_up_actions, is_new_investor')
         .order('created_at', { ascending: false })
         .limit(200);
       if (dbErr) throw new Error(dbErr.message);
