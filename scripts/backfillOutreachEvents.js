@@ -50,7 +50,7 @@ async function restGet(path) {
 async function restUpsert(path, rows) {
   const res = await fetch(`${url}/rest/v1/${path}`, {
     method: 'POST',
-    headers: restHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    headers: restHeaders({ Prefer: 'return=minimal' }),
     body: JSON.stringify(rows),
   });
   if (!res.ok) throw new Error(`POST ${path} failed: ${res.status} ${await res.text().catch(() => '')}`);
@@ -90,6 +90,26 @@ function mapRow(row) {
   };
 }
 
+function dedupeKey(row) {
+  return [
+    row.event_type || '',
+    row.contact_id || '',
+    row.provider_message_id || '',
+    row.created_at || '',
+  ].join('|');
+}
+
+async function fetchExistingRows(minCreatedAt, maxCreatedAt) {
+  const query = [
+    'outreach_events',
+    '?select=event_type,contact_id,provider_message_id,created_at',
+    `&created_at=gte.${encodeURIComponent(minCreatedAt)}`,
+    `&created_at=lte.${encodeURIComponent(maxCreatedAt)}`,
+    '&limit=5000',
+  ].join('');
+  return restGet(query);
+}
+
 async function run() {
   let offset = 0;
   const limit = 500;
@@ -100,14 +120,16 @@ async function run() {
     if (!rows.length) break;
 
     const payload = rows.map(mapRow);
-    await restUpsert(
-      'outreach_events?on_conflict=event_type,contact_id,provider_message_id,created_at',
-      payload
-    );
+    const existing = await fetchExistingRows(payload[0].created_at, payload[payload.length - 1].created_at);
+    const existingKeys = new Set((existing || []).map(dedupeKey));
+    const missing = payload.filter(row => !existingKeys.has(dedupeKey(row)));
+    if (missing.length) {
+      await restUpsert('outreach_events', missing);
+    }
 
     processed += payload.length;
     offset += limit;
-    console.log(`Backfilled ${processed} outreach event rows`);
+    console.log(`Processed ${processed} activity rows${missing.length ? ` · inserted ${missing.length}` : ' · no inserts needed'}`);
   }
 
   console.log(`Backfill complete. Processed ${processed} rows.`);
