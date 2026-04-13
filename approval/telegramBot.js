@@ -1893,7 +1893,13 @@ export async function dismissPendingApproval(id) {
 
 export async function updateApprovalDraftFromDashboard(id, { body = null, subject = null } = {}) {
   const numId = Number(id);
-  const approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
+  // Search by Telegram msgId (primary key) first, then fall back to searching by queueId
+  let approval = pendingApprovals.get(numId) || pendingApprovals.get(String(id));
+  if (!approval) {
+    for (const [, a] of pendingApprovals) {
+      if (String(a.queueId || '') === String(id)) { approval = a; break; }
+    }
+  }
   if (!approval) return false;
 
   if (body !== null) approval.emailDraft.body = sanitizeApprovalText(body);
