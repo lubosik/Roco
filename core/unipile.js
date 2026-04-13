@@ -764,7 +764,7 @@ export async function processLinkedInInvite({
   }
   if (noMatchState?.checkedAt) {
     const checkedAt = new Date(noMatchState.checkedAt).getTime();
-    const cooldownMs = 12 * 60 * 60 * 1000;
+    const cooldownMs = 72 * 60 * 60 * 1000; // 3-day cooldown to reduce repeated spam
     if (Number.isFinite(checkedAt) && (Date.now() - checkedAt) < cooldownMs) {
       return {
         status: 'suppressed_no_match',

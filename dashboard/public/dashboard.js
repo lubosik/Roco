@@ -518,11 +518,12 @@ function applyStats(s) {
   setText('stat-queue-sub',      s.queuePeriod || '');
 
   // LinkedIn metrics
-  setText('stat-li-invites',     fmt(s.li_invites_sent));
-  setText('stat-li-invites-sub', s.li_active_pending != null ? `${fmt(s.li_active_pending)} active pending` : '');
-  setText('stat-li-acceptance',  s.li_acceptance_rate != null ? pct(s.li_acceptance_rate) : '—');
-  setText('stat-li-dms',         fmt(s.li_dms_sent));
-  setText('stat-li-dm-response', s.li_dm_response_rate != null ? pct(s.li_dm_response_rate) : '—');
+  setText('stat-li-invites',       fmt(s.li_invites_sent));
+  setText('stat-li-invites-sub',   s.li_active_pending != null ? `${fmt(s.li_active_pending)} active pending` : '');
+  setText('stat-li-acceptance',    fmt(s.li_accepts != null ? s.li_accepts : 0));
+  setText('stat-li-acceptance-sub', s.li_acceptance_rate != null ? pct(s.li_acceptance_rate) + ' acceptance rate' : '');
+  setText('stat-li-dms',           fmt(s.li_dms_sent));
+  setText('stat-li-dm-response',   s.li_dm_response_rate != null ? pct(s.li_dm_response_rate) : '—');
 
   refreshQueueBadge(s.queueCount || s.approval_queue);
 }

@@ -186,7 +186,7 @@ function normalizeLinkedInIdentity(url) {
 
 const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
 
-function hasRecentLinkedInNoMatchSuppression(notes, hours = 12) {
+function hasRecentLinkedInNoMatchSuppression(notes, hours = 72) {
   const match = String(notes || '').match(LINKEDIN_NO_MATCH_NOTE_PATTERN);
   if (!match?.[1]) return false;
   const checkedAt = new Date(match[1]).getTime();

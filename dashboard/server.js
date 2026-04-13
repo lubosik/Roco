@@ -2929,7 +2929,9 @@ export function initDashboard(state) {
         // Inbound email reply from investor — mark contact as replied + notify
         const fromEmail = event?.from?.email || event?.from_email || event?.from || '';
         const subject   = event?.subject || '';
-        const body      = event?.text || event?.html || event?.body || '';
+        // Prefer plain-text; fall back to HTML and strip tags so Telegram/activity feed is readable.
+        const rawBody   = event?.text || event?.html || event?.body || '';
+        const body      = stripHtml(rawBody);
         const threadId  = event?.thread_id || event?.threadId || '';
         console.log(`[WEBHOOKS/UNIPILE] mail_received from: ${fromEmail} subject: ${subject}`);
 
@@ -4174,6 +4176,7 @@ function registerRoutes(app) {
             : 0;
           stats.responseRate = stats.response_rate;
           stats.li_invites_sent = totals.li_invites_sent;
+          stats.li_accepts = totals.li_accepts;
           stats.li_active_pending = totals.li_active_pending;
           stats.li_acceptance_rate = totals.li_invites_sent > 0
             ? Math.round((totals.li_accepts / totals.li_invites_sent) * 100)
@@ -8160,6 +8163,27 @@ function broadcastToAll(data) {
 // DEBOUNCE BATCHER — 90-second multi-reply handler
 // ─────────────────────────────────────────────
 
+function stripHtml(html) {
+  if (!html) return '';
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function normalizeInboundEmail(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (!raw) return '';
@@ -9071,7 +9095,9 @@ async function draftInstantReply({ contact, originalEmail, inboundBody, classifi
   }
 }
 
-async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyText, threadId, messageId, channel, threadField, emailAccountId }) {
+async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyText: rawBodyText, threadId, messageId, channel, threadField, emailAccountId }) {
+  // Strip HTML tags so Telegram notifications and activity feed only show plain text.
+  const bodyText = stripHtml(rawBodyText);
   if (!bodyText && !fromEmail && !fromUrn) return;
   const normalizedEmail = normalizeInboundEmail(fromEmail);
   if (shouldSuppressInboundWebhookMessage({
