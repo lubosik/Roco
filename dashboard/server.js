@@ -1377,9 +1377,7 @@ const CLOSED_CONTACT_STAGES = new Set([
 function hasLinkedInInviteHistory(contact) {
   return Boolean(
     contact?.invite_sent_at ||
-    contact?.invite_accepted_at ||
-    contact?.outreach_channel === 'linkedin_invite' ||
-    LINKEDIN_INVITE_STAGES.has(contact?.pipeline_stage)
+    contact?.invite_accepted_at
   );
 }
 
@@ -1391,7 +1389,7 @@ function hasLinkedInAccepted(contact) {
 }
 
 function hasActivePendingLinkedInInvite(contact) {
-  if (!hasLinkedInInviteHistory(contact)) return false;
+  if (!contact?.invite_sent_at) return false;
   if (hasLinkedInAccepted(contact)) return false;
   if (CLOSED_CONTACT_STAGES.has(contact?.pipeline_stage)) return false;
   return true;
