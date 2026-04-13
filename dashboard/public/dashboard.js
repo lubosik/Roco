@@ -4323,23 +4323,28 @@ async function loadDealTabSettings(id) {
 
       </div>
 
-      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Sending Windows</h3>
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email + LinkedIn DMs send in these two daily windows on the deal's selected active days. Connections send anytime.</div>
+      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Email Sending Window</h3>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email sends during this daytime window on the deal's selected active days.</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">
         <div class="form-group">
-          <label class="form-label">Morning window — start</label>
+          <label class="form-label">Email: from</label>
           <input type="time" class="form-input" id="ds-send-from" value="${esc(deal.send_from || '06:00')}" />
         </div>
         <div class="form-group">
-          <label class="form-label">Morning window — end</label>
-          <input type="time" class="form-input" id="ds-send-until" value="${esc(deal.send_until || '08:00')}" />
+          <label class="form-label">Email: until</label>
+          <input type="time" class="form-input" id="ds-send-until" value="${esc(deal.send_until || '18:00')}" />
         </div>
+      </div>
+
+      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px;margin-top:8px">LinkedIn DM Window</h3>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">LinkedIn DMs send in this separate window on the deal's selected active days.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">
         <div class="form-group">
-          <label class="form-label">Evening window — start</label>
+          <label class="form-label">LinkedIn DM: from</label>
           <input type="time" class="form-input" id="ds-li-dm-from" value="${esc(deal.li_dm_from || '20:00')}" />
         </div>
         <div class="form-group">
-          <label class="form-label">Evening window — end</label>
+          <label class="form-label">LinkedIn DM: until</label>
           <input type="time" class="form-input" id="ds-li-dm-until" value="${esc(deal.li_dm_until || '23:00')}" />
         </div>
       </div>
@@ -4618,7 +4623,7 @@ async function saveDealSettings(id) {
     committed_amount:      committedVal ? Number(committedVal) : null,
     currency:              document.getElementById('ds-currency')?.value || 'USD',
     send_from:             document.getElementById('ds-send-from')?.value    || '06:00',
-    send_until:            document.getElementById('ds-send-until')?.value   || '08:00',
+    send_until:            document.getElementById('ds-send-until')?.value   || '18:00',
     li_dm_from:            document.getElementById('ds-li-dm-from')?.value   || '20:00',
     li_dm_until:           document.getElementById('ds-li-dm-until')?.value  || '23:00',
     li_connect_from:       document.getElementById('ds-li-connect-from')?.value  || null,
