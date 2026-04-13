@@ -104,6 +104,56 @@ Dom`,
   },
 ];
 
+const OUTREACH_EVENT_TYPES = new Set([
+  'LINKEDIN_INVITE_SENT',
+  'LINKEDIN_INVITE_ALREADY_PENDING',
+  'LINKEDIN_ALREADY_CONNECTED',
+  'LINKEDIN_INVITE_FAILED',
+  'LINKEDIN_INVITE_SKIPPED_NO_PROFILE',
+  'LINKEDIN_INVITE_PROVIDER_LIMIT',
+  'LINKEDIN_INVITE_PROVIDER_LIMIT_ESCALATED',
+  'LINKEDIN_DM_SENT',
+  'EMAIL_SENT',
+]);
+
+function deriveOutreachEventStatus(eventType) {
+  const normalized = String(eventType || '').toUpperCase();
+  if (['LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT', 'EMAIL_SENT'].includes(normalized)) return 'confirmed';
+  if (['LINKEDIN_INVITE_ALREADY_PENDING', 'LINKEDIN_ALREADY_CONNECTED'].includes(normalized)) return 'inferred';
+  if (['LINKEDIN_INVITE_PROVIDER_LIMIT', 'LINKEDIN_INVITE_PROVIDER_LIMIT_ESCALATED'].includes(normalized)) return 'deferred';
+  if (['LINKEDIN_INVITE_SKIPPED_NO_PROFILE'].includes(normalized)) return 'skipped';
+  return 'failed';
+}
+
+async function mirrorOutreachEvent(sb, payload = {}) {
+  const eventType = String(payload?.eventType || '').toUpperCase();
+  if (!OUTREACH_EVENT_TYPES.has(eventType)) return;
+
+  const detail = payload?.detail && typeof payload.detail === 'object' ? payload.detail : {};
+  const row = {
+    deal_id: payload.dealId || null,
+    contact_id: payload.contactId || null,
+    event_type: eventType,
+    channel: detail.channel || null,
+    status: detail.status || deriveOutreachEventStatus(eventType),
+    provider: payload.apiUsed || detail.provider || detail.api_used || 'unipile',
+    provider_message_id: detail.invitation_id || detail.message_id || detail.email_id || null,
+    provider_account_id: detail.account_id || null,
+    metadata: {
+      summary: payload.summary || null,
+      fallback_used: !!payload.fallbackUsed,
+      ...detail,
+    },
+    created_at: new Date().toISOString(),
+  };
+
+  try {
+    await sb.from('outreach_events').insert([row]);
+  } catch {
+    // Best-effort only; deploy must not depend on this table existing yet.
+  }
+}
+
 // ─────────────────────────────────────────────
 // SESSION STATE
 // ─────────────────────────────────────────────
@@ -351,6 +401,15 @@ export async function logActivity({ dealId, contactId, eventType, summary, detai
       api_used: apiUsed || null,
       fallback_used: fallbackUsed || false,
     }]);
+    await mirrorOutreachEvent(sb, {
+      dealId,
+      contactId,
+      eventType,
+      summary,
+      detail,
+      apiUsed,
+      fallbackUsed,
+    });
   } catch {
     // Best-effort
   }
