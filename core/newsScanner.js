@@ -604,15 +604,6 @@ No bullets. No markdown.`;
 }
 
 export async function searchInvestorsWithGrok(deal, existingFirmNames, pushActivity) {
-  if (!deal?.id || !GROK_API_KEY) return [];
-
-  pushActivity?.({
-    type: 'research',
-    action: `Grok web search: finding active investors for ${deal.name}`,
-    note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
-    deal_id: deal.id,
-  });
-
   const query = `Find PE firms, family offices, and independent sponsors that have recently invested in or announced interest in ${deal.sector || 'the target sector'} companies in ${deal.target_geography || deal.geography || 'the United States'}.
 
 Focus on deals from the last 18 months. Include firms that:
@@ -633,22 +624,15 @@ Return ONLY a JSON array:
 ]
 Maximum 10 results.`;
 
-  const result = await grokWebSearch(
-    query,
-    'You are a PE research analyst. Return only valid JSON and only genuinely relevant firms.',
-    1200
-  );
-  if (!result) return [];
-
-  try {
-    const firms = extractJSONArray(result)
+  async function parseFirmResults(resultText, sourceFile, listName, sourceLabel) {
+    const firms = extractJSONArray(resultText)
       .filter(firm => Number(firm.confidence || 0) >= 7)
       .filter(firm => !existingFirmNames.has(String(firm.firm_name || '').toLowerCase().trim()));
 
     if (firms.length) {
       pushActivity?.({
         type: 'research',
-        action: `Grok found ${firms.length} additional investor leads`,
+        action: `${sourceLabel} found ${firms.length} additional investor leads`,
         note: firms.map(firm => `${firm.firm_name} (${firm.confidence}/10)`).join(' · ').slice(0, 180),
         deal_id: deal.id,
       });
@@ -660,14 +644,62 @@ Maximum 10 results.`;
       investor_type: firm.investor_type,
       hq_country: firm.hq_country,
       description: `${firm.reason_fit} Recent: ${firm.recent_activity || 'N/A'}`,
-      source_file: 'grok_web_search',
-      list_name: 'Grok Web Research',
+      source_file: sourceFile,
+      list_name: listName,
       _from_internet: true,
     }));
+  }
+
+  if (!deal?.id) return [];
+
+  if (GROK_API_KEY) {
+    pushActivity?.({
+      type: 'research',
+      action: `Grok web search: finding active investors for ${deal.name}`,
+      note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
+      deal_id: deal.id,
+    });
+    const result = await grokWebSearch(
+      query,
+      'You are a PE research analyst. Return only valid JSON and only genuinely relevant firms.',
+      1200
+    );
+    if (result) {
+      try {
+        return await parseFirmResults(result, 'grok_web_search', 'Grok Web Research', 'Grok');
+      } catch (err) {
+        pushActivity?.({
+          type: 'error',
+          action: 'Grok search parse failed',
+          note: err.message?.slice(0, 80),
+          deal_id: deal.id,
+        });
+      }
+    }
+  }
+
+  try {
+    pushActivity?.({
+      type: 'research',
+      action: `Claude web search fallback: finding active investors for ${deal.name}`,
+      note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
+      deal_id: deal.id,
+    });
+    const result = await claudeWebSearch(
+      `${query}\nReturn only valid JSON.`,
+      {
+        maxTokens: 1200,
+        maxUses: 4,
+        model: 'claude-sonnet-4-6',
+        systemPrompt: 'You are a PE research analyst. Use web search and return only valid JSON.',
+      }
+    );
+    if (!result) return [];
+    return await parseFirmResults(result, 'claude_web_search', 'Claude Web Research', 'Claude');
   } catch (err) {
     pushActivity?.({
       type: 'error',
-      action: 'Grok search parse failed',
+      action: 'Investor web search fallback failed',
       note: err.message?.slice(0, 80),
       deal_id: deal.id,
     });
