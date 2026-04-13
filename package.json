@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "seed": "node scripts/seedDeal.js"
+    "seed": "node scripts/seedDeal.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
