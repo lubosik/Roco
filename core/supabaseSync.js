@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getSupabase } from './supabase.js';
+import { deriveOutreachEventStatus } from './hardeningHelpers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '../state.json');
@@ -115,15 +116,6 @@ const OUTREACH_EVENT_TYPES = new Set([
   'LINKEDIN_DM_SENT',
   'EMAIL_SENT',
 ]);
-
-function deriveOutreachEventStatus(eventType) {
-  const normalized = String(eventType || '').toUpperCase();
-  if (['LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT', 'EMAIL_SENT'].includes(normalized)) return 'confirmed';
-  if (['LINKEDIN_INVITE_ALREADY_PENDING', 'LINKEDIN_ALREADY_CONNECTED'].includes(normalized)) return 'inferred';
-  if (['LINKEDIN_INVITE_PROVIDER_LIMIT', 'LINKEDIN_INVITE_PROVIDER_LIMIT_ESCALATED'].includes(normalized)) return 'deferred';
-  if (['LINKEDIN_INVITE_SKIPPED_NO_PROFILE'].includes(normalized)) return 'skipped';
-  return 'failed';
-}
 
 async function mirrorOutreachEvent(sb, payload = {}) {
   const eventType = String(payload?.eventType || '').toUpperCase();
