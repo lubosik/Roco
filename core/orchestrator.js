@@ -18,7 +18,7 @@ import {
   draftTempCloseFollowUp,
 } from './conversationManager.js';
 import { isWithinSendingWindow, isGloballyPaused, getNextWindowOpen, isWithinChannelWindow } from './scheduleChecker.js';
-import { isWithinEmailWindow, describeNextEmailWindow } from './sendingWindow.js';
+import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } from './sendingWindow.js';
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithKaspr } from '../enrichment/kaspEnricher.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
@@ -3841,8 +3841,8 @@ async function runApprovedOutreach(deal, batch, state, directives = null) {
   }
 
   const globallyPaused = state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until);
-  const inEmailWindow = isWithinEmailWindow(deal) && !globallyPaused;
-  if (inEmailWindow) {
+  const onActiveOutreachDay = isActiveOutreachDay(deal) && !globallyPaused;
+  if (onActiveOutreachDay) {
     if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
     if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
       await phaseFollowUps(deal, state);
