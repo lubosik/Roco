@@ -13,7 +13,7 @@ setInterval(() => {
   for (const [k, ts] of recentlyProcessed) if (ts < cutoff) recentlyProcessed.delete(k);
 }, 60_000);
 
-// Short per-contact message batching to catch split replies without delaying approvals too long
+// Per-contact batching window for multi-part inbound replies
 const messageBatches = new Map();
 
 // ── NORMALISATION ─────────────────────────────────────────────────────────────
@@ -272,7 +272,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
     } catch (err) {
       console.error('[UNIPILE/MSG] Draft reply error:', err.message);
     }
-  }, 15_000);
+  }, 90_000);
 }
 
 // ── PRIOR CHAT HELPERS ────────────────────────────────────────────────────────

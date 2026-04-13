@@ -134,10 +134,11 @@ export async function sendLinkedInDM({ attendeeProviderId, message }) {
 /**
  * Send a message in an existing chat.
  */
-export async function sendLinkedInReply({ chatId, message }) {
+export async function sendLinkedInReply({ chatId, message, quoteId = null }) {
   const result = await api('POST', `/chats/${chatId}/messages`, {
     account_id: getLiAcct(),
     text: message,
+    quote_id: quoteId || undefined,
   });
   return { success: true, accountId: getLiAcct(), chatId, messageId: result.message_id || result.id || null, raw: result };
 }

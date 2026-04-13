@@ -1161,7 +1161,7 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
 // REPLY DEBOUNCE BATCHER
 // ─────────────────────────────────────────────
 const replyDebounceMap = new Map();
-const REPLY_DEBOUNCE_MS = 15 * 1000;
+const REPLY_DEBOUNCE_MS = 90 * 1000;
 
 function clearDebounceForDeal(dealId) {
   let cleared = 0;
@@ -1987,9 +1987,10 @@ export async function sendApprovedReply({ queueId = null, queueItem = null, forc
 
   const sentAt = new Date().toISOString();
   if (isLinkedInReply) {
-    const chatId = item.reply_to_id || contact?.unipile_chat_id || null;
+    const chatId = contact?.unipile_chat_id || item.reply_to_id || null;
     if (!chatId) throw new Error('No LinkedIn chat available for reply');
-    const result = await sendLinkedInReply({ chatId, message: bodyToSend });
+    const quoteId = contact?.unipile_chat_id ? (item.reply_to_id || null) : null;
+    const result = await sendLinkedInReply({ chatId, message: bodyToSend, quoteId });
 
     if (queueId) {
       await sb.from('approval_queue').update({
@@ -8276,21 +8277,36 @@ async function processRocoBatchedReply(batch) {
     return;
   }
 
-  // Queue each drafted reply for approval. Sending only happens after approval.
-  for (let i = 0; i < (classification.messages_to_send || []).length; i++) {
-    const reply = classification.messages_to_send[i];
+  // Queue one reply per inbound message so each approval can target the exact message it answers.
+  for (let i = 0; i < messages.length; i++) {
+    const inbound = messages[i];
+    if (!inbound?.content?.trim()) continue;
+
+    const perMessageDraft = await classifyAndDraftRocoReply(
+      contact,
+      inbound.content,
+      effectiveConversationHistory,
+      deal,
+      campaign,
+      mode,
+      contextName,
+      researchContext,
+      guidanceBlock,
+      1
+    );
+    const reply = perMessageDraft?.messages_to_send?.[0] || null;
     if (!reply?.body?.trim()) continue;
 
-    // Simple placeholder guard
     if (/\[link\]|\[placeholder\]|\[calendar\]/i.test(reply.body)) {
       console.warn(`[REPLY] Placeholder detected in reply to ${contact.name} — skipping`);
       continue;
     }
 
-    if (await isDuplicateReplyApproval(contact.id, channel === 'linkedin' ? 'linkedin_reply' : 'email_reply')) {
-      console.log(`[REPLY] Duplicate suppressed for ${contact.name}`);
-      continue;
-    }
+    const replyTargetId = inbound.messageId || threadId || null;
+    const replyLabel = channel === 'linkedin'
+      ? `LinkedIn message ${i + 1}/${messages.length}`
+      : `Email message ${i + 1}/${messages.length}`;
+    const quotePreview = truncateInline(inbound.content, 160);
 
     const { data: queued } = await sb?.from('approval_queue').insert({
       deal_id:            deal?.id || null,
@@ -8309,37 +8325,35 @@ async function processRocoBatchedReply(batch) {
       message_text:       reply.body,
       body:               reply.body,
       subject_a:          reply.subject || null,
-      reply_to_id:        threadId || null,
+      reply_to_id:        replyTargetId,
       status:             'pending',
     }).select().single() || { data: null };
 
-    if (queued?.id) {
-      const label = (classification.messages_to_send.length > 1)
-        ? `Reply ${i + 1}/${classification.messages_to_send.length}: ${reply.reply_to_context || ''}`
-        : null;
+    if (!queued?.id) continue;
 
-      await sendReplyForApproval(
-        queued.id,
-        contact,
-        reply.body,
-        contextName,
-        channel,
-        threadId,
-        emailAccountId
-      ).catch(() => {});
+    await sendReplyForApproval(
+      queued.id,
+      contact,
+      reply.body,
+      contextName,
+      channel,
+      replyTargetId,
+      emailAccountId,
+      { replyLabel, quotePreview }
+    ).catch(() => {});
 
-      await sb?.from('activity_log').insert({
-        deal_id:    deal?.id || null,
-        contact_id: contact.id,
-        event_type: 'REPLY_QUEUED',
-        summary:    `[${contextName}]: Reply drafted for ${contact.name} — awaiting approval`,
-        detail:     {
-          label: label || null,
-          intent: classification.intent,
-          sentiment: classification.sentiment,
-        },
-      }).catch(() => {});
-    }
+    await sb?.from('activity_log').insert({
+      deal_id:    deal?.id || null,
+      contact_id: contact.id,
+      event_type: 'REPLY_QUEUED',
+      summary:    `[${contextName}]: Reply drafted for ${contact.name} — awaiting approval`,
+      detail:     {
+        label: reply.reply_to_context || replyLabel,
+        intent: classification.intent,
+        sentiment: classification.sentiment,
+        quote_preview: quotePreview,
+      },
+    }).catch(() => {});
   }
 }
 

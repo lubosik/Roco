@@ -244,13 +244,6 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
       const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: null };
       pendingApprovals.set(sent.message_id, entry);
-      // TTL: auto-expire after 4 hours to prevent unbounded memory growth from abandoned approvals
-      setTimeout(() => {
-        if (pendingApprovals.has(sent.message_id)) {
-          pendingApprovals.delete(sent.message_id);
-          resolve({ action: 'skip', reason: 'timeout' });
-        }
-      }, 4 * 60 * 60 * 1000);
       info(`Email draft sent to Telegram for approval: ${name}`);
 
       // Attach action buttons (done after send so we have the message_id)
@@ -518,24 +511,28 @@ function buildReplyKeyboard(msgId) {
  * Send a batched reply draft to Telegram for approval with inline buttons.
  * When approved, sends via Unipile automatically.
  */
-export async function sendReplyForApproval(queueItemId, contact, replyBody, contextName, channel, replyToId, emailAccountId) {
+export async function sendReplyForApproval(queueItemId, contact, replyBody, contextName, channel, replyToId, emailAccountId, options = {}) {
   if (!bot) return;
   const name        = contact?.name || 'Contact';
   const company     = contact?.company_name || '';
   const channelLbl  = channel === 'linkedin' ? 'LinkedIn' : 'Email';
+  const replyLabel  = String(options.replyLabel || '').trim();
+  const quotePreview = String(options.quotePreview || '').trim();
 
   const msg = [
     `💬 *Reply Queued — ${channelLbl}*`,
     ``,
     `To: *${name}*${company ? ` (${company})` : ''}`,
     `[${contextName}]`,
+    replyLabel ? `Replying to: ${replyLabel}` : null,
+    quotePreview ? `Quoted message: _${quotePreview}_` : null,
     ``,
     '```',
     String(replyBody || '').substring(0, 600),
     '```',
     ``,
     `_Approve = respect sending window. Send Now = bypass window._`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
   try {
     const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -550,6 +547,8 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
         queueItemId,
         channel,
         replyToId,
+        replyLabel,
+        quotePreview,
         contactId:       contact?.id,
         contactEmail:    contact?.email,
         replyBody:       replyBody,
