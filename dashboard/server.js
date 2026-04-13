@@ -1457,7 +1457,7 @@ function upsertChannelReplyMetrics(metrics, contact, seenEmailReplies, seenLinke
   const replySignal = contact.response_received === true || Boolean(contact.last_reply_at);
   if (!replySignal) return;
   const channel = String(contact.reply_channel || '').trim().toLowerCase();
-  const fallbackType = String(contact.last_contact_type || '').trim().toLowerCase();
+  const fallbackType = ''; // last_contact_type column removed — rely on reply_channel only
   const replyKey = `${contact.deal_id}:${contact.id || contact.email || contact.name || 'unknown-contact'}`;
 
   if ((channel === 'email' || fallbackType === 'email') && !seenEmailReplies.has(replyKey)) {
@@ -1484,7 +1484,7 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
     { data: repliesData },
   ] = await Promise.all([
     sb.from('contacts')
-      .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_contact_type, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel')
+      .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel')
       .in('deal_id', safeIds),
     sb.from('emails')
       .select('id, deal_id, status')
@@ -9168,7 +9168,6 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
       pipeline_stage:    'In Conversation',
       response_received: true,
       last_reply_at:     new Date().toISOString(),
-      last_contact_type: channel === 'linkedin' ? 'LinkedIn' : 'Email',
       follow_up_due_at:  null,
     }).eq('id', contact.id);
   }

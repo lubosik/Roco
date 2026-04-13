@@ -524,9 +524,9 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   if (!contact) {
     pushActivity({
-      type: 'excluded',
-      action: `LinkedIn acceptance received: ${payload.name || payload.public_identifier || payload.provider_id}`,
-      note: 'Person did not match any active deals',
+      type: 'linkedin',
+      action: payload.name || payload.public_identifier || payload.provider_id || 'Unknown person',
+      note: 'Accepted LinkedIn invite · not matched to any active deal',
     });
     try {
       const { logActivity } = await import('./supabaseSync.js');

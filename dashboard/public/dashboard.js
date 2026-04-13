@@ -7185,7 +7185,11 @@ function fmt(n) {
 
 function pct(n) {
   if (n == null) return '—';
-  const v = typeof n === 'string' && n.includes('%') ? n : (Number(n) * (Number(n) <= 1 ? 100 : 1)).toFixed(1) + '%';
+  if (typeof n === 'string' && n.includes('%')) return n;
+  const num = Number(n);
+  // Values strictly between 0 and 1 (exclusive) are decimal rates → multiply by 100.
+  // All other values (integers 0–100, or exactly 0/1) are already percentages.
+  const v = (num > 0 && num < 1) ? (num * 100).toFixed(1) + '%' : num.toFixed(1) + '%';
   return v;
 }
 
