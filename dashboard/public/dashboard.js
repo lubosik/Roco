@@ -171,7 +171,7 @@ function navigate(hash) {
    API HELPER
    ═══════════════════════════════════════════════════════════════════════════ */
 
-async function api(path, method = 'GET', body = null) {
+async function api(path, method = 'GET', body = null, options = {}) {
   const opts = {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -189,7 +189,7 @@ async function api(path, method = 'GET', body = null) {
     return res.text();
   } catch (err) {
     console.error(`[ROCO] API error ${method} ${path}:`, err);
-    showApiAlert(err.message);
+    if (!options.silent) showApiAlert(err.message);
     throw err;
   }
 }
@@ -364,7 +364,7 @@ function startClock() {
 
 async function loadState() {
   try {
-    const state = await api('/api/state');
+    const state = await api('/api/state', 'GET', null, { silent: true });
     applyState(state);
     await populateDealSelector();
   } catch { /* already shown alert */ }
@@ -490,7 +490,7 @@ async function loadOverview() {
 
 async function refreshStats() {
   try {
-    const stats = await api('/api/stats');
+    const stats = await api('/api/stats', 'GET', null, { silent: true });
     applyStats(stats);
   } catch { /* silent */ }
 }
@@ -544,7 +544,7 @@ const HEALTH_FAIL_THRESHOLD = 3; // only show error after 3 consecutive failures
 
 async function refreshHealth() {
   try {
-    const h = await api('/api/health');
+    const h = await api('/api/health', 'GET', null, { silent: true });
     healthCheckFailures = 0;
     applyHealth(h);
   } catch (err) {
@@ -584,9 +584,9 @@ function applyHealth(h) {
 async function loadActivityLog(renderToOverview = true) {
   try {
     // Use /api/activity/recent for overview widget (fast, no pagination)
-    const data = await api('/api/activity/recent').catch(async () => {
+    const data = await api('/api/activity/recent', 'GET', null, { silent: true }).catch(async () => {
       // Fallback to legacy endpoint if recent isn't available yet
-      const d = await api('/api/activity/log');
+      const d = await api('/api/activity/log', 'GET', null, { silent: true });
       return Array.isArray(d) ? d : (d.log || d.items || []);
     });
     const items = Array.isArray(data) ? data : (data.log || data.items || []);
@@ -5504,7 +5504,7 @@ async function loadActivity(page = 1) {
     const params = new URLSearchParams({ page });
     if (dealId) params.set('deal_id', dealId);
 
-    const data = await api(`/api/activity?${params}`);
+    const data = await api(`/api/activity?${params}`, 'GET', null, { silent: true });
 
     // New paginated format
     if (data && typeof data === 'object' && 'events' in data) {
@@ -5541,6 +5541,30 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', email_opened: '👁️', email_clicked: '🔗', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
   };
 
+  function stringifyActivityField(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (typeof value === 'object') {
+      const preferred = [
+        value.reason,
+        value.error,
+        value.message,
+        value.linkedin_url,
+        value.provider_id,
+        value.public_id,
+        value.source,
+      ].filter(Boolean);
+      if (preferred.length) return preferred.join(' · ');
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return '';
+      }
+    }
+    return String(value);
+  }
+
   const eventsHtml = (events || []).map(event => {
     const badge = getActivityBadgeMeta(event);
     const type  = badge.className;
@@ -5554,8 +5578,8 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     });
     const mainText = isExpandedType && event.full_content
       ? event.full_content
-      : (event.action || event.summary || '');
-    const note  = event.note || event.detail || '';
+      : stringifyActivityField(event.action || event.summary || '');
+    const note  = stringifyActivityField(event.note || event.detail || '');
 
     return `<div style="padding:10px 14px;background:rgba(${color === '#A78BFA' ? '167,139,250' : '138,134,128'},0.06);
                         border-left:3px solid ${color};border-radius:0 4px 4px 0;margin-bottom:5px">
