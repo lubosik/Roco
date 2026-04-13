@@ -5350,15 +5350,22 @@ function renderQueueCard(item) {
   const subB    = esc(item.subjectB || '');
   const hasAB   = !!subB;
   const body    = esc(item.body || item.emailBody || '');
+  const isWaiting = !!item.waitingForWindow;
 
-  const approveButtons = isReply
-    ? `
-      <button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>
-      <button class="btn btn-gold btn-sm" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', true)">&#9889; SEND NOW</button>
-    `
-    : `<button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>`;
+  const approveButtons = isWaiting
+    ? '' // already approved — no approve button, just edit/skip
+    : isReply
+      ? `
+        <button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>
+        <button class="btn btn-gold btn-sm" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', true)">&#9889; SEND NOW</button>
+      `
+      : `<button class="btn-approve" onclick="approveEmail('${id}', currentQueueVariant('${id}'), '${id}', false)">&#10003; APPROVE</button>`;
 
-  return `<div class="queue-card" id="qcard-${id}">
+  const waitingBadge = isWaiting
+    ? `<span class="status-badge" style="background:rgba(34,197,94,0.12);color:#4ade80;border-color:#4ade80;margin-left:6px">&#10003; Approved — awaiting window</span>`
+    : '';
+
+  return `<div class="queue-card" id="qcard-${id}" style="${isWaiting ? 'border-left:2px solid #4ade80;opacity:0.85' : ''}">
     <div class="queue-card-header">
       <div>
         <div class="queue-name">${name}</div>
@@ -5367,7 +5374,8 @@ function renderQueueCard(item) {
       <div class="queue-meta">
         ${scoreHt}
         ${stage ? `<span class="status-badge">${stage}</span>` : ''}
-        ${hasAB ? `<div class="subject-toggle">
+        ${waitingBadge}
+        ${hasAB && !isWaiting ? `<div class="subject-toggle">
           <button class="subject-toggle-btn active" id="stb-a-${id}" onclick="switchSubject('${id}','a')">A</button>
           <button class="subject-toggle-btn" id="stb-b-${id}" onclick="switchSubject('${id}','b')">B</button>
         </div>` : ''}

@@ -274,7 +274,7 @@ function findMatchingExistingContact(existingContacts, incoming, firmName = '') 
 
 const STALE_BATCH_FIRM_ENRICHMENT_MS = 20 * 60 * 1000;
 const MAX_FIRM_ENRICHMENT_ATTEMPTS = 3;
-const ACTIVE_MONITORING_STAGES = ['Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
+const ACTIVE_MONITORING_STAGES = ['pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
 const lastDealStatusActivity = new Map();
 const dailyNewsScanState = new Map();
 const dailyActivityDigestState = new Map();
@@ -1213,7 +1213,7 @@ async function getBatchEntitySnapshot(dealId, batchStart) {
   const sb = getSupabase();
   if (!sb) return { entityCount: 0, firmKeys: new Set() };
 
-  const ACTIVE_STAGES = ['Ranked', 'ranked', 'Enriched', 'enriched', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent',
+  const ACTIVE_STAGES = ['Ranked', 'ranked', 'Enriched', 'enriched', 'pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent',
     'invite_sent', 'invite_accepted', 'Replied', 'In Conversation'];
 
   const { data: firmContacts } = await sb.from('contacts')
@@ -5228,7 +5228,7 @@ async function phaseCrossDealCheck(deal, state) {
 // LinkedIn invite-first sequencing helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ACTIVE_STAGES = ['Ranked', 'Enriched', 'invite_sent', 'invite_accepted', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'];
+const ACTIVE_STAGES = ['Ranked', 'Enriched', 'invite_sent', 'invite_accepted', 'pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'];
 
 // Pipeline health constants
 const DAILY_INVITE_TARGET = 28;        // default target LinkedIn invites per day
@@ -5484,7 +5484,7 @@ async function phaseLinkedInInvites(deal, state) {
   // - send LinkedIn requests ahead of email where LinkedIn exists
   // - do not block a whole firm just because multiple invites are pending
   // - once a firm has any accepted invite / DM / email / response, stop sending fresh invites there
-  const ENGAGED_STAGES = ['invite_accepted', 'DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'dm_sent', 'email_sent', 'In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
+  const ENGAGED_STAGES = ['invite_accepted', 'pending_dm_approval', 'pending_email_approval', 'DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'dm_sent', 'email_sent', 'In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
 
   const { data: engagedContacts } = await sb.from('contacts')
     .select('company_name, pipeline_stage, response_received')
@@ -5596,7 +5596,7 @@ async function phaseOutreach(deal, state) {
   // 1. respondedFirms — firm has someone who replied → block all others entirely
   // 2. activeFirms    — firm has someone already in substantive outreach → hold new outreach
   const RESPONDED_STAGES = ['In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
-  const ACTIVE_PIPELINE_STAGES = ['invite_accepted', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
+  const ACTIVE_PIPELINE_STAGES = ['invite_accepted', 'pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
   const ACTIVE_CONVERSATION_STATES = ['intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
 
   const { data: firmGateContacts } = await sb.from('contacts')
@@ -6107,7 +6107,7 @@ async function phaseFollowUps(deal, state) {
     .not('company_name', 'is', null);
   const respondedFirms = new Set((respondedContacts || []).map(c => (c.company_name || '').toLowerCase().trim()).filter(Boolean));
 
-  const ACTIVE_SUBSTANTIVE_STAGES = ['Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
+  const ACTIVE_SUBSTANTIVE_STAGES = ['pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
   const { data: activeContacts } = await sb.from('contacts')
     .select('company_name')
     .eq('deal_id', deal.id)
@@ -6280,11 +6280,12 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
 
   contactsInFlight.add(contact.id);
 
-  // Immediately update the contact's pipeline_stage to 'Email Approved' / 'DM Approved'
+  // Immediately update the contact's pipeline_stage to 'pending_dm_approval' / 'pending_email_approval'
   // so that if Roco restarts before the user acts, the orchestrator's hasExistingOutreach()
   // check prevents re-selecting this contact and creating duplicate approvals.
+  // The stage advances to 'DM Approved' / 'Email Approved' only after Dom presses approve.
   try {
-    const pendingStage = forceChannel === 'linkedin_dm' ? 'DM Approved' : 'Email Approved';
+    const pendingStage = forceChannel === 'linkedin_dm' ? 'pending_dm_approval' : 'pending_email_approval';
     await sb.from('contacts').update({
       pipeline_stage: pendingStage,
       updated_at: new Date().toISOString(),

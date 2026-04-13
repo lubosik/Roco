@@ -1883,11 +1883,11 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   }]).select().single();
   if (error) throw error;
 
-  // Mark the contact as DM Approved immediately so the orchestrator doesn't
-  // re-select and re-draft on the next cycle or after a restart.
+  // Mark as pending_dm_approval so the orchestrator doesn't re-draft on the next cycle.
+  // Stage advances to 'DM Approved' only after Dom presses approve in Telegram/dashboard.
   await sb.from('contacts').update({
     pending_linkedin_dm: false,
-    pipeline_stage: 'DM Approved',
+    pipeline_stage: 'pending_dm_approval',
   }).eq('id', contact.id);
   await reloadPendingInvestorApprovals().catch(() => {});
   pushActivity({
@@ -3621,8 +3621,8 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (sb) {
         const { data: sbItems, error: sbErr } = await sb.from('approval_queue')
-          .select('id, contact_id, candidate_id, contact_name, contact_email, firm, stage, body, message_type, channel, reply_to_id, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode')
-          .in('status', ['pending'])
+          .select('id, contact_id, candidate_id, contact_name, contact_email, firm, stage, body, message_type, channel, reply_to_id, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode, status')
+          .in('status', ['pending', 'approved_waiting_for_window'])
           .order('created_at', { ascending: true });
         if (sbErr) console.warn('[/api/queue] Supabase query error:', sbErr.message);
         const LINKEDIN_STAGES = ['LinkedIn DM', 'LinkedIn Reply', 'prior_chat_review'];
@@ -3657,6 +3657,7 @@ function registerRoutes(app) {
             firm:            r.firm || '',
             stage:           r.stage,
             body:            r.edited_body || r.body || '',
+            emailBody:       r.edited_body || r.body || '',
             message_type:    r.message_type || null,
             isReply,
             channel:         r.channel || (isLinkedIn ? 'linkedin' : 'email'),
@@ -3669,6 +3670,8 @@ function registerRoutes(app) {
             contactEmail:    resolvedEmail,
             dealName:        r.deal_name || null,
             editInstructions: r.edit_instructions || null,
+            status:          r.status || 'pending',
+            waitingForWindow: r.status === 'approved_waiting_for_window',
             _supabaseOnly:   true,
           };
         });
@@ -4111,7 +4114,7 @@ function registerRoutes(app) {
         if (Object.keys(patch).length) {
           const { data } = await sb.from('approval_queue').update(patch)
             .eq('id', id)
-            .eq('status', 'pending')
+            .in('status', ['pending', 'approved_waiting_for_window'])
             .select('id')
             .maybeSingle();
           updatedDb = !!data?.id;
