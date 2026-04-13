@@ -12,6 +12,14 @@ create table if not exists outreach_events (
   created_at timestamptz default now()
 );
 
+create unique index if not exists outreach_events_dedupe_idx
+  on outreach_events (
+    event_type,
+    contact_id,
+    provider_message_id,
+    created_at
+  );
+
 create index if not exists outreach_events_deal_created_idx
   on outreach_events (deal_id, created_at desc);
 
