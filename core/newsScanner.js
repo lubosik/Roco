@@ -3,6 +3,7 @@ import { sendTelegram } from '../approval/telegramBot.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import { claudeWebSearch } from './aiClient.js';
 import { webSearch, formatWebResultsForPrompt } from '../research/webSearcher.js';
+import { getInvestorSearchProviderOrder } from './hardeningHelpers.js';
 import Anthropic from '@anthropic-ai/sdk';
 import { DateTime } from 'luxon';
 
