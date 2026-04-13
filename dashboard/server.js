@@ -1958,7 +1958,9 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
         status: 'sending',
         resolved_at: new Date().toISOString(),
       }).eq('id', queueId)
-        .in('status', ['approved', 'approved_waiting_for_window'])
+        // Accept 'pending' too — dashboard approvals fire before the async
+        // updateApprovalStatus('approved') call has completed.
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window'])
         .select('id,status')
         .maybeSingle());
     } catch {}
@@ -3802,6 +3804,11 @@ function registerRoutes(app) {
               queueId: queueItem.id,
               queueItem,
             });
+            if (sendResult?.skipped) {
+              // Item was already claimed by the orchestrator — treat as if sent
+              notifyQueueUpdated();
+              return res.json({ success: true, message: 'LinkedIn DM already being processed' });
+            }
             if (sendResult?.deferred) {
               return res.json({
                 success: true,

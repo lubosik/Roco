@@ -810,7 +810,12 @@ export async function updateApprovalStatus(id, status, approvedSubject = null) {
   try {
     const updates = { status };
     if (approvedSubject) updates.approved_subject = approvedSubject;
-    await sb.from('approval_queue').update(updates).eq('id', id);
+    // Only update if the item hasn't already been claimed/sent — prevents a race where
+    // sendApprovedLinkedInDM claims the 'pending' item and marks it 'sent' before this
+    // fire-and-forget call completes, which would otherwise overwrite 'sent' with 'approved'.
+    await sb.from('approval_queue').update(updates)
+      .eq('id', id)
+      .in('status', ['pending', 'approved', 'approved_waiting_for_window']);
   } catch {}
 }
 
