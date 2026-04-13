@@ -1,5 +1,3 @@
-import { createClient } from '@supabase/supabase-js';
-
 const url = process.env.SUPABASE_URL;
 const key = process.env.SUPABASE_SERVICE_KEY;
 
@@ -7,8 +5,6 @@ if (!url || !key) {
   console.error('SUPABASE_URL and SUPABASE_SERVICE_KEY are required');
   process.exit(1);
 }
-
-const sb = createClient(url, key, { auth: { persistSession: false } });
 
 const STATUSES = {
   LINKEDIN_INVITE_SENT: 'confirmed',
@@ -34,55 +30,87 @@ const CHANNELS = {
   EMAIL_SENT: 'email',
 };
 
-async function fetchRows(from, to) {
-  const { data, error } = await sb.from('activity_log')
-    .select('id, deal_id, contact_id, event_type, summary, detail, api_used, fallback_used, created_at')
-    .in('event_type', Object.keys(STATUSES))
-    .order('created_at', { ascending: true })
-    .range(from, to);
-  if (error) throw error;
-  return data || [];
+const EVENT_TYPES = Object.keys(STATUSES);
+
+function restHeaders(extra = {}) {
+  return {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    'Content-Type': 'application/json',
+    ...extra,
+  };
+}
+
+async function restGet(path) {
+  const res = await fetch(`${url}/rest/v1/${path}`, { headers: restHeaders() });
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status} ${await res.text().catch(() => '')}`);
+  return res.json();
+}
+
+async function restUpsert(path, rows) {
+  const res = await fetch(`${url}/rest/v1/${path}`, {
+    method: 'POST',
+    headers: restHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) throw new Error(`POST ${path} failed: ${res.status} ${await res.text().catch(() => '')}`);
+}
+
+async function fetchRows(offset, limit) {
+  const eventFilter = EVENT_TYPES.map(item => `"${item}"`).join(',');
+  const query = [
+    'activity_log',
+    `?select=id,deal_id,contact_id,event_type,summary,detail,api_used,fallback_used,created_at`,
+    `&event_type=in.(${eventFilter})`,
+    `&order=created_at.asc`,
+    `&limit=${limit}`,
+    `&offset=${offset}`,
+  ].join('');
+  return restGet(query);
+}
+
+function mapRow(row) {
+  const detail = row?.detail && typeof row.detail === 'object' ? row.detail : {};
+  return {
+    deal_id: row.deal_id || null,
+    contact_id: row.contact_id || null,
+    event_type: row.event_type,
+    channel: CHANNELS[row.event_type] || null,
+    status: STATUSES[row.event_type] || 'confirmed',
+    provider: row.api_used || 'unipile',
+    provider_message_id: detail.invitation_id || detail.message_id || detail.email_id || null,
+    provider_account_id: detail.account_id || null,
+    metadata: {
+      activity_log_id: row.id,
+      summary: row.summary || null,
+      fallback_used: !!row.fallback_used,
+      ...detail,
+    },
+    created_at: row.created_at,
+  };
 }
 
 async function run() {
-  let from = 0;
-  const pageSize = 500;
-  let inserted = 0;
+  let offset = 0;
+  const limit = 500;
+  let processed = 0;
 
   while (true) {
-    const rows = await fetchRows(from, from + pageSize - 1);
+    const rows = await fetchRows(offset, limit);
     if (!rows.length) break;
 
-    const payload = rows.map(row => ({
-      deal_id: row.deal_id || null,
-      contact_id: row.contact_id || null,
-      event_type: row.event_type,
-      channel: CHANNELS[row.event_type] || null,
-      status: STATUSES[row.event_type] || 'confirmed',
-      provider: row.api_used || 'unipile',
-      provider_message_id: row.detail?.invitation_id || row.detail?.message_id || row.detail?.email_id || null,
-      provider_account_id: row.detail?.account_id || null,
-      metadata: {
-        activity_log_id: row.id,
-        summary: row.summary || null,
-        fallback_used: !!row.fallback_used,
-        ...(row.detail && typeof row.detail === 'object' ? row.detail : {}),
-      },
-      created_at: row.created_at,
-    }));
+    const payload = rows.map(mapRow);
+    await restUpsert(
+      'outreach_events?on_conflict=event_type,contact_id,provider_message_id,created_at',
+      payload
+    );
 
-    const { error } = await sb.from('outreach_events').upsert(payload, {
-      onConflict: 'event_type,contact_id,provider_message_id,created_at',
-      ignoreDuplicates: true,
-    });
-    if (error) throw error;
-
-    inserted += payload.length;
-    from += pageSize;
-    console.log(`Backfilled ${inserted} outreach events so far`);
+    processed += payload.length;
+    offset += limit;
+    console.log(`Backfilled ${processed} outreach event rows`);
   }
 
-  console.log(`Backfill complete. Processed ${inserted} rows.`);
+  console.log(`Backfill complete. Processed ${processed} rows.`);
 }
 
 run().catch(err => {
