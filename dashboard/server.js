@@ -651,7 +651,23 @@ async function processUnipileMessageEvent(event) {
       if (!contact?.id) return null;
       return queueLinkedInDmApproval(contact.id, { reason });
     };
-    await handleLiRelation(event, pushActivity, queueForApproval);
+    const relationResult = await handleLiRelation(event, pushActivity, queueForApproval);
+    if (relationResult?.matchStatus && relationResult.matchStatus !== 'matched') {
+      await insertWebhookLogRecord({
+        event_type: eventType,
+        payload: {
+          ...(event || {}),
+          __roco_meta: {
+            ...((event && event.__roco_meta) || {}),
+            source: 'unipile_messages',
+            match_status: relationResult.matchStatus,
+            match_note: relationResult?.contactId
+              ? `contact ${relationResult.contactId}`
+              : 'acceptance webhook did not match an active contact',
+          },
+        },
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -1425,6 +1441,35 @@ async function listUnmatchedWebhookReceipts(limit = 100) {
     const meta = row?.payload?.__roco_meta || {};
     return meta.match_status === 'unmatched' || meta.match_status === 'ambiguous';
   });
+}
+
+async function listLinkedInProviderLimitPauses(limit = 100) {
+  const sb = getSupabase();
+  if (!sb) return [];
+  try {
+    const { data } = await sb.from('contacts')
+      .select('id, deal_id, name, company_name, notes, follow_up_due_at, deals!contacts_deal_id_fkey(name)')
+      .not('notes', 'is', null)
+      .order('follow_up_due_at', { ascending: true })
+      .limit(limit);
+
+    return (data || []).map(row => {
+      const match = String(row?.notes || '').match(/\[LI_INVITE_LIMIT:count=(\d+)\|blocked_until=([^|\]]+)(?:\|notified_at=([^\]]+))?\]/i);
+      if (!match) return null;
+      return {
+        id: row.id,
+        deal_id: row.deal_id || null,
+        deal_name: row.deals?.name || null,
+        contact_name: row.name || 'Unknown contact',
+        company_name: row.company_name || null,
+        retry_count: Number(match[1] || 0),
+        blocked_until: match[2] || row.follow_up_due_at || null,
+        notified_at: match[3] || null,
+      };
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 }
 
@@ -3140,6 +3185,29 @@ function registerRoutes(app) {
       res.json(merged.slice(0, 20));
     } catch {
       res.json(activityFeed.slice(-20).reverse());
+    }
+  });
+
+  app.get('/api/ops/alerts', requireAuth, async (req, res) => {
+    try {
+      const [webhookIssues, providerLimitPauses] = await Promise.all([
+        listUnmatchedWebhookReceipts(100),
+        listLinkedInProviderLimitPauses(100),
+      ]);
+
+      res.json({
+        webhook_issues: webhookIssues.slice(0, 12).map(row => ({
+          event_type: row.event_type || 'unknown',
+          received_at: row.received_at || row.created_at || null,
+          source: row?.payload?.__roco_meta?.source || null,
+          match_status: row?.payload?.__roco_meta?.match_status || null,
+          note: row?.payload?.__roco_meta?.match_note || null,
+          payload: row.payload || {},
+        })),
+        provider_limit_pauses: providerLimitPauses.slice(0, 12),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 
