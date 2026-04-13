@@ -8294,12 +8294,16 @@ async function processRocoBatchedReply(batch) {
 
     const { data: queued } = await sb?.from('approval_queue').insert({
       deal_id:            deal?.id || null,
+      deal_name:          deal?.name || campaign?.name || null,
       contact_id:         contact.id,
       candidate_id:       contact.id,
+      contact_name:       contact.name || '',
+      contact_email:      contact.email || null,
+      firm:               contact.company_name || '',
       campaign_id:        campaign?.id || null,
       company_contact_id: mode === 'company_sourcing' ? contact.id : null,
       message_type:       channel === 'linkedin' ? 'linkedin_reply' : 'email_reply',
-      outreach_mode:      mode === 'investor_outreach' ? 'investor' : 'company_sourcing',
+      outreach_mode:      mode === 'investor_outreach' ? 'investor_outreach' : 'company_sourcing',
       channel,
       stage:              channel === 'linkedin' ? 'LinkedIn Reply' : 'Email Reply',
       message_text:       reply.body,
@@ -8866,58 +8870,82 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
 
     if (draftBody) {
       const replySubject = `Re: ${subject || originalEmail?.subject_used || originalEmail?.subject_a || 'our conversation'}`;
-      let sent = null;
-
-      // Send immediately — no approval gate, no sending window check
-      if (channel === 'email' && replyContact.email) {
-        sent = await sendEmailReply({
-          to:                 replyContact.email,
-          toName:             replyContact.name || '',
-          subject:            replySubject,
-          body:               draftBody,
-          replyToProviderId:  threadId || null,
-          accountId:          emailAccountId || null, // use same account inbound came from
+      const activeDealId = originalEmail?.deal_id || deal?.id || contact?.deal_id || null;
+      if (!contact?.id || !activeDealId) {
+        await sendTelegram(
+          `⚠ *Inbound reply matched no active deal for approval*\n\n` +
+          `From: ${fromName || fromEmail || 'Unknown contact'}\n` +
+          `Channel: ${channel}\n` +
+          `Intent: ${classification.intent}\n\n` +
+          `${truncateInline(bodyText, 280)}`
+        ).catch(() => {});
+        pushActivity({
+          type: 'warning',
+          action: `Inbound reply needs manual review: ${replyContact.name || fromName || fromEmail || 'Unknown'}`,
+          note: `No active deal/contact context resolved for ${channel} reply`,
+          dealId: activeDealId,
         });
-      } else if (channel === 'linkedin' && threadId) {
-        sent = await sendLinkedInReply({ chatId: threadId, message: draftBody });
+        return;
       }
 
-      // Log the sent reply to emails table
-      if (sb) {
-        await sb.from('emails').insert({
-          contact_id:         replyContact?.id || null,
-          deal_id:            originalEmail?.deal_id || deal?.id || contact?.deal_id || null,
-          stage:              'REPLY',
-          direction:          'outbound',
-          subject_a:          replySubject,
-          subject_used:       replySubject,
-          body:               draftBody,
-          status:             sent ? 'sent' : 'send_failed',
-          is_reply:           true,
-          reply_to_record_id: replyRecord?.id || null,
-          gmail_thread_id:    channel === 'email' ? (sent?.threadId || threadId || null) : null,
-          sent_at:            sent ? new Date().toISOString() : null,
-        }).catch(e => console.warn('[INBOUND] email log failed:', e.message));
+      const activeDeal = await getDeal(activeDealId).catch(() => null);
+      if (activeDeal && String(activeDeal.status || '').toUpperCase() !== 'ACTIVE') {
+        pushActivity({
+          type: 'system',
+          action: `Inbound reply ignored for inactive deal: ${replyContact.name || fromName}`,
+          note: `${channel} reply matched deal ${activeDeal.name || activeDealId}, but deal is ${activeDeal.status || 'inactive'}`,
+          dealId: activeDealId,
+        });
+        return;
       }
 
-      const sentOk = sent ? '✅ Sent instantly' : '⚠️ Send failed — check logs';
+      const { data: queued } = await sb?.from('approval_queue').insert({
+        deal_id:            activeDealId,
+        deal_name:          activeDeal?.name || deal?.name || null,
+        contact_id:         contact.id,
+        candidate_id:       contact.id,
+        contact_name:       contact.name || replyContact.name || fromName || '',
+        contact_email:      contact.email || replyContact.email || fromEmail || null,
+        firm:               contact.company_name || '',
+        message_type:       channel === 'linkedin' ? 'linkedin_reply' : 'email_reply',
+        outreach_mode:      'investor_outreach',
+        channel,
+        stage:              channel === 'linkedin' ? 'LinkedIn Reply' : 'Email Reply',
+        message_text:       draftBody,
+        body:               draftBody,
+        subject_a:          channel === 'email' ? replySubject : null,
+        reply_to_id:        threadId || null,
+        status:             'pending',
+      }).select().single() || { data: null };
+
+      if (queued?.id) {
+        await sendReplyForApproval(
+          queued.id,
+          contact,
+          draftBody,
+          activeDeal?.name || deal?.name || 'Unknown',
+          channel,
+          threadId,
+          emailAccountId
+        ).catch(() => {});
+      }
+
       await sendTelegram(
-        `💬 *Instant Reply ${sent ? 'Sent' : 'FAILED'}*\n\n` +
+        `💬 *Reply drafted for approval*\n\n` +
         `From: ${fromName || fromEmail || 'LinkedIn contact'}\n` +
         `Intent: ${classification.intent} | Channel: ${channel}\n\n` +
-        `---\n${draftBody.substring(0, 600)}\n---\n\n` +
-        sentOk +
+        `---\n${draftBody.substring(0, 600)}\n---` +
         (domNote ? `\n\n${domNote}` : '')
-      );
+      ).catch(() => {});
 
       pushActivity({
-        type: 'email',
-        action: `Reply sent to ${replyContact.name || fromName}`,
-        note: `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent} · ${sent ? 'Delivered' : 'Send failed'}`,
-        dealId: originalEmail?.deal_id || contact?.deal_id,
+        type: 'approval',
+        action: `Reply drafted for approval: ${replyContact.name || fromName}`,
+        note: `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent}`,
+        dealId: activeDealId,
       });
 
-      console.log(`[INBOUND/${channel.toUpperCase()}] Instant reply ${sent ? 'sent' : 'FAILED'} to ${replyContact.name || fromEmail}`);
+      console.log(`[INBOUND/${channel.toUpperCase()}] Reply queued for approval for ${replyContact.name || fromEmail}`);
     }
   } else if (classification.intent === 'NOT_INTERESTED') {
     // Conversation over — close it out
