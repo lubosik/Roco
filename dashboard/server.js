@@ -1398,6 +1398,16 @@ function hasActivePendingLinkedInInvite(contact) {
 async function countConfirmedLinkedInInvitesForDeals(sb, dealIds = []) {
   const ids = (dealIds || []).filter(Boolean);
   if (!sb || !ids.length) return 0;
+
+  try {
+    const { count, error } = await sb.from('outreach_events')
+      .select('id', { count: 'exact', head: true })
+      .in('deal_id', ids)
+      .eq('event_type', 'LINKEDIN_INVITE_SENT')
+      .eq('status', 'confirmed');
+    if (!error) return Number(count || 0);
+  } catch {}
+
   try {
     const { count, error } = await sb.from('activity_log')
       .select('id', { count: 'exact', head: true })
@@ -1406,8 +1416,16 @@ async function countConfirmedLinkedInInvitesForDeals(sb, dealIds = []) {
     if (error) return 0;
     return Number(count || 0);
   } catch {
-    return 0;
-  }
+  return 0;
+}
+
+async function listUnmatchedWebhookReceipts(limit = 100) {
+  const logs = await listRecentWebhookLogs(limit);
+  return logs.filter(row => {
+    const meta = row?.payload?.__roco_meta || {};
+    return meta.match_status === 'unmatched' || meta.match_status === 'ambiguous';
+  });
+}
 }
 
 function buildFirmCampaignSummary(contacts = [], enrichmentStatus = 'pending') {
