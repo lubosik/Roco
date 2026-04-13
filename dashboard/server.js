@@ -1852,10 +1852,13 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   const sb = getSupabase();
   if (!sb) return null;
 
+  // Only block re-queuing on active (not yet terminal) statuses.
+  // Terminal statuses (sent, skipped, failed, closed) allow re-queuing after a stage reset.
   const { data: existingRows } = await sb.from('approval_queue')
     .select('id, status')
     .eq('contact_id', contact.id)
     .eq('stage', 'LinkedIn DM')
+    .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
     .order('created_at', { ascending: false })
     .limit(1);
   if (existingRows?.length) {

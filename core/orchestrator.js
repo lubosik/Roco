@@ -5759,7 +5759,7 @@ async function phaseOutreach(deal, state) {
 
   const queueInviteAcceptedLinkedInDrafts = async () => {
     const { data: acceptedContacts } = await sb.from('contacts')
-      .select('id, name, company_name, linkedin_provider_id, email, last_email_sent_at, response_received, conversation_state, invite_accepted_at, investor_score, created_at')
+      .select('id, name, company_name, linkedin_provider_id, email, last_email_sent_at, response_received, conversation_state, invite_accepted_at, investor_score, created_at, unipile_chat_id, reply_channel')
       .eq('deal_id', deal.id)
       .eq('pipeline_stage', 'invite_accepted')
       .not('linkedin_provider_id', 'is', null)
@@ -5792,7 +5792,22 @@ async function phaseOutreach(deal, state) {
       }
 
       try {
-        await queueLinkedInDmApproval(contact.id, { reason: 'invite_accepted_backfill' });
+        if (contact.unipile_chat_id) {
+          // Prior chat already detected and stored — queue DM directly into existing chat
+          await queueLinkedInDmApproval(contact.id, { reason: 'invite_accepted_backfill' });
+        } else {
+          // No prior chat ID — run full acceptance flow which checks for prior chat history.
+          // Uses dynamic import to avoid circular dep at module load time.
+          const { handleLinkedInAcceptance } = await import('./unipileWebhooks.js');
+          await handleLinkedInAcceptance(
+            { ...contact, deal_id: deal.id },
+            deal,
+            pushActivity,
+            async (_params) => {
+              await queueLinkedInDmApproval(contact.id, { reason: 'invite_accepted_backfill' });
+            }
+          );
+        }
         if (hasFirm) linkedInFirmSlots.add(firm);
       } catch (err) {
         warn(`[OUTREACH] Failed to queue LinkedIn DM approval for ${contact.name || contact.id}: ${err.message}`);
