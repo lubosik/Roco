@@ -747,39 +747,36 @@ Maximum 10 results.`;
 
   if (!deal?.id) return [];
 
+  // Try Grok first (if key available)
   if (GROK_API_KEY) {
-    pushActivity?.({
-      type: 'research',
-      action: `Grok web search: finding active investors for ${deal.name}`,
-      note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
-      deal_id: deal.id,
-    });
     const result = await grokWebSearch(
       query,
       'You are a PE research analyst. Return only valid JSON and only genuinely relevant firms.',
       1200
-    );
+    ).catch(() => null);
     if (result) {
       try {
-        return await parseFirmResults(result, 'grok_web_search', 'Grok Web Research', 'Grok');
-      } catch (err) {
-        pushActivity?.({
-          type: 'error',
-          action: 'Grok search parse failed',
-          note: err.message?.slice(0, 80),
-          deal_id: deal.id,
-        });
+        const firms = await parseFirmResults(result, 'grok_web_search', 'Grok Web Research', 'Grok');
+        if (firms.length) {
+          pushActivity?.({
+            type: 'research',
+            action: `Grok web search found ${firms.length} investor lead${firms.length === 1 ? '' : 's'} for ${deal.name}`,
+            note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
+            deal_id: deal.id,
+          });
+        }
+        // Grok ran successfully — don't fall through to Claude even if 0 results
+        return firms;
+      } catch {
+        // parse error — fall through to Claude
       }
     }
+    // Grok returned nothing — fall through to Claude only if Grok had no result (not just empty JSON)
+    if (result !== null) return []; // Grok responded but found nothing — don't burn Claude credits
   }
 
+  // Claude web search (used when Grok key missing OR Grok call itself failed)
   try {
-    pushActivity?.({
-      type: 'research',
-      action: `Claude web search fallback: finding active investors for ${deal.name}`,
-      note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
-      deal_id: deal.id,
-    });
     const result = await claudeWebSearch(
       `${query}\nReturn only valid JSON.`,
       {
@@ -790,15 +787,18 @@ Maximum 10 results.`;
       }
     );
     if (!result) return [];
-    return await parseFirmResults(result, 'claude_web_search', 'Claude Web Research', 'Claude');
-  } catch (err) {
-    try {
+    const firms = await parseFirmResults(result, 'claude_web_search', 'Claude Web Research', 'Claude');
+    if (firms.length) {
       pushActivity?.({
         type: 'research',
-        action: `SerpApi fallback: finding active investors for ${deal.name}`,
-        note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
+        action: `Web search found ${firms.length} investor lead${firms.length === 1 ? '' : 's'} for ${deal.name}`,
+        note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
         deal_id: deal.id,
       });
+    }
+    return firms;
+  } catch (err) {
+    try {
       const serpResults = [];
       for (const queryVariant of [query, `${deal.name} investors ${deal.sector || ''} ${deal.target_geography || deal.geography || 'US'}`].filter(Boolean)) {
         const rows = await runSerpInvestorSearch(queryVariant, 5).catch(() => []);
@@ -808,14 +808,17 @@ Maximum 10 results.`;
 
       const summarized = await summarizeSerpInvestorResults(deal, ['serpapi_fallback'], serpResults, 'investor_batch');
       if (!summarized) return [];
-      return await parseFirmResults(summarized, 'serpapi_web_search', 'SerpApi Web Research', 'SerpApi');
-    } catch (serpErr) {
-      pushActivity?.({
-        type: 'error',
-        action: 'Investor web search fallback failed',
-        note: serpErr.message?.slice(0, 80) || err.message?.slice(0, 80),
-        deal_id: deal.id,
-      });
+      const firms = await parseFirmResults(summarized, 'serpapi_web_search', 'SerpApi Web Research', 'SerpApi');
+      if (firms.length) {
+        pushActivity?.({
+          type: 'research',
+          action: `SerpApi found ${firms.length} investor lead${firms.length === 1 ? '' : 's'} for ${deal.name}`,
+          note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
+          deal_id: deal.id,
+        });
+      }
+      return firms;
+    } catch {
       return [];
     }
   }

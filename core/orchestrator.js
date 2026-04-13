@@ -1747,6 +1747,9 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
   const pipelineGap = Math.max(0, pipelineTarget - Number(metrics.firms_in_pipeline || 0));
   if (pipelineGap <= 0) return;
 
+  // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
+  approvedBatchTopUpState.set(topUpKey, true);
+
   const existingNames = await getExcludedFirmNames(deal.id);
   const grokLeads = await searchInvestorsWithGrok(deal, existingNames, pushActivity).catch(() => []);
   if (!grokLeads.length) return;
@@ -1763,7 +1766,6 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   const result = await addNewsLeadsToBatch(deal, topUpLeads).catch(() => ({ added: 0 }));
   if (result.added > 0) {
-    approvedBatchTopUpState.set(topUpKey, true);
     pushActivity({
       type: 'research',
       action: 'Approved campaign top-up added fresh firms',
