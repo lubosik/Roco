@@ -4815,7 +4815,7 @@ function registerRoutes(app) {
         max_contacts_per_firm: parseInt(req.body.maxContactsPerFirm || 3),
         max_total_outreach:    parseInt(req.body.maxTotalOutreach || 200),
         send_from:        req.body.emailFrom  || req.body.sendFrom  || req.body.send_from  || '06:00',
-        send_until:       req.body.emailUntil || req.body.sendUntil || req.body.send_until || '08:00',
+        send_until:       req.body.emailUntil || req.body.sendUntil || req.body.send_until || '18:00',
         li_connect_from:  req.body.liConnectFrom  || null,
         li_connect_until: req.body.liConnectUntil || null,
         li_dm_from:       req.body.liDmFrom  || '20:00',
