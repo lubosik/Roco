@@ -2490,6 +2490,19 @@ export function initDashboard(state) {
 
       if (!fromEmail) return;
 
+      // Skip Drafts/Sent copies and MAILER-DAEMON bounces
+      const gmailRole    = String(payload?.role || '').toLowerCase();
+      const gmailFolders = (payload?.folders || []).map(f => String(f).toLowerCase());
+      if (gmailRole === 'drafts' || gmailRole === 'sent' || gmailFolders.includes('drafts') || gmailFolders.includes('[gmail]/sent mail')) {
+        console.log('[WEBHOOK/GMAIL] Ignoring own outbound copy (role:', gmailRole || gmailFolders.join(','), ')');
+        return;
+      }
+      const fromLowerGmail = fromEmail.toLowerCase();
+      if (fromLowerGmail.startsWith('mailer-daemon') || fromLowerGmail.startsWith('postmaster')) {
+        console.log('[WEBHOOK/GMAIL] Ignoring bounce/system email from:', fromEmail);
+        return;
+      }
+
       await queueInboundWithDebounce({
         fromEmail, fromName, bodyText, threadId, messageId, channel: 'email', raw: payload,
       });
@@ -2517,6 +2530,14 @@ export function initDashboard(state) {
       // Only process inbound emails (ignore sent/moved)
       if (eventType && eventType !== 'mail_received') return;
 
+      // Ignore Drafts/Sent folder events (our own outbound emails echo back via webhook)
+      const role    = String(payload?.role || '').toLowerCase();
+      const folders = (payload?.folders || []).map(f => String(f).toLowerCase());
+      if (role === 'drafts' || role === 'sent' || folders.includes('drafts') || folders.includes('sent items')) {
+        console.log('[WEBHOOK/OUTLOOK] Ignoring own outbound copy (role:', role || folders.join(','), ')');
+        return;
+      }
+
       const fromEmail = payload?.from_attendee?.identifier || payload?.from_email || '';
       const fromName  = payload?.from_attendee?.display_name || payload?.from_name || '';
       const subject   = payload?.subject || '';
@@ -2526,6 +2547,14 @@ export function initDashboard(state) {
 
       if (!fromEmail) {
         console.log('[WEBHOOK/OUTLOOK] No from_email in payload — skipping');
+        return;
+      }
+
+      // Skip MAILER-DAEMON bounces and our own email address
+      const { outlook: ownOutlookId } = getConfiguredUnipileAccountIds();
+      const fromLower = fromEmail.toLowerCase();
+      if (fromLower.startsWith('mailer-daemon') || fromLower.startsWith('microsoftexchange') || fromEmail === ownOutlookId) {
+        console.log('[WEBHOOK/OUTLOOK] Ignoring bounce/system email from:', fromEmail);
         return;
       }
 
