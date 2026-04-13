@@ -3532,20 +3532,28 @@ function registerRoutes(app) {
           try {
             // Look up contact email if not stored directly on the queue item
             let toEmail = queueItem.contact_email;
+            let contactRow = null;
             if (!toEmail) {
-              let contactRow = null;
               try {
-                const result = await sb.from('contacts').select('email, name').eq('id', queueItem.contact_id).single();
+                const result = await sb.from('contacts').select('email, name, deal_id, company_name').eq('id', queueItem.contact_id).single();
                 contactRow = result?.data || null;
               } catch {
                 contactRow = null;
               }
               toEmail = contactRow?.email;
+            } else {
+              try {
+                const result = await sb.from('contacts').select('email, name, deal_id, company_name').eq('id', queueItem.contact_id).single();
+                contactRow = result?.data || null;
+              } catch {
+                contactRow = null;
+              }
             }
             if (!toEmail) {
               return res.status(400).json({ error: 'No email address found for this contact — cannot send' });
             }
 
+            const queueDealId = queueItem.deal_id || contactRow?.deal_id || null;
             const chosenSubject = subjectChoice === 'b' ? queueItem.subject_b : (queueItem.subject_a || queueItem.subject || '');
             const finalSubject  = editedBody ? chosenSubject : (chosenSubject || '');
             const bodyToSend    = sanitizeApprovalText(editedBody || queueItem.edited_body || queueItem.body || '');
@@ -3554,13 +3562,48 @@ function registerRoutes(app) {
               updated_at: new Date().toISOString(),
             }).eq('id', queueItem.contact_id);
 
+            let deal = null;
+            if (queueDealId) {
+              try {
+                const { data } = await sb.from('deals').select('*').eq('id', queueDealId).single();
+                deal = data || null;
+              } catch {}
+            }
+
+            if (!sendNow && deal && !isWithinChannelWindow(deal, 'email')) {
+              await sb.from('approval_queue').update({
+                status: 'approved_waiting_for_window',
+                resolved_at: new Date().toISOString(),
+                approved_subject: finalSubject || null,
+                edited_body: bodyToSend || null,
+                deal_id: queueDealId,
+              }).eq('id', queueItem.id);
+              pushActivity({
+                type: 'email',
+                action: `Email approved: ${queueItem.contact_name || ''}`,
+                note: deal?.name
+                  ? `${queueItem.firm || contactRow?.company_name || ''} · Waiting for email window${getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : ''}`
+                  : 'Waiting for email window',
+                deal_name: deal?.name || null,
+                dealId: queueDealId,
+              });
+              notifyQueueUpdated();
+              return res.json({
+                success: true,
+                deferred: true,
+                message: getWindowStatus(deal).nextOpen
+                  ? `Email approved and waiting for the sending window (${getWindowStatus(deal).nextOpen})`
+                  : 'Email approved and waiting for the sending window',
+              });
+            }
+
             const sendResult = await sendEmail({
               to: toEmail,
               toName: queueItem.contact_name || '',
               subject: finalSubject,
               body: bodyToSend,
               trackingLabel: buildEmailTrackingLabel({
-                dealId: queueItem.deal_id || null,
+                dealId: queueDealId,
                 contactId: queueItem.contact_id || null,
                 stage: queueItem.stage || 'email',
               }),
@@ -3571,6 +3614,7 @@ function registerRoutes(app) {
                 status:           'sent',
                 sent_at:          new Date().toISOString(),
                 approved_subject: finalSubject,
+                deal_id:          queueDealId,
               }).eq('id', queueItem.id);
             } catch {}
 
@@ -3647,6 +3691,9 @@ function registerRoutes(app) {
               action: `Email sent: ${queueItem.contact_name || ''}`,
               note:   `${queueItem.firm || ''} · ${finalSubject}`,
             });
+            await sendTelegram(
+              `✅ *Email sent* → *${queueItem.contact_name || 'contact'}* (${queueItem.firm || contactRow?.company_name || 'unknown firm'})${finalSubject ? `\nSubject: _${sanitizeApprovalText(finalSubject)}_` : ''}`
+            ).catch(() => {});
             return res.json({ success: true, message: 'Email sent' });
           } catch (err) {
             console.error('[/api/approve] Email send error:', err.message);

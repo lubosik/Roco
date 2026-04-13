@@ -4,6 +4,8 @@ import { info, warn, error } from './core/logger.js';
 import {
   initTelegramBot,
   sendTelegram,
+  reloadPendingInvestorApprovals,
+  reloadPendingSourcingApprovals,
   startSupabaseApprovalPoller,
 } from './approval/telegramBot.js';
 import { initDashboard } from './dashboard/server.js';
@@ -78,6 +80,8 @@ async function main() {
   // 5. Start Telegram bot
   const bot = initTelegramBot(rocoState);
   startSupabaseApprovalPoller();
+  await reloadPendingInvestorApprovals().catch(() => {});
+  await reloadPendingSourcingApprovals().catch(() => {});
   info('Telegram bot initialised');
 
   // 6. Start dashboard + webhook server

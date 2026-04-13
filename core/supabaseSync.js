@@ -663,6 +663,7 @@ export async function addApprovalToQueue(data) {
       .from('approval_queue')
       .insert([{
         telegram_msg_id: data.telegramMsgId || null,
+        deal_id: data.dealId || null,
         contact_id: data.contactId || null,
         contact_name: data.contactName || '',
         contact_email: data.contactEmail || null,

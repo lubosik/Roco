@@ -262,6 +262,7 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       // Mirror to Supabase so the dashboard can see the queue
       addApprovalToQueue({
         telegramMsgId: sent.message_id,
+        dealId,
         contactId: contactPage?.id,
         contactName: name,
         contactEmail,
@@ -725,7 +726,10 @@ async function handleCallbackQuery(query) {
   const action = data.slice(0, colon);
   const msgId  = Number(data.slice(colon + 1));
 
-  const approval = pendingApprovals.get(msgId);
+  let approval = pendingApprovals.get(msgId);
+  if (!approval) {
+    approval = await reloadApprovalForTelegramMessage(msgId);
+  }
   if (!approval) {
     await bot.sendMessage(chatId, '⚠ This draft is no longer in the queue — it may have already been handled.');
     return;
@@ -2002,7 +2006,47 @@ async function executeReloadedApproval(item, decision) {
   }
 
   pushActivity({ type: 'email', action: `Email sent: ${item.contact_name || ''}`, note: `${item.firm || ''} · ${approvedSubject}` });
+  await sendTelegram(
+    `✅ *Email sent* → *${item.contact_name || 'contact'}* (${item.firm || 'unknown firm'})${approvedSubject ? `\nSubject: _${sanitizeApprovalText(approvedSubject)}_` : ''}`
+  ).catch(() => {});
   notifyQueueUpdated();
+}
+
+function buildReloadedApprovalEntry(item) {
+  return {
+    name: item.contact_name || 'Unknown',
+    firm: item.firm || '',
+    stage: item.stage || 'EMAIL',
+    isLinkedInDM: isLinkedInStageLabel(item.stage),
+    contactId: item.contact_id || null,
+    emailDraft: {
+      subject: item.subject_a || item.subject || null,
+      alternativeSubject: item.subject_b || null,
+      body: item.edited_body || item.body || '',
+    },
+    queuedAt: new Date().toISOString(),
+    queueId: item.id,
+    replayed: true,
+    resolve: async (decision) => executeReloadedApproval(item, decision),
+  };
+}
+
+async function reloadApprovalForTelegramMessage(msgId) {
+  const sb = getSupabase();
+  if (!sb || !msgId) return null;
+  try {
+    const { data: item } = await sb.from('approval_queue')
+      .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id')
+      .eq('status', 'pending')
+      .eq('telegram_msg_id', msgId)
+      .maybeSingle();
+    if (!item || item.outreach_mode === 'company_sourcing') return null;
+    const entry = buildReloadedApprovalEntry(item);
+    pendingApprovals.set(msgId, entry);
+    return entry;
+  } catch {
+    return null;
+  }
 }
 
 export async function reloadPendingInvestorApprovals() {
@@ -2054,20 +2098,12 @@ export async function reloadPendingInvestorApprovals() {
       }).catch(() => {});
 
       pendingApprovals.set(sent.message_id, {
-        name: item.contact_name || 'Unknown',
-        firm: item.firm || '',
-        stage: item.stage || 'EMAIL',
-        isLinkedInDM: isLinkedInStageLabel(item.stage),
-        contactId: item.contact_id || null,
+        ...buildReloadedApprovalEntry(item),
         emailDraft: {
           subject: item.subject_a || item.subject || null,
           alternativeSubject: item.subject_b || null,
           body: item.body || '',
         },
-        queuedAt: new Date().toISOString(),
-        queueId: item.id,
-        replayed: true,
-        resolve: async (decision) => executeReloadedApproval(item, decision),
       });
       await new Promise(r => setTimeout(r, 400));
     } catch (err) {

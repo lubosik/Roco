@@ -5838,7 +5838,7 @@ async function phaseOutreach(deal, state) {
 
     const { data: approvedEmails } = await sb.from('approval_queue')
       .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
-      .eq('deal_id', deal.id)
+      .or(`deal_id.eq.${deal.id},deal_id.is.null`)
       .in('status', ['approved', 'approved_waiting_for_window'])
       .order('resolved_at', { ascending: true })
       .limit(10);
@@ -5872,6 +5872,7 @@ async function phaseOutreach(deal, state) {
           .select('*')
           .eq('id', item.contact_id)
           .maybeSingle();
+        if (!contact || String(contact.deal_id || '') !== String(deal.id)) continue;
         if (!contact?.email) throw new Error('Queued email has no usable recipient');
 
         const subject = item.approved_subject || item.subject_a || item.subject || '';
@@ -5900,6 +5901,7 @@ async function phaseOutreach(deal, state) {
           status: 'sent',
           sent_at: new Date().toISOString(),
           approved_subject: subject || null,
+          deal_id: item.deal_id || deal.id,
         }).eq('id', item.id);
 
         await sb.from('contacts').update({
