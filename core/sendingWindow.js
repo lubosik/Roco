@@ -73,6 +73,12 @@ function dayNameIn(timezone) {
   return new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(now).toLowerCase();
 }
 
+export function isActiveOutreachDay(deal) {
+  const tz = deal?.timezone || DEFAULTS.timezone;
+  const dayName = dayNameIn(tz);
+  return resolveActiveDays(deal).includes(dayName);
+}
+
 /**
  * Is now within the email + LinkedIn DM sending window?
  *
