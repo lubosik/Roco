@@ -1395,6 +1395,21 @@ function hasActivePendingLinkedInInvite(contact) {
   return true;
 }
 
+async function countConfirmedLinkedInInvitesForDeals(sb, dealIds = []) {
+  const ids = (dealIds || []).filter(Boolean);
+  if (!sb || !ids.length) return 0;
+  try {
+    const { count, error } = await sb.from('activity_log')
+      .select('id', { count: 'exact', head: true })
+      .in('deal_id', ids)
+      .eq('event_type', 'LINKEDIN_INVITE_SENT');
+    if (error) return 0;
+    return Number(count || 0);
+  } catch {
+    return 0;
+  }
+}
+
 function buildFirmCampaignSummary(contacts = [], enrichmentStatus = 'pending') {
   const archivedStages = new Set(['Archived', 'Deleted — Do Not Contact', 'Suppressed — Opt Out', 'Inactive']);
   const repliedStages = new Set(['Replied', 'In Conversation', 'Meeting Booked']);
@@ -3918,7 +3933,7 @@ function registerRoutes(app) {
             .select('pipeline_stage, invite_sent_at, invite_accepted_at, outreach_channel')
             .in('deal_id', safeAllActiveIds);
           const contacts = linkedinContacts || [];
-          stats.li_invites_sent = contacts.filter(hasLinkedInInviteHistory).length;
+          stats.li_invites_sent = await countConfirmedLinkedInInvitesForDeals(sb, safeAllActiveIds);
           stats.li_active_pending = contacts.filter(hasActivePendingLinkedInInvite).length;
           const liAccepted = contacts.filter(hasLinkedInAccepted).length;
           stats.li_acceptance_rate = stats.li_invites_sent > 0
@@ -5384,11 +5399,13 @@ function registerRoutes(app) {
         { data: emailRows },
         { count: emailRepliesCount },
         { count: firmsCount },
+        confirmedInvites,
       ] = await Promise.all([
-        sb.from('contacts').select('pipeline_stage, invite_sent_at, outreach_channel').eq('deal_id', req.params.id),
+        sb.from('contacts').select('pipeline_stage, invite_sent_at, invite_accepted_at, outreach_channel').eq('deal_id', req.params.id),
         sb.from('emails').select('id, metadata').eq('deal_id', req.params.id).eq('status', 'sent'),
         sb.from('replies').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
         sb.from('batch_firms').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
+        countConfirmedLinkedInInvitesForDeals(sb, [req.params.id]),
       ]);
       const all = contacts || [];
       const outboundEmails = emailRows || [];
@@ -5397,7 +5414,7 @@ function registerRoutes(app) {
       const emailReplies    = emailRepliesCount || 0;
       const emailsOpened    = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.opens_count || 0) > 0 ? 1 : 0), 0);
       const emailsClicked   = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.clicks_count || 0) > 0 ? 1 : 0), 0);
-      const invitesSent     = all.filter(hasLinkedInInviteHistory).length;
+      const invitesSent     = Number(confirmedInvites || 0);
       const activePendingInvites = all.filter(hasActivePendingLinkedInInvite).length;
       const invitesAccepted = all.filter(hasLinkedInAccepted).length;
       const dmsSent         = all.filter(c => ['DM Approved','DM Sent','dm_sent','Replied','In Conversation','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
