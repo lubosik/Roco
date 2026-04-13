@@ -2,7 +2,8 @@
 // Sending window helpers — all respect deal-level overrides, defaulting to Dom's preferred times.
 //
 // Defaults (Dom's preferences, EST):
-//   Email + LinkedIn DMs : 6am–8am  OR  8pm–11pm  (active deal days)
+//   Email                : 6am–6pm   (active deal days)
+//   LinkedIn DMs         : 8pm–11pm  (active deal days)
 //   LinkedIn connections  : anytime
 //   Research + enrichment: anytime
 //
@@ -13,8 +14,8 @@
 //   timezone                        — defaults to 'America/New_York'
 
 const DEFAULTS = {
-  morningStart:  6,
-  morningEnd:    8,
+  emailStart:    6,
+  emailEnd:      18,
   eveningStart:  20,
   eveningEnd:    23,
   timezone:      'America/New_York',
@@ -73,12 +74,17 @@ function dayNameIn(timezone) {
   return new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(now).toLowerCase();
 }
 
+export function isActiveOutreachDay(deal) {
+  const tz = deal?.timezone || DEFAULTS.timezone;
+  const dayName = dayNameIn(tz);
+  return resolveActiveDays(deal).includes(dayName);
+}
+
 /**
- * Is now within the email + LinkedIn DM sending window?
+ * Is now within the email sending window?
  *
- * Two windows (on the deal's active days):
- *   Morning : send_from  → send_until   (default 6–8am)
- *   Evening : li_dm_from → li_dm_until  (default 8–11pm)
+ * One daytime window (on the deal's active days):
+ *   Email : send_from → send_until (default 6am–6pm)
  *
  * Pass a deal object to use deal-level overrides.
  */
@@ -88,16 +94,12 @@ export function isWithinEmailWindow(deal) {
   const dayName = dayNameIn(tz);
   const activeDays = resolveActiveDays(deal);
 
-  const morningStart = parseHour(deal?.send_from)    ?? DEFAULTS.morningStart;
-  const morningEnd   = parseHour(deal?.send_until)   ?? DEFAULTS.morningEnd;
-  const eveningStart = parseHour(deal?.li_dm_from)   ?? DEFAULTS.eveningStart;
-  const eveningEnd   = parseHour(deal?.li_dm_until)  ?? DEFAULTS.eveningEnd;
+  const emailStart = parseHour(deal?.send_from)    ?? DEFAULTS.emailStart;
+  const emailEnd   = parseHour(deal?.send_until)   ?? DEFAULTS.emailEnd;
 
-  const inMorning = hour >= morningStart && hour < morningEnd;
-  const inEvening = hour >= eveningStart && hour < eveningEnd;
-  const within = activeDays.includes(dayName) && (inMorning || inEvening);
+  const within = activeDays.includes(dayName) && hour >= emailStart && hour < emailEnd;
 
-  console.log(`[SENDING WINDOW] ${hour}:xx ${tz} day=${dayName} → email ${within ? 'WITHIN' : 'OUTSIDE'} (${morningStart}-${morningEnd} or ${eveningStart}-${eveningEnd})`);
+  console.log(`[SENDING WINDOW] ${hour}:xx ${tz} day=${dayName} → email ${within ? 'WITHIN' : 'OUTSIDE'} (${emailStart}-${emailEnd})`);
   return within;
 }
 
@@ -131,10 +133,8 @@ export function describeNextEmailWindow(deal) {
   const hour = currentHourIn(tz);
   const activeDays = resolveActiveDays(deal);
 
-  const morningStart = parseHour(deal?.send_from)  ?? DEFAULTS.morningStart;
-  const morningEnd   = parseHour(deal?.send_until) ?? DEFAULTS.morningEnd;
-  const eveningStart = parseHour(deal?.li_dm_from) ?? DEFAULTS.eveningStart;
-  const eveningEnd   = parseHour(deal?.li_dm_until)?? DEFAULTS.eveningEnd;
+  const emailStart = parseHour(deal?.send_from)  ?? DEFAULTS.emailStart;
+  const emailEnd   = parseHour(deal?.send_until) ?? DEFAULTS.emailEnd;
   const tzLabel      = tz === 'America/New_York' ? 'EST' : tz;
   const now = new Date();
 
@@ -144,17 +144,15 @@ export function describeNextEmailWindow(deal) {
     if (!activeDays.includes(dayName)) continue;
 
     if (daysAhead === 0) {
-      if (hour < morningStart) return `today ${morningStart}am ${tzLabel}`;
-      if (hour < morningEnd)   return `now (morning window open, ${morningStart}-${morningEnd}am)`;
-      if (hour < eveningStart) return `tonight ${eveningStart === 20 ? '8pm' : eveningStart + ':00'} ${tzLabel}`;
-      if (hour < eveningEnd)   return `now (evening window open, ${eveningStart}-${eveningEnd})`;
+      if (hour < emailStart) return `today ${emailStart}am ${tzLabel}`;
+      if (hour < emailEnd)   return `now (email window open, ${emailStart}-${emailEnd})`;
       continue;
     }
 
     const dayLabel = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(candidate);
-    if (daysAhead === 1) return `tomorrow ${morningStart}am ${tzLabel}`;
-    return `${dayLabel} ${morningStart}am ${tzLabel}`;
+    if (daysAhead === 1) return `tomorrow ${emailStart}am ${tzLabel}`;
+    return `${dayLabel} ${emailStart}am ${tzLabel}`;
   }
 
-  return `${morningStart}am ${tzLabel}`;
+  return `${emailStart}am ${tzLabel}`;
 }

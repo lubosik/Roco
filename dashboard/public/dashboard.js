@@ -171,7 +171,7 @@ function navigate(hash) {
    API HELPER
    ═══════════════════════════════════════════════════════════════════════════ */
 
-async function api(path, method = 'GET', body = null) {
+async function api(path, method = 'GET', body = null, options = {}) {
   const opts = {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -189,7 +189,7 @@ async function api(path, method = 'GET', body = null) {
     return res.text();
   } catch (err) {
     console.error(`[ROCO] API error ${method} ${path}:`, err);
-    showApiAlert(err.message);
+    if (!options.silent) showApiAlert(err.message);
     throw err;
   }
 }
@@ -364,7 +364,7 @@ function startClock() {
 
 async function loadState() {
   try {
-    const state = await api('/api/state');
+    const state = await api('/api/state', 'GET', null, { silent: true });
     applyState(state);
     await populateDealSelector();
   } catch { /* already shown alert */ }
@@ -485,12 +485,12 @@ function onDealSelectorChange(id) {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function loadOverview() {
-  await Promise.all([refreshStats(), loadActivityLog(true)]);
+  await Promise.all([refreshStats(), loadActivityLog(true), loadOpsAlerts()]);
 }
 
 async function refreshStats() {
   try {
-    const stats = await api('/api/stats');
+    const stats = await api('/api/stats', 'GET', null, { silent: true });
     applyStats(stats);
   } catch { /* silent */ }
 }
@@ -545,7 +545,7 @@ const HEALTH_FAIL_THRESHOLD = 3; // only show error after 3 consecutive failures
 
 async function refreshHealth() {
   try {
-    const h = await api('/api/health');
+    const h = await api('/api/health', 'GET', null, { silent: true });
     healthCheckFailures = 0;
     applyHealth(h);
   } catch (err) {
@@ -582,12 +582,60 @@ function applyHealth(h) {
   });
 }
 
+async function loadOpsAlerts() {
+  try {
+    const data = await api('/api/ops/alerts', 'GET', null, { silent: true });
+    renderOpsAlerts(data || {});
+  } catch {
+    renderOpsAlerts({ webhook_issues: [], provider_limit_pauses: [] });
+  }
+}
+
+function renderOpsAlerts(data = {}) {
+  const webhookEl = document.getElementById('ops-unmatched-webhooks');
+  const pauseEl = document.getElementById('ops-provider-pauses');
+  if (webhookEl) {
+    const rows = Array.isArray(data.webhook_issues) ? data.webhook_issues : [];
+    webhookEl.innerHTML = rows.length
+      ? rows.map(item => {
+          const who = stringifyOpsValue(
+            item?.payload?.data?.user_full_name
+            || item?.payload?.data?.sender?.attendee_name
+            || item?.payload?.user_full_name
+            || item?.payload?.sender?.attendee_name
+            || item?.note
+            || 'Unknown sender'
+          );
+          return `<div style="padding:8px 0;border-top:1px solid rgba(255,255,255,0.05)">
+            <div style="font-size:11px;color:#EDE9E3">${esc(who)}</div>
+            <div style="font-size:10px;color:#8A8680;font-family:'DM Mono',monospace">${esc(item.match_status || item.event_type || 'unmatched')} · ${esc(formatTime(item.received_at))}</div>
+          </div>`;
+        }).join('')
+      : '<div style="color:#8A8680">No unmatched webhook receipts.</div>';
+  }
+  if (pauseEl) {
+    const rows = Array.isArray(data.provider_limit_pauses) ? data.provider_limit_pauses : [];
+    pauseEl.innerHTML = rows.length
+      ? rows.map(item => `<div style="padding:8px 0;border-top:1px solid rgba(255,255,255,0.05)">
+          <div style="font-size:11px;color:#EDE9E3">${esc(item.contact_name || 'Unknown contact')}${item.company_name ? ` · ${esc(item.company_name)}` : ''}</div>
+          <div style="font-size:10px;color:#8A8680;font-family:'DM Mono',monospace">retry ${esc(String(item.retry_count || 0))} · until ${esc(formatScheduleDate(item.blocked_until))}${item.deal_name ? ` · ${esc(item.deal_name)}` : ''}</div>
+        </div>`).join('')
+      : '<div style="color:#8A8680">No active provider-limit pauses.</div>';
+  }
+}
+
+function stringifyOpsValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
 async function loadActivityLog(renderToOverview = true) {
   try {
     // Use /api/activity/recent for overview widget (fast, no pagination)
-    const data = await api('/api/activity/recent').catch(async () => {
+    const data = await api('/api/activity/recent', 'GET', null, { silent: true }).catch(async () => {
       // Fallback to legacy endpoint if recent isn't available yet
-      const d = await api('/api/activity/log');
+      const d = await api('/api/activity/log', 'GET', null, { silent: true });
       return Array.isArray(d) ? d : (d.log || d.items || []);
     });
     const items = Array.isArray(data) ? data : (data.log || data.items || []);
@@ -4276,23 +4324,28 @@ async function loadDealTabSettings(id) {
 
       </div>
 
-      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Sending Windows</h3>
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email + LinkedIn DMs send in these two daily windows on the deal's selected active days. Connections send anytime.</div>
+      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px">Email Sending Window</h3>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Email sends during this daytime window on the deal's selected active days.</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">
         <div class="form-group">
-          <label class="form-label">Morning window — start</label>
+          <label class="form-label">Email: from</label>
           <input type="time" class="form-input" id="ds-send-from" value="${esc(deal.send_from || '06:00')}" />
         </div>
         <div class="form-group">
-          <label class="form-label">Morning window — end</label>
-          <input type="time" class="form-input" id="ds-send-until" value="${esc(deal.send_until || '08:00')}" />
+          <label class="form-label">Email: until</label>
+          <input type="time" class="form-input" id="ds-send-until" value="${esc(deal.send_until || '18:00')}" />
         </div>
+      </div>
+
+      <h3 style="font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 4px;margin-top:8px">LinkedIn DM Window</h3>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">LinkedIn DMs send in this separate window on the deal's selected active days.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">
         <div class="form-group">
-          <label class="form-label">Evening window — start</label>
+          <label class="form-label">LinkedIn DM: from</label>
           <input type="time" class="form-input" id="ds-li-dm-from" value="${esc(deal.li_dm_from || '20:00')}" />
         </div>
         <div class="form-group">
-          <label class="form-label">Evening window — end</label>
+          <label class="form-label">LinkedIn DM: until</label>
           <input type="time" class="form-input" id="ds-li-dm-until" value="${esc(deal.li_dm_until || '23:00')}" />
         </div>
       </div>
@@ -4571,7 +4624,7 @@ async function saveDealSettings(id) {
     committed_amount:      committedVal ? Number(committedVal) : null,
     currency:              document.getElementById('ds-currency')?.value || 'USD',
     send_from:             document.getElementById('ds-send-from')?.value    || '06:00',
-    send_until:            document.getElementById('ds-send-until')?.value   || '08:00',
+    send_until:            document.getElementById('ds-send-until')?.value   || '18:00',
     li_dm_from:            document.getElementById('ds-li-dm-from')?.value   || '20:00',
     li_dm_until:           document.getElementById('ds-li-dm-until')?.value  || '23:00',
     li_connect_from:       document.getElementById('ds-li-connect-from')?.value  || null,
@@ -5505,7 +5558,7 @@ async function loadActivity(page = 1) {
     const params = new URLSearchParams({ page });
     if (dealId) params.set('deal_id', dealId);
 
-    const data = await api(`/api/activity?${params}`);
+    const data = await api(`/api/activity?${params}`, 'GET', null, { silent: true });
 
     // New paginated format
     if (data && typeof data === 'object' && 'events' in data) {
@@ -5542,6 +5595,30 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', email_opened: '👁️', email_clicked: '🔗', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
   };
 
+  function stringifyActivityField(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (typeof value === 'object') {
+      const preferred = [
+        value.reason,
+        value.error,
+        value.message,
+        value.linkedin_url,
+        value.provider_id,
+        value.public_id,
+        value.source,
+      ].filter(Boolean);
+      if (preferred.length) return preferred.join(' · ');
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return '';
+      }
+    }
+    return String(value);
+  }
+
   const eventsHtml = (events || []).map(event => {
     const badge = getActivityBadgeMeta(event);
     const type  = badge.className;
@@ -5555,8 +5632,8 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     });
     const mainText = isExpandedType && event.full_content
       ? event.full_content
-      : (event.action || event.summary || '');
-    const note  = event.note || event.detail || '';
+      : stringifyActivityField(event.action || event.summary || '');
+    const note  = stringifyActivityField(event.note || event.detail || '');
 
     return `<div style="padding:10px 14px;background:rgba(${color === '#A78BFA' ? '167,139,250' : '138,134,128'},0.06);
                         border-left:3px solid ${color};border-radius:0 4px 4px 0;margin-bottom:5px">

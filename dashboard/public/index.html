@@ -213,6 +213,23 @@
             <div class="feed-empty">No recent activity</div>
           </div>
         </div>
+
+        <div class="card mt-24">
+          <div class="card-header">
+            <h2 class="card-title">Operational Alerts</h2>
+            <button class="btn btn-ghost btn-sm" onclick="loadOpsAlerts()">&#8635;</button>
+          </div>
+          <div id="ops-alerts-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;padding:0 24px 24px">
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(201,168,76,0.14);border-radius:10px;padding:14px 16px">
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8A8680;font-family:'DM Mono',monospace;margin-bottom:10px">Unmatched Webhooks</div>
+              <div id="ops-unmatched-webhooks" style="color:#8A8680;font-size:12px">Loading…</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(201,168,76,0.14);border-radius:10px;padding:14px 16px">
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8A8680;font-family:'DM Mono',monospace;margin-bottom:10px">Invite Provider Pauses</div>
+              <div id="ops-provider-pauses" style="color:#8A8680;font-size:12px">Loading…</div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ══════════════════════════════════ LAUNCH DEAL ══════════════════════════════════ -->

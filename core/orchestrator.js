@@ -18,7 +18,7 @@ import {
   draftTempCloseFollowUp,
 } from './conversationManager.js';
 import { isWithinSendingWindow, isGloballyPaused, getNextWindowOpen, isWithinChannelWindow } from './scheduleChecker.js';
-import { isWithinEmailWindow, describeNextEmailWindow } from './sendingWindow.js';
+import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } from './sendingWindow.js';
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithKaspr } from '../enrichment/kaspEnricher.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
@@ -182,6 +182,15 @@ function normalizeLinkedInIdentity(url) {
   } catch {
     return raw.toLowerCase();
   }
+}
+
+const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
+
+function hasRecentLinkedInNoMatchSuppression(notes, hours = 12) {
+  const match = String(notes || '').match(LINKEDIN_NO_MATCH_NOTE_PATTERN);
+  if (!match?.[1]) return false;
+  const checkedAt = new Date(match[1]).getTime();
+  return Number.isFinite(checkedAt) && (Date.now() - checkedAt) < (hours * 60 * 60 * 1000);
 }
 
 function buildContactIdentityKey(contact, firmName = '') {
@@ -3841,8 +3850,8 @@ async function runApprovedOutreach(deal, batch, state, directives = null) {
   }
 
   const globallyPaused = state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until);
-  const inEmailWindow = isWithinEmailWindow(deal) && !globallyPaused;
-  if (inEmailWindow) {
+  const onActiveOutreachDay = isActiveOutreachDay(deal) && !globallyPaused;
+  if (onActiveOutreachDay) {
     if (directives?.allowOutreach !== false && state.outreach_enabled !== false) await phaseOutreach(deal, state);
     if (directives?.allowFollowUps !== false && state.followup_enabled !== false) {
       await phaseFollowUps(deal, state);
@@ -4747,7 +4756,7 @@ async function enrichSingleContact(sb, contact, deal, state) {
       if (linkedinUrl && !contact.linkedin_provider_id && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
         linkedinUrl = null;
       }
-      if (!linkedinUrl && state.linkedin_enabled !== false) {
+      if (!linkedinUrl && state.linkedin_enabled !== false && !hasRecentLinkedInNoMatchSuppression(contact.notes)) {
         linkedinUrl = await findLinkedInUrl({
           name: contact.name,
           company: contact.company_name,
@@ -4962,6 +4971,9 @@ export async function phaseEnrich(deal, state) {
 
     for (const contact of (needLinkedIn || [])) {
       try {
+        if (hasRecentLinkedInNoMatchSuppression(contact.notes)) {
+          continue;
+        }
         const url = await findLinkedInUrl({ name: contact.name, company: contact.company_name, title: contact.job_title });
         if (url) {
           await sb.from('contacts').update({ linkedin_url: url }).eq('id', contact.id);
@@ -5054,7 +5066,7 @@ export async function runManualEnrich(deal, state) {
       if (linkedinUrl && !contact.linkedin_provider_id && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
         linkedinUrl = null;
       }
-      if (!linkedinUrl && state.linkedin_enabled !== false) {
+      if (!linkedinUrl && state.linkedin_enabled !== false && !hasRecentLinkedInNoMatchSuppression(contact.notes)) {
         linkedinUrl = await findLinkedInUrl({ name: contact.name, company: contact.company_name, title: contact.job_title });
         if (linkedinUrl) await sb.from('contacts').update({ linkedin_url: linkedinUrl }).eq('id', contact.id);
       }
@@ -5559,6 +5571,8 @@ async function phaseLinkedInInvites(deal, state) {
             warn(`[${deal.name}] Provider-limit email fallback queue failed for ${contact.name}: ${err.message}`);
           });
         }
+      } else if (outcome.status === 'suppressed_no_match') {
+        info(`[${deal.name}] ${contact.name} invite retry suppressed after recent LinkedIn mismatch until ${outcome.retryAt || 'later'}`);
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
       }

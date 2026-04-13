@@ -165,6 +165,26 @@ create table if not exists activity_log (
   created_at timestamptz default now()
 );
 
+create table if not exists outreach_events (
+  id uuid primary key default gen_random_uuid(),
+  deal_id uuid references deals(id),
+  contact_id uuid references contacts(id),
+  event_type text not null,
+  channel text,
+  status text not null default 'confirmed',
+  provider text,
+  provider_message_id text,
+  provider_account_id text,
+  metadata jsonb default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+create unique index if not exists outreach_events_dedupe_idx on outreach_events (
+  event_type,
+  contact_id,
+  provider_message_id,
+  created_at
+);
+
 -- ─── FIRM_SUPPRESSIONS ────────────────────────────────────────────────────────
 create table if not exists firm_suppressions (
   id uuid primary key default gen_random_uuid(),
@@ -383,6 +403,7 @@ alter table deals enable row level security;
 alter table contacts enable row level security;
 alter table emails enable row level security;
 alter table activity_log enable row level security;
+alter table outreach_events enable row level security;
 alter table email_templates enable row level security;
 alter table sessions enable row level security;
 alter table batches enable row level security;
@@ -405,6 +426,8 @@ create policy "service_role_all" on deals for all using (true);
 create policy "service_role_all" on contacts for all using (true);
 create policy "service_role_all" on emails for all using (true);
 create policy "service_role_all" on activity_log for all using (true);
+drop policy if exists "service_role_all" on outreach_events;
+create policy "service_role_all" on outreach_events for all using (true);
 create policy "service_role_all" on email_templates for all using (true);
 create policy "service_role_all" on sessions for all using (true);
 create policy "service_role_all" on batches for all using (true);

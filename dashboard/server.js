@@ -651,7 +651,23 @@ async function processUnipileMessageEvent(event) {
       if (!contact?.id) return null;
       return queueLinkedInDmApproval(contact.id, { reason });
     };
-    await handleLiRelation(event, pushActivity, queueForApproval);
+    const relationResult = await handleLiRelation(event, pushActivity, queueForApproval);
+    if (relationResult?.matchStatus && relationResult.matchStatus !== 'matched') {
+      await insertWebhookLogRecord({
+        event_type: eventType,
+        payload: {
+          ...(event || {}),
+          __roco_meta: {
+            ...((event && event.__roco_meta) || {}),
+            source: 'unipile_messages',
+            match_status: relationResult.matchStatus,
+            match_note: relationResult?.contactId
+              ? `contact ${relationResult.contactId}`
+              : 'acceptance webhook did not match an active contact',
+          },
+        },
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -1491,11 +1507,7 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
   const contacts = contactsData || [];
   const emails = emailsData || [];
   const replies = repliesData || [];
-  const sentEventCoverage = Object.fromEntries(ids.map(id => [id, {
-    email: false,
-    invite: false,
-    dm: false,
-  }]));
+  const sentEventCoverage = Object.fromEntries(ids.map(id => [id, { email: false, invite: false, dm: false }]));
   const seenEmailReplies = new Set();
   const seenLinkedInReplies = new Set();
 
@@ -1569,6 +1581,68 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
   }
 
   return metricsByDeal;
+}
+
+async function countConfirmedLinkedInInvitesForDeals(sb, dealIds = []) {
+  const ids = (dealIds || []).filter(Boolean);
+  if (!sb || !ids.length) return 0;
+
+  try {
+    const { count, error } = await sb.from('outreach_events')
+      .select('id', { count: 'exact', head: true })
+      .in('deal_id', ids)
+      .eq('event_type', 'LINKEDIN_INVITE_SENT')
+      .eq('status', 'confirmed');
+    if (!error) return Number(count || 0);
+  } catch {}
+
+  try {
+    const { count, error } = await sb.from('activity_log')
+      .select('id', { count: 'exact', head: true })
+      .in('deal_id', ids)
+      .eq('event_type', 'LINKEDIN_INVITE_SENT');
+    if (error) return 0;
+    return Number(count || 0);
+  } catch {
+  return 0;
+}
+
+async function listUnmatchedWebhookReceipts(limit = 100) {
+  const logs = await listRecentWebhookLogs(limit);
+  return logs.filter(row => {
+    const meta = row?.payload?.__roco_meta || {};
+    return meta.match_status === 'unmatched' || meta.match_status === 'ambiguous';
+  });
+}
+
+async function listLinkedInProviderLimitPauses(limit = 100) {
+  const sb = getSupabase();
+  if (!sb) return [];
+  try {
+    const { data } = await sb.from('contacts')
+      .select('id, deal_id, name, company_name, notes, follow_up_due_at, deals!contacts_deal_id_fkey(name)')
+      .not('notes', 'is', null)
+      .order('follow_up_due_at', { ascending: true })
+      .limit(limit);
+
+    return (data || []).map(row => {
+      const match = String(row?.notes || '').match(/\[LI_INVITE_LIMIT:count=(\d+)\|blocked_until=([^|\]]+)(?:\|notified_at=([^\]]+))?\]/i);
+      if (!match) return null;
+      return {
+        id: row.id,
+        deal_id: row.deal_id || null,
+        deal_name: row.deals?.name || null,
+        contact_name: row.name || 'Unknown contact',
+        company_name: row.company_name || null,
+        retry_count: Number(match[1] || 0),
+        blocked_until: match[2] || row.follow_up_due_at || null,
+        notified_at: match[3] || null,
+      };
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 }
 
 function buildFirmCampaignSummary(contacts = [], enrichmentStatus = 'pending') {
@@ -3286,6 +3360,29 @@ function registerRoutes(app) {
     }
   });
 
+  app.get('/api/ops/alerts', requireAuth, async (req, res) => {
+    try {
+      const [webhookIssues, providerLimitPauses] = await Promise.all([
+        listUnmatchedWebhookReceipts(100),
+        listLinkedInProviderLimitPauses(100),
+      ]);
+
+      res.json({
+        webhook_issues: webhookIssues.slice(0, 12).map(row => ({
+          event_type: row.event_type || 'unknown',
+          received_at: row.received_at || row.created_at || null,
+          source: row?.payload?.__roco_meta?.source || null,
+          match_status: row?.payload?.__roco_meta?.match_status || null,
+          note: row?.payload?.__roco_meta?.match_note || null,
+          payload: row.payload || {},
+        })),
+        provider_limit_pauses: providerLimitPauses.slice(0, 12),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/pipeline — active pipeline contacts from Supabase, filtered by deal
   app.get('/api/pipeline', async (req, res) => {
     try {
@@ -4029,7 +4126,6 @@ function registerRoutes(app) {
         let activeDealIds = [];     // non-paused (for orchestrator-relevant stats)
         let allActiveDealIds = [];  // all active incl. paused (for counting totals)
         let allDealsData  = [];
-        let channelMetricsByDeal = {};
         try {
           const { data: allDeals } = await sb.from('deals').select('id, name, committed_amount, target_amount, status, paused');
           allDealsData      = allDeals || [];
@@ -4040,7 +4136,7 @@ function registerRoutes(app) {
         const safeAllActiveIds = allActiveDealIds.length > 0 ? allActiveDealIds : ['00000000-0000-0000-0000-000000000000'];
 
         try {
-          channelMetricsByDeal = await computeDealChannelMetrics(sb, safeAllActiveIds);
+          const channelMetricsByDeal = await computeDealChannelMetrics(sb, safeAllActiveIds);
           const totals = Object.values(channelMetricsByDeal).reduce((acc, metrics) => {
             acc.emails_sent += metrics.emails_sent || 0;
             acc.emails_replied += metrics.emails_replied || 0;
@@ -4882,7 +4978,7 @@ function registerRoutes(app) {
         max_contacts_per_firm: parseInt(req.body.maxContactsPerFirm || 3),
         max_total_outreach:    parseInt(req.body.maxTotalOutreach || 200),
         send_from:        req.body.emailFrom  || req.body.sendFrom  || req.body.send_from  || '06:00',
-        send_until:       req.body.emailUntil || req.body.sendUntil || req.body.send_until || '08:00',
+        send_until:       req.body.emailUntil || req.body.sendUntil || req.body.send_until || '18:00',
         li_connect_from:  req.body.liConnectFrom  || null,
         li_connect_until: req.body.liConnectUntil || null,
         li_dm_from:       req.body.liDmFrom  || '20:00',

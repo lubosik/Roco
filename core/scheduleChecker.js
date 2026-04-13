@@ -18,7 +18,7 @@ const DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'satu
 // Resolve schedule fields — new column names take priority over legacy ones
 function resolveSchedule(deal) {
   const tz = deal.timezone || deal.sending_timezone || 'Europe/London';
-  const startStr = deal.send_from || (deal.sending_start ? deal.sending_start.slice(0, 5) : '08:00');
+  const startStr = deal.send_from || (deal.sending_start ? deal.sending_start.slice(0, 5) : '06:00');
   const endStr   = deal.send_until || (deal.sending_end   ? deal.sending_end.slice(0, 5)   : '18:00');
 
   // active_days is a comma-separated string ('Mon,Tue,Wed,Thu,Fri')
@@ -177,13 +177,15 @@ export function isWithinChannelWindow(deal, channel) {
   // Resolve per-channel window from flat columns
   let startStr, endStr;
   if (channel === 'linkedin_invite') {
-    startStr = deal.li_connect_from;
-    endStr   = deal.li_connect_until;
+    startStr = deal.li_connect_from || null;
+    endStr   = deal.li_connect_until || null;
   } else if (channel === 'linkedin_dm') {
-    startStr = deal.li_dm_from;
-    endStr   = deal.li_dm_until;
+    startStr = deal.li_dm_from || '20:00';
+    endStr   = deal.li_dm_until || '23:00';
+  } else if (channel === 'email') {
+    startStr = deal.send_from || '06:00';
+    endStr   = deal.send_until || '18:00';
   }
-  // email falls through to unified window below
 
   // If flat per-channel values are set, use them
   if (startStr && endStr) {

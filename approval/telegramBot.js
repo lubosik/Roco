@@ -740,7 +740,7 @@ async function handleCallbackQuery(query) {
     const variant = action === 'aa' ? 'A' : 'B';
     const subject = variant === 'A' ? approval.emailDraft.subject : approval.emailDraft.alternativeSubject;
     resolveApproval(msgId, approval, 'approve', { variant, subject });
-    await bot.sendMessage(chatId, `✅ Sending to *${approval.name}* with Subject ${variant}...`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Email approved for *${approval.name}* with Subject ${variant}. Roco will send it now if the window is open, otherwise it will wait for the next sending window.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'sa') {
     // Sourcing LinkedIn DM — single approve button
@@ -1064,7 +1064,7 @@ async function handleApprovalResponse(text, chatId) {
     const variant = approveNum[2];
     const subject = variant === 'A' ? approval.emailDraft.subject : approval.emailDraft.alternativeSubject;
     resolveApproval(msgId, approval, 'approve', { variant, subject });
-    await bot.sendMessage(chatId, `✅ Sending to *${approval.name}* with Subject ${variant}...`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Email approved for *${approval.name}* with Subject ${variant}. Roco will send it now if the window is open, otherwise it will wait for the next sending window.`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -1107,7 +1107,7 @@ async function handleApprovalResponse(text, chatId) {
     const variant = upper.endsWith('A') ? 'A' : 'B';
     const subject = variant === 'A' ? approval.emailDraft.subject : approval.emailDraft.alternativeSubject;
     resolveApproval(lastMsgId, approval, 'approve', { variant, subject });
-    await bot.sendMessage(chatId, `✅ Sending to *${approval.name}* with Subject ${variant}...`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Email approved for *${approval.name}* with Subject ${variant}. Roco will send it now if the window is open, otherwise it will wait for the next sending window.`, { parse_mode: 'Markdown' });
     return;
   }
 
