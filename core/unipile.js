@@ -7,6 +7,8 @@ import {
   listSentInvitations,
   resolveLinkedInProfile,
   sendLinkedInInvite,
+  searchLinkedInPeople,
+  searchLinkedInPeopleSalesNavigator,
 } from '../integrations/unipileClient.js';
 
 let _cachedCreds = null;
@@ -445,6 +447,93 @@ function namesLikelyMatch(left, right) {
   return shared.length >= Math.min(2, a.length, b.length);
 }
 
+function splitNameParts(value) {
+  const tokens = normalizeName(value).split(/\s+/).filter(Boolean);
+  if (!tokens.length) return { firstName: null, lastName: null };
+  return {
+    firstName: tokens[0] || null,
+    lastName: tokens.length > 1 ? tokens[tokens.length - 1] : null,
+  };
+}
+
+function companyLikelyMatches(contact, person) {
+  const expected = normalizeName(contact?.company_name || '');
+  if (!expected) return true;
+  const actual = normalizeName(
+    person?.company_name
+    || person?.company
+    || person?.companyName
+    || person?.organization
+    || person?.current_company
+    || ''
+  );
+  if (!actual) return true;
+  const expectedTokens = expected.split(/\s+/).filter(Boolean);
+  const actualTokens = actual.split(/\s+/).filter(Boolean);
+  return expectedTokens.some(token => actualTokens.includes(token));
+}
+
+async function findMatchingLinkedInProfileForContact(contact) {
+  const name = String(contact?.name || '').trim();
+  if (!name) return null;
+
+  const { firstName, lastName } = splitNameParts(name);
+  const companyName = String(contact?.company_name || '').trim();
+  const queries = [
+    [name, companyName].filter(Boolean).join(' '),
+    name,
+  ].filter(Boolean);
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (person, source) => {
+    const fullName = [person?.first_name, person?.last_name].filter(Boolean).join(' ').trim()
+      || String(person?.name || '').trim();
+    if (!fullName || !namesLikelyMatch(name, fullName) || !companyLikelyMatches(contact, person)) return;
+    const providerId = String(person?.provider_id || '').trim() || null;
+    const publicId = String(person?.public_identifier || person?.provider_public_id || '').trim() || null;
+    const linkedinUrl = normalizeLinkedInProfileUrl(
+      person?.public_profile_url
+      || person?.profile_url
+      || (publicId ? `https://www.linkedin.com/in/${publicId}` : '')
+    );
+    const key = providerId || publicId || linkedinUrl || fullName.toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push({
+      providerId,
+      publicId: publicId || extractLinkedInPublicId(linkedinUrl),
+      linkedinUrl: isLikelyLinkedInProfileUrl(linkedinUrl) ? linkedinUrl : null,
+      name: fullName,
+      source,
+    });
+  };
+
+  for (const query of queries) {
+    try {
+      const sales = await searchLinkedInPeopleSalesNavigator({
+        firstName,
+        lastName,
+        keywords: companyName || query,
+        limit: 5,
+      });
+      (sales || []).forEach(person => pushCandidate(person, 'unipile_sales_navigator'));
+    } catch {}
+
+    try {
+      const classic = await searchLinkedInPeople({
+        keywords: query,
+        limit: 10,
+      });
+      (classic || []).forEach(person => pushCandidate(person, 'unipile_search'));
+    } catch {}
+
+    if (candidates.length) break;
+  }
+
+  return candidates.find(candidate => candidate.providerId || candidate.linkedinUrl) || null;
+}
+
 function normalizeLinkedInProfileUrl(value) {
   return String(value || '')
     .trim()
@@ -640,21 +729,45 @@ export async function processLinkedInInvite({
 
   if (!providerId || !publicId) {
     if (!linkedinUrl && !providerId && !publicId) {
-      return markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivity, linkedinUrl, reason: 'Could not find LinkedIn profile URL' });
+      const discovered = await findMatchingLinkedInProfileForContact(contact);
+      if (discovered) {
+        providerId = discovered.providerId || providerId;
+        publicId = discovered.publicId || publicId;
+        if (discovered.linkedinUrl) {
+          await sb.from('contacts').update({
+            linkedin_url: discovered.linkedinUrl,
+            linkedin_provider_id: discovered.providerId || null,
+            linkedin_public_id: discovered.publicId || null,
+          }).eq('id', contact.id);
+        }
+      } else {
+        return markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivity, linkedinUrl, reason: 'Could not find LinkedIn profile URL' });
+      }
     }
 
+    let resolved = null;
     try {
-      const resolved = await resolveLinkedInProfile(providerId || publicId || linkedinUrl);
+      resolved = await resolveLinkedInProfile(providerId || publicId || linkedinUrl);
       if (resolved?.name && contact?.name && !namesLikelyMatch(contact.name, resolved.name)) {
-        return markMissingLinkedIn({
-          sb,
-          deal,
-          contact,
-          pushActivity,
-          logActivity,
-          linkedinUrl,
-          reason: `Resolved LinkedIn profile does not match contact name (${resolved.name})`,
-        });
+        const discovered = await findMatchingLinkedInProfileForContact(contact);
+        if (!discovered) {
+          return markMissingLinkedIn({
+            sb,
+            deal,
+            contact,
+            pushActivity,
+            logActivity,
+            linkedinUrl,
+            reason: `Resolved LinkedIn profile does not match contact name (${resolved.name})`,
+          });
+        }
+        resolved = {
+          ...resolved,
+          providerId: discovered.providerId || resolved.providerId,
+          publicId: discovered.publicId || resolved.publicId,
+          linkedinUrl: discovered.linkedinUrl || resolved.linkedinUrl,
+          name: discovered.name || resolved.name,
+        };
       }
       if (resolved?.providerId) providerId = resolved.providerId;
       if (resolved?.publicId) publicId = resolved.publicId;
@@ -715,7 +828,6 @@ export async function processLinkedInInvite({
   if (inviteAlreadyPending) {
     await sb.from('contacts').update({
       pipeline_stage: 'invite_sent',
-      invite_sent_at: new Date().toISOString(),
       outreach_channel: 'linkedin_invite',
       follow_up_due_at: followUpDueAt,
     }).eq('id', contact.id);
@@ -760,7 +872,6 @@ export async function processLinkedInInvite({
   if (relationship === 'pending') {
     await sb.from('contacts').update({
       pipeline_stage: 'invite_sent',
-      invite_sent_at: new Date().toISOString(),
       outreach_channel: 'linkedin_invite',
       follow_up_due_at: followUpDueAt,
     }).eq('id', contact.id);
@@ -795,23 +906,19 @@ export async function processLinkedInInvite({
     return { status: 'blocked', providerId, publicId };
   }
 
-  // Stamp the stage BEFORE the API call so no other cycle can re-pick this contact.
-  // If the invite fails we revert below.
-  const inviteSentAt = new Date().toISOString();
-  await sb.from('contacts').update({
-    pipeline_stage: 'invite_sent',
-    invite_sent_at: inviteSentAt,
-    outreach_channel: 'linkedin_invite',
-    follow_up_count: 0,
-    follow_up_due_at: followUpDueAt,
-  }).eq('id', contact.id);
-
   try {
     const inviteResult = await sendLinkedInInvite({ providerId });
     const cleanedNotes = stripProviderLimitState(contact?.notes);
-    if (cleanedNotes !== String(contact?.notes || '').trim()) {
-      await sb.from('contacts').update({ notes: cleanedNotes || null }).eq('id', contact.id);
-    }
+    await sb.from('contacts').update({
+      pipeline_stage: 'invite_sent',
+      invite_sent_at: new Date().toISOString(),
+      outreach_channel: 'linkedin_invite',
+      follow_up_count: 0,
+      follow_up_due_at: followUpDueAt,
+      notes: cleanedNotes || null,
+      linkedin_provider_id: providerId || contact.linkedin_provider_id || null,
+      linkedin_public_id: publicId || contact.linkedin_public_id || null,
+    }).eq('id', contact.id);
 
     await recordInviteActivity({
       pushActivity,
@@ -933,16 +1040,6 @@ export async function processLinkedInInvite({
 
       return { status: 'deferred_provider_limit', providerId, publicId, error: err, retryAt, retryCount };
     }
-
-    // Real failure — revert the stage so it can be retried next cycle
-    try {
-      await sb.from('contacts').update({
-        pipeline_stage: contact.pipeline_stage,  // restore original
-        invite_sent_at: null,
-        outreach_channel: null,
-        follow_up_due_at: null,
-      }).eq('id', contact.id);
-    } catch {}
 
     await recordInviteActivity({
       pushActivity,
