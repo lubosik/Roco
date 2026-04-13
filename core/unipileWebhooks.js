@@ -13,7 +13,7 @@ setInterval(() => {
   for (const [k, ts] of recentlyProcessed) if (ts < cutoff) recentlyProcessed.delete(k);
 }, 60_000);
 
-// 90-second per-contact message batching
+// Short per-contact message batching to catch split replies without delaying approvals too long
 const messageBatches = new Map();
 
 // ── NORMALISATION ─────────────────────────────────────────────────────────────
@@ -196,7 +196,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
     deal_name: getDealName(contact),
   });
 
-  // Batch within 90-second window per contact
+  // Batch within a short window per contact
   const batchKey = contact.id;
   if (messageBatches.has(batchKey)) {
     clearTimeout(messageBatches.get(batchKey).timer);
@@ -272,7 +272,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
     } catch (err) {
       console.error('[UNIPILE/MSG] Draft reply error:', err.message);
     }
-  }, 90_000);
+  }, 15_000);
 }
 
 // ── PRIOR CHAT HELPERS ────────────────────────────────────────────────────────

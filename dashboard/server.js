@@ -1161,7 +1161,7 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
 // REPLY DEBOUNCE BATCHER
 // ─────────────────────────────────────────────
 const replyDebounceMap = new Map();
-const REPLY_DEBOUNCE_MS = 90 * 1000;
+const REPLY_DEBOUNCE_MS = 15 * 1000;
 
 function clearDebounceForDeal(dealId) {
   let cleared = 0;
