@@ -5559,6 +5559,8 @@ async function phaseLinkedInInvites(deal, state) {
             warn(`[${deal.name}] Provider-limit email fallback queue failed for ${contact.name}: ${err.message}`);
           });
         }
+      } else if (outcome.status === 'suppressed_no_match') {
+        info(`[${deal.name}] ${contact.name} invite retry suppressed after recent LinkedIn mismatch until ${outcome.retryAt || 'later'}`);
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
       }
