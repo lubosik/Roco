@@ -16,6 +16,7 @@ let _credsCachedAt = 0;
 const CRED_TTL = 30_000;
 const LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS = [4, 8, 24];
 const PROVIDER_LIMIT_NOTE_PATTERN = /\[LI_INVITE_LIMIT:count=(\d+)\|blocked_until=([^|\]]+)(?:\|notified_at=([^\]]+))?\]/i;
+const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
 
 export async function getLiveCredentials() {
   if (_cachedCreds && Date.now() - _credsCachedAt < CRED_TTL) return _cachedCreds;
@@ -473,6 +474,10 @@ function companyLikelyMatches(contact, person) {
   return expectedTokens.some(token => actualTokens.includes(token));
 }
 
+function personExactNameMatches(expectedName, personName) {
+  return normalizeName(expectedName) === normalizeName(personName);
+}
+
 async function findMatchingLinkedInProfileForContact(contact) {
   const name = String(contact?.name || '').trim();
   if (!name) return null;
@@ -489,7 +494,9 @@ async function findMatchingLinkedInProfileForContact(contact) {
   const pushCandidate = (person, source) => {
     const fullName = [person?.first_name, person?.last_name].filter(Boolean).join(' ').trim()
       || String(person?.name || '').trim();
-    if (!fullName || !namesLikelyMatch(name, fullName) || !companyLikelyMatches(contact, person)) return;
+    if (!fullName || !namesLikelyMatch(name, fullName)) return;
+    const exactName = personExactNameMatches(name, fullName);
+    if (!exactName && !companyLikelyMatches(contact, person)) return;
     const providerId = String(person?.provider_id || '').trim() || null;
     const publicId = String(person?.public_identifier || person?.provider_public_id || '').trim() || null;
     const linkedinUrl = normalizeLinkedInProfileUrl(
@@ -505,6 +512,7 @@ async function findMatchingLinkedInProfileForContact(contact) {
       publicId: publicId || extractLinkedInPublicId(linkedinUrl),
       linkedinUrl: isLikelyLinkedInProfileUrl(linkedinUrl) ? linkedinUrl : null,
       name: fullName,
+      exactName,
       source,
     });
   };
@@ -531,6 +539,8 @@ async function findMatchingLinkedInProfileForContact(contact) {
     if (candidates.length) break;
   }
 
+  const exactMatches = candidates.filter(candidate => candidate.exactName);
+  if (exactMatches.length === 1) return exactMatches[0];
   return candidates.find(candidate => candidate.providerId || candidate.linkedinUrl) || null;
 }
 
@@ -619,6 +629,31 @@ function appendProviderLimitState(notes, state) {
   return cleaned ? `${cleaned} | ${marker}` : marker;
 }
 
+function parseLinkedInNoMatchState(notes) {
+  const match = String(notes || '').match(LINKEDIN_NO_MATCH_NOTE_PATTERN);
+  if (!match) return null;
+  return {
+    checkedAt: match[1] || null,
+    reason: match[2] || null,
+  };
+}
+
+function stripLinkedInNoMatchState(notes) {
+  return String(notes || '')
+    .replace(LINKEDIN_NO_MATCH_NOTE_PATTERN, '')
+    .replace(/\s+\|\s+/g, ' | ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .replace(/\|\s*$/, '')
+    .trim();
+}
+
+function appendLinkedInNoMatchState(notes, reason) {
+  const cleaned = stripLinkedInNoMatchState(notes);
+  const marker = `[LI_NO_MATCH:checked_at=${new Date().toISOString()}${reason ? `|reason=${String(reason).slice(0, 120)}` : ''}]`;
+  return cleaned ? `${cleaned} | ${marker}` : marker;
+}
+
 function isInvalidProfileError(err, linkedinUrl) {
   if (!linkedinUrl || !isLikelyLinkedInProfileUrl(linkedinUrl)) return true;
   const message = String(err?.message || '').toLowerCase();
@@ -658,7 +693,7 @@ async function markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivit
     pending_linkedin_dm: false,
     invite_sent_at: null,
     invite_accepted_at: null,
-    notes: appendNote(contact?.notes, note),
+    notes: appendLinkedInNoMatchState(appendNote(contact?.notes, note), note),
   };
 
   if (emailUsable) {
@@ -717,6 +752,7 @@ export async function processLinkedInInvite({
   if (!publicId) publicId = extractLinkedInPublicId(rawLinkedInValue);
   const invites = Array.isArray(pendingInvites) ? pendingInvites : await fetchPendingLinkedInInvitesSafe();
   const providerLimitState = parseProviderLimitState(contact?.notes);
+  const noMatchState = parseLinkedInNoMatchState(contact?.notes);
   if (providerLimitState?.blockedUntil && new Date(providerLimitState.blockedUntil).getTime() > Date.now()) {
     return {
       status: 'deferred_provider_limit',
@@ -725,6 +761,16 @@ export async function processLinkedInInvite({
       retryAt: providerLimitState.blockedUntil,
       retryCount: providerLimitState.count || 0,
     };
+  }
+  if (noMatchState?.checkedAt) {
+    const checkedAt = new Date(noMatchState.checkedAt).getTime();
+    const cooldownMs = 12 * 60 * 60 * 1000;
+    if (Number.isFinite(checkedAt) && (Date.now() - checkedAt) < cooldownMs) {
+      return {
+        status: 'suppressed_no_match',
+        retryAt: new Date(checkedAt + cooldownMs).toISOString(),
+      };
+    }
   }
 
   if (!providerId || !publicId) {
@@ -776,6 +822,8 @@ export async function processLinkedInInvite({
       if (resolved?.providerId && resolved.providerId !== contact.linkedin_provider_id) updates.linkedin_provider_id = resolved.providerId;
       if (resolved?.publicId && resolved.publicId !== contact.linkedin_public_id) updates.linkedin_public_id = resolved.publicId;
       if (resolved?.linkedinUrl && resolved.linkedinUrl !== contact.linkedin_url) updates.linkedin_url = resolved.linkedinUrl;
+      const cleanedNoMatch = stripLinkedInNoMatchState(contact?.notes);
+      if (cleanedNoMatch !== String(contact?.notes || '').trim()) updates.notes = cleanedNoMatch || null;
       if (Object.keys(updates).length) {
         await sb.from('contacts').update(updates).eq('id', contact.id);
       }
