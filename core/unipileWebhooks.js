@@ -537,6 +537,22 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
       action: `LinkedIn acceptance received: ${payload.name || payload.public_identifier || payload.provider_id}`,
       note: 'Person did not match any active deals',
     });
+    try {
+      const { logActivity } = await import('./supabaseSync.js');
+      await logActivity({
+        dealId: null,
+        contactId: null,
+        eventType: 'LINKEDIN_ACCEPTANCE_UNMATCHED',
+        summary: `LinkedIn acceptance unmatched for ${payload.name || payload.public_identifier || payload.provider_id || 'unknown person'}`,
+        detail: {
+          provider_id: payload.provider_id || null,
+          public_identifier: payload.public_identifier || null,
+          profile_url: payload.profile_url || null,
+          headline: payload.headline || null,
+        },
+        apiUsed: 'unipile',
+      });
+    } catch {}
     return;
   }
 
