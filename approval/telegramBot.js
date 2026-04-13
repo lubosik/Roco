@@ -191,6 +191,7 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
   const firm = getContactProp(contactPage, 'Company Name') || 'Unknown Firm';
   const rawEmail = getContactProp(contactPage, 'Email') || null;
   const contactEmail = String(rawEmail || '').trim() || null;
+  const sb = getSupabase();
 
   // GATE: never send to Telegram if name is null/invalid
   if (!name || name.trim() === '' || name.toLowerCase() === 'null') {
@@ -240,21 +241,9 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
 
   return new Promise(async (resolve) => {
     try {
-      const chatId = process.env.TELEGRAM_CHAT_ID;
-      const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-      const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: null };
-      pendingApprovals.set(sent.message_id, entry);
-      info(`Email draft sent to Telegram for approval: ${name}`);
-
-      // Attach action buttons (done after send so we have the message_id)
-      bot.editMessageReplyMarkup(buildKeyboard(sent.message_id), {
-        chat_id: chatId,
-        message_id: sent.message_id,
-      }).catch(() => {});
-
-      // Mirror to Supabase so the dashboard can see the queue
-      addApprovalToQueue({
-        telegramMsgId: sent.message_id,
+      let queueRow = null;
+      queueRow = await addApprovalToQueue({
+        telegramMsgId: null,
         dealId,
         contactId: contactPage?.id,
         contactName: name,
@@ -266,12 +255,25 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
         subjectB: emailDraft.alternativeSubject,
         body: emailDraft.body,
         researchSummary: researchSummary || null,
-      }).then(row => {
-        if (row) {
-          const existing = pendingApprovals.get(sent.message_id);
-          if (existing) pendingApprovals.set(sent.message_id, { ...existing, queueId: row.id });
-        }
+      }).catch(() => null);
+
+      const chatId = process.env.TELEGRAM_CHAT_ID;
+      const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: queueRow?.id || null, contactId: contactPage?.id || null };
+      pendingApprovals.set(sent.message_id, entry);
+      info(`Email draft sent to Telegram for approval: ${name}`);
+
+      // Attach action buttons (done after send so we have the message_id)
+      bot.editMessageReplyMarkup(buildKeyboard(sent.message_id), {
+        chat_id: chatId,
+        message_id: sent.message_id,
       }).catch(() => {});
+
+      if (sb && queueRow?.id) {
+        await sb.from('approval_queue').update({
+          telegram_msg_id: sent.message_id,
+        }).eq('id', queueRow.id);
+      }
     } catch (err) {
       error('Failed to send draft to Telegram', { err: err.message });
       resolve({ action: 'error' });
@@ -2091,6 +2093,9 @@ export async function reloadPendingInvestorApprovals() {
       ].filter(Boolean).join('\n');
 
       const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      await sb.from('approval_queue').update({
+        telegram_msg_id: sent.message_id,
+      }).eq('id', item.id).then(() => {}, () => {});
       await bot.editMessageReplyMarkup(buildReloadedApprovalKeyboard(sent.message_id, hasSubjects), {
         chat_id: chatId,
         message_id: sent.message_id,

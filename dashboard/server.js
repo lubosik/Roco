@@ -23,6 +23,7 @@ import {
   draftTempCloseFollowUp,
 } from '../core/conversationManager.js';
 import { sendEmailReply, sendLinkedInReply, sendEmail, listEmails, listWebhooks, listSentInvitations } from '../integrations/unipileClient.js';
+import { retrieveEmail } from '../integrations/unipileClient.js';
 import { getApiHealth, startHealthChecks } from '../core/apiFallback.js';
 import { info, error } from '../core/logger.js';
 import { aiComplete, haikuComplete, claudeWebSearch } from '../core/aiClient.js';
@@ -2030,13 +2031,31 @@ export async function sendApprovedReply({ queueId = null, queueItem = null, forc
   const toEmail = contact?.email || item.contact_email || null;
   if (!toEmail) throw new Error('No email address found for reply');
   const subject = sanitizeApprovalText(item.approved_subject || item.subject_a || item.subject || 'our conversation');
+  const inferReplyAccountId = async () => {
+    const candidates = [
+      process.env.UNIPILE_OUTLOOK_ACCOUNT_ID,
+      process.env.UNIPILE_GMAIL_ACCOUNT_ID,
+    ].filter(Boolean);
+    for (const accountId of candidates) {
+      try {
+        const mail = await retrieveEmail(item.reply_to_id, accountId).catch(() => null);
+        if (mail?.account_id || mail?.id) return mail.account_id || accountId;
+      } catch {}
+      try {
+        const threadItems = await listEmails({ threadId: item.reply_to_id, accountId, limit: 1, metaOnly: true }).catch(() => []);
+        if (threadItems?.[0]?.account_id || threadItems?.length) return threadItems[0]?.account_id || accountId;
+      } catch {}
+    }
+    return null;
+  };
+  const replyAccountId = await inferReplyAccountId();
   const result = await sendEmailReply({
     to: toEmail,
     toName: contact?.name || item.contact_name || '',
     subject,
     body: bodyToSend,
     replyToProviderId: item.reply_to_id || null,
-    accountId: null,
+    accountId: replyAccountId,
     trackingLabel: buildEmailTrackingLabel({
       dealId,
       contactId,
@@ -3708,7 +3727,9 @@ function registerRoutes(app) {
     pushActivity({
       type: 'APPROVAL',
       action: 'Approved via Dashboard',
-      note: item ? `${item.name} @ ${item.firm}` : 'Unknown contact',
+      note: item
+        ? `${item.name} @ ${item.firm}`
+        : (sbItem ? `${sbItem.contact_name || 'Unknown'} @ ${sbItem.firm || 'Unknown firm'}` : 'Unknown contact'),
     });
 
     const isLinkedIn = String(item?.stage || '').toLowerCase().includes('linkedin');

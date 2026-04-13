@@ -1,6 +1,7 @@
 import { getSupabase } from './supabase.js';
 import { sendTelegram } from '../approval/telegramBot.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
+import { claudeWebSearch } from './aiClient.js';
 import Anthropic from '@anthropic-ai/sdk';
 import { DateTime } from 'luxon';
 
@@ -10,6 +11,27 @@ const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
 const NEWS_SUMMARY_MODEL = process.env.ROCO_NEWS_SUMMARY_MODEL || 'claude-sonnet-4-6';
+const dailyNewsScanFailureState = new Map();
+
+function getNewsFailureKey(dealId) {
+  return `${dealId}:${DateTime.utc().toISODate()}`;
+}
+
+async function recordDailyNewsScanFailure(deal, pushActivity, message) {
+  const key = getNewsFailureKey(deal.id);
+  if (dailyNewsScanFailureState.has(key)) return;
+  dailyNewsScanFailureState.set(key, true);
+  pushActivity?.({
+    type: 'error',
+    action: 'News scan failed for today',
+    note: `${deal.name} · ${truncate(message, 180)}`,
+    deal_id: deal.id,
+  });
+  await sendTelegram(
+    `⚠ *News scan failed for ${DateTime.utc().toFormat('LLLL d, yyyy')}*\n` +
+    `${deal.name}\n${truncate(message, 260)}\nTop up Grok/xAI credits if needed. Roco will not retry this news scan until tomorrow.`
+  ).catch(() => {});
+}
 
 function extractJSONArray(text) {
   const match = String(text || '').match(/\[[\s\S]*\]/);
@@ -125,14 +147,6 @@ async function executeGrokNewsQueries(deal, queries = [], pushActivity) {
       success: !!result,
       raw_result: result || `Query failed for: ${query}`,
     });
-    if (!result) {
-      pushActivity?.({
-        type: 'warning',
-        action: 'News scan query failed',
-        note: `${deal.name} · ${query.slice(0, 140)}`,
-        deal_id: deal.id,
-      });
-    }
   }
   return rawResults;
 }
@@ -429,6 +443,9 @@ Maximum 5 recommended investors.`;
 }
 
 export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity) {
+  if (dailyNewsScanFailureState.has(getNewsFailureKey(deal.id))) {
+    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: 'News scan skipped after today’s failure.', recommendedInvestors: [] };
+  }
   if (!deal?.id || !GROK_API_KEY) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: '', recommendedInvestors: [] };
   }
@@ -437,6 +454,31 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
   const queryPlan = buildSpecificGrokQueries(deal);
   const grokRawResults = await executeGrokNewsQueries(deal, queryPlan, pushActivity);
   const successfulResults = grokRawResults.filter(item => item.success && item.raw_result).map(item => item.raw_result);
+
+  if (!successfulResults.length) {
+    const failureReason = grokRawResults.map(item => item.raw_result).filter(Boolean).slice(0, 2).join(' | ') || 'Grok web search returned no successful results';
+    try {
+      const fallbackSummary = await claudeWebSearch(
+        `Use live web search to find current investor and market signals relevant to this deal.\nDeal: ${deal.name}\nSector: ${deal.sector || 'General'}\nGeography: ${deal.target_geography || deal.geography || 'United States'}\nQueries attempted:\n${queryPlan.join('\n')}\nReturn a concise operator summary only.`,
+        { maxTokens: 500, maxUses: 3, model: 'claude-sonnet-4-6', systemPrompt: 'Use web search to produce a concise investor-news summary for the deal.' }
+      );
+      await recordDailyNewsScanFailure(deal, pushActivity, `${failureReason}. Claude web search fallback was used instead. Top up Grok/xAI credits if needed.`);
+      return {
+        leads: [],
+        summary: fallbackSummary || '',
+        rawSummary: '',
+        rejectedFindings: [],
+        grokQueries: queryPlan,
+        grokRawResults,
+        isRelevant: false,
+        notes: 'Grok failed today; Claude web search fallback used.',
+        recommendedInvestors: [],
+      };
+    } catch (fallbackErr) {
+      await recordDailyNewsScanFailure(deal, pushActivity, `${failureReason}. Claude fallback also failed: ${fallbackErr.message}`);
+      return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
+    }
+  }
 
   let searchPayload = null;
   if (successfulResults.length) {
