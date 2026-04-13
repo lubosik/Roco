@@ -1393,7 +1393,9 @@ const CLOSED_CONTACT_STAGES = new Set([
 function hasLinkedInInviteHistory(contact) {
   return Boolean(
     contact?.invite_sent_at ||
-    contact?.invite_accepted_at
+    contact?.invite_accepted_at ||
+    contact?.outreach_channel === 'linkedin_invite' ||
+    LINKEDIN_INVITE_STAGES.has(contact?.pipeline_stage)
   );
 }
 
@@ -1405,10 +1407,180 @@ function hasLinkedInAccepted(contact) {
 }
 
 function hasActivePendingLinkedInInvite(contact) {
-  if (!contact?.invite_sent_at) return false;
+  if (!hasLinkedInInviteHistory(contact)) return false;
   if (hasLinkedInAccepted(contact)) return false;
   if (CLOSED_CONTACT_STAGES.has(contact?.pipeline_stage)) return false;
   return true;
+}
+
+function createEmptyDealChannelMetrics() {
+  return {
+    contacts: 0,
+    active_prospects: 0,
+    emails_sent: 0,
+    emails_replied: 0,
+    li_invites_sent: 0,
+    li_accepts: 0,
+    li_active_pending: 0,
+    li_dms_sent: 0,
+    li_dm_replies: 0,
+    total_sent: 0,
+    total_responses: 0,
+    email_response_rate: 0,
+    li_acceptance_rate: 0,
+    li_dm_response_rate: 0,
+    overall_response_rate: 0,
+  };
+}
+
+function finalizeDealChannelMetrics(metrics) {
+  const next = { ...createEmptyDealChannelMetrics(), ...(metrics || {}) };
+  next.total_sent = next.emails_sent + next.li_invites_sent + next.li_dms_sent;
+  next.total_responses = next.emails_replied + next.li_accepts + next.li_dm_replies;
+  next.email_response_rate = next.emails_sent > 0
+    ? Math.round((next.emails_replied / next.emails_sent) * 100)
+    : 0;
+  next.li_acceptance_rate = next.li_invites_sent > 0
+    ? Math.round((next.li_accepts / next.li_invites_sent) * 100)
+    : 0;
+  next.li_dm_response_rate = next.li_dms_sent > 0
+    ? Math.round((next.li_dm_replies / next.li_dms_sent) * 100)
+    : 0;
+  next.overall_response_rate = next.total_sent > 0
+    ? Math.round((next.total_responses / next.total_sent) * 100)
+    : 0;
+  return next;
+}
+
+function upsertChannelReplyMetrics(metrics, contact, seenEmailReplies, seenLinkedInReplies) {
+  if (!contact || !contact.deal_id) return;
+  const replySignal = contact.response_received === true || Boolean(contact.last_reply_at);
+  if (!replySignal) return;
+  const channel = String(contact.reply_channel || '').trim().toLowerCase();
+  const fallbackType = String(contact.last_contact_type || '').trim().toLowerCase();
+  const replyKey = `${contact.deal_id}:${contact.id || contact.email || contact.name || 'unknown-contact'}`;
+
+  if ((channel === 'email' || fallbackType === 'email') && !seenEmailReplies.has(replyKey)) {
+    seenEmailReplies.add(replyKey);
+    metrics.emails_replied += 1;
+    return;
+  }
+
+  if ((channel === 'linkedin' || fallbackType === 'linkedin') && !seenLinkedInReplies.has(replyKey)) {
+    seenLinkedInReplies.add(replyKey);
+    metrics.li_dm_replies += 1;
+  }
+}
+
+async function computeDealChannelMetrics(sb, dealIds = []) {
+  const ids = [...new Set((dealIds || []).filter(Boolean))];
+  const metricsByDeal = Object.fromEntries(ids.map(id => [id, createEmptyDealChannelMetrics()]));
+  if (!sb || !ids.length) return metricsByDeal;
+
+  const safeIds = ids.length ? ids : ['00000000-0000-0000-0000-000000000000'];
+  const [
+    { data: contactsData },
+    { data: emailsData },
+    { data: repliesData },
+  ] = await Promise.all([
+    sb.from('contacts')
+      .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_contact_type, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel')
+      .in('deal_id', safeIds),
+    sb.from('emails')
+      .select('id, deal_id, status')
+      .eq('status', 'sent')
+      .in('deal_id', safeIds),
+    sb.from('replies')
+      .select('deal_id, contact_id, channel')
+      .in('deal_id', safeIds),
+  ]);
+
+  let outreachEvents = [];
+  try {
+    const { data } = await sb.from('outreach_events')
+      .select('deal_id, contact_id, event_type, status')
+      .in('deal_id', safeIds)
+      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT']);
+    outreachEvents = data || [];
+  } catch {}
+
+  const contacts = contactsData || [];
+  const emails = emailsData || [];
+  const replies = repliesData || [];
+  const sentEventCoverage = Object.fromEntries(ids.map(id => [id, { email: false, invite: false, dm: false }]));
+  const seenEmailReplies = new Set();
+  const seenLinkedInReplies = new Set();
+
+  for (const contact of contacts) {
+    if (!metricsByDeal[contact.deal_id]) continue;
+    const metrics = metricsByDeal[contact.deal_id];
+    metrics.contacts += 1;
+    if (!CLOSED_CONTACT_STAGES.has(contact.pipeline_stage)) metrics.active_prospects += 1;
+    if (hasLinkedInInviteHistory(contact)) metrics.li_active_pending += hasActivePendingLinkedInInvite(contact) ? 1 : 0;
+    if (hasLinkedInAccepted(contact)) metrics.li_accepts += 1;
+    upsertChannelReplyMetrics(metrics, contact, seenEmailReplies, seenLinkedInReplies);
+  }
+
+  for (const reply of replies) {
+    if (!reply?.deal_id || !metricsByDeal[reply.deal_id]) continue;
+    const metrics = metricsByDeal[reply.deal_id];
+    const channel = String(reply.channel || '').trim().toLowerCase();
+    const replyKey = `${reply.deal_id}:${reply.contact_id || `reply:${channel || 'unknown'}`}`;
+    if (channel === 'email') {
+      if (!seenEmailReplies.has(replyKey)) {
+        seenEmailReplies.add(replyKey);
+        metrics.emails_replied += 1;
+      }
+    } else if (channel === 'linkedin') {
+      if (!seenLinkedInReplies.has(replyKey)) {
+        seenLinkedInReplies.add(replyKey);
+        metrics.li_dm_replies += 1;
+      }
+    }
+  }
+
+  for (const row of outreachEvents) {
+    if (!row?.deal_id || !metricsByDeal[row.deal_id]) continue;
+    if (String(row.status || 'confirmed').toLowerCase() !== 'confirmed') continue;
+    const metrics = metricsByDeal[row.deal_id];
+    switch (row.event_type) {
+      case 'EMAIL_SENT':
+        sentEventCoverage[row.deal_id].email = true;
+        metrics.emails_sent += 1;
+        break;
+      case 'LINKEDIN_INVITE_SENT':
+        sentEventCoverage[row.deal_id].invite = true;
+        metrics.li_invites_sent += 1;
+        break;
+      case 'LINKEDIN_DM_SENT':
+        sentEventCoverage[row.deal_id].dm = true;
+        metrics.li_dms_sent += 1;
+        break;
+      default:
+        break;
+    }
+  }
+
+  for (const dealId of ids) {
+    const metrics = metricsByDeal[dealId];
+    const coverage = sentEventCoverage[dealId] || {};
+    if (!coverage.email) {
+      metrics.emails_sent = emails.filter(row => row.deal_id === dealId).length;
+    }
+    if (!coverage.invite) {
+      metrics.li_invites_sent = contacts.filter(contact => contact.deal_id === dealId && hasLinkedInInviteHistory(contact)).length;
+    }
+    if (!coverage.dm) {
+      metrics.li_dms_sent = contacts.filter(contact =>
+        contact.deal_id === dealId &&
+        ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(contact.pipeline_stage) &&
+        ['linkedin', 'linkedin_dm'].includes(contact.outreach_channel)
+      ).length;
+    }
+    metricsByDeal[dealId] = finalizeDealChannelMetrics(metrics);
+  }
+
+  return metricsByDeal;
 }
 
 async function countConfirmedLinkedInInvitesForDeals(sb, dealIds = []) {
@@ -3963,22 +4135,49 @@ function registerRoutes(app) {
         const safeActiveIds    = activeDealIds.length > 0    ? activeDealIds    : ['00000000-0000-0000-0000-000000000000'];
         const safeAllActiveIds = allActiveDealIds.length > 0 ? allActiveDealIds : ['00000000-0000-0000-0000-000000000000'];
 
-        // Email sent / response stats — use contacts table so Overview matches deal cards.
         try {
-          const { data: contactStats } = await sb.from('contacts')
-            .select('pipeline_stage, last_email_sent_at, response_received')
-            .in('deal_id', safeAllActiveIds);
-          const contacts = contactStats || [];
-          const emailsSent = contacts.filter(c => c.last_email_sent_at || ['Email Sent', 'email_sent'].includes(c.pipeline_stage)).length;
-          const emailReplies = contacts.filter(c => c.response_received === true).length;
-          stats.emails_sent = emailsSent;
-          stats.emailsSent = emailsSent;
-          stats.emails_replied = emailReplies;
-          stats.response_rate = emailsSent > 0
-            ? Math.round((emailReplies / emailsSent) * 100)
+          const channelMetricsByDeal = await computeDealChannelMetrics(sb, safeAllActiveIds);
+          const totals = Object.values(channelMetricsByDeal).reduce((acc, metrics) => {
+            acc.emails_sent += metrics.emails_sent || 0;
+            acc.emails_replied += metrics.emails_replied || 0;
+            acc.li_invites_sent += metrics.li_invites_sent || 0;
+            acc.li_accepts += metrics.li_accepts || 0;
+            acc.li_active_pending += metrics.li_active_pending || 0;
+            acc.li_dms_sent += metrics.li_dms_sent || 0;
+            acc.li_dm_replies += metrics.li_dm_replies || 0;
+            return acc;
+          }, {
+            emails_sent: 0,
+            emails_replied: 0,
+            li_invites_sent: 0,
+            li_accepts: 0,
+            li_active_pending: 0,
+            li_dms_sent: 0,
+            li_dm_replies: 0,
+          });
+
+          stats.emails_sent = totals.emails_sent;
+          stats.emailsSent = totals.emails_sent;
+          stats.emails_replied = totals.emails_replied;
+          stats.response_rate = totals.emails_sent > 0
+            ? Math.round((totals.emails_replied / totals.emails_sent) * 100)
             : 0;
           stats.responseRate = stats.response_rate;
-        } catch (e) { console.warn('/api/stats email metrics:', e.message); }
+          stats.li_invites_sent = totals.li_invites_sent;
+          stats.li_active_pending = totals.li_active_pending;
+          stats.li_acceptance_rate = totals.li_invites_sent > 0
+            ? Math.round((totals.li_accepts / totals.li_invites_sent) * 100)
+            : 0;
+          stats.li_dms_sent = totals.li_dms_sent;
+          stats.li_dm_response_rate = totals.li_dms_sent > 0
+            ? Math.round((totals.li_dm_replies / totals.li_dms_sent) * 100)
+            : 0;
+          stats.total_responses = totals.emails_replied + totals.li_accepts + totals.li_dm_replies;
+          stats.overall_outreach_sent = totals.emails_sent + totals.li_invites_sent + totals.li_dms_sent;
+          stats.overall_response_rate = stats.overall_outreach_sent > 0
+            ? Math.round((stats.total_responses / stats.overall_outreach_sent) * 100)
+            : 0;
+        } catch (e) { console.warn('/api/stats outreach metrics:', e.message); }
 
         // Pending approvals
         try {
@@ -4013,32 +4212,6 @@ function registerRoutes(app) {
           }
         } catch (e) { console.warn('/api/stats deals:', e.message); }
 
-        // LinkedIn metrics — all active deals incl. paused
-        try {
-          const { data: linkedinContacts } = await sb.from('contacts')
-            .select('pipeline_stage, invite_sent_at, invite_accepted_at, outreach_channel')
-            .in('deal_id', safeAllActiveIds);
-          const contacts = linkedinContacts || [];
-          stats.li_invites_sent = await countConfirmedLinkedInInvitesForDeals(sb, safeAllActiveIds);
-          stats.li_active_pending = contacts.filter(hasActivePendingLinkedInInvite).length;
-          const liAccepted = contacts.filter(hasLinkedInAccepted).length;
-          stats.li_acceptance_rate = stats.li_invites_sent > 0
-            ? Math.round((liAccepted / stats.li_invites_sent) * 100)
-            : 0;
-
-          stats.li_dms_sent = contacts.filter(c =>
-            ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(c.pipeline_stage) &&
-            ['linkedin', 'linkedin_dm'].includes(c.outreach_channel)
-          ).length;
-
-          const liReplied = contacts.filter(c =>
-            ['In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'].includes(c.pipeline_stage) &&
-            ['linkedin', 'linkedin_dm'].includes(c.outreach_channel)
-          ).length;
-          stats.li_dm_response_rate = stats.li_dms_sent > 0
-            ? Math.round((liReplied / stats.li_dms_sent) * 100)
-            : 0;
-        } catch (e) { console.warn('/api/stats linkedin metrics:', e.message); }
       }
     } catch (err) {
       console.error('/api/stats outer error:', err.message);
@@ -4567,20 +4740,8 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (!sb || !deals?.length) return res.json(deals || []);
 
-      // Enrich each deal with live counts from contacts table
       const dealIds = deals.map(d => d.id);
-      const { data: allContacts } = await sb.from('contacts')
-        .select('deal_id, pipeline_stage, response_received, last_email_sent_at')
-        .in('deal_id', dealIds);
-
-      const byDeal = {};
-      for (const c of (allContacts || [])) {
-        if (!byDeal[c.deal_id]) byDeal[c.deal_id] = [];
-        byDeal[c.deal_id].push(c);
-      }
-
-      const ARCHIVED_STAGES = ['Archived','ARCHIVED','archived','Skipped','skipped_no_name','skipped_no_linkedin','Inactive','Suppressed — Opt Out','Deleted — Do Not Contact'];
-      const OUTREACHED_STAGES = ['Email Approved','DM Approved','Email Sent','DM Sent','email_sent','dm_sent','invite_sent','invite_accepted','Replied','In Conversation','Meeting Booked','Meeting Scheduled'];
+      const channelMetricsByDeal = await computeDealChannelMetrics(sb, dealIds);
 
       // Fetch current campaign batch status for all deals
       const { data: campaignBatches } = await sb.from('campaign_batches')
@@ -4607,29 +4768,31 @@ function registerRoutes(app) {
       }
 
       const enriched = deals.map(deal => {
-        const contacts = byDeal[deal.id] || [];
-        const totalContacts = contacts.length; // all scraped
-        const emailsSentCount = contacts.filter(c => c.last_email_sent_at || ['Email Sent', 'email_sent'].includes(c.pipeline_stage)).length;
-        const totalOutreached = contacts.filter(c => OUTREACHED_STAGES.includes(c.pipeline_stage)).length;
-        const responses = contacts.filter(c => c.response_received === true).length;
-        const responseRate = totalOutreached > 0 ? Math.round((responses / totalOutreached) * 100) : 0;
-        const activeProspects = contacts.filter(c => !ARCHIVED_STAGES.includes(c.pipeline_stage)).length;
+        const metrics = channelMetricsByDeal[deal.id] || createEmptyDealChannelMetrics();
         const batch = batchByDeal[deal.id] || null;
         const liveFirmCount = batch?.id ? (firmCountByBatch[batch.id] || 0) : 0;
 
         return {
           ...deal,
-          contacts: totalContacts,
+          contacts: metrics.contacts,
           live_firms: liveFirmCount,
           firms: liveFirmCount,
-          active_prospects: activeProspects,
-          emails_sent: emailsSentCount,
-          response_rate: responseRate,
-          live_contacts: totalContacts,
-          live_active_prospects: activeProspects,
-          live_emails_sent: emailsSentCount,
-          live_response_rate: responseRate,
-          live_responses: responses,
+          active_prospects: metrics.active_prospects,
+          emails_sent: metrics.emails_sent,
+          emails_replied: metrics.emails_replied,
+          li_invites_sent: metrics.li_invites_sent,
+          li_accepts: metrics.li_accepts,
+          li_dms_sent: metrics.li_dms_sent,
+          li_dm_replies: metrics.li_dm_replies,
+          response_rate: metrics.overall_response_rate,
+          email_response_rate: metrics.email_response_rate,
+          li_acceptance_rate: metrics.li_acceptance_rate,
+          li_dm_response_rate: metrics.li_dm_response_rate,
+          live_contacts: metrics.contacts,
+          live_active_prospects: metrics.active_prospects,
+          live_emails_sent: metrics.emails_sent,
+          live_response_rate: metrics.overall_response_rate,
+          live_responses: metrics.total_responses,
           current_batch_status: batch?.status || null,
           current_batch_number: batch?.batch_number || null,
           current_batch_id: batch?.id || null,
@@ -5480,51 +5643,47 @@ function registerRoutes(app) {
       const deal = await getDeal(req.params.id);
       if (!deal) return res.status(404).json({ error: 'Deal not found' });
 
+      const channelMetricsByDeal = await computeDealChannelMetrics(sb, [req.params.id]);
+      const channelMetrics = channelMetricsByDeal[req.params.id] || createEmptyDealChannelMetrics();
       const [
-        { data: contacts },
         { data: emailRows },
-        { count: emailRepliesCount },
         { count: firmsCount },
-        confirmedInvites,
       ] = await Promise.all([
-        sb.from('contacts').select('pipeline_stage, invite_sent_at, invite_accepted_at, outreach_channel').eq('deal_id', req.params.id),
         sb.from('emails').select('id, metadata').eq('deal_id', req.params.id).eq('status', 'sent'),
-        sb.from('replies').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
         sb.from('batch_firms').select('id', { count: 'exact', head: true }).eq('deal_id', req.params.id),
-        countConfirmedLinkedInInvitesForDeals(sb, [req.params.id]),
       ]);
-      const all = contacts || [];
       const outboundEmails = emailRows || [];
 
-      const emailsSent      = outboundEmails.length;
-      const emailReplies    = emailRepliesCount || 0;
+      const emailsSent      = channelMetrics.emails_sent;
+      const emailReplies    = channelMetrics.emails_replied;
       const emailsOpened    = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.opens_count || 0) > 0 ? 1 : 0), 0);
       const emailsClicked   = outboundEmails.reduce((sum, row) => sum + (Number(row?.metadata?.clicks_count || 0) > 0 ? 1 : 0), 0);
-      const invitesSent     = Number(confirmedInvites || 0);
-      const activePendingInvites = all.filter(hasActivePendingLinkedInInvite).length;
-      const invitesAccepted = all.filter(hasLinkedInAccepted).length;
-      const dmsSent         = all.filter(c => ['DM Approved','DM Sent','dm_sent','Replied','In Conversation','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
-      const dmResponses     = all.filter(c => ['In Conversation','Replied','Meeting Booked','Meeting Scheduled'].includes(c.pipeline_stage) && (c.outreach_channel === 'linkedin_dm' || c.outreach_channel === 'linkedin')).length;
-      const activeProspects = all.filter(c => !['Archived','Skipped','Inactive','Suppressed — Opt Out','Deleted — Do Not Contact'].includes(c.pipeline_stage)).length;
+      const invitesSent     = channelMetrics.li_invites_sent;
+      const activePendingInvites = channelMetrics.li_active_pending;
+      const invitesAccepted = channelMetrics.li_accepts;
+      const dmsSent         = channelMetrics.li_dms_sent;
+      const dmResponses     = channelMetrics.li_dm_replies;
+      const activeProspects = channelMetrics.active_prospects;
 
       res.json({
-        totalContacts:      all.length,
+        totalContacts:      channelMetrics.contacts,
         activeProspects,
         invitesSent,
         activePendingInvites,
         invitesAccepted,
-        acceptanceRate:     invitesSent > 0 ? Math.round((invitesAccepted / invitesSent) * 100) : 0,
+        acceptanceRate:     channelMetrics.li_acceptance_rate,
         dmsSent,
         dmResponses,
-        dmResponseRate:     dmsSent > 0 ? Math.round((dmResponses / dmsSent) * 100) : 0,
+        dmResponseRate:     channelMetrics.li_dm_response_rate,
         emailsSent,
         emailReplies,
         emailsOpened,
         emailOpenRate:      emailsSent > 0 ? Math.round((emailsOpened / emailsSent) * 100) : 0,
         emailsClicked,
         emailClickRate:     emailsSent > 0 ? Math.round((emailsClicked / emailsSent) * 100) : 0,
-        emailResponseRate:  emailsSent > 0 ? Math.round((emailReplies / emailsSent) * 100) : 0,
-        totalResponses:     emailReplies + dmResponses,
+        emailResponseRate:  channelMetrics.email_response_rate,
+        totalResponses:     channelMetrics.total_responses,
+        overallResponseRate: channelMetrics.overall_response_rate,
         firms:              firmsCount || 0,
         capitalCommitted:   deal.committed_amount || 0,
         targetAmount:       deal.target_amount || 0,
@@ -8960,6 +9119,7 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
       message_id:     messageId || null,
       contact_id:     contact?.id || null,
       deal_id:        originalEmail?.deal_id || null,
+      channel,
       received_at:    new Date().toISOString(),
       classification: 'PENDING',
     }).select().single();

@@ -500,8 +500,9 @@ function applyStats(s) {
   setText('stat-active-deals',   fmt(s.active_deals));
   setText('stat-total-deals',    fmt(s.total_deals_launched));
   setText('stat-emails-sent',    fmt(s.emailsSent || s.emails_sent));
+  setText('stat-emails-replied', fmt(s.emails_replied || 0));
   setText('stat-response-rate',  s.response_rate != null ? pct(s.response_rate) : (s.responseRate != null ? pct(s.responseRate) : '—'));
-  if (s.emails_replied != null) setText('stat-response-sub', `${fmt(s.emails_replied)} repl${s.emails_replied === 1 ? 'y' : 'ies'}`);
+  if (s.emails_replied != null) setText('stat-response-sub', `${fmt(s.emails_replied)} email repl${s.emails_replied === 1 ? 'y' : 'ies'}`);
   setText('stat-prospects',      fmt(s.activeProspects || s.active_prospects));
   setText('stat-queue',          fmt(s.queueCount || s.approval_queue));
   const totalRaised = s.total_funds_raised ?? s.committed ?? s.capital_committed ?? s.capitalCommitted;
@@ -512,7 +513,7 @@ function applyStats(s) {
       ? `Active: ${formatMoney(activeCom)}${s.targetAmount ? ` · Target: ${formatMoney(s.targetAmount)}` : ''}`
       : (s.targetAmount ? `Target: ${fmt(s.targetAmount)}` : ''));
   setText('stat-emails-sub',     s.emailsSentPeriod || '');
-  setText('stat-response-sub',   s.responseRatePeriod || '');
+  setText('stat-emails-replied-sub', s.emailsRepliedPeriod || 'inbound replies');
   setText('stat-prospects-sub',  s.prospectsPeriod || '');
   setText('stat-queue-sub',      s.queuePeriod || '');
 
