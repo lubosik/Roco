@@ -45,7 +45,7 @@ import { researchFirmOnly, findDecisionMakers } from '../research/firmResearcher
 import { runDealResearch } from '../research/dealResearcher.js'; // legacy fallback
 import { queryInvestorDatabase, batchScoreInvestors as batchScoreInvestors } from './investorDatabaseQuery.js';
 import { haikuComplete } from './aiClient.js';
-import { pushActivity, queueLinkedInDmApproval, sendApprovedLinkedInDM, sendApprovedReply } from '../dashboard/server.js';
+import { pushActivity, notifyQueueUpdated, queueLinkedInDmApproval, sendApprovedLinkedInDM, sendApprovedReply } from '../dashboard/server.js';
 import { info, warn, error } from './logger.js';
 import { ORCHESTRATOR_INTERVAL_MS } from '../config/constants.js';
 import { runFundraiserReasoning, gatherCurrentMetrics } from './fundraiserBrain.js';
@@ -5989,6 +5989,7 @@ async function phaseOutreach(deal, state) {
         }).catch(() => {});
 
         sendTelegram(`✅ *Email sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subject ? `\nSubject: _${sanitizeOutreach(subject)}_` : ''}`).catch(() => {});
+        notifyQueueUpdated();
       } catch (err) {
         try {
           const { data: failedContact } = await sb.from('contacts').select('id, email').eq('id', item.contact_id).maybeSingle();

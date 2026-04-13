@@ -5637,7 +5637,7 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     const isResearchTrace = type === 'research' && !!event.full_content;
     const isExpandedType = isThinking || isResearchTrace;
     const ts    = new Date(event.created_at || event.timestamp).toLocaleString('en-US', {
-      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: DOM_TZ,
     });
     const mainText = isExpandedType && event.full_content
       ? event.full_content
