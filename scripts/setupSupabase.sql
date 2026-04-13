@@ -178,6 +178,12 @@ create table if not exists outreach_events (
   metadata jsonb default '{}'::jsonb,
   created_at timestamptz default now()
 );
+create unique index if not exists outreach_events_dedupe_idx on outreach_events (
+  event_type,
+  contact_id,
+  provider_message_id,
+  created_at
+);
 
 -- ─── FIRM_SUPPRESSIONS ────────────────────────────────────────────────────────
 create table if not exists firm_suppressions (
