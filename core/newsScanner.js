@@ -2,6 +2,7 @@ import { getSupabase } from './supabase.js';
 import { sendTelegram } from '../approval/telegramBot.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import { claudeWebSearch } from './aiClient.js';
+import { webSearch, formatWebResultsForPrompt } from '../research/webSearcher.js';
 import Anthropic from '@anthropic-ai/sdk';
 import { DateTime } from 'luxon';
 
@@ -31,6 +32,76 @@ async function recordDailyNewsScanFailure(deal, pushActivity, message) {
     `⚠ *News scan failed for ${DateTime.utc().toFormat('LLLL d, yyyy')}*\n` +
     `${deal.name}\n${truncate(message, 260)}\nTop up Grok/xAI credits if needed. Roco will not retry this news scan until tomorrow.`
   ).catch(() => {});
+}
+
+async function runSerpInvestorSearch(query, num = 5) {
+  const results = await webSearch(query, num, { engine: 'google', gl: 'us', hl: 'en' });
+  return results.filter(item => item.title || item.snippet);
+}
+
+async function summarizeSerpInvestorResults(deal, queryPlan, serpResults, mode = 'investor_batch') {
+  if (!anthropic || !serpResults.length) return null;
+
+  const modeInstructions = mode === 'news_scan'
+    ? `Return valid JSON with keys:
+{
+  "search_summary": "short operator summary",
+  "findings": [
+    {
+      "firm_name": "string",
+      "news_event": "string",
+      "why_relevant": "string",
+      "source_url": "string or null",
+      "source_hint": "string or null",
+      "published_at": "string or null",
+      "relevance_score": 1-10,
+      "investor_type": "string or null",
+      "hq_country": "string or null"
+    }
+  ]
+}`
+    : `Return valid JSON array:
+[
+  {
+    "firm_name": "string",
+    "investor_type": "string or null",
+    "hq_country": "string or null",
+    "reason_fit": "string",
+    "recent_activity": "string",
+    "confidence": 1-10
+  }
+]`;
+
+  const prompt = `You are ROCO's investor research analyst.
+
+Deal:
+- Name: ${deal.name}
+- Sector: ${deal.sector || 'General'}
+- Geography: ${deal.target_geography || deal.geography || 'United States'}
+- Type: ${deal.deal_type || deal.raise_type || 'N/A'}
+
+Queries attempted:
+${queryPlan.join('\n')}
+
+SERP RESULTS
+${formatWebResultsForPrompt(serpResults)}
+
+Task:
+- Identify real investors only.
+- Ignore pure media, advisors, or irrelevant operators.
+- Use the search snippets as source material.
+- Be conservative.
+- ${mode === 'news_scan' ? 'Focus on recent investor/news signals relevant to the current deal.' : 'Focus on investors that should be added to the current pipeline or batch.'}
+
+${modeInstructions}`;
+
+  const response = await anthropic.messages.create({
+    model: NEWS_SUMMARY_MODEL,
+    max_tokens: 1200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  return String(response.content?.[0]?.text || '').trim();
 }
 
 function extractJSONArray(text) {
@@ -475,6 +546,29 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
         recommendedInvestors: [],
       };
     } catch (fallbackErr) {
+      try {
+        const serpResults = [];
+        for (const query of queryPlan.slice(0, 3)) {
+          const rows = await runSerpInvestorSearch(query, 5).catch(() => []);
+          serpResults.push(...rows);
+        }
+        const serpSummary = await summarizeSerpInvestorResults(deal, queryPlan, serpResults, 'news_scan');
+        const serpPayload = serpSummary ? extractJSONObject(serpSummary) : null;
+        if (serpPayload) {
+          return {
+            leads: safeArray(serpPayload.findings || []).map(normalizeDealLead),
+            summary: String(serpPayload.search_summary || '').trim(),
+            rawSummary: formatWebResultsForPrompt(serpResults).slice(0, 4000),
+            rejectedFindings: [],
+            grokQueries: queryPlan,
+            grokRawResults,
+            isRelevant: safeArray(serpPayload.findings).length > 0,
+            notes: 'Grok and Claude web search failed; SerpApi fallback used.',
+            recommendedInvestors: [],
+          };
+        }
+      } catch {}
+
       await recordDailyNewsScanFailure(deal, pushActivity, `${failureReason}. Claude fallback also failed: ${fallbackErr.message}`);
       return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
     }
@@ -697,13 +791,32 @@ Maximum 10 results.`;
     if (!result) return [];
     return await parseFirmResults(result, 'claude_web_search', 'Claude Web Research', 'Claude');
   } catch (err) {
-    pushActivity?.({
-      type: 'error',
-      action: 'Investor web search fallback failed',
-      note: err.message?.slice(0, 80),
-      deal_id: deal.id,
-    });
-    return [];
+    try {
+      pushActivity?.({
+        type: 'research',
+        action: `SerpApi fallback: finding active investors for ${deal.name}`,
+        note: `${deal.sector || 'General'} · ${deal.target_geography || deal.geography || 'US'}`,
+        deal_id: deal.id,
+      });
+      const serpResults = [];
+      for (const queryVariant of [query, `${deal.name} investors ${deal.sector || ''} ${deal.target_geography || deal.geography || 'US'}`].filter(Boolean)) {
+        const rows = await runSerpInvestorSearch(queryVariant, 5).catch(() => []);
+        serpResults.push(...rows);
+      }
+      if (!serpResults.length) return [];
+
+      const summarized = await summarizeSerpInvestorResults(deal, ['serpapi_fallback'], serpResults, 'investor_batch');
+      if (!summarized) return [];
+      return await parseFirmResults(summarized, 'serpapi_web_search', 'SerpApi Web Research', 'SerpApi');
+    } catch (serpErr) {
+      pushActivity?.({
+        type: 'error',
+        action: 'Investor web search fallback failed',
+        note: serpErr.message?.slice(0, 80) || err.message?.slice(0, 80),
+        deal_id: deal.id,
+      });
+      return [];
+    }
   }
 }
 
