@@ -2060,14 +2060,29 @@ export async function reloadPendingInvestorApprovals() {
   );
 
   const { data: pending } = await sb.from('approval_queue')
-    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, outreach_mode')
+    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, outreach_mode, telegram_msg_id')
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(30);
 
-  const unsent = (pending || [])
+  const investorPending = (pending || [])
     .filter(item => item.outreach_mode !== 'company_sourcing')
     .filter(item => !existingQueueIds.has(String(item.id)));
+
+  // Items that already had a Telegram message: restore them to the in-memory map
+  // silently instead of re-sending (avoids duplicate Telegram messages on restart).
+  for (const item of investorPending.filter(i => i.telegram_msg_id)) {
+    pendingApprovals.set(String(item.telegram_msg_id), {
+      ...buildReloadedApprovalEntry(item),
+      emailDraft: {
+        subject: item.subject_a || item.subject || null,
+        alternativeSubject: item.subject_b || null,
+        body: item.body || '',
+      },
+    });
+  }
+
+  const unsent = investorPending.filter(item => !item.telegram_msg_id);
   if (!unsent.length) return;
 
   const chatId = process.env.TELEGRAM_CHAT_ID;

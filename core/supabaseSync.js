@@ -710,6 +710,24 @@ export async function addApprovalToQueue(data) {
   const sb = getSupabase();
   if (!sb) return null;
   try {
+    // Dedup: never create a second active entry for the same contact+stage.
+    // Covers the restart-loop case where contactsInFlight is cleared but the
+    // DB row is still pending/approved/sending.
+    if (data.contactId && data.stage) {
+      const { data: existing } = await sb.from('approval_queue')
+        .select('id, status')
+        .eq('contact_id', data.contactId)
+        .eq('stage', data.stage)
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existing) {
+        console.log(`[supabaseSync] addApprovalToQueue: dedup — returning existing row ${existing.id} (${existing.status}) for contact ${data.contactId}`);
+        return existing;
+      }
+    }
+
     const { data: row, error } = await sb
       .from('approval_queue')
       .insert([{

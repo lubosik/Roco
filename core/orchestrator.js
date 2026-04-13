@@ -6208,6 +6208,27 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
   if (contactsInFlight.has(contact.id)) return;
   const forceChannel = options.forceChannel || 'email';
 
+  // DB-level dedup: if there's already an active approval for this contact+deal,
+  // don't draft again. This survives restarts (contactsInFlight is in-memory only).
+  {
+    const activeSb = getSupabase();
+    if (activeSb && contact.id) {
+      const { data: existingApproval } = await activeSb.from('approval_queue')
+        .select('id, status, stage')
+        .eq('contact_id', contact.id)
+        .eq('deal_id', deal.id)
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingApproval) {
+        info(`[OUTREACH] Skipping ${contact.name} — active approval already in queue (${existingApproval.stage} / ${existingApproval.status})`);
+        contactsInFlight.add(contact.id); // keep in-memory gate consistent
+        return;
+      }
+    }
+  }
+
   // Hard gate — never attempt to draft or send if the contact has no name
   if (!contact.name || contact.name.trim() === '' || contact.name.toLowerCase() === 'null') {
     warn(`[OUTREACH] Skipping contact ${contact.id} — no name, cannot draft a message`);
@@ -6258,6 +6279,17 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
   }
 
   contactsInFlight.add(contact.id);
+
+  // Immediately update the contact's pipeline_stage to 'Email Approved' / 'DM Approved'
+  // so that if Roco restarts before the user acts, the orchestrator's hasExistingOutreach()
+  // check prevents re-selecting this contact and creating duplicate approvals.
+  try {
+    const pendingStage = forceChannel === 'linkedin_dm' ? 'DM Approved' : 'Email Approved';
+    await sb.from('contacts').update({
+      pipeline_stage: pendingStage,
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id);
+  } catch {}
 
   pushActivity({
     type: forceChannel === 'linkedin_dm' ? 'linkedin' : 'email',

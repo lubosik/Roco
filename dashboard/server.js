@@ -1883,7 +1883,12 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   }]).select().single();
   if (error) throw error;
 
-  await sb.from('contacts').update({ pending_linkedin_dm: false }).eq('id', contact.id);
+  // Mark the contact as DM Approved immediately so the orchestrator doesn't
+  // re-select and re-draft on the next cycle or after a restart.
+  await sb.from('contacts').update({
+    pending_linkedin_dm: false,
+    pipeline_stage: 'DM Approved',
+  }).eq('id', contact.id);
   await reloadPendingInvestorApprovals().catch(() => {});
   pushActivity({
     type: 'linkedin',
