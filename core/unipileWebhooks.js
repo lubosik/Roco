@@ -5,6 +5,7 @@
 import { getSupabase } from './supabase.js';
 import { getLiveCredentials, isWithinSendingWindow, getExistingChatWithContact, getChatMessages } from './unipile.js';
 import { aiComplete } from './aiClient.js';
+import { normalizeComparableName } from './hardeningHelpers.js';
 
 // In-memory dedupe cache — cleared every 5 minutes
 const recentlyProcessed = new Map();
@@ -103,16 +104,6 @@ function buildLinkedInIdentityClauses(payload) {
   if (payload?.profile_url) clauses.push(`linkedin_url.eq.${payload.profile_url}`);
   if (payload?.public_identifier) clauses.push(`linkedin_url.ilike.%${payload.public_identifier}%`);
   return [...new Set(clauses)].filter(Boolean);
-}
-
-function normalizeComparableName(value) {
-  return String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\b(caia|cfa|mba|phd|md)\b/gi, ' ')
-    .replace(/[^a-z0-9]+/gi, ' ')
-    .trim()
-    .toLowerCase();
 }
 
 async function findUniqueContactByName(sb, rawName) {
@@ -490,7 +481,7 @@ export async function handleLinkedInAcceptance(contact, deal, pushActivity, queu
 
 export async function handleLinkedInRelation(raw, pushActivity, queueForApproval) {
   const sb      = getSupabase();
-  if (!sb) return;
+  if (!sb) return { matchStatus: 'no_db' };
 
   const payload = normalizeRelation(raw);
 
@@ -501,7 +492,7 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
       action: 'LinkedIn acceptance received',
       note: 'Payload did not include a provider ID, profile URL, public identifier, or name, so no active deal could be matched',
     });
-    return;
+    return { matchStatus: 'missing_identifiers' };
   }
 
   // Look up contact by linkedin_provider_id
@@ -553,7 +544,7 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
         apiUsed: 'unipile',
       });
     } catch {}
-    return;
+    return { matchStatus: 'unmatched', payload };
   }
 
   const dealStatus = contact.deals?.status || contact.deal_status;
@@ -566,7 +557,7 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
       dealId: contact.deal_id,
       deal_name: getDealName(contact),
     });
-    return;
+    return { matchStatus: 'inactive_deal', contactId: contact.id, dealId: contact.deal_id || null };
   }
 
   // Mark connection accepted
@@ -616,4 +607,5 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   const deal = contact.deals || { id: contact.deal_id, name: null };
   await handleLinkedInAcceptance(contact, deal, pushActivity, queueForApproval);
+  return { matchStatus: 'matched', contactId: contact.id, dealId: contact.deal_id || null };
 }
