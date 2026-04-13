@@ -485,7 +485,7 @@ function onDealSelectorChange(id) {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 async function loadOverview() {
-  await Promise.all([refreshStats(), loadActivityLog(true)]);
+  await Promise.all([refreshStats(), loadActivityLog(true), loadOpsAlerts()]);
 }
 
 async function refreshStats() {
@@ -579,6 +579,54 @@ function applyHealth(h) {
       console.warn(`[ROCO] Health render error for ${svc}:`, svcErr.message);
     }
   });
+}
+
+async function loadOpsAlerts() {
+  try {
+    const data = await api('/api/ops/alerts', 'GET', null, { silent: true });
+    renderOpsAlerts(data || {});
+  } catch {
+    renderOpsAlerts({ webhook_issues: [], provider_limit_pauses: [] });
+  }
+}
+
+function renderOpsAlerts(data = {}) {
+  const webhookEl = document.getElementById('ops-unmatched-webhooks');
+  const pauseEl = document.getElementById('ops-provider-pauses');
+  if (webhookEl) {
+    const rows = Array.isArray(data.webhook_issues) ? data.webhook_issues : [];
+    webhookEl.innerHTML = rows.length
+      ? rows.map(item => {
+          const who = stringifyOpsValue(
+            item?.payload?.data?.user_full_name
+            || item?.payload?.data?.sender?.attendee_name
+            || item?.payload?.user_full_name
+            || item?.payload?.sender?.attendee_name
+            || item?.note
+            || 'Unknown sender'
+          );
+          return `<div style="padding:8px 0;border-top:1px solid rgba(255,255,255,0.05)">
+            <div style="font-size:11px;color:#EDE9E3">${esc(who)}</div>
+            <div style="font-size:10px;color:#8A8680;font-family:'DM Mono',monospace">${esc(item.match_status || item.event_type || 'unmatched')} · ${esc(formatTime(item.received_at))}</div>
+          </div>`;
+        }).join('')
+      : '<div style="color:#8A8680">No unmatched webhook receipts.</div>';
+  }
+  if (pauseEl) {
+    const rows = Array.isArray(data.provider_limit_pauses) ? data.provider_limit_pauses : [];
+    pauseEl.innerHTML = rows.length
+      ? rows.map(item => `<div style="padding:8px 0;border-top:1px solid rgba(255,255,255,0.05)">
+          <div style="font-size:11px;color:#EDE9E3">${esc(item.contact_name || 'Unknown contact')}${item.company_name ? ` · ${esc(item.company_name)}` : ''}</div>
+          <div style="font-size:10px;color:#8A8680;font-family:'DM Mono',monospace">retry ${esc(String(item.retry_count || 0))} · until ${esc(formatScheduleDate(item.blocked_until))}${item.deal_name ? ` · ${esc(item.deal_name)}` : ''}</div>
+        </div>`).join('')
+      : '<div style="color:#8A8680">No active provider-limit pauses.</div>';
+  }
+}
+
+function stringifyOpsValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
 }
 
 async function loadActivityLog(renderToOverview = true) {
