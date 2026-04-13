@@ -8,7 +8,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DateTime } from 'luxon';
-import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals, dismissPendingApproval } from '../approval/telegramBot.js';
+import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals, dismissPendingApproval, getRecentlyResolvedQueueIds } from '../approval/telegramBot.js';
 import { getInvestorGuidance, getSourcingGuidance, saveInvestorGuidance, saveSourcingGuidance, buildGuidanceBlock } from '../services/guidanceService.js';
 import { invalidateCache as invalidateAgentContext } from '../core/agentContext.js';
 import { getSupabase } from '../core/supabase.js';
@@ -34,7 +34,7 @@ import {
   getActivityLog, logActivity as sbLogActivity,
   getBatches, deleteApprovalFromQueue,
 } from '../core/supabaseSync.js';
-import { getWindowStatus, getWindowVisualization, isWithinChannelWindow } from '../core/scheduleChecker.js';
+import { getWindowStatus, getWindowVisualization, isWithinChannelWindow, getNextWindowOpenForChannel } from '../core/scheduleChecker.js';
 import { getBatchSummary } from '../core/batchManager.js';
 import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply, getConnectedEmailAccounts, getExistingChatWithContact, getChatMessages, processLinkedInInvite } from '../core/unipile.js';
 import { handleLinkedInMessage as handleLiMsg, handleLinkedInRelation as handleLiRelation } from '../core/unipileWebhooks.js';
@@ -2053,13 +2053,13 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
       type: 'linkedin',
       action: `LinkedIn DM approved: ${contact.name || 'contact'}`,
       note: deal?.name
-        ? `${contact.company_name || queueItem?.firm || ''} · Waiting for DM window${getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : ''}`
-        : `Waiting for DM window${getWindowStatus(deal).nextOpen ? ` (${getWindowStatus(deal).nextOpen})` : ''}`,
+        ? `${contact.company_name || queueItem?.firm || ''} · Waiting for DM window${deal ? ` (${getNextWindowOpenForChannel(deal, 'linkedin_dm')})` : ''}`
+        : `Waiting for DM window${deal ? ` (${getNextWindowOpenForChannel(deal, 'linkedin_dm')})` : ''}`,
       deal_name: deal?.name || queueItem?.deal_name || null,
       dealId: contact.deal_id || queueItem?.deal_id || null,
     });
     notifyQueueUpdated();
-    return { deferred: true, nextOpen: getWindowStatus(deal).nextOpen || null };
+    return { deferred: true, nextOpen: deal ? getNextWindowOpenForChannel(deal, 'linkedin_dm') : null };
   }
 
   const bodyToSend = sanitizeApprovalText(text || queueItem?.edited_body || queueItem?.body || '');
@@ -3662,11 +3662,16 @@ function registerRoutes(app) {
           merged.push(item);
         }
 
+        // Items resolved via Telegram but whose DB update may still be in flight
+        const recentlyResolved = getRecentlyResolvedQueueIds();
+
         for (const item of sbMapped) {
           const queueKey = item.id ? `q:${item.id}` : null;
           if (queueKey && seenQueueIds.has(queueKey)) continue;
           const localKey = item.telegramMsgId ? `i:${item.telegramMsgId}` : null;
           if (localKey && seenLocalIds.has(localKey)) continue;
+          // Filter out items that were just approved/skipped via Telegram
+          if (item.id && recentlyResolved.has(String(item.id))) continue;
           merged.push(item);
         }
 

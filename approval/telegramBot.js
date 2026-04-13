@@ -132,6 +132,13 @@ async function resolveRequiredDeal(chatId, args, {
 const pendingApprovals  = new Map(); // messageId -> { contactPage, emailDraft, resolve, ... }
 const editLoops         = new Map(); // contactPageId -> count
 const pendingEditReqs   = new Map(); // chatId -> msgId  (waiting for edit instructions after button press)
+const processingApprovals     = new Set(); // msgIds currently being handled (dedup guard)
+const recentlyResolvedQueueIds = new Set(); // queue IDs resolved via Telegram, awaiting DB commit
+
+/** Called by /api/queue to filter out items whose Telegram approval is still committing. */
+export function getRecentlyResolvedQueueIds() {
+  return recentlyResolvedQueueIds;
+}
 
 export function initTelegramBot(state) {
   rocoState = state;
@@ -727,11 +734,16 @@ async function handleCallbackQuery(query) {
   const action = data.slice(0, colon);
   const msgId  = Number(data.slice(colon + 1));
 
+  // Dedup guard — ignore duplicate button presses while one is in flight
+  if (processingApprovals.has(msgId)) return;
+  processingApprovals.add(msgId);
+
   let approval = pendingApprovals.get(msgId);
   if (!approval) {
     approval = await reloadApprovalForTelegramMessage(msgId);
   }
   if (!approval) {
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, '⚠ This draft is no longer in the queue — it may have already been handled.');
     return;
   }
@@ -740,12 +752,15 @@ async function handleCallbackQuery(query) {
     const variant = action === 'aa' ? 'A' : 'B';
     const subject = variant === 'A' ? approval.emailDraft.subject : approval.emailDraft.alternativeSubject;
     resolveApproval(msgId, approval, 'approve', { variant, subject });
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `✅ Email approved for *${approval.name}* with Subject ${variant}. Roco will send it now if the window is open, otherwise it will wait for the next sending window.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'sa') {
-    // Sourcing LinkedIn DM — single approve button
+    // LinkedIn DM — single approve button
     resolveApproval(msgId, approval, 'approve', { variant: 'A', subject: approval.emailDraft.subject });
-    await bot.sendMessage(chatId, `✅ LinkedIn DM approved for *${approval.name}*...`, { parse_mode: 'Markdown' });
+    processingApprovals.delete(msgId);
+    const dmWindowHint = `Roco will send the DM during the LinkedIn DM window (8pm–11pm). If the window is already open, it will fire immediately.`;
+    await bot.sendMessage(chatId, `✅ *LinkedIn DM approved* for *${approval.name}*\n\n${dmWindowHint}`, { parse_mode: 'Markdown' });
 
   } else if (action === 'lm') {
     const sb = getSupabase();
@@ -767,6 +782,7 @@ async function handleCallbackQuery(query) {
     await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
     editLoops.delete(approval.contactPage?.id);
+    processingApprovals.delete(msgId);
     try { approval.resolve?.({ action: 'skip' }); } catch {}
     await bot.sendMessage(chatId, `📝 *Manual* — *${approval.name}* will be ignored for this step. If they reply later, Roco can still pick that up.`, { parse_mode: 'Markdown' });
 
@@ -793,11 +809,13 @@ async function handleCallbackQuery(query) {
     await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
     editLoops.delete(approval.contactPage?.id);
+    processingApprovals.delete(msgId);
     try { approval.resolve?.({ action: 'skip' }); } catch {}
     await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* will not be picked up by Roco again.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'sk') {
     resolveApproval(msgId, approval, 'skip');
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `🗑 Deleted — *${approval.name}* skipped from Roco outreach. Handle manually.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'ec') {
@@ -814,9 +832,11 @@ async function handleCallbackQuery(query) {
       } catch {}
     }
     resolveApproval(msgId, approval, 'skip');
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `🚫 *${approval.name}* archived — Roco will not contact them again.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'ed') {
+    processingApprovals.delete(msgId);
     pendingEditReqs.set(chatId, msgId);
     await bot.sendMessage(chatId,
       `✏ *Edit draft for ${approval.name}*\n\nType your instructions and I'll redraft:`,
@@ -826,7 +846,7 @@ async function handleCallbackQuery(query) {
   } else if (action === 'rq' || action === 'ra') {
     // Reply approve — either queue for window or bypass it immediately
     const ra = approval.replyApproval;
-    if (!ra) { await bot.sendMessage(chatId, '⚠ Missing reply data.'); return; }
+    if (!ra) { processingApprovals.delete(msgId); await bot.sendMessage(chatId, '⚠ Missing reply data.'); return; }
     try {
       const { sendApprovedReply } = await import('../dashboard/server.js');
       const sendNow = action === 'ra';
@@ -849,6 +869,7 @@ async function handleCallbackQuery(query) {
       });
       await clearTelegramApprovalControls(msgId);
       pendingApprovals.delete(msgId);
+      processingApprovals.delete(msgId);
       if (result?.deferred) {
         await bot.sendMessage(chatId, `✅ Reply approved for *${approval.name}* and queued for the next sending window${result?.nextOpen ? ` (${result.nextOpen})` : ''}.`, { parse_mode: 'Markdown' });
       } else {
@@ -856,11 +877,13 @@ async function handleCallbackQuery(query) {
         await bot.sendMessage(chatId, `✅ Reply sent to *${approval.name}* via ${ch}.`, { parse_mode: 'Markdown' });
       }
     } catch (err) {
+      processingApprovals.delete(msgId);
       await bot.sendMessage(chatId, `⚠ Send failed: ${err.message}`);
     }
 
   } else if (action === 're') {
     // Reply edit — wait for instructions
+    processingApprovals.delete(msgId);
     pendingEditReqs.set(chatId, msgId);
     await bot.sendMessage(chatId,
       `✏ *Edit reply for ${approval.name}*\n\nType your edit instructions:`,
@@ -876,6 +899,7 @@ async function handleCallbackQuery(query) {
     }
     await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `✗ Reply to *${approval.name}* skipped.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'rm') {
@@ -891,6 +915,7 @@ async function handleCallbackQuery(query) {
     }
     await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `📝 *Manual mode* — auto-reply dismissed for *${approval.name}*. Future replies will still be tracked and re-queued.`, { parse_mode: 'Markdown' });
 
   } else if (action === 'rc') {
@@ -923,6 +948,7 @@ async function handleCallbackQuery(query) {
     }
     await clearTelegramApprovalControls(msgId);
     pendingApprovals.delete(msgId);
+    processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* moved to Inactive and this conversation is finished.`, { parse_mode: 'Markdown' });
   }
 }
@@ -938,6 +964,9 @@ function resolveApproval(msgId, approval, action, extra = {}) {
   if (approval.queueId) {
     const status = action === 'approve' ? 'approved' : 'telegram_skipped';
     const subject = action === 'approve' ? (extra.subject || null) : null;
+    // Track as recently resolved so /api/queue doesn't flash stale data while DB commits
+    recentlyResolvedQueueIds.add(String(approval.queueId));
+    setTimeout(() => recentlyResolvedQueueIds.delete(String(approval.queueId)), 12_000);
     updateApprovalStatus(approval.queueId, status, subject).catch(() => {});
   }
   import('../dashboard/server.js').then(({ pushActivity, notifyQueueUpdated }) => {

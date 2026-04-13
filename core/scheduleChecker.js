@@ -107,6 +107,53 @@ export function getNextWindowOpen(deal) {
 }
 
 /**
+ * Get human-readable next open time for a specific channel.
+ * Respects per-channel windows (li_dm_from/until for linkedin_dm, etc.)
+ * @param {object} deal
+ * @param {'email'|'linkedin_dm'|'linkedin_invite'} channel
+ * @returns {string}
+ */
+export function getNextWindowOpenForChannel(deal, channel) {
+  if (!deal) return 'Now';
+
+  const { tz, sendingDays } = resolveSchedule(deal);
+  const now = DateTime.now().setZone(tz);
+  const tzLabel = tz === 'America/New_York' ? 'EST' : tz;
+
+  let startStr;
+  if (channel === 'linkedin_dm') {
+    startStr = deal.li_dm_from || '20:00';
+  } else if (channel === 'linkedin_invite') {
+    startStr = deal.li_connect_from || null;
+    if (!startStr) return 'Now (any time)';
+  } else {
+    // email — use email window
+    startStr = deal.send_from || '06:00';
+  }
+
+  // For linkedin_dm / linkedin_invite: not day-restricted by default
+  const isDayRestricted = channel === 'email';
+
+  for (let daysAhead = 0; daysAhead <= 7; daysAhead++) {
+    const candidate = now.plus({ days: daysAhead });
+    const dayName = candidate.weekdayLong.toLowerCase();
+
+    if (isDayRestricted && !sendingDays.includes(dayName)) continue;
+
+    const [startH, startM] = startStr.split(':').map(Number);
+    const windowStart = candidate.set({ hour: startH, minute: startM, second: 0 });
+
+    if (windowStart > now) {
+      if (daysAhead === 0) return `today at ${startStr} ${tzLabel}`;
+      if (daysAhead === 1) return `tomorrow at ${startStr} ${tzLabel}`;
+      return `${candidate.weekdayLong} at ${startStr} ${tzLabel}`;
+    }
+  }
+
+  return `${startStr} ${tzLabel}`;
+}
+
+/**
  * Get detailed window status for a deal (used by dashboard).
  * @param {object} deal
  * @param {string|null} globalPausedUntil

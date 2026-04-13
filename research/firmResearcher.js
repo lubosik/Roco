@@ -1485,6 +1485,27 @@ async function hydrateFirmResearchForEnrichment(firm, deal) {
 
 export async function findDecisionMakers(firm, deal) {
   const storedContacts = await getStoredDecisionMakersForFirm(firm);
+
+  // If the DB already has a contact with complete data (name + email), trust it.
+  // Do NOT run Unipile or AI research that could introduce a completely different
+  // person with the same firm — this caused false identification (e.g. Francisco
+  // being returned instead of Fernando who was already in the DB with full details).
+  const completeStoredContacts = storedContacts.filter(c =>
+    (c.full_name || c.name) && c.email
+  );
+  if (completeStoredContacts.length >= 1) {
+    console.log(`[FIRM RESEARCH] ${firm.firm_name || firm.name}: trusting ${completeStoredContacts.length} existing DB contact(s) with complete data — skipping external research`);
+    return storedContacts.map(person => ({
+      name: person.full_name,
+      job_title: person.title || null,
+      linkedin_url: validateLinkedInUrl(person.linkedin_url),
+      linkedin_provider_id: person.linkedin_provider_id || null,
+      email: person.email || null,
+      source: person.source || 'contacts_db',
+    }));
+  }
+
+  // No complete stored contacts — search via Unipile (LinkedIn) first, AI web as fallback
   const unipileContacts = await findDecisionMakersViaUnipile(firm, deal);
 
   const firmRecord = {
@@ -1496,17 +1517,38 @@ export async function findDecisionMakers(firm, deal) {
     ? []
     : await findContactsAtFirm(firmRecord, deal, { persist: false });
 
-  const merged = dedupeDecisionMakers([
-    ...storedContacts,
+  // When merging, stored contacts take priority — filter AI/Unipile results that
+  // have a different name from any stored contact (prevents overriding known contacts)
+  const storedNames = storedContacts
+    .map(c => parseDecisionMakerName(c.full_name || c.name))
+    .filter(Boolean);
+
+  const safeMergeContacts = [
     ...unipileContacts,
     ...aiContacts.map(person => ({
       full_name: person.full_name,
       title: person.title || null,
-      linkedin_url: null,  // AI-generated URLs are unverified — enrichment finds the real one via Unipile
+      linkedin_url: null,
       linkedin_provider_id: null,
       email: person.email || null,
       source: person.source || 'gemini',
     })),
+  ].filter(person => {
+    // Always allow if there are no stored contacts with a name
+    if (storedNames.length === 0) return true;
+    // Filter out if they share the same firm but have a clearly different name from all stored contacts
+    const incomingParsed = parseDecisionMakerName(person.full_name || person.name);
+    if (!incomingParsed) return false;
+    // Allow if they match at least one stored contact name (it's the same person with extra data)
+    const matchesStored = storedNames.some(n => areLikelySameDecisionMaker(
+      `${n.first} ${n.last}`, `${incomingParsed.first} ${incomingParsed.last}`
+    ));
+    return matchesStored;
+  });
+
+  const merged = dedupeDecisionMakers([
+    ...storedContacts,
+    ...safeMergeContacts,
   ]);
 
   return merged.map(person => ({
