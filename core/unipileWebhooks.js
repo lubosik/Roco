@@ -32,6 +32,13 @@ function normalizeMessage(raw) {
       data.sender_id ||
       data.attendees?.find(a => !a.is_self)?.provider_id ||
       raw.sender?.attendee_provider_id,
+    sender_name:
+      data.sender?.attendee_name ||
+      data.sender?.name ||
+      data.sender_name ||
+      data.attendee_name ||
+      raw.sender?.attendee_name ||
+      '',
     account_user_id:    data.account_info?.user_id || data.account_id || raw.account_info?.user_id,
     raw,
   };
@@ -98,6 +105,36 @@ function buildLinkedInIdentityClauses(payload) {
   return [...new Set(clauses)].filter(Boolean);
 }
 
+function normalizeComparableName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(caia|cfa|mba|phd|md)\b/gi, ' ')
+    .replace(/[^a-z0-9]+/gi, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+async function findUniqueContactByName(sb, rawName) {
+  const normalizedTarget = normalizeComparableName(rawName);
+  if (!normalizedTarget) return null;
+
+  const parts = normalizedTarget.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return null;
+
+  const { data } = await sb.from('contacts')
+    .select('*, deals!contacts_deal_id_fkey(*)')
+    .ilike('name', `%${parts[0]}%`)
+    .limit(20);
+
+  const active = (data || []).filter(row => {
+    const dealStatus = String(row?.deals?.status || row?.deal_status || '').toUpperCase();
+    return dealStatus === 'ACTIVE' && normalizeComparableName(row?.name) === normalizedTarget;
+  });
+
+  return active.length === 1 ? active[0] : null;
+}
+
 // ── CONTACT MATCHING ──────────────────────────────────────────────────────────
 
 async function findContact(sb, payload) {
@@ -119,6 +156,12 @@ async function findContact(sb, payload) {
         .eq('linkedin_provider_id', payload.sender_provider_id)
         .limit(1).single();
       if (data) return data;
+    } catch {}
+  }
+  if (payload.sender_name) {
+    try {
+      const matchedByName = await findUniqueContactByName(sb, payload.sender_name);
+      if (matchedByName) return matchedByName;
     } catch {}
   }
   return null;
@@ -481,6 +524,14 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
 
   if (!contact) {
     console.log('[UNIPILE/REL] Contact not found for identifiers:', payload.provider_id || payload.public_identifier || payload.profile_url || payload.name);
+    let matchedByName = null;
+    try {
+      matchedByName = await findUniqueContactByName(sb, payload.name);
+    } catch {}
+    contact = matchedByName;
+  }
+
+  if (!contact) {
     pushActivity({
       type: 'excluded',
       action: `LinkedIn acceptance received: ${payload.name || payload.public_identifier || payload.provider_id}`,
@@ -508,6 +559,9 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
       linkedin_connected:  true,
       invite_accepted_at:  new Date().toISOString(),
       pipeline_stage:      'invite_accepted',
+      linkedin_provider_id: payload.provider_id || contact.linkedin_provider_id || null,
+      linkedin_public_id: payload.public_identifier || contact.linkedin_public_id || null,
+      linkedin_url: payload.profile_url || contact.linkedin_url || null,
     }).eq('id', contact.id);
   } catch {}
 
