@@ -184,6 +184,15 @@ function normalizeLinkedInIdentity(url) {
   }
 }
 
+const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
+
+function hasRecentLinkedInNoMatchSuppression(notes, hours = 12) {
+  const match = String(notes || '').match(LINKEDIN_NO_MATCH_NOTE_PATTERN);
+  if (!match?.[1]) return false;
+  const checkedAt = new Date(match[1]).getTime();
+  return Number.isFinite(checkedAt) && (Date.now() - checkedAt) < (hours * 60 * 60 * 1000);
+}
+
 function buildContactIdentityKey(contact, firmName = '') {
   const providerId = String(contact?.linkedin_provider_id || '').trim().toLowerCase();
   if (providerId) return `provider:${providerId}`;
@@ -4747,7 +4756,7 @@ async function enrichSingleContact(sb, contact, deal, state) {
       if (linkedinUrl && !contact.linkedin_provider_id && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
         linkedinUrl = null;
       }
-      if (!linkedinUrl && state.linkedin_enabled !== false) {
+      if (!linkedinUrl && state.linkedin_enabled !== false && !hasRecentLinkedInNoMatchSuppression(contact.notes)) {
         linkedinUrl = await findLinkedInUrl({
           name: contact.name,
           company: contact.company_name,
@@ -4962,6 +4971,9 @@ export async function phaseEnrich(deal, state) {
 
     for (const contact of (needLinkedIn || [])) {
       try {
+        if (hasRecentLinkedInNoMatchSuppression(contact.notes)) {
+          continue;
+        }
         const url = await findLinkedInUrl({ name: contact.name, company: contact.company_name, title: contact.job_title });
         if (url) {
           await sb.from('contacts').update({ linkedin_url: url }).eq('id', contact.id);
@@ -5054,7 +5066,7 @@ export async function runManualEnrich(deal, state) {
       if (linkedinUrl && !contact.linkedin_provider_id && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
         linkedinUrl = null;
       }
-      if (!linkedinUrl && state.linkedin_enabled !== false) {
+      if (!linkedinUrl && state.linkedin_enabled !== false && !hasRecentLinkedInNoMatchSuppression(contact.notes)) {
         linkedinUrl = await findLinkedInUrl({ name: contact.name, company: contact.company_name, title: contact.job_title });
         if (linkedinUrl) await sb.from('contacts').update({ linkedin_url: linkedinUrl }).eq('id', contact.id);
       }
