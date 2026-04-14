@@ -2143,7 +2143,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
         firm: contact.company_name || queueItem?.firm || null,
       },
       created_at: sentAt,
-    }).catch(() => {});
+    }).catch(err => console.warn('[LI DM] activity_log insert error:', err.message));
   }
 
   pushActivity({
@@ -2159,7 +2159,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
       status: 'sent',
       sent_at: sentAt,
       edited_body: bodyToSend !== queueItem?.body ? bodyToSend : (queueItem?.edited_body || null),
-    }).eq('id', queueId);
+    }).eq('id', queueId).catch(err => console.warn('[LI DM] approval_queue update error:', err.message));
   }
 
   notifyQueueUpdated();
@@ -8016,8 +8016,8 @@ export function pushActivity(entry, legacyType) {
         deal_id,
         event_type: type.toUpperCase(),
         summary:    message,
-        detail:     note || null,
-      }).then(() => {}).catch(() => {});
+        detail:     note ? { note } : null,
+      }).then(() => {}).catch(err => console.warn('[pushActivity] activity_log fallback error:', err.message));
     });
   }
 }
