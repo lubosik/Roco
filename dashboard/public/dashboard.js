@@ -5597,11 +5597,12 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
   const typeColors = {
     thinking: '#A78BFA', research: '#60A5FA', email: '#C9A84C',
     linkedin: '#4ADE80', accepted: '#A78BFA', relation: '#f59e0b', reply: '#C084FC', linkedin_reply: '#38bdf8', email_reply: '#a78bfa', email_opened: '#ec4899', email_clicked: '#f472b6', system: '#8A8680',
-    error: '#F87171', analysis: '#4ADE80', excluded: '#6b7280',
+    error: '#F87171', analysis: '#4ADE80', excluded: '#6b7280', dm: '#fb923c', invite: '#4ADE80', enrichment: '#60A5FA', approval: '#C9A84C',
   };
   const typeIcons = {
     thinking: '🧠', research: '🔍', email: '📧', linkedin: '💼',
     accepted: '✓', relation: '🟧', reply: '↩️', linkedin_reply: '↩️', email_reply: '↩️', email_opened: '👁️', email_clicked: '🔗', system: '⚙️', error: '⚠️', analysis: '📊', excluded: '✕',
+    dm: '💬', invite: '🔗', enrichment: '🔎', approval: '⏳',
   };
 
   function stringifyActivityField(value) {
@@ -7303,7 +7304,7 @@ function getActivityBadgeMeta(item) {
     email_opened: 'Email Opened',
     email_clicked: 'Email Clicked',
     invite: 'Invite',
-    dm: 'DM',
+    dm: 'DM Sent',
     linkedin: 'LinkedIn',
     email: 'Email',
     research: 'Research',

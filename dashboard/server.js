@@ -2147,9 +2147,9 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
   }
 
   pushActivity({
-    type: 'linkedin',
-    action: `LinkedIn DM sent: ${contact.name || 'contact'}`,
-    note: `${contact.company_name || queueItem?.firm || ''}${result?.chat_id || contact.unipile_chat_id ? ` · chat ${result?.chat_id || contact.unipile_chat_id}` : ''}`,
+    type: 'dm',
+    action: `LinkedIn DM sent`,
+    note: `${contact.name || 'contact'}${contact.company_name ? ` @ ${contact.company_name}` : ''}${deal?.name ? ` · ${deal.name}` : ''}`,
     deal_name: deal?.name || queueItem?.deal_name || null,
     dealId: contact.deal_id || queueItem?.deal_id || null,
   });
@@ -2163,8 +2163,10 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
   }
 
   notifyQueueUpdated();
+  const _dmPreview = bodyToSend ? `\n\n_${bodyToSend.slice(0, 120).replace(/[\n\r]+/g, ' ')}${bodyToSend.length > 120 ? '…' : ''}_` : '';
+  const _dmDealLabel = (deal?.name || queueItem?.deal_name) ? ` · *${deal?.name || queueItem?.deal_name}*` : '';
   await sendTelegram(
-    `💬 LinkedIn DM sent to ${contact.name || 'contact'}${contact.company_name ? ` (${contact.company_name})` : ''}`
+    `💬 *LinkedIn DM sent* → *${contact.name || 'contact'}* (${contact.company_name || queueItem?.firm || 'unknown firm'})${_dmDealLabel}${_dmPreview}`
   ).catch(() => {});
 
   return result;

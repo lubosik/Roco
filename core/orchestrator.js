@@ -6527,7 +6527,11 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
   // Telegram confirmation after successful send
   const channelLabel = channel === 'linkedin_dm' ? 'LinkedIn DM' : 'Email';
   const subjectLine = channel === 'email' && decision?.subject ? `\nSubject: _${sanitizeOutreach(decision.subject)}_` : '';
-  sendTelegram(`✅ *${channelLabel} sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subjectLine}`).catch(() => {});
+  const dealLabel = deal?.name ? ` · *${deal.name}*` : '';
+  const liPreview = channel === 'linkedin_dm' && draft?.body
+    ? `\n\n_${draft.body.slice(0, 120).replace(/[\n\r]+/g, ' ')}${draft.body.length > 120 ? '…' : ''}_`
+    : '';
+  sendTelegram(`✅ *${channelLabel} sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${dealLabel}${subjectLine}${liPreview}`).catch(() => {});
 
   await sbLogActivity({
     dealId: deal?.id,
