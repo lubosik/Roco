@@ -221,33 +221,34 @@ export function isWithinChannelWindow(deal, channel) {
   if (!deal) return true;
   if (deal.paused === true || deal.status === 'PAUSED') return false;
 
-  // Resolve per-channel window from flat columns
-  let startStr, endStr;
-  if (channel === 'linkedin_invite') {
-    startStr = deal.li_connect_from || null;
-    endStr   = deal.li_connect_until || null;
-  } else if (channel === 'linkedin_dm') {
-    startStr = deal.li_dm_from || '20:00';
-    endStr   = deal.li_dm_until || '23:00';
-  } else if (channel === 'email') {
-    startStr = deal.send_from || '06:00';
-    endStr   = deal.send_until || '18:00';
-  }
+  const tz = deal.timezone || 'Europe/London';
+  const now = DateTime.now().setZone(tz);
+  const nowMinutes = now.hour * 60 + now.minute;
+  const { sendingDays } = resolveSchedule(deal);
+  const dayName = now.weekdayLong.toLowerCase();
 
-  // If flat per-channel values are set, use them
-  if (startStr && endStr) {
-    const tz = deal.timezone || 'Europe/London';
-    const now = DateTime.now().setZone(tz);
-    const dayName = now.weekdayLong.toLowerCase();
-    const { sendingDays } = resolveSchedule(deal);
-    if (!sendingDays.includes(dayName)) return false;
+  function minutesInRange(startStr, endStr) {
     const [startH, startM] = startStr.split(':').map(Number);
     const [endH, endM]     = endStr.split(':').map(Number);
-    const nowMinutes = now.hour * 60 + now.minute;
     return nowMinutes >= (startH * 60 + startM) && nowMinutes < (endH * 60 + endM);
   }
 
-  // Fallback to unified window (also covers email channel)
+  if (channel === 'linkedin_invite') {
+    // No window configured → anytime (connection requests are not day-restricted)
+    if (!deal.li_connect_from || !deal.li_connect_until) return true;
+    // Window configured → honour it, no day restriction
+    return minutesInRange(deal.li_connect_from, deal.li_connect_until);
+  }
+
+  if (channel === 'linkedin_dm') {
+    // Respect active deal days (DMs are evening sends on working days)
+    if (!sendingDays.includes(dayName)) return false;
+    const startStr = deal.li_dm_from  || '20:00';
+    const endStr   = deal.li_dm_until || '23:00';
+    return minutesInRange(startStr, endStr);
+  }
+
+  // email — full window including active days check
   return isWithinSendingWindow(deal);
 }
 
