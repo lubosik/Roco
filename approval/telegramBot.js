@@ -762,6 +762,21 @@ async function handleCallbackQuery(query) {
     return;
   }
 
+  if (approval.__alreadyHandled) {
+    processingApprovals.delete(msgId);
+    const who = [approval.contactName, approval.firm].filter(Boolean).join(' @ ');
+    if (approval.status === 'approved_waiting_for_window') {
+      await bot.sendMessage(chatId, `✅ *Already approved* — ${who}\n\nEmail is queued and will send when the sending window opens.`, { parse_mode: 'Markdown' });
+    } else if (approval.status === 'sent') {
+      await bot.sendMessage(chatId, `✅ *Already sent* — ${who}`, { parse_mode: 'Markdown' });
+    } else if (approval.status === 'telegram_skipped') {
+      await bot.sendMessage(chatId, `⏭ *Already skipped* — ${who}`, { parse_mode: 'Markdown' });
+    } else {
+      await bot.sendMessage(chatId, `✅ *Already handled* (${approval.status}) — ${who}`, { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
   if (action === 'aa' || action === 'ab') {
     const variant = action === 'aa' ? 'A' : 'B';
     const subject = variant === 'A' ? approval.emailDraft.subject : approval.emailDraft.alternativeSubject;
@@ -2086,11 +2101,17 @@ async function reloadApprovalForTelegramMessage(msgId) {
   if (!sb || !msgId) return null;
   try {
     const { data: item } = await sb.from('approval_queue')
-      .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id')
-      .eq('status', 'pending')
+      .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
       .eq('telegram_msg_id', msgId)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
     if (!item || item.outreach_mode === 'company_sourcing') return null;
+    // Already handled by another instance (Railway/VPS both running) or window-queued
+    if (['approved', 'approved_waiting_for_window', 'sending', 'sent', 'telegram_skipped'].includes(item.status)) {
+      return { __alreadyHandled: true, status: item.status, contactName: item.contact_name, firm: item.firm };
+    }
+    if (item.status !== 'pending') return null;
     const entry = buildReloadedApprovalEntry(item);
     pendingApprovals.set(msgId, entry);
     return entry;

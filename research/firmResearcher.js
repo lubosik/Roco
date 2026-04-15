@@ -1759,14 +1759,22 @@ async function findDecisionMakersViaUnipile(firm, deal) {
     });
   };
 
-  for (const query of queries) {
+  // When we have a company ID, do ONE search with company ID only (no text keywords — Unipile
+  // text-based filtering is unreliable; company ID is the reliable filter).
+  // When no company ID, fall back to keyword-based queries across multiple role titles.
+  const searchPasses = companyIds.length
+    ? [{ companyIds, keywords: undefined }]
+    : queries.map(q => ({ companyIds: [], keywords: q }));
+
+  for (const pass of searchPasses) {
     if (isFirmLinkedInRateLimited()) break;
 
     try {
       const salesResults = await searchLinkedInPeopleSalesNavigator({
-        keywords: query,
-        companyIds,
-        networkDistance: [1, 2, 3],
+        keywords: pass.keywords,
+        companyIds: pass.companyIds,
+        // When using company ID, omit network_distance — we want all employees, not just connections
+        networkDistance: pass.companyIds.length ? [] : [1, 2, 3],
         limit: 10,
       });
       (salesResults || []).forEach(person => pushCandidate(person, 'unipile_sales_navigator'));
@@ -1774,7 +1782,7 @@ async function findDecisionMakersViaUnipile(firm, deal) {
       if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
       const message = String(err?.message || '');
       if (!/403|501|feature_not_subscribed|subscription_required|not implemented/i.test(message)) {
-        console.warn(`[FIRM RESEARCH] Sales Navigator search failed for "${query}": ${message}`);
+        console.warn(`[FIRM RESEARCH] Sales Navigator search failed for "${pass.keywords || 'company ID'}": ${message}`);
       }
     }
 
@@ -1782,15 +1790,16 @@ async function findDecisionMakersViaUnipile(firm, deal) {
 
     try {
       const classicResults = await searchLinkedInPeople({
-        keywords: companyIds.length ? undefined : query,
-        companyIds,
-        networkDistance: [1, 2, 3],
+        keywords: pass.keywords,
+        companyIds: pass.companyIds,
+        // When using company ID, omit network_distance — search all employees
+        networkDistance: pass.companyIds.length ? [] : [1, 2, 3],
         limit: 25,
       });
       (classicResults || []).forEach(person => pushCandidate(person, 'unipile_linkedin_search'));
     } catch (err) {
       if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
-      console.warn(`[FIRM RESEARCH] LinkedIn search failed for "${query}": ${err.message}`);
+      console.warn(`[FIRM RESEARCH] LinkedIn search failed for "${pass.keywords || 'company ID'}": ${err.message}`);
     }
 
     if (candidates.length >= 8) break;
@@ -1840,20 +1849,24 @@ async function findContactsAtFirm(firm, deal, options = {}) {
   const { geminiModels, grokModel } = getResearchConfig();
   const geminiKeys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
 
-  const prompt = `Search for the following investment firm and find the names, titles, and LinkedIn URLs of the key decision-makers who evaluate and invest in deals:
+  const prompt = `Search for the investment firm "${firm.name}" (${firm.firm_type || 'investment firm'}${firm.website ? `, website: ${firm.website}` : ''}) and find the 2-4 current decision-makers who actively evaluate and make investment decisions at THIS firm.
 
-Firm: ${firm.name}
-Firm Type: ${firm.firm_type || 'Investment firm'}
-Website: ${firm.website || 'Unknown'}
+STRICT RULES:
+1. Only include people who CURRENTLY work at ${firm.name} — verify on their LinkedIn profile or firm website.
+2. Do NOT include former employees, advisors, or people who left the firm.
+3. Do NOT include people who merely mention ${firm.name} in passing — they must actually work there now.
+4. Target roles: Partner, Managing Director, Investment Director, Principal, Founder, or Managing Partner.
+5. For linkedin_url: only include a URL if you can verify it belongs to this exact person at this exact firm. Set to null if unsure — do NOT guess or fabricate URLs.
+6. For email: only include if publicly listed on firm website or LinkedIn.
 
-Return the 2-4 most relevant people (Partners, Managing Directors, Investment Directors, Principals, or Founders who are active investors). For each person return:
+For each confirmed current employee return:
 - full_name
-- title
-- linkedin_url (if findable — must be a real linkedin.com/in/ URL, do NOT guess)
-- email (if publicly listed)
-- notes (any relevant info about their investment focus)
+- title (their current title at ${firm.name})
+- linkedin_url (verified real linkedin.com/in/ URL or null)
+- email (publicly listed or null)
+- notes (brief: their investment focus or relevant background)
 
-Return ONLY a valid JSON array. If you cannot find real LinkedIn URLs, set linkedin_url to null. Never fabricate URLs.`;
+Return ONLY a valid JSON array. No prose, no explanation. If you cannot find verified current employees, return [].`;
 
   let people = [];
   let modelUsed = null;

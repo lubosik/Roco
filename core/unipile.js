@@ -170,13 +170,17 @@ export async function searchDecisionMakersByCompany(firmName, pushActivity = nul
   const creds    = await getLiveCredentials();
   const cleaned  = cleanFirmNameForLinkedIn(firmName);
   const companyId = await resolveLinkedInCompanyId(firmName);
-  const body = {
-    api: 'classic',
-    category: 'people',
-    keywords: 'Managing Partner OR General Partner OR Partner OR Principal OR "Managing Director" OR Director OR Vice President',
-  };
-  if (companyId) body.company = [companyId];
-  if (!companyId) body.keywords += ` ${cleaned}`;
+
+  // When we have a company ID, use it as the ONLY filter — Unipile text keywords are
+  // unreliable and can suppress results. Let the company ID do the filtering.
+  // Without a company ID, fall back to firm-name keywords so we get something.
+  const body = { api: 'classic', category: 'people' };
+  if (companyId) {
+    body.company = [companyId];
+    // No keywords — company ID alone is the filter
+  } else {
+    body.keywords = `${cleaned} Managing Partner OR General Partner OR Partner OR Principal OR "Managing Director" OR Director`;
+  }
 
   const result = await request('POST', '/linkedin/search', {
     query: { account_id: creds.linkedinAccountId, limit: 10 },
