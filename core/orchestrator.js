@@ -1328,10 +1328,15 @@ async function isApprovedForOutreach(dealId) {
 async function getExcludedFirmNames(dealId) {
   const sb = getSupabase();
   if (!sb) return new Set();
-  const [batchRes, contactRes, exclusionRes] = await Promise.all([
-    sb.from('batch_firms').select('firm_name').eq('deal_id', dealId).then(result => result).catch(() => ({ data: [] })),
-    sb.from('contacts').select('company_name').eq('deal_id', dealId).then(result => result).catch(() => ({ data: [] })),
-    sb.from('firm_exclusion_list').select('company_name, deal_id, deal_status').then(result => result).catch(() => ({ data: [] })),
+
+  // Exclude from: current deal's batch_firms + ALL active deals' contacts + global exclusion list
+  // This prevents adding a firm to the pipeline if we're already reaching out to them on another deal
+  const [batchRes, allContactsRes, exclusionRes, otherDealsRes] = await Promise.all([
+    sb.from('batch_firms').select('firm_name').eq('deal_id', dealId).then(r => r).catch(() => ({ data: [] })),
+    sb.from('contacts').select('company_name').eq('deal_id', dealId).then(r => r).catch(() => ({ data: [] })),
+    sb.from('firm_exclusion_list').select('company_name, deal_id, deal_status').then(r => r).catch(() => ({ data: [] })),
+    // Also grab all firms from OTHER active deals' contacts (cross-deal dedup)
+    sb.from('contacts').select('company_name').neq('deal_id', dealId).not('company_name', 'is', null).then(r => r).catch(() => ({ data: [] })),
   ]);
 
   const names = new Set();
@@ -1339,7 +1344,7 @@ async function getExcludedFirmNames(dealId) {
     const name = normalizeFirmName(row?.firm_name);
     if (name) names.add(name);
   }
-  for (const row of contactRes.data || []) {
+  for (const row of allContactsRes.data || []) {
     const name = normalizeFirmName(row?.company_name);
     if (name) names.add(name);
   }
@@ -1348,6 +1353,11 @@ async function getExcludedFirmNames(dealId) {
     if (!name) continue;
     const status = normalizeActionLabel(row?.deal_status);
     if (status === 'active' || status === 'paused') names.add(name);
+  }
+  // Cross-deal: exclude any firm already being contacted on another deal
+  for (const row of otherDealsRes.data || []) {
+    const name = normalizeFirmName(row?.company_name);
+    if (name) names.add(name);
   }
   return names;
 }
@@ -5006,13 +5016,14 @@ export async function phaseEnrich(deal, state) {
 
   // Secondary pass: find LinkedIn for contacts that have email (e.g. from CSV) but no linkedin_url
   // phaseLinkedInInvites requires linkedin_url — without this, CSV contacts never get invites
+  // Process in batches of 5 to avoid LinkedIn 429 rate limits
   if (state.linkedin_enabled !== false) {
     const { data: needLinkedIn } = await sb.from('contacts')
       .select('id, name, company_name, job_title, email, enrichment_status')
       .eq('deal_id', deal.id)
       .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Enriched', 'ENRICHED', 'enriched'])
       .is('linkedin_url', null)
-      .limit(20);
+      .limit(5); // batch of 5 per cycle to stay well under LinkedIn rate limits
 
     for (const contact of (needLinkedIn || [])) {
       try {
@@ -5027,7 +5038,7 @@ export async function phaseEnrich(deal, state) {
       } catch (e) {
         console.warn(`[ENRICH] LinkedIn find failed for ${contact.name}:`, e.message);
       }
-      await sleep(1000);
+      await sleep(2000); // 2s between calls — gentler on LinkedIn API
     }
   }
 
@@ -6184,12 +6195,20 @@ async function phaseFollowUps(deal, state) {
     .in('pipeline_stage', ['Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'invite_accepted', 'invite_sent'])
     .limit(10);
 
+  // No same-channel follow-ups: always switch channels or advance to next person.
+  // invite_sent (ignored 2d) → email intro if available, else next person
+  // dm_sent / invite_accepted (ignored 2d) → email intro if available, else next person
+  // email_sent (ignored 2d) → next person (no follow-up email)
   const followUpChannelFor = (contact) => {
-    // invite_sent = invite sent but not yet accepted — fall back to email if available
-    if (contact.pipeline_stage === 'invite_sent') return contact.email ? 'email' : null;
-    if ((contact.pipeline_stage === 'invite_accepted' || contact.pipeline_stage === 'DM Sent' || contact.pipeline_stage === 'dm_sent') && contact.linkedin_provider_id) return 'linkedin_dm';
-    return 'email';
+    const stage = contact.pipeline_stage;
+    if (stage === 'invite_sent') return contact.email ? 'email' : null;
+    if (stage === 'invite_accepted' || stage === 'DM Sent' || stage === 'dm_sent') {
+      return contact.email ? 'email' : null;
+    }
+    return null; // email_sent / Email Sent → null triggers next-person advance below
   };
+  // Stages where the channel-switch email is an intro (not a follow-up)
+  const LINKEDIN_STAGES = new Set(['invite_sent', 'invite_accepted', 'DM Sent', 'dm_sent']);
 
   // Apply firm gate + channel window gate + cross-channel response gate
   const emailFallbackSeenFirms = new Set();
@@ -6221,57 +6240,51 @@ async function phaseFollowUps(deal, state) {
   for (const contact of contacts) {
     if (contactsInFlight.has(contact.id)) continue;
     const followUpChannel = followUpChannelFor(contact);
-    const maxFollowUps = await getMaxFollowUpsForChannel(deal, followUpChannel || 'email');
-    const followUpNumber = (contact.follow_up_count || 0) + 1;
-    const stage = formatFollowUpStage(followUpNumber);
-    const noFollowUpsMode = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
 
-    if (followUpNumber > maxFollowUps) {
-      if (noFollowUpsMode && followUpChannel === 'linkedin_dm' && hasUsableEmail(contact.email)) {
-        // no_follow_ups: LinkedIn DM sent → no response → cascade to email intro
-        await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id);
-        info(`[${deal.name}] ${contact.name}: no_follow_ups — cascading LI DM to email intro`);
-        pushActivity({
-          type: 'outreach',
-          action: `[WATERFALL] LinkedIn no response — switching to email`,
-          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · DM unanswered, trying email`,
-          deal_name: deal.name,
-          dealId: deal.id,
-        });
-        await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' });
-      } else if (noFollowUpsMode && followUpChannel === 'email') {
-        // no_follow_ups: email intro sent → no response → mark inactive, try next contact at firm
-        await sb.from('contacts').update({
-          follow_up_due_at: null,
-          pipeline_stage: 'Inactive',
-        }).eq('id', contact.id);
-        info(`[${deal.name}] ${contact.name}: no_follow_ups — email unanswered, marking inactive`);
-        pushActivity({
-          type: 'outreach',
-          action: `[WATERFALL] Email no response — moving to next contact`,
-          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · email unanswered`,
-          deal_name: deal.name,
-          dealId: deal.id,
-        });
-        await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
-      } else {
-        await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id);
-        info(`[${deal.name}] ${contact.name}: sequence exhausted for ${followUpChannel || 'email'} — no further follow-ups due`);
-      }
-      continue;
-    }
     if (!followUpChannel) {
-      // No email and LinkedIn invite pending — nothing we can do yet, push due date forward
-      const nextPlan = await getNextFollowUpPlanForChannel(deal, 'linkedin_dm', contact.follow_up_count || 0);
-      const nextDays = nextPlan.delayDays || deal?.followup_days_li || 7;
+      // No channel available (no email, or email already used) → advance waterfall to next person
       await sb.from('contacts').update({
-        follow_up_due_at: new Date(Date.now() + nextDays * 24 * 60 * 60 * 1000).toISOString(),
+        follow_up_due_at: null,
+        pipeline_stage: 'Inactive',
       }).eq('id', contact.id);
-      info(`[${deal.name}] ${contact.name}: invite pending, no email — waiting another ${nextDays} days`);
+      info(`[${deal.name}] ${contact.name}: no response, no channel — advancing to next contact at ${contact.company_name || 'firm'}`);
+      pushActivity({
+        type: 'outreach',
+        action: `[WATERFALL] No response — moving to next contact at firm`,
+        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · no channel available`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
       continue;
     }
-    await handleOutreachApproval(contact, stage, followUpNumber, deal, { forceChannel: followUpChannel });
 
+    // Channel switch from LinkedIn → email is always an INTRO (not a numbered follow-up)
+    if (LINKEDIN_STAGES.has(contact.pipeline_stage) && followUpChannel === 'email') {
+      info(`[${deal.name}] ${contact.name}: LinkedIn no response — switching to email intro`);
+      pushActivity({
+        type: 'outreach',
+        action: `[WATERFALL] LinkedIn no response — switching to email`,
+        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · invite/DM unanswered, trying email`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' });
+      continue;
+    }
+
+    // Email already sent and no response → mark inactive and advance waterfall
+    // (followUpChannelFor returns null for email_sent, so this path handles only edge cases)
+    const followUpNumber = (contact.follow_up_count || 0) + 1;
+    const maxFollowUps = await getMaxFollowUpsForChannel(deal, followUpChannel);
+    if (followUpNumber > maxFollowUps) {
+      await sb.from('contacts').update({ follow_up_due_at: null, pipeline_stage: 'Inactive' }).eq('id', contact.id);
+      info(`[${deal.name}] ${contact.name}: sequence exhausted — marking inactive`);
+      await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
+      continue;
+    }
+
+    await handleOutreachApproval(contact, formatFollowUpStage(followUpNumber), followUpNumber, deal, { forceChannel: followUpChannel });
   }
 }
 
@@ -6912,13 +6925,16 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
     .limit(1);
   if (queued?.length) return;
 
+  // Look for the next uncontacted person at this firm:
+  // Priority 1: invite_accepted contacts not yet messaged (ready for DM)
+  // Priority 2: Enriched contacts not yet invited (start LinkedIn invite or email)
+  // Priority 3: Ranked contacts (will get invited in next phaseLinkedInInvites cycle)
   const { data: firmContacts } = await sb.from('contacts')
     .select('*')
     .eq('deal_id', deal.id)
     .eq('company_name', firm)
     .neq('id', sourceContact.id)
-    .eq('pipeline_stage', 'invite_accepted')
-    .order('invite_accepted_at', { ascending: true })
+    .in('pipeline_stage', ['invite_accepted', 'Enriched', 'enriched', 'Ranked', 'ranked'])
     .order('investor_score', { ascending: false })
     .order('created_at', { ascending: true })
     .limit(20);
@@ -6926,16 +6942,24 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
   const nextContact = (firmContacts || []).find(contact => {
     if (contact.response_received) return false;
     if (contact.conversation_state === 'manual' || contact.conversation_state === 'do_not_contact') return false;
-    if (contact.last_email_sent_at || contact.dm_sent_at || contact.last_outreach_at) return false;
+    if (contact.last_email_sent_at || contact.dm_sent_at || contact.last_outreach_at || contact.invite_sent_at) return false;
     if (contactsInFlight.has(contact.id)) return false;
     return true;
   });
 
   if (!nextContact) return;
 
+  // Determine the right channel for the next contact
   let forceChannel = null;
   if (nextContact.pipeline_stage === 'invite_accepted' && nextContact.linkedin_provider_id && isWithinChannelWindow(deal, 'linkedin_dm')) {
     forceChannel = 'linkedin_dm';
+  } else if (nextContact.linkedin_url && !nextContact.invite_sent_at) {
+    // Has LinkedIn but invite not sent — let phaseLinkedInInvites handle it naturally
+    // Just log that this person is queued; don't force a channel here
+    info(`[${deal.name}] Waterfall: ${nextContact.name} @ ${firm} queued — LinkedIn invite will go out next cycle`);
+    return;
+  } else if (nextContact.email) {
+    forceChannel = 'email';
   }
 
   if (!forceChannel) return;
