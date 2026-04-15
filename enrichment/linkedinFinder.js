@@ -10,30 +10,15 @@ import {
   searchLinkedInPeople,
   searchLinkedInPeopleSalesNavigator,
 } from '../integrations/unipileClient.js';
+import {
+  markLinkedInRateLimited,
+  isLinkedInRateLimited as _isLinkedInRateLimited,
+  is429Error,
+} from '../core/linkedInRateLimit.js';
 
-// Module-level rate limit cooldown — when LinkedIn returns 429, pause all searches for 45 minutes
-const LINKEDIN_COOLDOWN_MS = 45 * 60 * 1000;
-let linkedInRateLimitedUntil = null;
-
-function markLinkedInRateLimited() {
-  linkedInRateLimitedUntil = Date.now() + LINKEDIN_COOLDOWN_MS;
-  console.warn(`[LINKEDIN FINDER] Rate limited by LinkedIn — pausing all searches for 45 minutes (until ${new Date(linkedInRateLimitedUntil).toISOTimeString?.() || new Date(linkedInRateLimitedUntil).toISOString()})`);
-}
-
-function isLinkedInRateLimited() {
-  if (!linkedInRateLimitedUntil) return false;
-  if (Date.now() >= linkedInRateLimitedUntil) {
-    linkedInRateLimitedUntil = null;
-    console.info('[LINKEDIN FINDER] Rate limit cooldown expired — resuming searches');
-    return false;
-  }
-  return true;
-}
-
-function is429Error(err) {
-  const msg = String(err?.message || err || '');
-  return msg.includes('429') || msg.toLowerCase().includes('too_many_requests') || msg.toLowerCase().includes('too many requests');
-}
+// Wrap with module label
+const markRateLimited    = () => markLinkedInRateLimited('LINKEDIN FINDER');
+const isLinkedInRateLimited = () => _isLinkedInRateLimited('LINKEDIN FINDER');
 
 function normalizeText(value) {
   return String(value || '')
@@ -273,7 +258,7 @@ async function searchCandidates({ name, company, title }) {
     });
     salesResults.forEach(pushCandidate);
   } catch (err) {
-    if (is429Error(err)) { markLinkedInRateLimited(); return candidates; }
+    if (is429Error(err)) { markRateLimited(); return candidates; }
     const message = String(err?.message || '');
     if (!/403|501|feature_not_subscribed|subscription_required|not implemented/i.test(message)) {
       console.warn(`[LINKEDIN FINDER] Sales Navigator search failed for "${name}": ${message}`);
@@ -288,7 +273,7 @@ async function searchCandidates({ name, company, title }) {
       const results = await searchLinkedInPeople({ keywords, limit: 10 });
       results.forEach(pushCandidate);
     } catch (err) {
-      if (is429Error(err)) { markLinkedInRateLimited(); break; }
+      if (is429Error(err)) { markRateLimited(); break; }
       console.warn(`[LINKEDIN FINDER] Classic search failed for "${name}" with "${keywords}": ${err.message}`);
     }
     if (candidates.length >= 15) break;

@@ -22,29 +22,15 @@ import { parse } from 'csv-parse/sync';
 
 // Keys read lazily inside functions so dotenv is loaded first
 
-// ── LinkedIn rate-limit cooldown (shared across all firm research searches) ──
-const LINKEDIN_FIRM_COOLDOWN_MS = 45 * 60 * 1000; // 45 minutes
-let linkedInFirmRateLimitedUntil = null;
+// ── LinkedIn rate-limit cooldown (file-persisted, survives PM2 restarts) ──
+import {
+  markLinkedInRateLimited as _markLinkedInRateLimited,
+  isLinkedInRateLimited as _isLinkedInRateLimited,
+  is429Error as isFirm429Error,
+} from '../core/linkedInRateLimit.js';
 
-function markFirmLinkedInRateLimited() {
-  linkedInFirmRateLimitedUntil = Date.now() + LINKEDIN_FIRM_COOLDOWN_MS;
-  console.warn(`[FIRM RESEARCH] LinkedIn rate limited — pausing all LinkedIn searches for 45 minutes (until ${new Date(linkedInFirmRateLimitedUntil).toISOString()})`);
-}
-
-function isFirmLinkedInRateLimited() {
-  if (!linkedInFirmRateLimitedUntil) return false;
-  if (Date.now() >= linkedInFirmRateLimitedUntil) {
-    linkedInFirmRateLimitedUntil = null;
-    console.info('[FIRM RESEARCH] LinkedIn rate limit cooldown expired — resuming searches');
-    return false;
-  }
-  return true;
-}
-
-function isFirm429Error(err) {
-  const msg = String(err?.message || err || '');
-  return msg.includes('429') || msg.toLowerCase().includes('too_many_requests') || msg.toLowerCase().includes('too many requests');
-}
+const markFirmLinkedInRateLimited = () => _markLinkedInRateLimited('FIRM RESEARCH');
+const isFirmLinkedInRateLimited   = () => _isLinkedInRateLimited('FIRM RESEARCH');
 
 function boolFromEnv(value, fallback = false) {
   if (value == null || value === '') return fallback;
