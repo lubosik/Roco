@@ -4886,8 +4886,34 @@ async function enrichSingleContact(sb, contact, deal, state) {
       // Extra profile data Apify may return
       if (enrichResult?.source === 'apify') {
         if (enrichResult.headline && !contact.job_title)            updates.job_title = enrichResult.headline;
-        if (enrichResult.company_name && !contact.company_name)     updates.company_name = enrichResult.company_name;
         if (enrichResult.linkedin_provider_id && !contact.linkedin_provider_id) updates.linkedin_provider_id = enrichResult.linkedin_provider_id;
+
+        // Company mismatch check: Apify returned a current_company that doesn't
+        // match the firm this contact is assigned to.  Log it but do NOT block —
+        // the investor may work across multiple firms or Apify may be slightly off.
+        if (enrichResult.company_name && contact.company_name) {
+          const enrichFirmNorm = normalizeFirmIdentity(enrichResult.company_name);
+          const assignedFirmNorm = normalizeFirmIdentity(contact.company_name);
+          if (enrichFirmNorm && assignedFirmNorm && enrichFirmNorm !== assignedFirmNorm) {
+            const enrichTokens = new Set(enrichFirmNorm.split(' ').filter(Boolean));
+            const assignedTokens = new Set(assignedFirmNorm.split(' ').filter(Boolean));
+            let inter = 0;
+            for (const t of enrichTokens) if (assignedTokens.has(t)) inter++;
+            const union = enrichTokens.size + assignedTokens.size - inter;
+            const similarity = union > 0 ? inter / union : 0;
+            if (similarity < 0.5) {
+              pushActivity({
+                type: 'warning',
+                action: '[MATCH] Company mismatch — contact may be at a different firm',
+                note: `${contact.name} — Apify shows "${enrichResult.company_name}", assigned to "${contact.company_name}" (${Math.round(similarity * 100)}% match)`,
+                deal_name: deal.name,
+                dealId: deal.id,
+              });
+            }
+          }
+        } else if (enrichResult.company_name && !contact.company_name) {
+          updates.company_name = enrichResult.company_name;
+        }
       }
 
       updates.pipeline_stage = 'Enriched'; // Always advance to Enriched after enrichment attempt
@@ -5575,6 +5601,20 @@ async function phaseLinkedInInvites(deal, state) {
         }
       } else if (outcome.status === 'suppressed_no_match') {
         info(`[${deal.name}] ${contact.name} invite retry suppressed after recent LinkedIn mismatch until ${outcome.retryAt || 'later'}`);
+      } else if (outcome.status === 'routed_to_email') {
+        info(`[${deal.name}] ${contact.name} — low LinkedIn activity (score ${outcome.score ?? '?'}), routing to email`);
+        pushActivity({
+          type: 'outreach',
+          action: '[ACTIVITY] Low LinkedIn activity — sending email instead',
+          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · score ${outcome.score ?? '?'}/100`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
+        if (canQueueOutboundEmailFallback && hasUsableEmail(contact.email) && !contact.last_email_sent_at) {
+          await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' }).catch(err => {
+            warn(`[${deal.name}] Email queue failed after low-activity routing for ${contact.name}: ${err.message}`);
+          });
+        }
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
       }
@@ -6173,6 +6213,13 @@ async function phaseFollowUps(deal, state) {
         // no_follow_ups: LinkedIn DM sent → no response → cascade to email intro
         await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id);
         info(`[${deal.name}] ${contact.name}: no_follow_ups — cascading LI DM to email intro`);
+        pushActivity({
+          type: 'outreach',
+          action: `[WATERFALL] LinkedIn no response — switching to email`,
+          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · DM unanswered, trying email`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
         await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' });
       } else if (noFollowUpsMode && followUpChannel === 'email') {
         // no_follow_ups: email intro sent → no response → mark inactive, try next contact at firm
@@ -6181,6 +6228,13 @@ async function phaseFollowUps(deal, state) {
           pipeline_stage: 'Inactive',
         }).eq('id', contact.id);
         info(`[${deal.name}] ${contact.name}: no_follow_ups — email unanswered, marking inactive`);
+        pushActivity({
+          type: 'outreach',
+          action: `[WATERFALL] Email no response — moving to next contact`,
+          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · email unanswered`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
         await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
       } else {
         await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id);
@@ -6869,6 +6923,13 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
   if (!forceChannel) return;
 
   info(`[${deal.name}] Waterfall advancing to ${nextContact.name} @ ${firm} via ${forceChannel}`);
+  pushActivity({
+    type: 'outreach',
+    action: `[WATERFALL] Moving to next contact at ${firm}`,
+    note: `${sourceContact.name} unanswered → ${nextContact.name} @ ${firm} via ${forceChannel}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
   await handleOutreachApproval(nextContact, 'INTRO', 0, deal, { forceChannel });
 }
 

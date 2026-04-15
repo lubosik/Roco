@@ -574,6 +574,88 @@ function summarizeInviteError(err) {
   return String(err?.message || err || 'Unknown LinkedIn invite error').slice(0, 300);
 }
 
+// Normalise a firm name to a set of meaningful tokens for fuzzy comparison.
+function normalizeFirmNameTokens(value) {
+  const STRIP = new Set(['inc', 'llc', 'ltd', 'lp', 'llp', 'plc', 'corp', 'corporation',
+    'partners', 'partner', 'capital', 'holdings', 'group', 'ventures', 'management',
+    'advisors', 'advisory', 'and', '&']);
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 0 && !STRIP.has(t));
+}
+
+// Jaccard token similarity between two firm name strings.  Returns 0-1.
+function firmNameSimilarity(a, b) {
+  const tokA = new Set(normalizeFirmNameTokens(a));
+  const tokB = new Set(normalizeFirmNameTokens(b));
+  if (!tokA.size || !tokB.size) return 0;
+  let intersection = 0;
+  for (const t of tokA) if (tokB.has(t)) intersection++;
+  const union = tokA.size + tokB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+/**
+ * Score a LinkedIn profile for estimated activity level.
+ * Returns { score: 0–100, channel: 'linkedin'|'email', reason: string }
+ * score < 40 with a valid email = route to email first instead of sending a
+ * LinkedIn connection request.
+ *
+ * Inputs accepted from both resolveLinkedInProfile() and
+ * retrieveLinkedInProfile() shapes.
+ */
+export function scoreLinkedInActivity(profile) {
+  let score = 55; // baseline — assume moderately active
+  const reasons = [];
+
+  const connections = Number(
+    profile?.connections              // retrieveLinkedInProfile shape
+    || profile?.raw?.connections_count // resolveLinkedInProfile shape
+    || 0,
+  );
+  const headline = String(
+    profile?.headline
+    || profile?.raw?.headline
+    || '',
+  ).trim();
+
+  // ── Connections count: primary signal ───────────────────────────────────
+  if (connections >= 500) {
+    score += 25; reasons.push(`${connections}+ connections`);
+  } else if (connections >= 200) {
+    score += 12;
+  } else if (connections >= 50) {
+    score += 3;
+  } else if (connections > 0 && connections < 50) {
+    score -= 30; reasons.push(`only ${connections} connections`);
+  }
+  // connections == 0 → unknown; no penalty
+
+  // ── Headline: secondary signal ───────────────────────────────────────────
+  const INVESTMENT_KEYWORDS = ['partner', 'principal', 'director', 'managing', 'investment',
+    'capital', 'fund', 'venture', 'investor', 'ceo', 'founder', 'cfo', 'portfolio'];
+  const hl = headline.toLowerCase();
+  if (headline.length >= 20 && INVESTMENT_KEYWORDS.some(kw => hl.includes(kw))) {
+    score += 10; reasons.push('professional headline');
+  } else if (headline.length >= 5) {
+    score += 3;
+  } else {
+    score -= 12; reasons.push('no LinkedIn headline');
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  const channel = score < 40 ? 'email' : 'linkedin';
+  const reason = reasons.length
+    ? reasons.join(', ')
+    : score >= 40 ? 'active LinkedIn profile' : 'low LinkedIn activity';
+  return { score, channel, reason };
+}
+
 function isAlreadyConnectedError(message) {
   return [
     'already connected',
@@ -773,6 +855,9 @@ export async function processLinkedInInvite({
     }
   }
 
+  // Holds the resolved profile data so we can score activity after the block.
+  let resolvedProfileData = null;
+
   if (!providerId || !publicId) {
     if (!linkedinUrl && !providerId && !publicId) {
       const discovered = await findMatchingLinkedInProfileForContact(contact);
@@ -818,6 +903,9 @@ export async function processLinkedInInvite({
       if (resolved?.providerId) providerId = resolved.providerId;
       if (resolved?.publicId) publicId = resolved.publicId;
 
+      // Capture for activity scoring after the block.
+      resolvedProfileData = resolved;
+
       const updates = {};
       if (resolved?.providerId && resolved.providerId !== contact.linkedin_provider_id) updates.linkedin_provider_id = resolved.providerId;
       if (resolved?.publicId && resolved.publicId !== contact.linkedin_public_id) updates.linkedin_public_id = resolved.publicId;
@@ -862,6 +950,85 @@ export async function processLinkedInInvite({
 
   if (!providerId) {
     return markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivity, linkedinUrl, reason: 'Could not find LinkedIn provider ID' });
+  }
+
+  // ── Company mismatch check ───────────────────────────────────────────────
+  // If the resolved profile headline/raw contains a current_company, check it
+  // matches the contact's assigned firm.  Log mismatches — don't block.
+  if (resolvedProfileData && contact?.company_name) {
+    const rawCompany = String(
+      resolvedProfileData?.raw?.company_name
+      || resolvedProfileData?.raw?.current_company
+      || '',
+    ).trim();
+    if (rawCompany) {
+      const sim = firmNameSimilarity(rawCompany, contact.company_name);
+      if (sim < 0.5) {
+        pushActivity?.({
+          type: 'warning',
+          action: '[MATCH] Company mismatch detected',
+          note: `${contact.name || 'Contact'} — LinkedIn shows "${rawCompany}", assigned firm is "${contact.company_name}" (similarity ${Math.round(sim * 100)}%)`,
+          deal_name: deal?.name,
+          dealId: deal?.id,
+        });
+      }
+    }
+  }
+
+  // ── LinkedIn activity scoring ────────────────────────────────────────────
+  // Determine whether to send a LinkedIn invite or route to email first.
+  // Low-activity profiles (score < 40) with a usable email are routed to
+  // email — research shows they're unlikely to respond on LinkedIn.
+  const hasContactEmail = hasUsableEmail(contact?.email);
+  {
+    const existingChannel = contact?.recommended_channel;
+    const existingScore   = contact?.linkedin_activity_score;
+
+    if (existingChannel === 'email' && hasContactEmail) {
+      // Already scored on a previous cycle — respect that decision.
+      await recordInviteActivity({
+        pushActivity, logActivity, deal, contact,
+        type: 'outreach',
+        action: '[ACTIVITY] Low LinkedIn activity — routing to email first',
+        note: `${contact.name || 'Contact'} · score ${existingScore ?? '?'}/100 · email-first (pre-scored)`,
+        eventType: 'LINKEDIN_LOW_ACTIVITY_EMAIL_ROUTE',
+        detail: { score: existingScore, channel: 'email', reason: 'pre-scored email-first' },
+      });
+      return { status: 'routed_to_email', score: existingScore, reason: 'pre-scored email-first' };
+    }
+
+    if (existingScore == null && resolvedProfileData) {
+      // Just resolved the profile this cycle — compute and persist the score.
+      const { score, channel, reason } = scoreLinkedInActivity(resolvedProfileData);
+      try {
+        await sb.from('contacts')
+          .update({ linkedin_activity_score: score, recommended_channel: channel })
+          .eq('id', contact.id);
+      } catch {}
+
+      if (channel === 'email' && hasContactEmail) {
+        await recordInviteActivity({
+          pushActivity, logActivity, deal, contact,
+          type: 'outreach',
+          action: '[ACTIVITY] Low LinkedIn activity — routing to email first',
+          note: `${contact.name || 'Contact'} · score ${score}/100 · ${reason}`,
+          eventType: 'LINKEDIN_LOW_ACTIVITY_EMAIL_ROUTE',
+          detail: { score, channel: 'email', reason },
+        });
+        return { status: 'routed_to_email', score, reason };
+      }
+
+      if (channel === 'email' && !hasContactEmail) {
+        // Low activity but no email — proceed with LinkedIn invite (no other option)
+        pushActivity?.({
+          type: 'outreach',
+          action: '[ACTIVITY] Low LinkedIn activity — no email, using LinkedIn anyway',
+          note: `${contact.name || 'Contact'} · score ${score}/100`,
+          deal_name: deal?.name,
+          dealId: deal?.id,
+        });
+      }
+    }
   }
 
   const inviteAlreadyPending = invites.some(inv => {
