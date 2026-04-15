@@ -6225,13 +6225,16 @@ async function phaseFollowUps(deal, state) {
     if (c.conversation_state === 'manual') return false;
 
     const ch = followUpChannelFor(c);
-    if (!ch) return false;
+    // IMPORTANT: contacts with null channel (no email, LinkedIn-only ignored) must still
+    // be included here so the loop can advance the waterfall to the next person.
+    // Only apply window check when a real channel exists.
+    if (ch === null) return true; // advance-to-next-person path — always include
     if (c.pipeline_stage === 'invite_sent' && ch === 'email' && firm && !GENERIC_FIRM_NAMES.has(firm)) {
       if (activeFirms.has(firm) || emailFallbackSeenFirms.has(firm)) return false;
       emailFallbackSeenFirms.add(firm);
     }
     return isWithinChannelWindow(deal, ch);
-  }).slice(0, 2);
+  }).slice(0, 5); // increased from 2 — process more stale contacts per cycle
 
   if (!contacts?.length) return;
 
@@ -6949,16 +6952,33 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
 
   if (!nextContact) return;
 
-  // Determine the right channel for the next contact
+  // Determine the right channel for the next contact using smart routing:
+  // - Already connected (invite_accepted) → DM
+  // - Has LinkedIn with high activity (score >= 40 or unscored) → LinkedIn invite
+  // - Has LinkedIn but low activity (score < 40) + has email → email
+  // - Has LinkedIn but no email → LinkedIn invite regardless
+  // - No LinkedIn but has email → email
+  // - Neither → nothing
   let forceChannel = null;
+  const actScore = nextContact.linkedin_activity_score;
+  const recChannel = nextContact.recommended_channel;
+  const hasLinkedIn = !!nextContact.linkedin_url;
+  const hasEmail = hasUsableEmail(nextContact.email);
+  const isLowActivity = recChannel === 'email' || (actScore != null && actScore < 40);
+
   if (nextContact.pipeline_stage === 'invite_accepted' && nextContact.linkedin_provider_id && isWithinChannelWindow(deal, 'linkedin_dm')) {
     forceChannel = 'linkedin_dm';
-  } else if (nextContact.linkedin_url && !nextContact.invite_sent_at) {
-    // Has LinkedIn but invite not sent — let phaseLinkedInInvites handle it naturally
-    // Just log that this person is queued; don't force a channel here
-    info(`[${deal.name}] Waterfall: ${nextContact.name} @ ${firm} queued — LinkedIn invite will go out next cycle`);
-    return;
-  } else if (nextContact.email) {
+  } else if (hasLinkedIn && !nextContact.invite_sent_at) {
+    if (isLowActivity && hasEmail) {
+      // Low LinkedIn activity and has email → go email first
+      forceChannel = 'email';
+    } else {
+      // High/unknown activity, or no email alternative → LinkedIn invite
+      // Let phaseLinkedInInvites handle it naturally (picks it up next cycle)
+      info(`[${deal.name}] Waterfall: ${nextContact.name} @ ${firm} queued for LinkedIn invite (score: ${actScore ?? 'unscored'})`);
+      return;
+    }
+  } else if (!hasLinkedIn && hasEmail) {
     forceChannel = 'email';
   }
 

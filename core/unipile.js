@@ -1056,7 +1056,7 @@ export async function processLinkedInInvite({
     return invitedProviderId === providerId || (!!publicId && invitedPublicId === publicId.toLowerCase());
   });
 
-  const liFollowupDays = deal?.followup_days_li || 7;
+  const liFollowupDays = deal?.followup_days_li || 2; // 2-day default: if ignored, move on
   const followUpDueAt = new Date(Date.now() + liFollowupDays * 24 * 60 * 60 * 1000).toISOString();
 
   if (inviteAlreadyPending) {
