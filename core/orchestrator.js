@@ -1810,6 +1810,24 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
       deal_name: deal.name,
       dealId: deal.id,
     });
+
+    // Notify Telegram so we know what was found and why
+    const firmLines = topUpLeads.slice(0, result.added).map((lead, i) => {
+      const reason = String(lead.why_relevant || lead.news_event || '').slice(0, 100);
+      return `${i + 1}. *${lead.firm_name}*${reason ? `\n   _${reason}_` : ''}`;
+    }).join('\n');
+
+    const msg = [
+      `🔍 *Top-up: ${result.added} new firm${result.added === 1 ? '' : 's'} added — ${deal.name}*`,
+      ``,
+      `Pipeline ran low (${inviteReadyCount} invite-ready contacts). Found ${grokLeads.length} matches, adding the best ${result.added}:`,
+      ``,
+      firmLines,
+      ``,
+      `Enriching now → contacts will be queued for outreach once ready.`,
+    ].join('\n');
+
+    sendTelegram(msg).catch(() => {});
   }
 }
 
@@ -5547,23 +5565,23 @@ async function phaseLinkedInInvites(deal, state) {
     return;
   }
 
-  // Invite-first strategy:
-  // - send LinkedIn requests ahead of email where LinkedIn exists
-  // - do not block a whole firm just because multiple invites are pending
-  // - once a firm has any accepted invite / DM / email / response, stop sending fresh invites there
-  const ENGAGED_STAGES = ['invite_accepted', 'pending_dm_approval', 'pending_email_approval', 'DM Approved', 'Email Approved', 'DM Sent', 'Email Sent', 'dm_sent', 'email_sent', 'In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
+  // LinkedIn invite strategy:
+  // - connection requests are passive — send to all contacts at a firm proactively
+  // - only block a firm once someone there has ACTIVELY RESPONDED (replied, meeting booked, conversation)
+  // - don't block just because a pending approval, DM, or email is in flight — those are still cold outreach
+  const RESPONDED_STAGES = ['In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
 
-  const { data: engagedContacts } = await sb.from('contacts')
-    .select('company_name, pipeline_stage, response_received')
+  const { data: respondedContacts } = await sb.from('contacts')
+    .select('company_name, response_received')
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ENGAGED_STAGES)
+    .or(`response_received.eq.true,pipeline_stage.in.(${RESPONDED_STAGES.map(s => `"${s}"`).join(',')})`)
     .not('company_name', 'is', null);
 
   const blockedFirms = new Set();
-  for (const c of engagedContacts || []) {
+  for (const c of respondedContacts || []) {
     const firm = (c.company_name || '').toLowerCase().trim();
     if (!firm || GENERIC_FIRM_NAMES.has(firm)) continue;
-    if (c.response_received || ENGAGED_STAGES.includes(c.pipeline_stage)) blockedFirms.add(firm);
+    blockedFirms.add(firm);
   }
 
   const perCycleLimit = Math.min(8, remainingToday);
