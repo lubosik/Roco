@@ -10,6 +10,11 @@ import {
   searchLinkedInPeople,
   searchLinkedInPeopleSalesNavigator,
 } from '../integrations/unipileClient.js';
+import {
+  markLinkedInRateLimited,
+  isLinkedInRateLimited,
+  is429Error as _is429Error,
+} from './linkedInRateLimit.js';
 
 let _cachedCreds = null;
 let _credsCachedAt = 0;
@@ -166,6 +171,7 @@ async function resolveLinkedInCompanyId(firmName) {
 
 export async function searchDecisionMakersByCompany(firmName, pushActivity = null, dealId = null) {
   if (!firmName) return [];
+  if (isLinkedInRateLimited('UNIPILE')) return [];
 
   const creds    = await getLiveCredentials();
   const cleaned  = cleanFirmNameForLinkedIn(firmName);
@@ -186,7 +192,16 @@ export async function searchDecisionMakersByCompany(firmName, pushActivity = nul
     query: { account_id: creds.linkedinAccountId, limit: 10 },
     body,
     allowErrorResponse: true,
-  }).catch(() => null);
+  }).catch(err => {
+    if (_is429Error(err)) markLinkedInRateLimited('UNIPILE');
+    return null;
+  });
+
+  // Check for rate-limit in response body
+  if (result?.status === 429 || (result && _is429Error(new Error(JSON.stringify(result))))) {
+    markLinkedInRateLimited('UNIPILE');
+    return [];
+  }
 
   const people = (result?.items || [])
     .filter(person => person?.name || person?.headline)
