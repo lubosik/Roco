@@ -1987,7 +1987,7 @@ Return ONLY a valid JSON array. No prose, no explanation. If you cannot find ver
           name: person.full_name.trim(),
           company_name: firm.name,
           job_title: person.title || null,
-          linkedin_url: null,
+          linkedin_url: validateLinkedInUrl(person.linkedin_url) || null,
           email: person.email || null,
           notes: person.notes || null,
           source: `Firm Research (${modelUsed || 'AI'})`,

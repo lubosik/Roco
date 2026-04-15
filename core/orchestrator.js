@@ -1770,8 +1770,19 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
     info(`[${deal.name}] Top-up skipped — ${inviteReadyCount} invite-ready contacts (≥ ${dailyTarget * 3} needed)`);
     return;
   }
-  info(`[${deal.name}] Top-up triggered — only ${inviteReadyCount} invite-ready contacts at fresh firms (gap: ${pipelineGap})`);
+  // Don't trigger a new Grok search if there are already firms queued for enrichment.
+  // The enrichment pipeline will convert those to invite-ready contacts soon enough.
+  const { count: pendingFirms } = await sb.from('batch_firms')
+    .select('id', { count: 'exact', head: true })
+    .eq('deal_id', deal.id)
+    .in('status', ['pending', 'processing', 'researched', 'enriching']);
+  if (Number(pendingFirms || 0) >= 10) {
+    info(`[${deal.name}] Top-up skipped — ${pendingFirms} firms already in enrichment queue`);
+    approvedBatchTopUpState.set(topUpKey, true); // don't recheck today
+    return;
+  }
 
+  info(`[${deal.name}] Top-up triggered — only ${inviteReadyCount} invite-ready contacts, ${pendingFirms || 0} firms in queue (gap: ${pipelineGap})`);
 
   // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
   approvedBatchTopUpState.set(topUpKey, true);
@@ -6476,21 +6487,22 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
   }
 
   if (!isWithinChannelWindow(deal, channel)) {
-    if (channel === 'email' && sb && decision?.queueId) {
+    // Update queue + contact stage for both email and linkedin_dm so dashboard shows correct state
+    if (sb && decision?.queueId) {
+      const approvedStage = channel === 'linkedin_dm' ? 'DM Approved' : 'Email Approved';
       await sb.from('approval_queue').update({
         status: 'approved_waiting_for_window',
         approved_subject: decision?.subject || draft?.subject || null,
         edited_body: decision?.body || draft?.body || null,
         resolved_at: new Date().toISOString(),
-      }).eq('id', decision.queueId);
-      try {
-        await sb.from('contacts').update({
-          pipeline_stage: 'Email Approved',
-          updated_at: new Date().toISOString(),
-        }).eq('id', contact.id);
-      } catch {}
+      }).eq('id', decision.queueId).catch(() => {});
+      await sb.from('contacts').update({
+        pipeline_stage: approvedStage,
+        updated_at: new Date().toISOString(),
+      }).eq('id', contact.id).catch(() => {});
+      notifyQueueUpdated();
     }
-    info(`[${deal.name}] executeOutreach: outside ${channel} window for ${contact.name} — skipping this cycle`);
+    info(`[${deal.name}] executeOutreach: outside ${channel} window for ${contact.name} — waiting for window`);
     return;
   }
 
@@ -6970,10 +6982,10 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
     forceChannel = 'linkedin_dm';
   } else if (hasLinkedIn && !nextContact.invite_sent_at) {
     if (isLowActivity && hasEmail) {
-      // Low LinkedIn activity and has email → go email first
+      // Low LinkedIn activity AND has email → go email first
       forceChannel = 'email';
     } else {
-      // High/unknown activity, or no email alternative → LinkedIn invite
+      // High/unknown activity, OR low activity but no email → LinkedIn invite
       // Let phaseLinkedInInvites handle it naturally (picks it up next cycle)
       info(`[${deal.name}] Waterfall: ${nextContact.name} @ ${firm} queued for LinkedIn invite (score: ${actScore ?? 'unscored'})`);
       return;
@@ -7190,6 +7202,7 @@ function buildContactPage(contact) {
     email: contact.email,
     company_name: contact.company_name,
     linkedin_url: contact.linkedin_url,
+    website: contact.website || contact.firms?.website || null,
     investor_score: contact.investor_score,
     why_this_firm: whyThisFirm,
   };

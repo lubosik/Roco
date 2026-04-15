@@ -243,10 +243,18 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
     ? emailDraft.body.substring(0, 800) + '…'
     : emailDraft.body;
 
+  // Hyperlink the contact name: LinkedIn URL first, website fallback, else plain bold
+  const emailContactLinkedIn = getContactProp(contactPage, 'LinkedIn URL') || contactPage?.linkedin_url || null;
+  const emailContactWebsite = contactPage?.website || null;
+  const emailContactProfileUrl = emailContactLinkedIn || emailContactWebsite || null;
+  const emailNameDisplay = emailContactProfileUrl
+    ? `[${name}](${emailContactProfileUrl})`
+    : `*${name}*`;
+
   const msg = [
     `*ROCO — ${stageLabel} Ready for Approval*`,
     ``,
-    `👤 *${name}* · ${firm}`,
+    `👤 ${emailNameDisplay} · ${firm}`,
     `📊 Score: ${score || '—'}/100  |  Stage: ${stageLabel}`,
     `🔍 _${researchBasis}_`,
     ``,
@@ -319,10 +327,16 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
   body = sanitizeApprovalText(body);
   const bodyPreview = (body || '').length > 600 ? body.substring(0, 600) + '…' : body;
 
+  // Hyperlink the contact name: LinkedIn URL first, website fallback, else plain bold
+  const dmContactProfileUrl = contact.linkedin_url || contact.website || null;
+  const dmNameDisplay = dmContactProfileUrl
+    ? `[${name}](${dmContactProfileUrl})`
+    : `*${name}*`;
+
   const msg = [
     `*ROCO — LinkedIn DM Ready for Approval*`,
     ``,
-    `👤 *${name}* · ${firm}`,
+    `👤 ${dmNameDisplay} · ${firm}`,
     `📊 Score: ${score}/100  |  ${contactType}  |  LinkedIn DM`,
     researchSummary ? `🔍 _${String(researchSummary).substring(0, 220)}_` : null,
     ``,
