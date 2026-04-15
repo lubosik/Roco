@@ -148,7 +148,21 @@ export function initTelegramBot(state) {
 
   bot.on('message',        handleMessage);
   bot.on('callback_query', handleCallbackQuery);
-  bot.on('polling_error',  (err) => error('Telegram polling error', { err: err.message }));
+
+  // Suppress repeated 409 Conflict errors (two instances competing for same token)
+  // to once per 60 seconds — the bot still works for outgoing messages even when 409 fires.
+  let last409LogTime = 0;
+  bot.on('polling_error', (err) => {
+    if (String(err?.message || '').includes('409 Conflict')) {
+      const now = Date.now();
+      if (now - last409LogTime > 60000) {
+        error('Telegram polling conflict (409) — another bot instance may be running on Railway', { err: err.message });
+        last409LogTime = now;
+      }
+      return;
+    }
+    error('Telegram polling error', { err: err.message });
+  });
 
   registerCommands();
   return bot;

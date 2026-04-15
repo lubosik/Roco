@@ -11,6 +11,30 @@ import {
   searchLinkedInPeopleSalesNavigator,
 } from '../integrations/unipileClient.js';
 
+// Module-level rate limit cooldown — when LinkedIn returns 429, pause all searches for 45 minutes
+const LINKEDIN_COOLDOWN_MS = 45 * 60 * 1000;
+let linkedInRateLimitedUntil = null;
+
+function markLinkedInRateLimited() {
+  linkedInRateLimitedUntil = Date.now() + LINKEDIN_COOLDOWN_MS;
+  console.warn(`[LINKEDIN FINDER] Rate limited by LinkedIn — pausing all searches for 45 minutes (until ${new Date(linkedInRateLimitedUntil).toISOTimeString?.() || new Date(linkedInRateLimitedUntil).toISOString()})`);
+}
+
+function isLinkedInRateLimited() {
+  if (!linkedInRateLimitedUntil) return false;
+  if (Date.now() >= linkedInRateLimitedUntil) {
+    linkedInRateLimitedUntil = null;
+    console.info('[LINKEDIN FINDER] Rate limit cooldown expired — resuming searches');
+    return false;
+  }
+  return true;
+}
+
+function is429Error(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('429') || msg.toLowerCase().includes('too_many_requests') || msg.toLowerCase().includes('too many requests');
+}
+
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
@@ -249,20 +273,26 @@ async function searchCandidates({ name, company, title }) {
     });
     salesResults.forEach(pushCandidate);
   } catch (err) {
+    if (is429Error(err)) { markLinkedInRateLimited(); return candidates; }
     const message = String(err?.message || '');
     if (!/403|501|feature_not_subscribed|subscription_required|not implemented/i.test(message)) {
       console.warn(`[LINKEDIN FINDER] Sales Navigator search failed for "${name}": ${message}`);
     }
   }
 
+  // Bail out immediately if rate limited during Sales Nav attempt
+  if (isLinkedInRateLimited()) return candidates;
+
   for (const keywords of keywordSets) {
     try {
       const results = await searchLinkedInPeople({ keywords, limit: 10 });
       results.forEach(pushCandidate);
     } catch (err) {
+      if (is429Error(err)) { markLinkedInRateLimited(); break; }
       console.warn(`[LINKEDIN FINDER] Classic search failed for "${name}" with "${keywords}": ${err.message}`);
     }
     if (candidates.length >= 15) break;
+    if (isLinkedInRateLimited()) break;
   }
 
   return candidates;
@@ -333,6 +363,9 @@ async function verifyFallbackUrl(url, expected) {
 
 export async function findLinkedInUrl({ name, company, title }) {
   if (!name || !String(name).trim()) return null;
+
+  // Respect rate limit cooldown — don't hammer LinkedIn when we're already being throttled
+  if (isLinkedInRateLimited()) return null;
 
   const expected = { name, company, title };
   if (!hasEnoughIdentityContext(expected)) return null;

@@ -1448,7 +1448,6 @@ async function addNewsLeadsToBatch(deal, leads) {
       deal_id: deal.id,
       firm_name: firmName,
       score: finalScore,
-      scoring_breakdown: scoring_breakdown || null,
       justification: lead.why_relevant || null,
       thesis: lead.news_event || null,
       notes: lead.source_hint ? `Source: ${lead.source_hint}` : null,
@@ -1740,12 +1739,29 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
   const topUpKey = `${deal.id}:${estNow.toISODate()}`;
   if (approvedBatchTopUpState.get(topUpKey)) return;
 
-  const metrics = await gatherCurrentMetrics(deal.id).catch(() => null);
-  if (!metrics) return;
+  const sb = getSupabase();
+  if (!sb) return;
 
-  const pipelineTarget = Number(deal.pipeline_max || 100);
-  const pipelineGap = Math.max(0, pipelineTarget - Number(metrics.firms_in_pipeline || 0));
-  if (pipelineGap <= 0) return;
+  // Use invite-ready count at unblocked firms as the real pipeline health signal.
+  // "Total contacts" overstates health — contacts waiting for invite-accepts block their firm
+  // from getting fresh invites, so the real actionable count is contacts at NEW firms.
+  const { count: inviteReadyCount } = await sb.from('contacts')
+    .select('id', { count: 'exact', head: true })
+    .eq('deal_id', deal.id)
+    .in('pipeline_stage', ['Ranked', 'Enriched'])
+    .not('linkedin_url', 'is', null)
+    .is('invite_sent_at', null);
+
+  // How many of those are at truly unblocked firms (no one else there already engaged)?
+  // Approximate this as: if invite-ready count is < daily target, we need fresh firms.
+  const dailyTarget = deal.linkedin_daily_limit || DAILY_INVITE_TARGET;
+  const pipelineGap = Math.max(0, dailyTarget * 3 - Number(inviteReadyCount || 0)); // need 3x buffer
+  if (pipelineGap <= 0) {
+    info(`[${deal.name}] Top-up skipped — ${inviteReadyCount} invite-ready contacts (≥ ${dailyTarget * 3} needed)`);
+    return;
+  }
+  info(`[${deal.name}] Top-up triggered — only ${inviteReadyCount} invite-ready contacts at fresh firms (gap: ${pipelineGap})`);
+
 
   // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
   approvedBatchTopUpState.set(topUpKey, true);
@@ -1754,7 +1770,7 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
   const grokLeads = await searchInvestorsWithGrok(deal, existingNames, pushActivity).catch(() => []);
   if (!grokLeads.length) return;
 
-  const topUpLeads = grokLeads.slice(0, Math.min(2, pipelineGap)).map(lead => ({
+  const topUpLeads = grokLeads.slice(0, Math.min(20, pipelineGap)).map(lead => ({
     firm_name: lead.firm_name || lead.name,
     news_event: truncateForNote(lead.description || 'Fresh investor activity identified via Grok top-up scan', 160),
     why_relevant: truncateForNote(lead.description || `${lead.firm_name || lead.name} appears to fit ${deal.name}`, 180),
@@ -4161,6 +4177,7 @@ async function runDealCycle(deal, state) {
       await runApprovedEnrichment(deal, batch, state);
       await runApprovedOutreach(deal, batch, state, brainDirectives);
       await maybeTopUpApprovedBatch(deal, brainDirectives);
+      await phaseTopUpPipeline(deal, state);  // promote archived contacts + trigger research when pipeline low
       await logDealIdleStatus(deal, batch, state);
       break;
     case 'completed':
@@ -6168,7 +6185,8 @@ async function phaseFollowUps(deal, state) {
     .limit(10);
 
   const followUpChannelFor = (contact) => {
-    if (contact.pipeline_stage === 'invite_sent') return null;
+    // invite_sent = invite sent but not yet accepted — fall back to email if available
+    if (contact.pipeline_stage === 'invite_sent') return contact.email ? 'email' : null;
     if ((contact.pipeline_stage === 'invite_accepted' || contact.pipeline_stage === 'DM Sent' || contact.pipeline_stage === 'dm_sent') && contact.linkedin_provider_id) return 'linkedin_dm';
     return 'email';
   };

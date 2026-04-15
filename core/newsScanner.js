@@ -106,8 +106,40 @@ ${modeInstructions}`;
 }
 
 function extractJSONArray(text) {
-  const match = String(text || '').match(/\[[\s\S]*\]/);
-  return match ? JSON.parse(match[0]) : [];
+  const str = String(text || '');
+  // Strip markdown code fences
+  const cleaned = str.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+
+  // Try all [ ... ] matches from largest to smallest to find a valid JSON array
+  const allMatches = [];
+  let depth = 0, start = -1;
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] === '[') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (cleaned[i] === ']') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        allMatches.push(cleaned.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  // Try each match from longest to shortest (the full array is usually the longest)
+  allMatches.sort((a, b) => b.length - a.length);
+  for (const candidate of allMatches) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {}
+  }
+  // Last resort: extract individual objects
+  const objects = cleaned.match(/\{[^{}]*"firm_name"[^{}]*\}/g) || [];
+  const results = [];
+  for (const obj of objects) {
+    try { results.push(JSON.parse(obj)); } catch {}
+  }
+  return results;
 }
 
 function extractJSONObject(text) {
@@ -224,13 +256,15 @@ async function executeGrokNewsQueries(deal, queries = [], pushActivity) {
 }
 
 export async function grokWebSearch(query, systemContext = '', maxTokens = 1000) {
-  if (!GROK_API_KEY) return null;
+  // Read key at call time — module-level GROK_API_KEY may be undefined if dotenv loaded after module init
+  const apiKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY;
+  if (!apiKey) return null;
 
   try {
     const response = await fetch(`${GROK_BASE}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${GROK_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -518,7 +552,7 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
   if (dailyNewsScanFailureState.has(getNewsFailureKey(deal.id))) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: 'News scan skipped after today’s failure.', recommendedInvestors: [] };
   }
-  if (!deal?.id || !GROK_API_KEY) {
+  if (!deal?.id || !(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: '', recommendedInvestors: [] };
   }
 
@@ -699,12 +733,26 @@ No bullets. No markdown.`;
 }
 
 export async function searchInvestorsWithGrok(deal, existingFirmNames, pushActivity) {
+  // Pass ALL excluded firms — not just 40 — so the model doesn't keep returning the same well-known names
+  const allExcluded = Array.from(existingFirmNames || []);
+  const excludedNote = allExcluded.length
+    ? `\n\nIMPORTANT — Do NOT include any of these ${allExcluded.length} firms already in our pipeline:\n${allExcluded.join(', ')}\n\nSearch specifically for DIFFERENT firms not on this list. Do not repeat any firm from this list.`
+    : '';
+
   const query = `Find PE firms, family offices, and independent sponsors that have recently invested in or announced interest in ${deal.sector || 'the target sector'} companies in ${deal.target_geography || deal.geography || 'the United States'}.
 
-Focus on deals from the last 18 months. Include firms that:
+We need NICHE and LESSER-KNOWN firms — skip any well-known brand-name PE firms and focus on:
+- Regional boutique PE firms
+- Sector-specialist lower-middle-market funds
+- Active family offices that do direct investments
+- Independent sponsors who recently closed ${deal.sector || 'sector'} deals
+- Search deal announcement databases and regional business journals, not just mainstream PE directories
+
+Focus on deals from the last 24 months. Include firms that:
 - Are based in or actively invest in ${deal.target_geography || deal.geography || 'the US'}
 - Have done ${deal.deal_type || deal.raise_type || 'similar'} transactions in ${deal.sector || 'the target sector'} or adjacent sectors
 - Would consider a deal with ${deal.ebitda || deal.ebitda_usd_m ? `$${deal.ebitda || deal.ebitda_usd_m}M EBITDA` : 'the current EBITDA profile'} and ${deal.equity || deal.equity_required_usd_m ? `$${deal.equity || deal.equity_required_usd_m}M equity needed` : 'the current equity need'}
+${excludedNote}
 
 Return ONLY a JSON array:
 [
@@ -714,15 +762,26 @@ Return ONLY a JSON array:
     "hq_country": "United States",
     "reason_fit": "1 sentence specific to this deal",
     "recent_activity": "specific deal or announcement that makes them relevant",
-    "confidence": 7
+    "confidence": 6
   }
 ]
-Maximum 10 results.`;
+Return 25-30 results. Every single firm MUST be different from the exclusion list above.`;
 
   async function parseFirmResults(resultText, sourceFile, listName, sourceLabel) {
-    const firms = extractJSONArray(resultText)
-      .filter(firm => Number(firm.confidence || 0) >= 7)
-      .filter(firm => !existingFirmNames.has(String(firm.firm_name || '').toLowerCase().trim()));
+    const rawFirms = extractJSONArray(resultText);
+    const firms = rawFirms
+      .filter(firm => Number(firm.confidence || 0) >= 5)  // lowered to 5 — exclusion list is the real dedup guard
+      .filter(firm => {
+        const name = String(firm.firm_name || '').toLowerCase().trim();
+        if (!name) return false;
+        // Exact match
+        if (existingFirmNames.has(name)) return false;
+        // Partial match (e.g. "Blackstone Group" matches "blackstone")
+        for (const excluded of existingFirmNames) {
+          if (excluded.length >= 5 && (name.includes(excluded) || excluded.includes(name))) return false;
+        }
+        return true;
+      });
 
     if (firms.length) {
       pushActivity?.({
@@ -746,17 +805,22 @@ Maximum 10 results.`;
   }
 
   if (!deal?.id) return [];
+  console.log(`[GROK SEARCH] Starting investor search for ${deal.name} (${Array.from(existingFirmNames || []).length} excluded)`);
 
-  // Try Grok first (if key available)
-  if (GROK_API_KEY) {
+
+  // Try Grok first (if key available — read at call time to handle dotenv loading order)
+  const grokKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY;
+  if (grokKey) {
     const result = await grokWebSearch(
       query,
       'You are a PE research analyst. Return only valid JSON and only genuinely relevant firms.',
-      1200
+      3000
     ).catch(() => null);
     if (result) {
       try {
+        const rawCount = (result.match(/"firm_name"/g) || []).length;
         const firms = await parseFirmResults(result, 'grok_web_search', 'Grok Web Research', 'Grok');
+        console.log(`[GROK SEARCH] ${deal.name}: ${rawCount} Grok results → ${firms.length} new firms`);
         if (firms.length) {
           pushActivity?.({
             type: 'research',
@@ -764,26 +828,27 @@ Maximum 10 results.`;
             note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
             deal_id: deal.id,
           });
+          return firms;
         }
-        // Grok ran successfully — don't fall through to Claude even if 0 results
-        return firms;
+        // Grok responded but all results were excluded/low-confidence — fall through to Claude
       } catch {
         // parse error — fall through to Claude
       }
+    } else {
+      // Grok returned null — fall through to Claude
     }
-    // Grok returned nothing — fall through to Claude only if Grok had no result (not just empty JSON)
-    if (result !== null) return []; // Grok responded but found nothing — don't burn Claude credits
+    // Grok returned nothing or all filtered out — try Claude as fallback
   }
 
   // Claude web search (used when Grok key missing OR Grok call itself failed)
   try {
     const result = await claudeWebSearch(
-      `${query}\nReturn only valid JSON.`,
+      `${query}\n\nIMPORTANT: Your ENTIRE response must be a raw JSON array starting with [ and ending with ]. No prose, no explanation, no markdown, no code fences. Just the JSON array.`,
       {
-        maxTokens: 1200,
-        maxUses: 4,
+        maxTokens: 4096,
+        maxUses: 5,
         model: 'claude-sonnet-4-6',
-        systemPrompt: 'You are a PE research analyst. Use web search and return only valid JSON.',
+        systemPrompt: 'You are a PE research analyst. You MUST return ONLY a valid JSON array — no text before or after the JSON. Start your response with [ and end with ].',
       }
     );
     if (!result) return [];
@@ -834,7 +899,7 @@ export async function scanInvestorNewsForDeal(deal, optionsOrPushActivity, maybe
       ? safeArray(optionsOrPushActivity?.portfolioDeals)
       : [deal];
 
-  if (!deal?.id || !GROK_API_KEY) return [];
+  if (!deal?.id || !(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) return [];
 
   try {
     pushActivity?.({
@@ -896,7 +961,7 @@ export async function saveDealNewsLeads(dealId, leads) {
 }
 
 export async function scanGeneralInvestorSignals(pushActivity) {
-  if (!GROK_API_KEY) return [];
+  if (!(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) return [];
 
   try {
     const guidanceBlock = await buildGuidanceBlock('investor_outreach').catch(() => '');
@@ -1026,7 +1091,7 @@ const PUBLIC_INVESTOR_DIRECTORIES = [
 ];
 
 export async function scrapePublicInvestorDirectories(deal, existingNames, pushActivity) {
-  if (!GROK_API_KEY || !deal?.id) return [];
+  if (!(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY) || !deal?.id) return [];
 
   const relevantUrls = [];
   const ebitda = parseFloat(deal.ebitda_usd_m || deal.ebitda || 0);
