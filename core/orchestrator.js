@@ -5478,7 +5478,7 @@ async function phaseTempCloseCheck(deal, state) {
 
             if (sent) {
               const newFollowUpCount = (contact.follow_up_count || 0) + 1;
-              const followupDays     = deal?.followup_days_email || 7;
+              const followupDays     = deal?.followup_days_email || 3;
 
               // If they've ghosted 2+ times, move to ghosted and let phaseOutreach pick up next person
               if (newFollowUpCount >= 2) {
@@ -6021,7 +6021,7 @@ async function phaseOutreach(deal, state) {
 
         const noFollowUpsMode = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
         if (noFollowUpsMode && !followUpDueAt) {
-          const cascadeDays = Number(deal?.followup_days_email) || 7;
+          const cascadeDays = Number(deal?.followup_days_email) || 3;
           followUpDueAt = new Date(Date.now() + cascadeDays * 24 * 60 * 60 * 1000).toISOString();
         }
 
@@ -6592,8 +6592,8 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
   const noFollowUpsMode = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
   if (noFollowUpsMode && !followUpDueAt) {
     const cascadeDays = channel === 'linkedin_dm'
-      ? (Number(deal?.followup_days_li) || 3)
-      : (Number(deal?.followup_days_email) || 7);
+      ? (Number(deal?.followup_days_li) || 2)
+      : (Number(deal?.followup_days_email) || 3);
     followUpDueAt = new Date(Date.now() + cascadeDays * 24 * 60 * 60 * 1000).toISOString();
   }
 
@@ -6911,8 +6911,8 @@ async function getNextFollowUpPlanForChannel(deal, channel, sentFollowUpNumber) 
   const currentStep = steps[sentFollowUpNumber] || null;
   const nextStep = steps[sentFollowUpNumber + 1] || null;
   const defaultGap = channel === 'linkedin_dm'
-    ? (Number(deal?.followup_days_li) || 7)
-    : (Number(deal?.followup_days_email) || 7);
+    ? (Number(deal?.followup_days_li) || 2)
+    : (Number(deal?.followup_days_email) || 3);
 
   if (!nextStep) {
     return { delayDays: null, nextStep: null };
