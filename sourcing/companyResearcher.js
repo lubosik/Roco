@@ -88,7 +88,7 @@ async function runGrokCompanyResearch(campaign) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
       body: JSON.stringify({
-        model: 'grok-4.1-fast',
+        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
         input: [{ role: 'user', content: prompt }],
         tools: [{ type: 'web_search' }],
       }),
@@ -103,7 +103,7 @@ async function runGrokCompanyResearch(campaign) {
     const data = await res.json();
     const outputMsg = (data.output || []).find(o => o.type === 'message');
     const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-    const companies = parseCompanyResults(text, 'grok-4.1-fast');
+    const companies = parseCompanyResults(text, process.env.RESEARCH_GROK_MODEL || 'grok-3-fast');
 
     if (companies.length > 0) {
       console.log(`[SOURCING RESEARCH] Grok returned ${companies.length} companies`);
@@ -357,7 +357,7 @@ Return ONLY a valid JSON array of up to 10 companies. If nothing relevant found,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
         body: JSON.stringify({
-          model: 'grok-4.1-fast',
+          model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
           input: [{ role: 'user', content: prompt }],
           tools: [{ type: 'web_search' }],
         }),
@@ -473,7 +473,7 @@ Never fabricate names, URLs, or emails.`;
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
         body: JSON.stringify({
-          model: 'grok-4.1-fast',
+          model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
           input: [{ role: 'user', content: prompt }],
           tools: [{ type: 'web_search' }],
         }),

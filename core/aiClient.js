@@ -302,7 +302,7 @@ export async function grokResearch(prompt, { maxTokens = 1000 } = {}) {
   return gptSem.run(() => withRetry(async () => {
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
     const response = await client.chat.completions.create({
-      model: 'grok-4.1-fast',
+      model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
       messages: [{ role: 'user', content: prompt }],
       max_tokens: maxTokens,
       temperature: 0.2,

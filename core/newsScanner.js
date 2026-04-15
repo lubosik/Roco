@@ -268,7 +268,7 @@ export async function grokWebSearch(query, systemContext = '', maxTokens = 1000)
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'grok-4.1-fast',
+        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
         max_tokens: maxTokens,
         messages: [
           ...(systemContext ? [{ role: 'system', content: systemContext }] : []),
