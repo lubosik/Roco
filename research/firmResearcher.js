@@ -22,6 +22,30 @@ import { parse } from 'csv-parse/sync';
 
 // Keys read lazily inside functions so dotenv is loaded first
 
+// ── LinkedIn rate-limit cooldown (shared across all firm research searches) ──
+const LINKEDIN_FIRM_COOLDOWN_MS = 45 * 60 * 1000; // 45 minutes
+let linkedInFirmRateLimitedUntil = null;
+
+function markFirmLinkedInRateLimited() {
+  linkedInFirmRateLimitedUntil = Date.now() + LINKEDIN_FIRM_COOLDOWN_MS;
+  console.warn(`[FIRM RESEARCH] LinkedIn rate limited — pausing all LinkedIn searches for 45 minutes (until ${new Date(linkedInFirmRateLimitedUntil).toISOString()})`);
+}
+
+function isFirmLinkedInRateLimited() {
+  if (!linkedInFirmRateLimitedUntil) return false;
+  if (Date.now() >= linkedInFirmRateLimitedUntil) {
+    linkedInFirmRateLimitedUntil = null;
+    console.info('[FIRM RESEARCH] LinkedIn rate limit cooldown expired — resuming searches');
+    return false;
+  }
+  return true;
+}
+
+function isFirm429Error(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('429') || msg.toLowerCase().includes('too_many_requests') || msg.toLowerCase().includes('too many requests');
+}
+
 function boolFromEnv(value, fallback = false) {
   if (value == null || value === '') return fallback;
   return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
@@ -1654,6 +1678,7 @@ async function resolveCompanyParameterIds(firm, deal) {
   const normalizedFirmName = normalizeSearchText(firmName);
 
   for (const attempt of attempts) {
+    if (isFirmLinkedInRateLimited()) break;
     try {
       const items = await getLinkedInSearchParameters({
         type: 'COMPANY',
@@ -1670,6 +1695,7 @@ async function resolveCompanyParameterIds(firm, deal) {
       }
       if (ids.size) break;
     } catch (err) {
+      if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
       console.warn(`[FIRM RESEARCH] Company parameter lookup failed for "${firmName}" (${attempt.service}): ${err.message}`);
     }
   }
@@ -1699,9 +1725,11 @@ function scoreUnipileDecisionMaker(person, firm) {
 }
 
 async function findDecisionMakersViaUnipile(firm, deal) {
+  if (isFirmLinkedInRateLimited()) return [];
   const queries = buildDecisionMakerSearchQueries(firm, deal);
   if (!queries.length) return [];
   const companyIds = await resolveCompanyParameterIds(firm, deal);
+  if (isFirmLinkedInRateLimited()) return [];
 
   const seen = new Set();
   const candidates = [];
@@ -1732,6 +1760,8 @@ async function findDecisionMakersViaUnipile(firm, deal) {
   };
 
   for (const query of queries) {
+    if (isFirmLinkedInRateLimited()) break;
+
     try {
       const salesResults = await searchLinkedInPeopleSalesNavigator({
         keywords: query,
@@ -1741,11 +1771,14 @@ async function findDecisionMakersViaUnipile(firm, deal) {
       });
       (salesResults || []).forEach(person => pushCandidate(person, 'unipile_sales_navigator'));
     } catch (err) {
+      if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
       const message = String(err?.message || '');
       if (!/403|501|feature_not_subscribed|subscription_required|not implemented/i.test(message)) {
         console.warn(`[FIRM RESEARCH] Sales Navigator search failed for "${query}": ${message}`);
       }
     }
+
+    if (isFirmLinkedInRateLimited()) break;
 
     try {
       const classicResults = await searchLinkedInPeople({
@@ -1756,6 +1789,7 @@ async function findDecisionMakersViaUnipile(firm, deal) {
       });
       (classicResults || []).forEach(person => pushCandidate(person, 'unipile_linkedin_search'));
     } catch (err) {
+      if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
       console.warn(`[FIRM RESEARCH] LinkedIn search failed for "${query}": ${err.message}`);
     }
 
