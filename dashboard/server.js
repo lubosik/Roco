@@ -902,10 +902,10 @@ async function upsertTranscriptInvestorDatabaseRecord(sb, { analysis, contact, i
 
   let record = null;
   if (existing?.id) {
-    const { data } = await sb.from('investors_db').update(payload).eq('id', existing.id).select('*').single().catch(() => ({ data: existing }));
+    const { data } = await sb.from('investors_db').update(payload).eq('id', existing.id).select('*').single().then(r => r, () => ({ data: existing }));
     record = data || existing;
   } else {
-    const { data } = await sb.from('investors_db').insert(payload).select('*').single().catch(() => ({ data: null }));
+    const { data } = await sb.from('investors_db').insert(payload).select('*').single().then(r => r, () => ({ data: null }));
     record = data || null;
   }
   return record;

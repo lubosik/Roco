@@ -315,7 +315,7 @@ async function implementPendingDailyLogActions(deals = []) {
     if (!deal) continue;
     const actions = Array.isArray(row.recommended_actions) ? row.recommended_actions.filter(Boolean) : [];
     if (!actions.length) {
-      await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).catch(() => {});
+      await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).then(null, () => {});
       continue;
     }
 
@@ -331,7 +331,7 @@ async function implementPendingDailyLogActions(deals = []) {
       });
     }
 
-    await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).catch(() => {});
+    await sb.from('daily_logs').update({ actions_implemented: true }).eq('id', row.id).then(null, () => {});
   }
 
   dailyLogRecommendationState.set(todayEt, true);
@@ -6513,11 +6513,11 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
         approved_subject: decision?.subject || draft?.subject || null,
         edited_body: decision?.body || draft?.body || null,
         resolved_at: new Date().toISOString(),
-      }).eq('id', decision.queueId).catch(() => {});
+      }).eq('id', decision.queueId).then(null, () => {});
       await sb.from('contacts').update({
         pipeline_stage: approvedStage,
         updated_at: new Date().toISOString(),
-      }).eq('id', contact.id).catch(() => {});
+      }).eq('id', contact.id).then(null, () => {});
       notifyQueueUpdated();
     }
     info(`[${deal.name}] executeOutreach: outside ${channel} window for ${contact.name} — waiting for window`);
