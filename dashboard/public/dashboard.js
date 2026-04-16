@@ -8991,10 +8991,18 @@ async function loadAnalyticsPage() {
       .ap-tab { background:transparent; border:1px solid var(--border); color:var(--mid); padding:10px 14px; border-radius:999px; cursor:pointer; font-family:'DM Mono',monospace; font-size:11px; letter-spacing:.12em; text-transform:uppercase; transition:border-color .2s,color .2s,background .2s; }
       .ap-tab.active { border-color:var(--gold); color:var(--gold); background:var(--gold-dim); }
       .analytics-panel.hidden { display:none; }
-      .shelf { display:flex; gap:20px; align-items:flex-end;
-               padding:0 4px 40px; overflow-x:auto; scrollbar-width:none; }
-      .shelf::-webkit-scrollbar { display:none; }
-      .book { flex-shrink:0; width:120px; height:180px; cursor:pointer;
+      .books-grid { display:grid; grid-template-columns:repeat(4,120px);
+                    gap:20px 20px; padding:4px 4px 24px; }
+      .books-pgr { display:flex; align-items:center; gap:16px; margin-top:8px;
+                   padding-top:16px; border-top:1px solid var(--border); }
+      .books-pgr-btn { background:transparent; border:1px solid var(--border);
+                       color:var(--mid); padding:7px 14px; border-radius:6px;
+                       cursor:pointer; font-family:'DM Mono',monospace; font-size:11px;
+                       transition:border-color .2s,color .2s; }
+      .books-pgr-btn:hover:not(:disabled) { border-color:var(--gold); color:var(--gold); }
+      .books-pgr-btn:disabled { opacity:0.3; cursor:default; }
+      .books-pgr-info { font-size:11px; color:var(--mid); flex:1; text-align:center; }
+      .book { width:120px; height:180px; cursor:pointer;
               transition:transform .3s,filter .3s; }
       .book:hover { transform:translateY(-14px) rotateY(-6deg);
                     filter:brightness(1.2); }
@@ -9129,7 +9137,7 @@ async function loadAnalyticsPage() {
               <div class="ap-section-sub">Generated automatically at the end of each America/New_York day</div>
             </div>
           </div>
-          <div class="shelf" id="daily-log-shelf">
+          <div id="daily-log-shelf">
             <div style="color:#3A3835;font-size:12px;padding:40px 0">Loading daily logs...</div>
           </div>
         </div>
@@ -9142,7 +9150,7 @@ async function loadAnalyticsPage() {
               <div class="ap-section-sub">Generated automatically every Monday at 9am EST</div>
             </div>
           </div>
-          <div class="shelf" id="roco-shelf">
+          <div id="roco-shelf">
             <div style="color:#3A3835;font-size:12px;padding:40px 0">Loading reports...</div>
           </div>
         </div>
@@ -9150,6 +9158,11 @@ async function loadAnalyticsPage() {
     </div>
   `;
 
+  // Reset caches so fresh data loads on each analytics page open
+  _dailyLogData = null;
+  _weeklyData = null;
+  analyticsPageState.daily = 0;
+  analyticsPageState.weekly = 0;
   renderDailyLogShelf();
   renderShelf();
   window.switchAnalyticsTab('daily');
@@ -9169,28 +9182,75 @@ window.switchAnalyticsTab = function(tab) {
   weeklyPanel.classList.toggle('hidden', showDaily);
 };
 
+// ─── Analytics shelf pagination state ──────────────────────────────────────
+const analyticsPageState = { daily: 0, weekly: 0 };
+const BOOKS_PER_PAGE = 12; // 4 columns × 3 rows
+
+function renderBooksPage(containerId, items, pageKey, renderCardFn) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const page = analyticsPageState[pageKey] || 0;
+  const totalPages = Math.max(1, Math.ceil(items.length / BOOKS_PER_PAGE));
+  // Clamp page within bounds
+  analyticsPageState[pageKey] = Math.min(Math.max(0, page), totalPages - 1);
+  const safePage = analyticsPageState[pageKey];
+  const pageItems = items.slice(safePage * BOOKS_PER_PAGE, (safePage + 1) * BOOKS_PER_PAGE);
+
+  const gridHtml = `<div class="books-grid">${pageItems.map(renderCardFn).join('')}</div>`;
+  const pgrHtml = totalPages > 1 ? `
+    <div class="books-pgr">
+      <button class="books-pgr-btn" ${safePage === 0 ? 'disabled' : ''}
+        onclick="analyticsPageState['${pageKey}']--;renderBooksPageRefresh('${containerId}','${pageKey}')">← Prev</button>
+      <span class="books-pgr-info">Page ${safePage + 1} of ${totalPages}</span>
+      <button class="books-pgr-btn" ${safePage >= totalPages - 1 ? 'disabled' : ''}
+        onclick="analyticsPageState['${pageKey}']++;renderBooksPageRefresh('${containerId}','${pageKey}')">Next →</button>
+    </div>` : '';
+
+  container.innerHTML = gridHtml + pgrHtml;
+}
+
+// Called by inline onclick handlers to re-render the page after navigating
+window.renderBooksPageRefresh = function(containerId, pageKey) {
+  if (pageKey === 'daily') _renderDailyLogGrid();
+  else _renderWeeklyGrid();
+};
+
+// Cached data for re-renders without refetching
+let _weeklyData = null;
+let _dailyLogData = null;
+
 async function renderShelf() {
-  const shelf = document.getElementById('roco-shelf');
-  if (!shelf) return;
+  const container = document.getElementById('roco-shelf');
+  if (!container) return;
 
-  let weeks;
+  // Use cache if available (pagination re-render)
+  if (_weeklyData) {
+    _renderWeeklyGrid();
+    return;
+  }
+
   try {
-    weeks = await api('/api/analytics/weeks');
-    if (!Array.isArray(weeks)) weeks = [];
+    const weeks = await api('/api/analytics/weeks');
+    _weeklyData = Array.isArray(weeks) ? weeks : [];
   } catch {
-    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load reports.</div>';
+    container.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load reports.</div>';
     return;
   }
 
-  if (!weeks.length) {
-    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No reports yet. First report generates automatically next Monday.</div>';
+  if (!_weeklyData.length) {
+    container.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No reports yet. First report generates automatically next Monday.</div>';
     return;
   }
 
-  const sorted = [...weeks].sort((a, b) => new Date(a.week_start) - new Date(b.week_start));
+  _renderWeeklyGrid();
+}
 
-  shelf.innerHTML = sorted.map((w, i) => {
-    const isLatest = i === sorted.length - 1;
+function _renderWeeklyGrid() {
+  if (!_weeklyData) return;
+  const sorted = [..._weeklyData].sort((a, b) => new Date(a.week_start) - new Date(b.week_start));
+
+  renderBooksPage('roco-shelf', sorted, 'weekly', (w) => {
+    const isLatest = sorted.indexOf(w) === sorted.length - 1;
     const isGen    = w.status === 'generated';
     const isGenning = w.status === 'generating';
     const isFailed = w.status === 'failed';
@@ -9199,7 +9259,6 @@ async function renderShelf() {
     const d1 = new Date(w.week_start);
     const d2 = new Date(w.week_end);
     const fmtD = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-
     return `
       <div class="book" onclick="window.openBook('${esc(w.week_start)}')">
         <div class="cover">
@@ -9215,30 +9274,40 @@ async function renderShelf() {
           </div>
         </div>
       </div>`;
-  }).join('');
+  });
 }
 
 async function renderDailyLogShelf() {
-  const shelf = document.getElementById('daily-log-shelf');
-  if (!shelf) return;
+  const container = document.getElementById('daily-log-shelf');
+  if (!container) return;
 
-  let logs;
+  // Re-render from cache if pagination triggered (no new fetch needed)
+  if (_dailyLogData) {
+    _renderDailyLogGrid();
+    return;
+  }
+
   try {
-    logs = await api('/api/analytics/daily-logs');
-    if (!Array.isArray(logs)) logs = [];
+    const logs = await api('/api/analytics/daily-logs');
+    _dailyLogData = Array.isArray(logs) ? logs : [];
   } catch {
-    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load daily logs.</div>';
+    container.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">Could not load daily logs.</div>';
     return;
   }
 
-  if (!logs.length) {
-    shelf.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No daily logs yet. The first end-of-day log will appear automatically.</div>';
+  if (!_dailyLogData.length) {
+    container.innerHTML = '<div style="color:#3A3835;font-size:12px;padding:40px 0">No daily logs yet. The first end-of-day log will appear automatically.</div>';
     return;
   }
 
-  const sorted = [...logs].sort((a, b) => new Date(a.report_date) - new Date(b.report_date));
-  shelf.innerHTML = sorted.map((log, index) => {
-    const isLatest = index === sorted.length - 1;
+  _renderDailyLogGrid();
+}
+
+function _renderDailyLogGrid() {
+  if (!_dailyLogData) return;
+  const sorted = [..._dailyLogData].sort((a, b) => new Date(a.report_date) - new Date(b.report_date));
+  renderBooksPage('daily-log-shelf', sorted, 'daily', (log) => {
+    const isLatest = sorted.indexOf(log) === sorted.length - 1;
     const isGen = log.status === 'generated';
     const isFailed = log.status === 'failed';
     const stClass = isGen ? 'st-gen' : isFailed ? 'st-fail' : 'st-pend';
@@ -9246,7 +9315,6 @@ async function renderDailyLogShelf() {
     const date = new Date(`${log.report_date}T12:00:00`);
     const day = date.toLocaleDateString('en-GB', { day: 'numeric' });
     const month = date.toLocaleDateString('en-GB', { month: 'short' });
-
     return `
       <div class="book" onclick="window.openDailyLog('${esc(log.report_date)}')">
         <div class="cover">
@@ -9262,7 +9330,7 @@ async function renderDailyLogShelf() {
           </div>
         </div>
       </div>`;
-  }).join('');
+  });
 }
 
 window.openBook = async function(weekStart) {

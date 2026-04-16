@@ -1653,92 +1653,123 @@ async function runDailyNewsScanCycle(deals) {
 async function runDailyActivityDigestCycle(deals) {
   const estNow = DateTime.now().setZone('America/New_York');
   const digestHour = Number(process.env.DAILY_ACTIVITY_DIGEST_HOUR_ET || 20);
-  if (estNow.hour !== digestHour) return;
-  const targetDate = estNow.toISODate();
 
-  const sb = getSupabase();
-  if (sb && targetDate) {
-    try {
-      const { data: existingRows } = await sb.from('daily_logs')
-        .select('id, log_date, deal_id, telegram_voice_script')
-        .eq('log_date', targetDate)
-        .limit(1);
-      if (existingRows?.length) {
-        dailyActivityDigestState.set(targetDate, 'done');
-        return;
-      }
-    } catch {}
+  // Collect dates to process: today (if at digest hour) + any missing days from the past 7 days
+  const datesToProcess = [];
 
-    try {
-      const { data: legacyRows } = await sb.from('daily_activity_reports')
-        .select('id, report_date')
-        .eq('report_date', targetDate)
-        .limit(1);
-      if (legacyRows?.length) {
-        dailyActivityDigestState.set(targetDate, 'done');
-        return;
-      }
-    } catch {}
+  // Today's digest — only fire at the scheduled hour
+  if (estNow.hour === digestHour) {
+    datesToProcess.push(estNow.toISODate());
   }
 
-  const existingState = dailyActivityDigestState.get(targetDate);
-  if (existingState === 'running' || existingState === 'done') return;
-  dailyActivityDigestState.set(targetDate, 'running');
+  // Catch-up: check the past 7 days for any missing logs and backfill them
+  const sb = getSupabase();
+  if (sb) {
+    for (let daysBack = 1; daysBack <= 7; daysBack++) {
+      const pastDate = estNow.minus({ days: daysBack }).toISODate();
+      if (dailyActivityDigestState.get(pastDate) === 'done') continue;
+      try {
+        const { data: existingRows } = await sb.from('daily_logs')
+          .select('id').eq('log_date', pastDate).limit(1);
+        if (existingRows?.length) { dailyActivityDigestState.set(pastDate, 'done'); continue; }
+      } catch {}
+      try {
+        const { data: legacyRows } = await sb.from('daily_activity_reports')
+          .select('id').eq('report_date', pastDate).limit(1);
+        if (legacyRows?.length) { dailyActivityDigestState.set(pastDate, 'done'); continue; }
+      } catch {}
+      // Missing — add to backfill queue (skip today if already queued above)
+      if (!datesToProcess.includes(pastDate)) datesToProcess.push(pastDate);
+    }
+  }
 
-  try {
-    const reportReference = DateTime.fromISO(`${targetDate}T20:05:00`, { zone: 'America/New_York' });
-    const report = await buildDailyActivityReport({ deals, reference: reportReference });
-    let sentVoiceAt = null;
-    let voiceName = null;
+  if (!datesToProcess.length) return;
+
+  for (const targetDate of datesToProcess) {
+    const isCatchUp = targetDate !== estNow.toISODate();
+
+    if (sb && targetDate && !isCatchUp) {
+      try {
+        const { data: existingRows } = await sb.from('daily_logs')
+          .select('id, log_date, deal_id, telegram_voice_script')
+          .eq('log_date', targetDate)
+          .limit(1);
+        if (existingRows?.length) {
+          dailyActivityDigestState.set(targetDate, 'done');
+          continue;
+        }
+      } catch {}
+
+      try {
+        const { data: legacyRows } = await sb.from('daily_activity_reports')
+          .select('id, report_date')
+          .eq('report_date', targetDate)
+          .limit(1);
+        if (legacyRows?.length) {
+          dailyActivityDigestState.set(targetDate, 'done');
+          continue;
+        }
+      } catch {}
+    }
+
+    const existingState = dailyActivityDigestState.get(targetDate);
+    if (existingState === 'running' || existingState === 'done') continue;
+    dailyActivityDigestState.set(targetDate, 'running');
 
     try {
-      const voiceNote = await renderDailyVoiceNoteFromText(report.voice_script || report.executive_summary || '');
-      if (voiceNote?.filePath) {
-        const sent = await sendTelegramVoiceNote(voiceNote.filePath, {
-          caption: report.telegram_caption || `Daily voice log · ${report.report_date}`,
-        }).catch(() => null);
-        if (sent) {
-          sentVoiceAt = new Date().toISOString();
-          voiceName = voiceNote.voiceName || null;
+      const reportReference = DateTime.fromISO(`${targetDate}T20:05:00`, { zone: 'America/New_York' });
+      const report = await buildDailyActivityReport({ deals, reference: reportReference });
+      let sentVoiceAt = null;
+      let voiceName = null;
+
+      // Only send voice note for today's report — not for catch-up backfills
+      if (!isCatchUp) {
+        try {
+          const voiceNote = await renderDailyVoiceNoteFromText(report.voice_script || report.executive_summary || '');
+          if (voiceNote?.filePath) {
+            const sent = await sendTelegramVoiceNote(voiceNote.filePath, {
+              caption: report.telegram_caption || `Daily voice log · ${report.report_date}`,
+            }).catch(() => null);
+            if (sent) {
+              sentVoiceAt = new Date().toISOString();
+              voiceName = voiceNote.voiceName || null;
+            }
+            if (fs.existsSync(voiceNote.filePath)) fs.unlinkSync(voiceNote.filePath);
+          } else {
+            pushActivity({
+              type: 'warning',
+              action: 'Daily voice log skipped',
+              note: 'No ElevenLabs voice note was generated for the daily report',
+            });
+          }
+        } catch (voiceErr) {
+          pushActivity({
+            type: 'warning',
+            action: 'Daily voice log generation failed',
+            note: voiceErr.message?.slice(0, 160),
+          });
         }
-        if (fs.existsSync(voiceNote.filePath)) fs.unlinkSync(voiceNote.filePath);
-      } else {
-        pushActivity({
-          type: 'warning',
-          action: 'Daily voice log skipped',
-          note: 'No ElevenLabs voice note was generated for the daily report',
-        });
       }
-    } catch (voiceErr) {
+
+      await persistDailyActivityReport({
+        ...report,
+        voice_name: voiceName,
+        actions_implemented: false,
+        voice_note_sent_at: sentVoiceAt || null,
+      }).catch(() => {});
+
       pushActivity({
-        type: 'warning',
-        action: 'Daily voice log generation failed',
-        note: voiceErr.message?.slice(0, 160),
+        type: 'system',
+        action: isCatchUp ? `Daily log backfilled for ${targetDate}` : 'Daily activity log generated',
+        note: `${report.deals_covered || 0} deal${report.deals_covered === 1 ? '' : 's'} · ${report.activity_count || 0} activity events`,
       });
-    }
 
-    await persistDailyActivityReport({
-      ...report,
-      voice_name: voiceName,
-      actions_implemented: false,
-      voice_note_sent_at: sentVoiceAt || null,
-    }).catch(() => {});
-
-    pushActivity({
-      type: 'system',
-      action: 'Daily activity log generated',
-      note: `${report.deals_covered || 0} deal${report.deals_covered === 1 ? '' : 's'} · ${report.activity_count || 0} activity events`,
-    });
-
-    const voiceCompleted = !!(sentVoiceAt || !report.voice_script);
-    if (voiceCompleted) {
       dailyActivityDigestState.set(targetDate, 'done');
-    } else {
+    } catch (err) {
       dailyActivityDigestState.delete(targetDate);
+      if (!isCatchUp) throw err;
+      warn(`[ANALYTICS] Failed to backfill daily log for ${targetDate}: ${err.message}`);
     }
-  } catch (err) {
-    dailyActivityDigestState.delete(targetDate);
-    throw err;
   }
 }
 
@@ -6237,14 +6268,18 @@ async function phaseFollowUps(deal, state) {
     .in('pipeline_stage', ['Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'invite_accepted', 'invite_sent'])
     .limit(10);
 
-  // Patience policy: after the wait window expires, ALWAYS advance to the next person.
-  // Never switch channels (LinkedIn→email) as a follow-up — channel selection for the
-  // next contact is handled by queueNextFirmWaterfallContact using activity-score routing.
-  // LinkedIn (invite/DM): followup_days_li (default 2) → next person
+  // Channel-switch policy:
+  // - no_follow_ups=true  (e.g. Project Electrify) → always advance to next person, no channel switching
+  // - no_follow_ups=false (default) → if LinkedIn unanswered and contact has email, try email first
+  // LinkedIn (invite/DM): followup_days_li (default 2) → channel switch or next person
   // Email:                followup_days_email (default 3) → next person
-  // eslint-disable-next-line no-unused-vars
-  const followUpChannelFor = (_contact) => null;
-  // Stages where the channel-switch email is an intro (not a follow-up)
+  const noFollowUpsMode = deal?.no_follow_ups ?? false;
+  const followUpChannelFor = (contact) => {
+    if (noFollowUpsMode) return null; // always advance to next person
+    const isLinkedInStage = ['DM Sent', 'dm_sent', 'invite_sent', 'invite_accepted'].includes(contact.pipeline_stage);
+    if (isLinkedInStage && contact.email && hasUsableEmail(contact.email)) return 'email';
+    return null;
+  };
   // Filter: skip responded firms, skip manual/suppressed contacts
   const contacts = (allDue || []).sort((a, b) => {
     const scoreDiff = Number(b.investor_score || 0) - Number(a.investor_score || 0);
@@ -6265,23 +6300,40 @@ async function phaseFollowUps(deal, state) {
   for (const contact of contacts) {
     if (contactsInFlight.has(contact.id)) continue;
 
-    // Patience window expired → mark inactive and advance waterfall to next person at the firm.
-    // Channel selection for the replacement contact is handled by queueNextFirmWaterfallContact
-    // using LinkedIn activity-score routing (high activity → LI, low + email → email, etc.).
+    const switchChannel = followUpChannelFor(contact);
     const channelLabel = ['Email Sent', 'email_sent'].includes(contact.pipeline_stage) ? 'email' : 'LinkedIn';
-    await sb.from('contacts').update({
-      follow_up_due_at: null,
-      pipeline_stage: 'Inactive',
-    }).eq('id', contact.id);
-    info(`[${deal.name}] ${contact.name}: ${channelLabel} unanswered — advancing to next contact at ${contact.company_name || 'firm'}`);
-    pushActivity({
-      type: 'outreach',
-      action: `[WATERFALL] No response — moving to next contact at firm`,
-      note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · ${channelLabel} unanswered`,
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
-    await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
+
+    if (switchChannel) {
+      // Channel switch: LinkedIn unanswered → try email
+      info(`[${deal.name}] ${contact.name}: LinkedIn unanswered — switching to email channel`);
+      pushActivity({
+        type: 'outreach',
+        action: `[CHANNEL SWITCH] LinkedIn unanswered — trying email`,
+        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      // Clear the LinkedIn patience timer before drafting the email
+      await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id).catch(() => {});
+      await handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' }).catch(() => {});
+    } else {
+      // Patience window expired → mark inactive and advance waterfall to next person at the firm.
+      // Channel selection for the replacement contact is handled by queueNextFirmWaterfallContact
+      // using LinkedIn activity-score routing (high activity → LI, low + email → email, etc.).
+      await sb.from('contacts').update({
+        follow_up_due_at: null,
+        pipeline_stage: 'Inactive',
+      }).eq('id', contact.id);
+      info(`[${deal.name}] ${contact.name}: ${channelLabel} unanswered — advancing to next contact at ${contact.company_name || 'firm'}`);
+      pushActivity({
+        type: 'outreach',
+        action: `[WATERFALL] No response — moving to next contact at firm`,
+        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · ${channelLabel} unanswered`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
+    }
   }
 }
 
@@ -6552,10 +6604,9 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
     : null;
 
   // Always set a patience timer so phaseFollowUps can advance to the next contact when it fires.
-  // LinkedIn (invite/DM): fires after followup_days_li days → marks inactive, tries next person
+  // LinkedIn (invite/DM): fires after followup_days_li days → marks inactive / channel-switch
   // Email:                fires after followup_days_email days → marks inactive, tries next person
-  const noFollowUpsMode = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
-  if (noFollowUpsMode && !followUpDueAt) {
+  if (!followUpDueAt) {
     const cascadeDays = channel === 'linkedin_dm'
       ? (Number(deal?.followup_days_li) || 2)
       : (Number(deal?.followup_days_email) || 3);
