@@ -5843,35 +5843,57 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // GET /api/deals/:id/kanban — firms for current active batch grouped by kanban stage
+  // GET /api/deals/:id/kanban — firms for current batch grouped by kanban stage
   app.get('/api/deals/:id/kanban', requireAuth, async (req, res) => {
     try {
       const sb = getSupabase();
-      // Get the most recent active/approved batch
+      const dealId = req.params.id;
+
+      // Match the same batch query as batch/current — exclude only completed/skipped
       const { data: batch } = await sb.from('campaign_batches')
         .select('*')
-        .eq('deal_id', req.params.id)
-        .in('status', ['approved', 'active'])
+        .eq('deal_id', dealId)
+        .not('status', 'in', '("completed","skipped")')
         .order('batch_number', { ascending: false })
         .limit(1).maybeSingle();
 
-      if (!batch) return res.json({ batch: null, columns: {} });
+      if (!batch) {
+        info(`[kanban] no active batch found for deal ${dealId}`);
+        return res.json({ batch: null, columns: {}, _debug: { reason: 'no_batch', deal_id: dealId } });
+      }
 
       // Get all firms for this batch
-      const { data: firmRows } = await sb.from('batch_firms')
+      const { data: firmRows, error: firmErr } = await sb.from('batch_firms')
         .select('id, firm_name, score, rank, enrichment_status')
         .eq('batch_id', batch.id)
         .order('score', { ascending: false });
 
-      // Get all contacts for this deal+batch
-      const { data: contacts } = await sb.from('contacts')
+      if (firmErr) throw firmErr;
+
+      info(`[kanban] deal=${dealId} batch=${batch.id} status=${batch.status} firms=${firmRows?.length ?? 0}`);
+
+      // Try contacts filtered by batch_id first; fall back to deal_id only
+      // (contacts pre-dating batch tracking may lack batch_id)
+      let contacts = [];
+      const { data: batchContacts } = await sb.from('contacts')
         .select('id, name, job_title, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at, investor_score')
-        .eq('deal_id', req.params.id)
+        .eq('deal_id', dealId)
         .eq('batch_id', batch.id);
+
+      if (batchContacts?.length) {
+        contacts = batchContacts;
+      } else {
+        // Fallback: all contacts for this deal (ignore batch_id)
+        const { data: dealContacts } = await sb.from('contacts')
+          .select('id, name, job_title, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at, investor_score')
+          .eq('deal_id', dealId);
+        contacts = dealContacts || [];
+        info(`[kanban] batch_id contact lookup returned 0 — fell back to deal-level contacts (${contacts.length})`);
+      }
 
       // Group contacts by normalised firm name
       const contactsByFirm = new Map();
-      for (const c of (contacts || [])) {
+      for (const c of contacts) {
         const key = normalizeFirmLookupName(c.company_name);
         if (!key) continue;
         if (!contactsByFirm.has(key)) contactsByFirm.set(key, []);
@@ -5884,7 +5906,6 @@ function registerRoutes(app) {
         const firmContacts = contactsByFirm.get(normalizeFirmLookupName(row.firm_name)) || [];
         const summary = buildFirmCampaignSummary(firmContacts, row.enrichment_status || 'pending');
 
-        // Top contact = highest investor_score
         const sorted = [...firmContacts].sort((a, b) => Number(b.investor_score || 0) - Number(a.investor_score || 0));
         const top = sorted[0];
 
@@ -5899,16 +5920,52 @@ function registerRoutes(app) {
         };
 
         switch (summary.firm_stage) {
-          case 'meeting_booked':    columns.meeting_booked.push(firmData); break;
-          case 'replied':           columns.engaged.push(firmData); break;
-          case 'invite_accepted':   columns.connected.push(firmData); break;
-          case 'outreach_started':  columns.contacted.push(firmData); break;
-          case 'closed':            columns.passed.push(firmData); break;
-          default:                  columns.queued.push(firmData);
+          case 'meeting_booked':   columns.meeting_booked.push(firmData); break;
+          case 'replied':          columns.engaged.push(firmData); break;
+          case 'invite_accepted':  columns.connected.push(firmData); break;
+          case 'outreach_started': columns.contacted.push(firmData); break;
+          case 'closed':           columns.passed.push(firmData); break;
+          default:                 columns.queued.push(firmData);
         }
       }
 
-      res.json({ batch, columns });
+      res.json({
+        batch: { id: batch.id, status: batch.status, batch_number: batch.batch_number },
+        columns,
+        _debug: { firms: firmRows?.length ?? 0, contacts: contacts.length },
+      });
+    } catch (err) {
+      error(`[kanban] ${err.message}`);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/deals/:id/kanban/debug — raw diagnostics (no auth needed in dev, requireAuth in prod)
+  app.get('/api/deals/:id/kanban/debug', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      const dealId = req.params.id;
+
+      const { data: allBatches } = await sb.from('campaign_batches')
+        .select('id, status, batch_number, created_at')
+        .eq('deal_id', dealId)
+        .order('batch_number', { ascending: false });
+
+      const { count: totalFirms } = await sb.from('batch_firms')
+        .select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId);
+
+      const { count: contactsWithBatch } = await sb.from('contacts')
+        .select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId)
+        .not('batch_id', 'is', null);
+
+      const { count: contactsNoBatch } = await sb.from('contacts')
+        .select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId)
+        .is('batch_id', null);
+
+      res.json({ deal_id: dealId, batches: allBatches, totalFirms, contactsWithBatch, contactsNoBatch });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
