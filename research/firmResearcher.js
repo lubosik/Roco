@@ -1137,7 +1137,7 @@ async function runLinkedInFirmSearch(deal) {
           firmMap.get(firmName.toLowerCase()).candidates.push({
             name,
             title: person.title || person.headline || null,
-            linkedin_url: person.profile_url || (person.public_identifier ? `https://linkedin.com/in/${person.public_identifier}` : null),
+            linkedin_url: validateLinkedInUrl(person.profile_url || (person.public_identifier ? `https://linkedin.com/in/${person.public_identifier}` : null)),
             linkedin_provider_id: person.provider_id || null,
           });
         }
