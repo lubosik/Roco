@@ -26,8 +26,13 @@ Writing style rules:
 - One clear ask at the end.
 - Subject lines: curiosity-driven, under 8 words.
 - Maximum 150 words for email body. LinkedIn DMs: 3-5 sentences.
+- ALWAYS write with FULL CONFIDENCE. Never express uncertainty about the prospect's focus, background, or interest. Use whatever research you have and write as if you did your homework. If specific thesis data is unavailable, write "given your focus at [Firm]" or "I was looking at [Firm] and thought this was worth a conversation" — never say "I'm not sure of your focus" or "I'm not certain you cover this".
 
-FORBIDDEN: "Hope this finds you well", "I wanted to reach out", "synergy", "exciting opportunity", "impressive portfolio"`;
+FORBIDDEN PHRASES (never use any of these):
+"Hope this finds you well", "I wanted to reach out", "synergy", "exciting opportunity", "impressive portfolio",
+"I'm not sure of your", "I'm not certain", "I don't know if you", "I wasn't sure if",
+"not sure if this is your focus", "not sure if this fits", "may or may not be",
+"might not be relevant", "this may not be in your wheelhouse", "apologies if this isn't relevant"`;
 
 /**
  * Construct a personalised outreach message with full deal isolation.

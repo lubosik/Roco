@@ -1561,7 +1561,13 @@ export async function findDecisionMakers(firm, deal) {
     ...safeMergeContacts,
   ]);
 
-  return merged.map(person => ({
+  // For any contact that came from AI (no LinkedIn URL), do a targeted LinkedIn
+  // name search to find their exact profile URL.  This fills the gap where
+  // Gemini/Grok returns names but the company-level LinkedIn search returned 0 results.
+  const firmDisplayName = firm.firm_name || firm.name || '';
+  const withUrls = await enrichMissingLinkedInUrls(merged, firmDisplayName);
+
+  return withUrls.map(person => ({
     name: person.full_name,
     job_title: person.title || null,
     linkedin_url: validateLinkedInUrl(person.linkedin_url),
@@ -1569,6 +1575,57 @@ export async function findDecisionMakers(firm, deal) {
     email: person.email || null,
     source: person.source || 'gemini',
   }));
+}
+
+/**
+ * For contacts that have a name but no LinkedIn URL, search LinkedIn by
+ * "name + firm" to find their exact profile.  Best-effort: skips on rate-limit
+ * or error, and never blocks the research pipeline.
+ */
+async function enrichMissingLinkedInUrls(contacts, firmName) {
+  if (isFirmLinkedInRateLimited()) return contacts;
+  const toEnrich = contacts.filter(c => !(c.linkedin_url) && (c.full_name || c.name));
+  if (!toEnrich.length) return contacts;
+
+  const result = [...contacts];
+
+  for (const contact of toEnrich) {
+    if (isFirmLinkedInRateLimited()) break;
+    const name = String(contact.full_name || contact.name || '').trim();
+    if (!name) continue;
+
+    const query = firmName ? `${name} ${firmName}` : name;
+    try {
+      const hits = await searchLinkedInPeople({ keywords: query, limit: 5 });
+      const match = hits.find(hit => {
+        const hitName = String(hit.name || [hit.first_name, hit.last_name].filter(Boolean).join(' ')).trim();
+        return areLikelySameDecisionMaker(name, hitName);
+      });
+      if (match) {
+        const cleanUrl = canonicalizeLinkedInProfileUrl(
+          match.public_profile_url || match.profile_url ||
+          (match.public_identifier ? `https://www.linkedin.com/in/${match.public_identifier}` : null)
+        );
+        const idx = result.findIndex(c => (c.full_name || c.name) === name);
+        if (idx !== -1 && cleanUrl) {
+          result[idx] = {
+            ...result[idx],
+            linkedin_url: cleanUrl,
+            linkedin_provider_id: match.id || result[idx].linkedin_provider_id || null,
+            source: 'unipile_name_lookup',
+          };
+          console.log(`[FIRM RESEARCH] LinkedIn URL found for ${name} via name search: ${cleanUrl}`);
+        }
+      }
+    } catch (err) {
+      if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
+      console.warn(`[FIRM RESEARCH] LinkedIn name lookup failed for "${name}":`, err.message?.slice(0, 80));
+    }
+    // Brief delay between lookups to avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, 1200));
+  }
+
+  return result;
 }
 
 async function getStoredDecisionMakersForFirm(firm) {
