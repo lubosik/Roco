@@ -1523,7 +1523,20 @@ export async function findDecisionMakers(firm, deal) {
     firm_type: firm.contact_type || firm.firm_type || 'Investment firm',
     website: firm.website || null,
   };
-  const aiContacts = (storedContacts.length + unipileContacts.length) >= 2
+
+  // If LinkedIn returned zero results, scrape the firm's team/about page for names,
+  // then look up each name on LinkedIn.  This catches small firms whose LinkedIn
+  // company page either doesn't exist or has no listed employees.
+  let websiteContacts = [];
+  if (unipileContacts.length === 0) {
+    websiteContacts = await findContactsViaWebsiteScrape(firmRecord).catch(err => {
+      console.warn(`[FIRM RESEARCH] Website scrape failed for ${firmRecord.name}: ${err.message?.slice(0, 80)}`);
+      return [];
+    });
+  }
+
+  const totalBeforeAI = storedContacts.length + unipileContacts.length + websiteContacts.length;
+  const aiContacts = totalBeforeAI >= 2
     ? []
     : await findContactsAtFirm(firmRecord, deal, { persist: false });
 
@@ -1535,6 +1548,7 @@ export async function findDecisionMakers(firm, deal) {
 
   const safeMergeContacts = [
     ...unipileContacts,
+    ...websiteContacts,
     ...aiContacts.map(person => ({
       full_name: person.full_name,
       title: person.title || null,
@@ -1765,6 +1779,151 @@ function scoreUnipileDecisionMaker(person, firm) {
   if (titleTokens.includes('investor')) score += 2;
   if (person?.provider_id) score += 1;
   return score;
+}
+
+/**
+ * Scrape a firm's website team/about page and extract decision-maker names.
+ * Returns contacts in the same shape as findDecisionMakersViaUnipile (no LinkedIn URL yet —
+ * those get filled by enrichMissingLinkedInUrls which runs afterwards).
+ */
+async function findContactsViaWebsiteScrape(firm) {
+  const firmName = firm.name || '';
+  if (!firmName) return [];
+
+  // Step 1: Resolve the website URL. Use stored URL if available; otherwise ask Grok.
+  let baseUrl = firm.website || null;
+  if (baseUrl && !/^https?:\/\//i.test(baseUrl)) baseUrl = `https://${baseUrl}`;
+
+  if (!baseUrl) {
+    baseUrl = await resolveWebsiteViaGrok(firmName).catch(() => null);
+  }
+  if (!baseUrl) return [];
+
+  // Step 2: Try common team page paths
+  const teamPaths = ['/team', '/our-team', '/people', '/about', '/leadership', '/partners', '/about-us', ''];
+  let pageText = null;
+  let usedUrl = null;
+
+  for (const path of teamPaths) {
+    const url = baseUrl.replace(/\/$/, '') + path;
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; research-bot/1.0)' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) continue;
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('text/html')) continue;
+      const html = await res.text();
+      if (html.length < 500) continue;
+      // Strip scripts/styles, keep readable text
+      const stripped = html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .slice(0, 12000);
+      // Only continue if the page mentions people-like words
+      if (/partner|principal|director|founder|managing|investment/i.test(stripped)) {
+        pageText = stripped;
+        usedUrl = url;
+        break;
+      }
+    } catch { continue; }
+  }
+
+  if (!pageText) return [];
+
+  // Step 3: Use Gemini to extract person names + titles from the page text
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_FALLBACK;
+  if (!geminiKey) return [];
+
+  const extractPrompt = `You are reading a webpage from the investment firm "${firmName}" (URL: ${usedUrl}).
+Extract the names and titles of all current team members who are investment decision-makers (Partners, MDs, Principals, Founders, Directors).
+
+Page text:
+"""
+${pageText.slice(0, 8000)}
+"""
+
+Return ONLY a valid JSON array of objects like:
+[{"full_name": "Jane Smith", "title": "Managing Partner"}, ...]
+
+Rules:
+- Only include people who clearly work at ${firmName} now
+- Only include investment roles (Partner, Principal, Director, MD, Founder) — not admin/ops/IR
+- If you cannot find any decision-makers, return []
+- No prose, no explanation, just the JSON array`;
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: extractPrompt }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
+        }),
+      }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return [];
+    const people = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(people)) return [];
+
+    const results = people
+      .filter(p => p?.full_name && typeof p.full_name === 'string' && p.full_name.trim().length > 3)
+      .slice(0, 6)
+      .map(p => ({
+        full_name: String(p.full_name).trim(),
+        title: p.title ? String(p.title).trim() : null,
+        linkedin_url: null,
+        linkedin_provider_id: null,
+        email: null,
+        source: 'website_scrape',
+        _score: 6, // treat website names as high-confidence
+      }));
+
+    if (results.length > 0) {
+      console.log(`[FIRM RESEARCH] Website scrape found ${results.length} contacts at ${firmName} from ${usedUrl}: ${results.map(r => r.full_name).join(', ')}`);
+    }
+    return results;
+  } catch (err) {
+    console.warn(`[FIRM RESEARCH] Gemini extraction failed for ${firmName}:`, err.message?.slice(0, 80));
+    return [];
+  }
+}
+
+/**
+ * Ask Grok (with web search) for a firm's website URL.
+ * Returns a URL string or null.
+ */
+async function resolveWebsiteViaGrok(firmName) {
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
+  if (!key) return null;
+  const { grokModel } = getResearchConfig();
+  try {
+    const res = await fetch('https://api.x.ai/v1/responses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify({
+        model: grokModel,
+        input: [{ role: 'user', content: `What is the official website URL for the investment firm "${firmName}"? Return ONLY the URL (e.g. https://example.com), nothing else. If you cannot find it, return null.` }],
+        tools: [{ type: 'web_search' }],
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const outputMsg = (data.output || []).find(o => o.type === 'message');
+    const text = (outputMsg?.content?.find(c => c.type === 'output_text')?.text || '').trim();
+    const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/);
+    return urlMatch ? urlMatch[0].replace(/[.,;]+$/, '') : null;
+  } catch { return null; }
 }
 
 async function findDecisionMakersViaUnipile(firm, deal) {
