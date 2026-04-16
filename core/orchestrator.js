@@ -4311,7 +4311,8 @@ async function phaseDatabaseQuery(deal, batch) {
     const { data: alreadyContacted } = await sb.from('contacts')
       .select('investors_db_id, company_name').eq('deal_id', deal.id);
     const contactedDbIds = new Set((alreadyContacted || []).map(c => c.investors_db_id).filter(Boolean));
-    const contactedFirms = new Set((alreadyContacted || []).map(c => (c.company_name || '').toLowerCase().trim()).filter(Boolean));
+    // Normalize firm names to catch "XYZ Capital, LLC" vs "XYZ Capital" mismatches
+    const contactedFirms = new Set((alreadyContacted || []).map(c => normalizeFirmForDedup(c.company_name)).filter(Boolean));
 
     let shortlisted = [];
 
@@ -4328,10 +4329,22 @@ async function phaseDatabaseQuery(deal, batch) {
       for (const pl of priorityLists) {
         info(`[${deal.name}] DB QUERY: checking priority list "${pl.list_name}" (order ${pl.priority_order})`);
 
-        const { data: listInvestors } = await sb.from('investors_db')
-          .select('*').eq('list_id', pl.list_id).limit(500);
+        // Load ALL firms from this priority list — paginated so no 500-row cap
+        const LIST_PAGE = 1000;
+        let listFrom = 0;
+        const allListInvestors = [];
+        while (true) {
+          const { data: page } = await sb.from('investors_db')
+            .select('*').eq('list_id', pl.list_id)
+            .range(listFrom, listFrom + LIST_PAGE - 1);
+          if (!page?.length) break;
+          allListInvestors.push(...page);
+          if (page.length < LIST_PAGE) break;
+          listFrom += LIST_PAGE;
+        }
+        const listInvestors = allListInvestors;
 
-        if (!listInvestors?.length) {
+        if (!listInvestors.length) {
           await sb.from('deal_list_priorities')
             .update({ status: 'exhausted', exhausted_at: new Date().toISOString() }).eq('id', pl.id);
           continue;
@@ -4339,7 +4352,7 @@ async function phaseDatabaseQuery(deal, batch) {
 
         const fresh = listInvestors.filter(inv =>
           !contactedDbIds.has(inv.id) &&
-          !contactedFirms.has((inv.name || '').toLowerCase().trim())
+          !contactedFirms.has(normalizeFirmForDedup(inv.name))
         );
 
         if (!fresh.length) {
@@ -4378,7 +4391,7 @@ async function phaseDatabaseQuery(deal, batch) {
       // Filter out already-contacted
       shortlisted = fullShortlisted.filter(inv =>
         !contactedDbIds.has(inv.id) &&
-        !contactedFirms.has((inv.name || '').toLowerCase().trim())
+        !contactedFirms.has(normalizeFirmForDedup(inv.name))
       );
     }
 
@@ -7239,6 +7252,17 @@ function buildContactPage(contact) {
     investor_score: contact.investor_score,
     why_this_firm: whyThisFirm,
   };
+}
+
+// Strip common legal suffixes so "XYZ Capital Partners, LLC" matches "XYZ Capital Partners"
+function normalizeFirmForDedup(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/^the\s+/i, '')
+    .replace(/[,.]?\s*(llc|lp|l\.p\.|l\.l\.c\.|inc\.?|ltd\.?|corp\.?|co\.?|group|capital|partners|management|advisors|investments?|fund|funds|associates|services|solutions|holdings?)\.?\s*$/gi, '')
+    .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function logStep(action, note, type = 'General', deal = null) {

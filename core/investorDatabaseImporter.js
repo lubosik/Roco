@@ -351,6 +351,11 @@ export async function importXLSXToDatabase({ filePath, filename, listId, listNam
       record.description = String(row[6] || '').trim();
     }
 
+    // If no pitchbook_id (non-PitchBook CSV), generate a stable key from the firm name
+    // so the UPSERT can still deduplicate repeat uploads of the same list
+    if (record.name && !record.pitchbook_id) {
+      record.pitchbook_id = `IMPORT-${record.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60)}`;
+    }
     if (!record.name || !record.pitchbook_id) { skipped++; continue; }
 
     // Classify as angel / individual_at_firm / firm
