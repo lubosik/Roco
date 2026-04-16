@@ -1209,11 +1209,11 @@ export async function persistDailyActivityReport(report) {
   if (!supabase || !report?.report_date) return null;
   const reportDate = report.log_date || report.report_date;
   const sections = Array.isArray(report.deal_sections) ? report.deal_sections : [];
-  const snapshotsByDealId = new Map(
-    (report.raw_payload?.deal_snapshots || [])
-      .filter(snapshot => snapshot?.deal_id)
-      .map(snapshot => [String(snapshot.deal_id), snapshot])
-  );
+  const rawSnapshots = (report.raw_payload?.deal_snapshots || []).filter(s => s?.deal_id);
+  const snapshotsByDealId = new Map(rawSnapshots.map(s => [String(s.deal_id), s]));
+  // Also index snapshots by normalised deal_name so sections without deal_id can be matched
+  const snapshotsByName = new Map(rawSnapshots.map(s => [(s.deal_name || '').toLowerCase().trim(), s]));
+
   const activityByDealId = new Map();
   for (const entry of report.raw_payload?.activity_entries || []) {
     const key = String(entry?.deal_id || '');
@@ -1222,9 +1222,16 @@ export async function persistDailyActivityReport(report) {
     activityByDealId.get(key).push(entry);
   }
 
-  const rows = sections
-    .filter(section => section?.deal_id)
-    .map(section => {
+  // Resolve deal_id for each section: prefer explicit id, fall back to name-match against snapshots
+  const resolvedSections = sections.map(section => {
+    if (section?.deal_id) return section;
+    const nameKey = (section?.deal_name || '').toLowerCase().trim();
+    const matched = nameKey ? snapshotsByName.get(nameKey) : null;
+    if (matched) return { ...section, deal_id: matched.deal_id };
+    return section;
+  }).filter(s => s?.deal_id);
+
+  const rows = resolvedSections.map(section => {
       const snapshot = snapshotsByDealId.get(String(section.deal_id)) || {};
       const metrics = snapshot.metrics || {};
       return {

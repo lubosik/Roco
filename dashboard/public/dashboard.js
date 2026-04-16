@@ -4081,8 +4081,13 @@ function renderKanbanBoard(data, dealId, batchId) {
             ${firms.map(firm => `
               <div class="kanban-firm-card${col.dim ? ' kanban-firm-card-dim' : ''}"
                    data-firm-name="${esc((firm.firm_name || '').toLowerCase())}"
-                   onclick="window.openFirmKanbanDrillDown('${firm.id}',${JSON.stringify(firm.firm_name)},${firm.score},'${dealId}','${batchId}',${JSON.stringify(firm.firm_stage_label||firm.firm_stage||'')})">
-                <div class="kanban-firm-name">${esc(firm.firm_name)}</div>
+                   data-firm-id="${esc(firm.id)}"
+                   data-score="${esc(String(firm.score || 0))}"
+                   data-deal-id="${esc(dealId)}"
+                   data-batch-id="${esc(batchId)}"
+                   data-stage-label="${esc(firm.firm_stage_label || firm.firm_stage || '')}"
+                   onclick="window.onKanbanFirmClick(this)">
+                <div class="kanban-firm-name" title="${esc(firm.firm_name)}">${esc(firm.firm_name)}</div>
                 ${firm.top_contact
                   ? `<div class="kanban-firm-contact">${esc(firm.top_contact.name || '—')}${firm.top_contact.title ? ` <span style="opacity:0.5">·</span> ${esc(firm.top_contact.title)}` : ''}</div>`
                   : `<div class="kanban-firm-contact">${firm.total_contacts || 0} contact${firm.total_contacts !== 1 ? 's' : ''}</div>`}
@@ -4094,6 +4099,17 @@ function renderKanbanBoard(data, dealId, batchId) {
     </div>
   </div>`;
 }
+
+// Reads firm data from data-* attributes to avoid quoting issues in onclick HTML
+window.onKanbanFirmClick = function(card) {
+  const firmId     = card.dataset.firmId;
+  const firmName   = card.querySelector('.kanban-firm-name')?.getAttribute('title') || card.dataset.firmName || '';
+  const score      = Number(card.dataset.score || 0);
+  const dealId     = card.dataset.dealId;
+  const batchId    = card.dataset.batchId;
+  const stageLabel = card.dataset.stageLabel || '';
+  window.openFirmKanbanDrillDown(firmId, firmName, score, dealId, batchId, stageLabel);
+};
 
 window.filterKanban = function(boardId, val, clearBtn) {
   const board = document.getElementById(boardId);
