@@ -5863,8 +5863,9 @@ function registerRoutes(app) {
       }
 
       // Get all firms for this batch
+      // Note: select('*') avoids the `rank` reserved-word clash in PostgREST
       const { data: firmRows, error: firmErr } = await sb.from('batch_firms')
-        .select('id, firm_name, score, rank, enrichment_status')
+        .select('*')
         .eq('batch_id', batch.id)
         .order('score', { ascending: false });
 

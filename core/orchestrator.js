@@ -6237,23 +6237,15 @@ async function phaseFollowUps(deal, state) {
     .in('pipeline_stage', ['Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'invite_accepted', 'invite_sent'])
     .limit(10);
 
-  // No same-channel follow-ups: always switch channels or advance to next person.
-  // invite_sent (ignored 2d) → email intro if available, else next person
-  // dm_sent / invite_accepted (ignored 2d) → email intro if available, else next person
-  // email_sent (ignored 2d) → next person (no follow-up email)
-  const followUpChannelFor = (contact) => {
-    const stage = contact.pipeline_stage;
-    if (stage === 'invite_sent') return contact.email ? 'email' : null;
-    if (stage === 'invite_accepted' || stage === 'DM Sent' || stage === 'dm_sent') {
-      return contact.email ? 'email' : null;
-    }
-    return null; // email_sent / Email Sent → null triggers next-person advance below
-  };
+  // Patience policy: after the wait window expires, ALWAYS advance to the next person.
+  // Never switch channels (LinkedIn→email) as a follow-up — channel selection for the
+  // next contact is handled by queueNextFirmWaterfallContact using activity-score routing.
+  // LinkedIn (invite/DM): followup_days_li (default 2) → next person
+  // Email:                followup_days_email (default 3) → next person
+  // eslint-disable-next-line no-unused-vars
+  const followUpChannelFor = (_contact) => null;
   // Stages where the channel-switch email is an intro (not a follow-up)
-  const LINKEDIN_STAGES = new Set(['invite_sent', 'invite_accepted', 'DM Sent', 'dm_sent']);
-
-  // Apply firm gate + channel window gate + cross-channel response gate
-  const emailFallbackSeenFirms = new Set();
+  // Filter: skip responded firms, skip manual/suppressed contacts
   const contacts = (allDue || []).sort((a, b) => {
     const scoreDiff = Number(b.investor_score || 0) - Number(a.investor_score || 0);
     if (scoreDiff !== 0) return scoreDiff;
@@ -6261,22 +6253,10 @@ async function phaseFollowUps(deal, state) {
   }).filter(c => {
     const firm = (c.company_name || '').toLowerCase().trim();
     if (firm && !GENERIC_FIRM_NAMES.has(firm) && respondedFirms.has(firm)) return false;
-
-    // Cross-channel block: if they responded on one channel, don't follow up on the other
     if (c.response_received) return false;
     if (c.conversation_state === 'manual') return false;
-
-    const ch = followUpChannelFor(c);
-    // IMPORTANT: contacts with null channel (no email, LinkedIn-only ignored) must still
-    // be included here so the loop can advance the waterfall to the next person.
-    // Only apply window check when a real channel exists.
-    if (ch === null) return true; // advance-to-next-person path — always include
-    if (c.pipeline_stage === 'invite_sent' && ch === 'email' && firm && !GENERIC_FIRM_NAMES.has(firm)) {
-      if (activeFirms.has(firm) || emailFallbackSeenFirms.has(firm)) return false;
-      emailFallbackSeenFirms.add(firm);
-    }
-    return isWithinChannelWindow(deal, ch);
-  }).slice(0, 5); // increased from 2 — process more stale contacts per cycle
+    return true;
+  }).slice(0, 5);
 
   if (!contacts?.length) return;
 
@@ -6284,67 +6264,24 @@ async function phaseFollowUps(deal, state) {
 
   for (const contact of contacts) {
     if (contactsInFlight.has(contact.id)) continue;
-    const followUpChannel = followUpChannelFor(contact);
 
-    if (!followUpChannel) {
-      // No channel available (no email, or email already used) → advance waterfall to next person
-      await sb.from('contacts').update({
-        follow_up_due_at: null,
-        pipeline_stage: 'Inactive',
-      }).eq('id', contact.id);
-      info(`[${deal.name}] ${contact.name}: no response, no channel — advancing to next contact at ${contact.company_name || 'firm'}`);
-      pushActivity({
-        type: 'outreach',
-        action: `[WATERFALL] No response — moving to next contact at firm`,
-        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · no channel available`,
-        deal_name: deal.name,
-        dealId: deal.id,
-      });
-      await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
-      continue;
-    }
-
-    // Channel switch from LinkedIn → email is always an INTRO (not a numbered follow-up)
-    // In no_follow_ups mode: skip the channel switch entirely — just advance to next person
-    if (LINKEDIN_STAGES.has(contact.pipeline_stage) && followUpChannel === 'email') {
-      const noFollowUps = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
-      if (noFollowUps) {
-        await sb.from('contacts').update({ follow_up_due_at: null, pipeline_stage: 'Inactive' }).eq('id', contact.id);
-        info(`[${deal.name}] ${contact.name}: LinkedIn no response (no_follow_ups) — advancing to next contact`);
-        pushActivity({
-          type: 'outreach',
-          action: `[WATERFALL] No response — moving to next contact at firm`,
-          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · LinkedIn unanswered, moving on`,
-          deal_name: deal.name,
-          dealId: deal.id,
-        });
-        await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
-        continue;
-      }
-      info(`[${deal.name}] ${contact.name}: LinkedIn no response — switching to email intro`);
-      pushActivity({
-        type: 'outreach',
-        action: `[WATERFALL] LinkedIn no response — switching to email`,
-        note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · invite/DM unanswered, trying email`,
-        deal_name: deal.name,
-        dealId: deal.id,
-      });
-      await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel: 'email' });
-      continue;
-    }
-
-    // Email already sent and no response → mark inactive and advance waterfall
-    // (followUpChannelFor returns null for email_sent, so this path handles only edge cases)
-    const followUpNumber = (contact.follow_up_count || 0) + 1;
-    const maxFollowUps = await getMaxFollowUpsForChannel(deal, followUpChannel);
-    if (followUpNumber > maxFollowUps) {
-      await sb.from('contacts').update({ follow_up_due_at: null, pipeline_stage: 'Inactive' }).eq('id', contact.id);
-      info(`[${deal.name}] ${contact.name}: sequence exhausted — marking inactive`);
-      await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
-      continue;
-    }
-
-    await handleOutreachApproval(contact, formatFollowUpStage(followUpNumber), followUpNumber, deal, { forceChannel: followUpChannel });
+    // Patience window expired → mark inactive and advance waterfall to next person at the firm.
+    // Channel selection for the replacement contact is handled by queueNextFirmWaterfallContact
+    // using LinkedIn activity-score routing (high activity → LI, low + email → email, etc.).
+    const channelLabel = ['Email Sent', 'email_sent'].includes(contact.pipeline_stage) ? 'email' : 'LinkedIn';
+    await sb.from('contacts').update({
+      follow_up_due_at: null,
+      pipeline_stage: 'Inactive',
+    }).eq('id', contact.id);
+    info(`[${deal.name}] ${contact.name}: ${channelLabel} unanswered — advancing to next contact at ${contact.company_name || 'firm'}`);
+    pushActivity({
+      type: 'outreach',
+      action: `[WATERFALL] No response — moving to next contact at firm`,
+      note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · ${channelLabel} unanswered`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+    await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
   }
 }
 
@@ -6614,9 +6551,9 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
     ? new Date(Date.now() + nextFollowUpPlan.delayDays * 24 * 60 * 60 * 1000).toISOString()
     : null;
 
-  // no_follow_ups mode: still schedule a cascade timer so phaseFollowUps can fire
-  // LinkedIn DM: timer fires after followup_days_li → cascades to email intro
-  // Email intro: timer fires after followup_days_email → marks inactive, tries next contact at firm
+  // Always set a patience timer so phaseFollowUps can advance to the next contact when it fires.
+  // LinkedIn (invite/DM): fires after followup_days_li days → marks inactive, tries next person
+  // Email:                fires after followup_days_email days → marks inactive, tries next person
   const noFollowUpsMode = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
   if (noFollowUpsMode && !followUpDueAt) {
     const cascadeDays = channel === 'linkedin_dm'
