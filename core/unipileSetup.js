@@ -108,6 +108,9 @@ export async function registerWebhooks(baseUrl) {
     console.warn('[UNIPILE SETUP] No baseUrl provided — skipping webhook registration');
     return;
   }
+  // Guarantee https:// is present — Railway env vars sometimes omit the protocol
+  if (!String(baseUrl).startsWith('http')) baseUrl = `https://${baseUrl}`;
+  baseUrl = String(baseUrl).replace(/\/+$/, '');
 
   const webhooks = [
     {

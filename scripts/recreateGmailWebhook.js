@@ -10,13 +10,15 @@ dotenv.config({ path: '/root/roco/.env' });
 const rawDsn = process.env.UNIPILE_DSN || 'https://api34.unipile.com:16411';
 const DSN = rawDsn.startsWith('http') ? rawDsn.replace(/\/+$/, '') : `https://${rawDsn.replace(/\/+$/, '')}`;
 const KEY = process.env.UNIPILE_API_KEY;
-const BASE_URL = String(
+let BASE_URL = String(
   process.env.PUBLIC_URL ||
   process.env.SERVER_BASE_URL ||
   process.env.RAILWAY_STATIC_URL ||
   process.env.RAILWAY_PUBLIC_DOMAIN ||
   'https://roco-production.up.railway.app'
 ).trim().replace(/\/+$/, '');
+// Ensure protocol is always present — Railway env vars sometimes omit it
+if (!BASE_URL.startsWith('http')) BASE_URL = `https://${BASE_URL}`;
 
 const ACCOUNT_IDS = {
   linkedin: process.env.UNIPILE_LINKEDIN_ACCOUNT_ID || '',
