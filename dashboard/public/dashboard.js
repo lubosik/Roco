@@ -1912,6 +1912,9 @@ function renderDealPipelineRows(rows, dealId) {
     </tr>`).join('');
 }
 
+// Cached pipeline rows per deal for live search filtering
+const _pipelineRowsCache = {};
+
 async function loadDealTabPipeline(id) {
   const el = document.getElementById('deal-tab-pipeline');
   if (!el) return;
@@ -1921,8 +1924,16 @@ async function loadDealTabPipeline(id) {
     if (!rows.length) { el.innerHTML = '<div class="loading-placeholder">No active contacts in pipeline.</div>'; return; }
     const stageOrder = { 'Approved for Outreach': 1, Ranked: 2, Enriched: 3, invite_sent: 4, invite_accepted: 5, dm_sent: 6, email_sent: 7, Replied: 8, 'In Conversation': 9, 'Meeting Booked': 10 };
     const sorted = [...rows].sort((a, b) => (stageOrder[b.stage] || 0) - (stageOrder[a.stage] || 0) || (b.score || 0) - (a.score || 0));
+    _pipelineRowsCache[id] = sorted;
     el.innerHTML = `
       <div data-pipeline-deal-id="${id}">
+      <div class="pipeline-search-bar">
+        <span style="color:var(--text-dim);font-size:13px">⌕</span>
+        <input type="text" placeholder="Search firms or contacts…"
+               oninput="window.filterPipeline('${id}',this.value,this.nextElementSibling)"
+               autocomplete="off" spellcheck="false">
+        <button class="search-clear" onclick="window.clearPipelineSearch('${id}',this)">×</button>
+      </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div data-pipeline-count style="font-size:13px;color:var(--text-dim)">${rows.length} contact${rows.length !== 1 ? 's' : ''}</div>
         <div style="display:flex;gap:8px;align-items:center">
@@ -1938,8 +1949,83 @@ async function loadDealTabPipeline(id) {
         </tbody>
       </table>
     </div>
+    <div id="deal-pipeline-no-results-${id}" style="display:none;padding:24px;text-align:center;color:var(--text-dim);font-size:13px;font-style:italic">No firms or contacts match your search</div>
     </div>`;
   } catch { el.innerHTML = '<div class="loading-placeholder text-red">Failed to load.</div>'; }
+}
+
+window.filterPipeline = function(dealId, val, clearBtn) {
+  const tbody = document.getElementById(`deal-pipeline-tbody-${dealId}`);
+  const noResults = document.getElementById(`deal-pipeline-no-results-${dealId}`);
+  const countEl = document.querySelector(`[data-pipeline-deal-id="${dealId}"] [data-pipeline-count]`);
+  if (!tbody) return;
+  if (clearBtn) clearBtn.style.display = val ? 'block' : 'none';
+  const term = (val || '').toLowerCase().trim();
+  const rows = _pipelineRowsCache[dealId] || [];
+  if (!term) {
+    tbody.innerHTML = renderDealPipelineRows(rows, dealId);
+    if (noResults) noResults.style.display = 'none';
+    if (countEl) countEl.textContent = `${rows.length} contact${rows.length !== 1 ? 's' : ''}`;
+    return;
+  }
+  const filtered = rows.filter(r =>
+    (r.name || '').toLowerCase().includes(term) ||
+    (r.firm || '').toLowerCase().includes(term)
+  );
+  tbody.innerHTML = renderDealPipelineRowsHighlighted(filtered, dealId, term);
+  if (noResults) noResults.style.display = filtered.length ? 'none' : 'block';
+  if (countEl) countEl.textContent = `${filtered.length} of ${rows.length} contact${rows.length !== 1 ? 's' : ''}`;
+};
+
+window.clearPipelineSearch = function(dealId, clearBtn) {
+  const el = document.getElementById('deal-tab-pipeline');
+  const input = el?.querySelector('.pipeline-search-bar input');
+  if (input) input.value = '';
+  if (clearBtn) clearBtn.style.display = 'none';
+  window.filterPipeline(dealId, '', clearBtn);
+};
+
+function highlightMatch(text, term) {
+  if (!term || !text) return esc(text || '');
+  const lower = text.toLowerCase();
+  const idx = lower.indexOf(term.toLowerCase());
+  if (idx === -1) return esc(text);
+  return esc(text.slice(0, idx)) + `<mark class="gold-match">${esc(text.slice(idx, idx + term.length))}</mark>` + esc(text.slice(idx + term.length));
+}
+
+function renderDealPipelineRowsHighlighted(rows, dealId, term) {
+  const renderScheduledFollowUp = (value) => {
+    if (!value) return '<span class="text-dim">—</span>';
+    return `<span class="text-dim">${formatScheduleDate(value)}</span>`;
+  };
+  return rows.map(r => `
+    <tr data-pipeline-contact-id="${r.id}" style="cursor:pointer" onclick="toggleDealPipelineDetail('${r.id}', '${dealId}')">
+      <td>
+        <div style="font-weight:500">${highlightMatch(r.name || '—', term)}</div>
+        ${r.email ? `<div style="font-size:11px;color:var(--text-dim)">${esc(r.email)}</div>` : ''}
+      </td>
+      <td class="text-dim" style="font-size:12px">${r.jobTitle && r.firm
+        ? `${esc(r.jobTitle)} <span style="opacity:0.5">·</span> ${highlightMatch(r.firm, term)}`
+        : highlightMatch(r.jobTitle || r.firm || '—', term)}</td>
+      <td>${scoreHtml(r.score)}</td>
+      <td><span class="status-badge">${esc(r.stage || '—')}</span></td>
+      <td>${sentimentBadge(r.lastIntentLabel, r.lastIntent, r.conversationState)}</td>
+      <td class="text-dim">${renderScheduledFollowUp(r.scheduledFollowUpAt)}</td>
+      <td class="text-dim">${formatDate(r.lastReplyAt || r.lastContacted)}</td>
+      ${!selectedDealReadOnly ? `<td><button class="row-action-btn" style="color:#e05c5c" onclick="event.stopPropagation();deleteDealTabContact('${r.id}', '${dealId}', this)">✕</button></td>` : ''}
+    </tr>
+    <tr class="hidden" id="deal-pipeline-detail-${r.id}">
+      <td colspan="${!selectedDealReadOnly ? 8 : 7}" style="padding:0;background:var(--bg-raised)">
+        <div id="deal-pipeline-conv-${r.id}" style="padding:16px 20px;font-size:12px;color:var(--text-mid)">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">
+            ${r.email ? `<div><span style="color:var(--text-dim)">Email</span><br><a href="mailto:${esc(r.email)}" style="color:var(--accent)">${esc(r.email)}</a></div>` : ''}
+            ${r.phone ? `<div><span style="color:var(--text-dim)">Phone</span><br>${esc(r.phone)}</div>` : ''}
+            ${r.linkedinUrl ? `<div><span style="color:var(--text-dim)">LinkedIn</span><br><a href="${esc(r.linkedinUrl)}" target="_blank" style="color:var(--accent)">View profile</a></div>` : ''}
+          </div>
+          <div style="color:var(--text-dim);font-size:11px">Loading conversation…</div>
+        </div>
+      </td>
+    </tr>`).join('');
 }
 
 async function patchDealPipelineInPlace(id) {
@@ -3969,37 +4055,84 @@ function renderKanbanBoard(data, dealId, batchId) {
     { key: 'connected',      label: 'Connected' },
     { key: 'engaged',        label: 'Engaged' },
     { key: 'meeting_booked', label: 'Meeting Booked' },
-    { key: 'passed',         label: 'Passed' },
-    { key: 'exhausted',      label: 'Exhausted' },
+    { key: 'passed',         label: 'Passed / Declined', dim: true,
+      tooltip: 'Firm declined the opportunity, said they\'re not the right fit, or was manually marked as not pursuing' },
+    { key: 'exhausted',      label: 'Exhausted', dim: true },
   ];
-  return `<div class="kanban-board">
-    ${COLS.map(col => {
-      const firms = cols[col.key] || [];
-      const dimmed = col.key === 'passed' || col.key === 'exhausted';
-      return `<div class="kanban-col">
-        <div class="kanban-col-header">
-          <span class="kanban-col-title">${col.label}</span>
-          <span class="kanban-col-count">${firms.length}</span>
-        </div>
-        <div class="kanban-col-cards">
-          ${firms.length === 0
-            ? '<div class="kanban-empty">—</div>'
-            : firms.map(firm => `
-              <div class="kanban-firm-card${dimmed ? ' kanban-firm-card-dim' : ''}"
-                   onclick="window.openFirmKanbanDrillDown('${firm.id}',${JSON.stringify(firm.firm_name)},${firm.score},'${dealId}','${batchId}')">
+  const boardId = `kanban-board-${dealId}`;
+  return `<div class="kanban-wrap">
+    <div class="kanban-search-bar">
+      <span style="color:var(--text-dim);font-size:13px">⌕</span>
+      <input type="text" placeholder="Search firms…" oninput="window.filterKanban('${boardId}',this.value,this.nextElementSibling)"
+             autocomplete="off" spellcheck="false">
+      <button class="kanban-search-clear" onclick="window.clearKanbanSearch('${boardId}',this)">×</button>
+    </div>
+    <div class="kanban-board" id="${boardId}">
+      ${COLS.map(col => {
+        const firms = cols[col.key] || [];
+        return `<div class="kanban-col">
+          <div class="kanban-col-header">
+            <span class="kanban-col-title${col.dim ? ' kanban-col-title-dim' : ''}">${col.label}</span>
+            ${col.tooltip ? `<span class="kanban-col-info-icon">ⓘ<span class="kanban-tooltip">${esc(col.tooltip)}</span></span>` : ''}
+            <span class="kanban-col-count">${firms.length}</span>
+          </div>
+          <div class="kanban-col-cards">
+            <div class="kanban-empty" style="${firms.length > 0 ? 'display:none' : ''}">—</div>
+            ${firms.map(firm => `
+              <div class="kanban-firm-card${col.dim ? ' kanban-firm-card-dim' : ''}"
+                   data-firm-name="${esc((firm.firm_name || '').toLowerCase())}"
+                   onclick="window.openFirmKanbanDrillDown('${firm.id}',${JSON.stringify(firm.firm_name)},${firm.score},'${dealId}','${batchId}',${JSON.stringify(firm.firm_stage_label||firm.firm_stage||'')})">
                 <div class="kanban-firm-name">${esc(firm.firm_name)}</div>
                 ${firm.top_contact
                   ? `<div class="kanban-firm-contact">${esc(firm.top_contact.name || '—')}${firm.top_contact.title ? ` <span style="opacity:0.5">·</span> ${esc(firm.top_contact.title)}` : ''}</div>`
                   : `<div class="kanban-firm-contact">${firm.total_contacts || 0} contact${firm.total_contacts !== 1 ? 's' : ''}</div>`}
                 ${firm.score ? `<div class="kanban-firm-footer"><span class="kanban-score-badge">${firm.score}</span></div>` : ''}
               </div>`).join('')}
-        </div>
-      </div>`;
-    }).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
   </div>`;
 }
 
-window.openFirmKanbanDrillDown = async function(firmId, firmName, score, dealId, batchId) {
+window.filterKanban = function(boardId, val, clearBtn) {
+  const board = document.getElementById(boardId);
+  if (!board) return;
+  const term = (val || '').toLowerCase().trim();
+  if (clearBtn) clearBtn.style.display = term ? 'block' : 'none';
+  board.querySelectorAll('.kanban-col-cards').forEach(colCards => {
+    const cards = colCards.querySelectorAll('.kanban-firm-card');
+    let anyVisible = false;
+    cards.forEach(card => {
+      const name = card.dataset.firmName || '';
+      const show = !term || name.includes(term);
+      card.style.display = show ? '' : 'none';
+      if (show) anyVisible = true;
+    });
+    const empty = colCards.querySelector('.kanban-empty');
+    if (empty) empty.style.display = anyVisible ? 'none' : '';
+  });
+};
+
+window.clearKanbanSearch = function(boardId, clearBtn) {
+  const board = document.getElementById(boardId);
+  if (!board) return;
+  // Find the input — it's in the parent .kanban-wrap before the board
+  const wrap = board.parentElement;
+  const input = wrap?.querySelector('input');
+  if (input) { input.value = ''; }
+  if (clearBtn) clearBtn.style.display = 'none';
+  board.querySelectorAll('.kanban-firm-card').forEach(c => { c.style.display = ''; });
+  board.querySelectorAll('.kanban-col-cards').forEach(colCards => {
+    const empty = colCards.querySelector('.kanban-empty');
+    if (empty) {
+      const hasCards = colCards.querySelectorAll('.kanban-firm-card').length > 0;
+      empty.style.display = hasCards ? 'none' : '';
+    }
+  });
+};
+
+window.openFirmKanbanDrillDown = async function(firmId, firmName, score, dealId, batchId, firmStageLabel) {
   window.closeKanbanDrillDown();
 
   const overlay = document.createElement('div');
@@ -4007,14 +4140,19 @@ window.openFirmKanbanDrillDown = async function(firmId, firmName, score, dealId,
   overlay.id = 'kanban-drill-overlay';
   overlay.addEventListener('click', window.closeKanbanDrillDown);
 
+  const stageLabel = (firmStageLabel || '').replace(/_/g, ' ').toUpperCase();
+
   const panel = document.createElement('div');
   panel.className = 'kanban-drill-panel';
   panel.id = 'kanban-drill-panel';
   panel.innerHTML = `
     <div class="kanban-drill-header">
-      <div style="min-width:0">
+      <div style="min-width:0;flex:1">
         <div class="kanban-drill-firm-name">${esc(firmName)}</div>
-        ${score ? `<div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--gold);margin-top:2px">Score: ${score}</div>` : ''}
+        <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
+          ${stageLabel ? `<span style="font-family:'DM Mono',monospace;font-size:9px;letter-spacing:0.12em;text-transform:uppercase;padding:2px 7px;border-radius:3px;background:rgba(201,168,76,0.1);color:var(--gold);border:1px solid rgba(201,168,76,0.2)">${esc(stageLabel)}</span>` : ''}
+          ${score ? `<span style="font-family:'DM Mono',monospace;font-size:11px;color:var(--gold)">Score ${score}</span>` : ''}
+        </div>
       </div>
       <button class="kanban-drill-close" onclick="window.closeKanbanDrillDown()">&#215;</button>
     </div>
@@ -4028,7 +4166,7 @@ window.openFirmKanbanDrillDown = async function(firmId, firmName, score, dealId,
   try {
     const contacts = await api(`/api/deals/${dealId}/batch/${batchId}/firms/${firmId}/contacts`);
     const body = document.getElementById('kanban-drill-body');
-    if (body) body.innerHTML = renderContactKanbanBoard(contacts);
+    if (body) body.innerHTML = renderFirmContactPanel(contacts);
   } catch (e) {
     const body = document.getElementById('kanban-drill-body');
     if (body) body.innerHTML = `<div style="padding:20px;color:var(--red);font-size:12px">${esc(e.message)}</div>`;
@@ -4068,62 +4206,64 @@ function getContactLastAction(contact) {
   return contact.last_reply_at || contact.invite_accepted_at || contact.last_outreach_at || contact.last_email_sent_at || contact.invite_sent_at || null;
 }
 
-function renderContactKanbanBoard(contacts) {
-  if (!contacts.length) {
-    return '<div style="padding:24px;color:var(--text-dim);font-size:12px;text-align:center;font-style:italic">No contacts found for this firm yet</div>';
+function contactStagePillClass(ps) {
+  if (['Meeting Booked', 'Replied', 'In Conversation'].includes(ps)) return 'kanban-stage-pill-replied';
+  if (['Inactive', 'Archived', 'Deleted — Do Not Contact', 'Suppressed — Opt Out'].includes(ps)) return 'kanban-stage-pill-neutral';
+  if (ps) return 'kanban-stage-pill-active';
+  return 'kanban-stage-pill-neutral';
+}
+
+function contactStagePillLabel(contact) {
+  const ps = contact.pipeline_stage;
+  if (!ps || ps === 'Approved for Outreach') return 'Queued';
+  return ps.replace(/_/g, ' ');
+}
+
+function renderFirmContactPanel(contacts) {
+  if (!contacts || !contacts.length) {
+    return '<div style="padding:24px 20px;color:var(--text-dim);font-size:12px;text-align:center;font-style:italic">No contacts found for this firm yet</div>';
   }
 
-  const CONTACT_COLS = [
-    { key: 'queued',       label: 'Queued' },
-    { key: 'request_sent', label: 'Request Sent' },
-    { key: 'connected',    label: 'Connected' },
-    { key: 'dm_sent',      label: 'DM Sent' },
-    { key: 'email_sent',   label: 'Email Sent' },
-    { key: 'replied',      label: 'Replied' },
-    { key: 'skipped',      label: 'Skipped' },
-  ];
+  // Sort: active first, then by last action desc
+  const sorted = [...contacts].sort((a, b) => {
+    const aInactive = ['Inactive','Archived'].includes(a.pipeline_stage) ? 1 : 0;
+    const bInactive = ['Inactive','Archived'].includes(b.pipeline_stage) ? 1 : 0;
+    if (aInactive !== bInactive) return aInactive - bInactive;
+    const aDate = new Date(getContactLastAction(a) || 0).getTime();
+    const bDate = new Date(getContactLastAction(b) || 0).getTime();
+    return bDate - aDate;
+  });
 
-  const groups = {};
-  CONTACT_COLS.forEach(c => { groups[c.key] = []; });
-  for (const c of contacts) {
-    const col = getContactKanbanColumn(c);
-    if (groups[col]) groups[col].push(c);
-  }
+  const rows = sorted.map(c => {
+    const lastAction = getContactLastAction(c);
+    const ago = timeAgo(lastAction);
+    const hasLinkedIn = !!(c.linkedin_url || c.invite_sent_at || c.invite_accepted_at);
+    const hasEmail    = !!(c.email || c.last_email_sent_at);
+    const isSkipped   = !hasLinkedIn && !hasEmail && !c.last_outreach_at;
+    const chIcon = hasLinkedIn ? `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" style="color:#0a66c2"><path d="M20.45 20.45h-3.56v-5.57c0-1.33-.03-3.04-1.85-3.04-1.86 0-2.14 1.45-2.14 2.95v5.66H9.34V9h3.41v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.45v6.29zM5.34 7.43a2.07 2.07 0 1 1 0-4.14 2.07 2.07 0 0 1 0 4.14zm1.78 13.02H3.56V9h3.56v11.45zM22.23 0H1.77C.79 0 0 .77 0 1.72v20.56C0 23.23.79 24 1.77 24h20.46C23.21 24 24 23.23 24 22.28V1.72C24 .77 23.21 0 22.23 0z"/></svg>`
+                       : hasEmail ? '✉' : '—';
+    const pillClass = isSkipped ? 'kanban-stage-pill-neutral' : contactStagePillClass(c.pipeline_stage);
+    const pillLabel = isSkipped ? 'Skipped' : contactStagePillLabel(c);
 
-  // Only show columns with contacts, always keeping Queued and Replied in view
-  const visible = CONTACT_COLS.filter(c => groups[c.key].length > 0 || c.key === 'queued' || c.key === 'replied');
+    return `<div class="kanban-contact-row">
+      <div class="kanban-contact-ch-icon">${chIcon}</div>
+      <div class="kanban-contact-main">
+        <div class="kanban-contact-name">${c.linkedin_url
+          ? `<a href="${esc(c.linkedin_url)}" target="_blank" style="color:var(--text-bright);text-decoration:none">${esc(c.name || '—')}</a>`
+          : esc(c.name || '—')}</div>
+        ${c.job_title ? `<div class="kanban-contact-role">${esc(c.job_title)}</div>` : ''}
+        ${isSkipped ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px;font-style:italic">No email or LinkedIn found</div>` : ''}
+      </div>
+      <div class="kanban-contact-meta">
+        <span class="kanban-stage-pill ${pillClass}">${esc(pillLabel)}</span>
+        ${ago ? `<span class="kanban-contact-ts">${ago}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
 
-  return `<div class="kanban-contacts-board">
-    ${visible.map(col => {
-      const colContacts = groups[col.key];
-      return `<div class="kanban-contact-col">
-        <div class="kanban-contact-col-header">
-          <span>${col.label}</span>
-          <span style="color:var(--text-dim)">${colContacts.length}</span>
-        </div>
-        ${colContacts.length === 0
-          ? '<div style="font-size:11px;color:var(--text-dim);padding:4px 0;font-style:italic">None</div>'
-          : colContacts.map(c => {
-            const lastAction = getContactLastAction(c);
-            const ago = timeAgo(lastAction);
-            const hasLinkedIn = !!(c.linkedin_url || c.invite_sent_at || c.invite_accepted_at);
-            const hasEmail = !!(c.email || c.last_email_sent_at);
-            const channel = hasLinkedIn ? 'LI' : (hasEmail ? '✉' : '—');
-            return `<div class="kanban-contact-card">
-              <div class="kanban-contact-info">
-                <div class="kanban-contact-name">${c.linkedin_url
-                  ? `<a href="${esc(c.linkedin_url)}" target="_blank" style="color:var(--text-bright);text-decoration:none">${esc(c.name || '—')}</a>`
-                  : esc(c.name || '—')}</div>
-                ${c.job_title ? `<div class="kanban-contact-role">${esc(c.job_title)}</div>` : ''}
-              </div>
-              <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0">
-                <span class="kanban-contact-channel">${esc(channel)}</span>
-                ${ago ? `<span style="font-size:10px;color:var(--text-dim);font-family:'DM Mono',monospace;white-space:nowrap">${ago}</span>` : ''}
-              </div>
-            </div>`;
-          }).join('')}
-      </div>`;
-    }).join('')}
+  return `<div class="kanban-contact-list">
+    <div class="kanban-contact-list-label">${contacts.length} contact${contacts.length !== 1 ? 's' : ''}</div>
+    ${rows}
   </div>`;
 }
 
