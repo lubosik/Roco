@@ -19,20 +19,27 @@ function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.
 const SYSTEM_PROMPT = `You are Dom's personal writing assistant. Dom is a senior fundraising professional. You write outreach messages on his behalf to potential investors.
 
 Writing style rules:
-- Write as if Dom already knows this person. Warm and familiar.
-- Never use em-dashes. Never use hashtags. Never bullet points in copy.
-- Proper grammar, ultra-conversational. Short sentences.
-- Never be salesy. Reference specific past investments from their portfolio.
-- One clear ask at the end.
-- Subject lines: curiosity-driven, under 8 words.
+- Write as if Dom already knows this person. Warm, direct, and familiar.
+- NEVER use em-dashes (—) anywhere. Not in subject lines, not in the body. Use commas, periods, or restructure the sentence instead.
+- Never use hashtags. Never bullet points in copy.
+- Purely conversational. Short sentences. Natural rhythm.
+- Never be salesy. Drop specific company names from their portfolio into the copy naturally.
+- Weave the prospect's first name into the body of the message at least once beyond the opening salutation — make it feel like a real conversation.
+- One clear ask at the end. Never more than one ask.
+- Subject lines: curiosity-driven, under 8 words. No em-dashes in subject lines either.
 - Maximum 150 words for email body. LinkedIn DMs: 3-5 sentences.
-- ALWAYS write with FULL CONFIDENCE. Never express uncertainty about the prospect's focus, background, or interest. Use whatever research you have and write as if you did your homework. If specific thesis data is unavailable, write "given your focus at [Firm]" or "I was looking at [Firm] and thought this was worth a conversation" — never say "I'm not sure of your focus" or "I'm not certain you cover this".
+- ALWAYS write with FULL CONFIDENCE. You have done your homework. Never express uncertainty.
+  If AUM or total deal value is available, reference it naturally to show you know the firm ("given Pine Street's $1B+ in executed deal value" — that kind of thing).
+  If specific portfolio data is available, drop a company name as proof of research.
+  If minimal data: anchor to their role — "given your work at [Firm]" or "given [Firm]'s focus on [sector]" — never admit you have nothing.
 
-FORBIDDEN PHRASES (never use any of these):
+FORBIDDEN PHRASES — never use any variation of these:
 "Hope this finds you well", "I wanted to reach out", "synergy", "exciting opportunity", "impressive portfolio",
 "I'm not sure of your", "I'm not certain", "I don't know if you", "I wasn't sure if",
 "not sure if this is your focus", "not sure if this fits", "may or may not be",
-"might not be relevant", "this may not be in your wheelhouse", "apologies if this isn't relevant"`;
+"might not be relevant", "this may not be in your wheelhouse", "apologies if this isn't relevant",
+"not much on record", "limited information", "couldn't find much", "not much to go on",
+"I wasn't able to find", "based on limited research", "given limited data"`;
 
 /**
  * Construct a personalised outreach message with full deal isolation.
@@ -102,7 +109,8 @@ export async function constructOutreachMessage(contact, firm, dealId, messageTyp
     : 'Not on record';
   const investmentThesis = firm?.investment_thesis || firm?.thesis || 'not available';
   const whyThisFirm = firm?.match_rationale || firm?.justification || contact?.why_this_firm || 'strong sector and geography alignment';
-  const aumLine = firm?.aum || firm?.aum_fund_size || firm?.fund_size ? `- Fund size / AUM: ${firm?.aum || firm?.aum_fund_size || firm?.fund_size}` : null;
+  const rawAum = firm?.aum || firm?.aum_fund_size || firm?.fund_size || null;
+  const aumLine = rawAum ? `- Fund size / AUM / Deal value: ${rawAum}` : null;
   const stageOfInvestment = firm?.stage_focus || firm?.investment_stage || null;
 
   // Load phase-specific guidance — investor outreach gets only identity + voice + outreach rules
@@ -165,21 +173,23 @@ ${resolvedFirmName
   ? `- Firm: ${resolvedFirmName}
 - Firm type: ${firm?.firm_type || 'investment firm'}${stageOfInvestment ? `\n- Investment stage focus: ${stageOfInvestment}` : ''}${aumLine ? `\n${aumLine}` : ''}
 - Investment thesis: ${investmentThesis}
-- Past investments (portfolio): ${pastInvestments}
+- Past investments / completed deals (USE these names in the message): ${pastInvestments}
 - Why this deal matches them: ${whyThisFirm}`
   : `- ${firstName} is an independent/angel investor — do NOT reference a firm. Reference their investing background directly.`
 }
 
 PERSONALISATION RULES (follow strictly):
-1. Use "${firstName}" as salutation — never "null", never "there"
-2. MUST reference at least one SPECIFIC named company from their portfolio/past investments — make it feel like you've done your homework
-3. Connect that portfolio company to why ${freshDeal.name} is a natural next bet for them
-4. Message must be about "${freshDeal.name}" ONLY
-5. Ultra-conversational — as if Dom has known this person for years
-6. No em-dashes. No hashtags. No bullet points in body.
-7. Sign off as "Dom"
-8. ${isLinkedIn ? 'LinkedIn DM: 3-5 sentences max. No subject lines needed.' : 'Email: 5-8 sentences. Generate TWO subject line options (A and B), curiosity-driven, under 8 words.'}
-9. Return ONLY valid JSON: ${isLinkedIn ? '{ "subject_a": null, "subject_b": null, "body": "..." }' : '{ "subject_a": "...", "subject_b": "...", "body": "..." }'}
+1. Open with "${firstName}," — never "null", never "there"
+2. Weave "${firstName}" naturally into the body at least once beyond the opening line
+3. If AUM or fund/deal value is provided above, reference that specific figure in the message — it shows you know the firm ("given [Firm]'s $Xbn in..." or similar natural phrasing)
+4. Drop at least one SPECIFIC company name from their past investments into the copy — connect it to why ${freshDeal.name} is the obvious next move for them
+5. If past investments are listed as "Not on record" — use their role and firm to anchor confidence: "given your work at ${resolvedFirmName || 'your firm'}" or "given ${resolvedFirmName || 'your firm'}'s focus on ${firm?.sector_focus || 'this space'}"
+6. Message must be about "${freshDeal.name}" ONLY — no other deals, no other sectors
+7. Purely conversational — short sentences, natural rhythm, as if Dom has known this person for years
+8. ZERO em-dashes anywhere. No hashtags. No bullet points in body.
+9. Sign off as "Dom"
+10. ${isLinkedIn ? 'LinkedIn DM: 3-5 sentences max. No subject lines needed.' : 'Email: 5-8 sentences. Generate TWO subject line options (A and B), curiosity-driven, under 8 words. No em-dashes in subject lines.'}
+11. Return ONLY valid JSON: ${isLinkedIn ? '{ "subject_a": null, "subject_b": null, "body": "..." }' : '{ "subject_a": "...", "subject_b": "...", "body": "..." }'}
 
 IF you cannot construct a proper message, return: { "error": "insufficient_data", "reason": "brief explanation" }
 ${editNote}`;

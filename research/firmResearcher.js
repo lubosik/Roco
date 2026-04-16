@@ -806,7 +806,7 @@ YOUR TASK:
 Identify 20-30 firms with the HIGHEST likelihood of investing in this specific deal. Precision matters — irrelevant firms waste outreach budget. Each firm must genuinely match the deal structure, size, sector, and geography.
 
 For each firm return these exact JSON keys:
-firm_name (exact legal name), firm_type (specific: e.g. "LMM Healthcare PE", "Family Office Direct", "Independent Sponsor", "Healthcare VC"), website, geography_focus, sector_focus, cheque_size (typical equity ticket in ${sym}), aum, past_investments (array of 3-5 specific deals: company name + year + amount), investment_thesis (1-2 sentences from their own materials), match_rationale (2-3 sentences explaining why THIS deal fits THEIR criteria — be specific about deal size, sector, and structure fit), match_score (integer 0-100)
+firm_name (exact legal name), firm_type (specific: e.g. "LMM Healthcare PE", "Family Office Direct", "Independent Sponsor", "Healthcare VC"), website, geography_focus, sector_focus, cheque_size (typical equity ticket in ${sym}), aum (include total executed deal value for independent sponsors, e.g. "$1B+ in executed deal value"), past_investments (array of 3-5 specific completed deals/acquisitions WITH deal value and year where known — format each as "Company Name (Year, $Xm acquisition)" or "Company Name (Year, $Xm investment)" — use real company names only), investment_thesis (1-2 sentences from their own materials), match_rationale (2-3 sentences explaining why THIS deal fits THEIR criteria — be specific about deal size, sector, and structure fit), match_score (integer 0-100)
 
 Return ONLY a valid JSON array. No preamble, no markdown, no explanation.`;
 }
@@ -830,8 +830,8 @@ Return ONLY valid JSON:
 {
   "base_score": <integer 0-100>,
   "thesis": "<1-3 sentence investment thesis or null>",
-  "past_investments": ["Company 1", "Company 2"],
-  "aum": "<AUM or fund size or null>",
+  "past_investments": ["Company Name (Year, $Xm acquisition)", "Company Name (Year, $Xm)"],
+  "aum": "<AUM, fund size, or total executed deal value — e.g. '$1B+ in executed deal value' for independent sponsors>",
   "justification": "<2 sentence explanation of why this firm fits the deal>"
 }`;
 }
