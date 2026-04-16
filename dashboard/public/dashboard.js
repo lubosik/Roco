@@ -3856,6 +3856,13 @@ function renderCampaignTrackerState(dealId, batch, firms) {
           <div data-campaign-summary="outreachBar" style="height:100%;background:linear-gradient(90deg,#38bdf8,#4ade80);width:${pct}%;border-radius:4px;transition:width 0.6s ease"></div>
         </div>
       </div>
+      <div style="display:flex;align-items:center;justify-content:flex-end;margin-bottom:14px">
+        <div class="view-toggle-bar">
+          <button class="view-toggle-btn active" id="campaign-list-toggle-${dealId}" onclick="window.setKanbanView('${dealId}','${batch.id}','list')">List View</button>
+          <button class="view-toggle-btn" id="campaign-kanban-toggle-${dealId}" onclick="window.setKanbanView('${dealId}','${batch.id}','kanban')">Kanban View</button>
+        </div>
+      </div>
+      <div id="campaign-list-view-${dealId}">
       <div style="display:flex;flex-direction:column;gap:6px">
         ${firms.map((f, i) => {
           const status = getFirmTrackerStatusDisplay(f);
@@ -3903,8 +3910,221 @@ function renderCampaignTrackerState(dealId, batch, firms) {
         }).join('')}
       </div>
       <div style="margin-top:16px"><button onclick="window.closeBatch('${dealId}','${batch.id}')" style="padding:8px 16px;background:#1a1a1a;border:1px solid #d4a847;color:#d4a847;border-radius:6px;cursor:pointer;font-size:13px">Close Batch</button></div>
+      </div>
+      <div id="campaign-kanban-view-${dealId}" style="display:none">
+        <div style="padding:20px 0;color:#4a4a4a;font-size:12px;font-family:'DM Mono',monospace">Loading Kanban…</div>
+      </div>
     </div>
   `;
+}
+
+// ─── KANBAN VIEW ──────────────────────────────────────────────────────────────
+
+let kanbanPollTimer = null;
+
+window.setKanbanView = function(dealId, batchId, mode) {
+  const listView   = document.getElementById(`campaign-list-view-${dealId}`);
+  const kanbanView = document.getElementById(`campaign-kanban-view-${dealId}`);
+  const listBtn    = document.getElementById(`campaign-list-toggle-${dealId}`);
+  const kanbanBtn  = document.getElementById(`campaign-kanban-toggle-${dealId}`);
+  if (!listView || !kanbanView) return;
+
+  if (mode === 'kanban') {
+    listView.style.display  = 'none';
+    kanbanView.style.display = '';
+    listBtn?.classList.remove('active');
+    kanbanBtn?.classList.add('active');
+    loadKanbanView(dealId, batchId, kanbanView);
+    if (kanbanPollTimer) clearInterval(kanbanPollTimer);
+    kanbanPollTimer = setInterval(() => {
+      const kv = document.getElementById(`campaign-kanban-view-${dealId}`);
+      if (kv && kv.style.display !== 'none') loadKanbanView(dealId, batchId, kv, true);
+    }, 30000);
+  } else {
+    listView.style.display   = '';
+    kanbanView.style.display = 'none';
+    listBtn?.classList.add('active');
+    kanbanBtn?.classList.remove('active');
+    if (kanbanPollTimer) { clearInterval(kanbanPollTimer); kanbanPollTimer = null; }
+  }
+};
+
+async function loadKanbanView(dealId, batchId, container, silent = false) {
+  if (!silent) {
+    container.innerHTML = '<div style="padding:20px 0;color:#4a4a4a;font-size:12px;font-family:\'DM Mono\',monospace">Loading Kanban…</div>';
+  }
+  try {
+    const data = await api(`/api/deals/${dealId}/kanban`);
+    container.innerHTML = renderKanbanBoard(data, dealId, batchId);
+  } catch (e) {
+    if (!silent) container.innerHTML = `<div style="color:var(--red);padding:20px 0;font-size:12px">${esc(e.message)}</div>`;
+  }
+}
+
+function renderKanbanBoard(data, dealId, batchId) {
+  const cols = data.columns || {};
+  const COLS = [
+    { key: 'queued',         label: 'Queued' },
+    { key: 'contacted',      label: 'Contacted' },
+    { key: 'connected',      label: 'Connected' },
+    { key: 'engaged',        label: 'Engaged' },
+    { key: 'meeting_booked', label: 'Meeting Booked' },
+    { key: 'passed',         label: 'Passed' },
+    { key: 'exhausted',      label: 'Exhausted' },
+  ];
+  return `<div class="kanban-board">
+    ${COLS.map(col => {
+      const firms = cols[col.key] || [];
+      const dimmed = col.key === 'passed' || col.key === 'exhausted';
+      return `<div class="kanban-col">
+        <div class="kanban-col-header">
+          <span class="kanban-col-title">${col.label}</span>
+          <span class="kanban-col-count">${firms.length}</span>
+        </div>
+        <div class="kanban-col-cards">
+          ${firms.length === 0
+            ? '<div class="kanban-empty">—</div>'
+            : firms.map(firm => `
+              <div class="kanban-firm-card${dimmed ? ' kanban-firm-card-dim' : ''}"
+                   onclick="window.openFirmKanbanDrillDown('${firm.id}',${JSON.stringify(firm.firm_name)},${firm.score},'${dealId}','${batchId}')">
+                <div class="kanban-firm-name">${esc(firm.firm_name)}</div>
+                ${firm.top_contact
+                  ? `<div class="kanban-firm-contact">${esc(firm.top_contact.name || '—')}${firm.top_contact.title ? ` <span style="opacity:0.5">·</span> ${esc(firm.top_contact.title)}` : ''}</div>`
+                  : `<div class="kanban-firm-contact">${firm.total_contacts || 0} contact${firm.total_contacts !== 1 ? 's' : ''}</div>`}
+                ${firm.score ? `<div class="kanban-firm-footer"><span class="kanban-score-badge">${firm.score}</span></div>` : ''}
+              </div>`).join('')}
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+window.openFirmKanbanDrillDown = async function(firmId, firmName, score, dealId, batchId) {
+  window.closeKanbanDrillDown();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'kanban-drill-overlay';
+  overlay.id = 'kanban-drill-overlay';
+  overlay.addEventListener('click', window.closeKanbanDrillDown);
+
+  const panel = document.createElement('div');
+  panel.className = 'kanban-drill-panel';
+  panel.id = 'kanban-drill-panel';
+  panel.innerHTML = `
+    <div class="kanban-drill-header">
+      <div style="min-width:0">
+        <div class="kanban-drill-firm-name">${esc(firmName)}</div>
+        ${score ? `<div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--gold);margin-top:2px">Score: ${score}</div>` : ''}
+      </div>
+      <button class="kanban-drill-close" onclick="window.closeKanbanDrillDown()">&#215;</button>
+    </div>
+    <div class="kanban-drill-body" id="kanban-drill-body">
+      <div style="padding:20px;color:var(--text-dim);font-size:12px;font-family:'DM Mono',monospace">Loading contacts…</div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  document.body.appendChild(panel);
+
+  try {
+    const contacts = await api(`/api/deals/${dealId}/batch/${batchId}/firms/${firmId}/contacts`);
+    const body = document.getElementById('kanban-drill-body');
+    if (body) body.innerHTML = renderContactKanbanBoard(contacts);
+  } catch (e) {
+    const body = document.getElementById('kanban-drill-body');
+    if (body) body.innerHTML = `<div style="padding:20px;color:var(--red);font-size:12px">${esc(e.message)}</div>`;
+  }
+};
+
+window.closeKanbanDrillDown = function() {
+  document.getElementById('kanban-drill-overlay')?.remove();
+  document.getElementById('kanban-drill-panel')?.remove();
+};
+
+function getContactKanbanColumn(contact) {
+  const ps = contact.pipeline_stage;
+  if (['Meeting Booked', 'Replied', 'In Conversation'].includes(ps)) return 'replied';
+  if (['Archived', 'Deleted — Do Not Contact', 'Suppressed — Opt Out', 'Inactive'].includes(ps)) return 'skipped';
+  if (contact.invite_accepted_at || ps === 'invite_accepted') return 'connected';
+  if (['dm_sent', 'DM Sent', 'DM Approved'].includes(ps)) return 'dm_sent';
+  if (contact.last_email_sent_at || ['email_sent', 'Email Sent', 'Email Approved'].includes(ps)) return 'email_sent';
+  if (contact.invite_sent_at || ps === 'invite_sent') return 'request_sent';
+  return 'queued';
+}
+
+function timeAgo(dateStr) {
+  if (!dateStr) return null;
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 2) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+function getContactLastAction(contact) {
+  return contact.last_reply_at || contact.invite_accepted_at || contact.last_outreach_at || contact.last_email_sent_at || contact.invite_sent_at || null;
+}
+
+function renderContactKanbanBoard(contacts) {
+  if (!contacts.length) {
+    return '<div style="padding:24px;color:var(--text-dim);font-size:12px;text-align:center;font-style:italic">No contacts found for this firm yet</div>';
+  }
+
+  const CONTACT_COLS = [
+    { key: 'queued',       label: 'Queued' },
+    { key: 'request_sent', label: 'Request Sent' },
+    { key: 'connected',    label: 'Connected' },
+    { key: 'dm_sent',      label: 'DM Sent' },
+    { key: 'email_sent',   label: 'Email Sent' },
+    { key: 'replied',      label: 'Replied' },
+    { key: 'skipped',      label: 'Skipped' },
+  ];
+
+  const groups = {};
+  CONTACT_COLS.forEach(c => { groups[c.key] = []; });
+  for (const c of contacts) {
+    const col = getContactKanbanColumn(c);
+    if (groups[col]) groups[col].push(c);
+  }
+
+  // Only show columns with contacts, always keeping Queued and Replied in view
+  const visible = CONTACT_COLS.filter(c => groups[c.key].length > 0 || c.key === 'queued' || c.key === 'replied');
+
+  return `<div class="kanban-contacts-board">
+    ${visible.map(col => {
+      const colContacts = groups[col.key];
+      return `<div class="kanban-contact-col">
+        <div class="kanban-contact-col-header">
+          <span>${col.label}</span>
+          <span style="color:var(--text-dim)">${colContacts.length}</span>
+        </div>
+        ${colContacts.length === 0
+          ? '<div style="font-size:11px;color:var(--text-dim);padding:4px 0;font-style:italic">None</div>'
+          : colContacts.map(c => {
+            const lastAction = getContactLastAction(c);
+            const ago = timeAgo(lastAction);
+            const hasLinkedIn = !!(c.linkedin_url || c.invite_sent_at || c.invite_accepted_at);
+            const hasEmail = !!(c.email || c.last_email_sent_at);
+            const channel = hasLinkedIn ? 'LI' : (hasEmail ? '✉' : '—');
+            return `<div class="kanban-contact-card">
+              <div class="kanban-contact-info">
+                <div class="kanban-contact-name">${c.linkedin_url
+                  ? `<a href="${esc(c.linkedin_url)}" target="_blank" style="color:var(--text-bright);text-decoration:none">${esc(c.name || '—')}</a>`
+                  : esc(c.name || '—')}</div>
+                ${c.job_title ? `<div class="kanban-contact-role">${esc(c.job_title)}</div>` : ''}
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0">
+                <span class="kanban-contact-channel">${esc(channel)}</span>
+                ${ago ? `<span style="font-size:10px;color:var(--text-dim);font-family:'DM Mono',monospace;white-space:nowrap">${ago}</span>` : ''}
+              </div>
+            </div>`;
+          }).join('')}
+      </div>`;
+    }).join('')}
+  </div>`;
 }
 
 async function patchCampaignTrackerInPlace(dealId) {

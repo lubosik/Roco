@@ -5843,6 +5843,75 @@ function registerRoutes(app) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  // GET /api/deals/:id/kanban — firms for current active batch grouped by kanban stage
+  app.get('/api/deals/:id/kanban', requireAuth, async (req, res) => {
+    try {
+      const sb = getSupabase();
+      // Get the most recent active/approved batch
+      const { data: batch } = await sb.from('campaign_batches')
+        .select('*')
+        .eq('deal_id', req.params.id)
+        .in('status', ['approved', 'active'])
+        .order('batch_number', { ascending: false })
+        .limit(1).maybeSingle();
+
+      if (!batch) return res.json({ batch: null, columns: {} });
+
+      // Get all firms for this batch
+      const { data: firmRows } = await sb.from('batch_firms')
+        .select('id, firm_name, score, rank, enrichment_status')
+        .eq('batch_id', batch.id)
+        .order('score', { ascending: false });
+
+      // Get all contacts for this deal+batch
+      const { data: contacts } = await sb.from('contacts')
+        .select('id, name, job_title, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at, investor_score')
+        .eq('deal_id', req.params.id)
+        .eq('batch_id', batch.id);
+
+      // Group contacts by normalised firm name
+      const contactsByFirm = new Map();
+      for (const c of (contacts || [])) {
+        const key = normalizeFirmLookupName(c.company_name);
+        if (!key) continue;
+        if (!contactsByFirm.has(key)) contactsByFirm.set(key, []);
+        contactsByFirm.get(key).push(c);
+      }
+
+      const columns = { queued: [], contacted: [], connected: [], engaged: [], meeting_booked: [], passed: [], exhausted: [] };
+
+      for (const row of (firmRows || [])) {
+        const firmContacts = contactsByFirm.get(normalizeFirmLookupName(row.firm_name)) || [];
+        const summary = buildFirmCampaignSummary(firmContacts, row.enrichment_status || 'pending');
+
+        // Top contact = highest investor_score
+        const sorted = [...firmContacts].sort((a, b) => Number(b.investor_score || 0) - Number(a.investor_score || 0));
+        const top = sorted[0];
+
+        const firmData = {
+          id: row.id,
+          firm_name: row.firm_name,
+          score: row.score || 0,
+          firm_stage: summary.firm_stage,
+          firm_stage_label: summary.firm_stage_label,
+          total_contacts: summary.total_contacts,
+          top_contact: top ? { name: top.name, title: top.job_title } : null,
+        };
+
+        switch (summary.firm_stage) {
+          case 'meeting_booked':    columns.meeting_booked.push(firmData); break;
+          case 'replied':           columns.engaged.push(firmData); break;
+          case 'invite_accepted':   columns.connected.push(firmData); break;
+          case 'outreach_started':  columns.contacted.push(firmData); break;
+          case 'closed':            columns.passed.push(firmData); break;
+          default:                  columns.queued.push(firmData);
+        }
+      }
+
+      res.json({ batch, columns });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
   app.get('/api/deals/:id/batch/:batchId/firms', requireAuth, async (req, res) => {
     try {
       const sb = getSupabase();
