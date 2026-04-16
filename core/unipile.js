@@ -19,7 +19,22 @@ import {
 let _cachedCreds = null;
 let _credsCachedAt = 0;
 const CRED_TTL = 30_000;
-const LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS = [4, 8, 24];
+const LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS = [4, 8]; // retries 1-2 only; retry 3+ defers to Monday
+
+/**
+ * Next Monday at 09:00 UTC — LinkedIn weekly invite quota resets on Mondays.
+ * If today IS Monday we still return the NEXT Monday (7 days away) because
+ * we only reach here after exhausting all same-week retries.
+ */
+function nextMondayNineAmUtc() {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun, 1=Mon … 6=Sat
+  const daysUntilMonday = ((8 - day) % 7) || 7; // always 1-7
+  const nextMon = new Date(now);
+  nextMon.setUTCDate(now.getUTCDate() + daysUntilMonday);
+  nextMon.setUTCHours(9, 0, 0, 0);
+  return nextMon;
+}
 const PROVIDER_LIMIT_NOTE_PATTERN = /\[LI_INVITE_LIMIT:count=(\d+)\|blocked_until=([^|\]]+)(?:\|notified_at=([^\]]+))?\]/i;
 const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
 
@@ -972,8 +987,11 @@ export async function processLinkedInInvite({
   }
 
   // ── Company mismatch check ───────────────────────────────────────────────
-  // If the resolved profile headline/raw contains a current_company, check it
-  // matches the contact's assigned firm.  Log mismatches — don't block.
+  // Strict: if the resolved LinkedIn profile's current company doesn't match
+  // the contact's assigned firm, do NOT send the invite — we have the wrong
+  // person.  Route to email if a usable address is available; otherwise mark
+  // for manual review.  A similarity ≥ 0.35 is treated as a match (handles
+  // minor naming variations like "BlackRock Inc" vs "BlackRock").
   if (resolvedProfileData && contact?.company_name) {
     const rawCompany = String(
       resolvedProfileData?.raw?.company_name
@@ -982,11 +1000,34 @@ export async function processLinkedInInvite({
     ).trim();
     if (rawCompany) {
       const sim = firmNameSimilarity(rawCompany, contact.company_name);
-      if (sim < 0.5) {
+      if (sim < 0.35) {
+        const mismatchNote = `[COMPANY_MISMATCH: LinkedIn shows "${rawCompany}", expected "${contact.company_name}" (${Math.round(sim * 100)}% match)]`;
+        const updatedNotes = ((contact?.notes || '') + ' ' + mismatchNote).trim();
+        try {
+          await sb.from('contacts').update({
+            pipeline_stage: hasUsableEmail(contact?.email) ? contact.pipeline_stage : 'profile_mismatch',
+            notes: updatedNotes,
+            updated_at: new Date().toISOString(),
+          }).eq('id', contact.id);
+        } catch {}
+        await recordInviteActivity({
+          pushActivity, logActivity, deal, contact,
+          type: 'warning',
+          action: '[MATCH] Company mismatch — invite blocked',
+          note: `${contact.name || 'Contact'} · LinkedIn: "${rawCompany}" vs assigned: "${contact.company_name}" (${Math.round(sim * 100)}% match)`,
+          eventType: 'LINKEDIN_INVITE_COMPANY_MISMATCH',
+          detail: { linkedin_company: rawCompany, assigned_company: contact.company_name, similarity: sim, routed_to_email: hasUsableEmail(contact?.email) },
+        });
+        if (hasUsableEmail(contact?.email)) {
+          return { status: 'routed_to_email', reason: 'company_mismatch', rawCompany };
+        }
+        return { status: 'skipped_company_mismatch', providerId, publicId };
+      } else if (sim < 0.6) {
+        // Soft warning only — names are similar enough but flag it
         pushActivity?.({
           type: 'warning',
-          action: '[MATCH] Company mismatch detected',
-          note: `${contact.name || 'Contact'} — LinkedIn shows "${rawCompany}", assigned firm is "${contact.company_name}" (similarity ${Math.round(sim * 100)}%)`,
+          action: '[MATCH] Company name partial match',
+          note: `${contact.name || 'Contact'} — LinkedIn: "${rawCompany}" vs assigned: "${contact.company_name}" (${Math.round(sim * 100)}%)`,
           deal_name: deal?.name,
           dealId: deal?.id,
         });
@@ -1218,9 +1259,19 @@ export async function processLinkedInInvite({
 
     if (isProviderLimitError(message)) {
       const retryCount = Math.max(0, Number(providerLimitState?.count || 0)) + 1;
-      const cooldownHours = LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS[Math.min(retryCount - 1, LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS.length - 1)];
-      const retryAt = new Date(Date.now() + cooldownHours * 60 * 60 * 1000).toISOString();
-      const shouldNotify = retryCount >= 3 && !providerLimitState?.notifiedAt;
+
+      // Retries 1-2: short exponential backoff.
+      // Retry 3+: the weekly LinkedIn quota is exhausted — defer until next Monday reset.
+      let retryAt;
+      const weeklyLimitHit = retryCount >= 3;
+      if (weeklyLimitHit) {
+        retryAt = nextMondayNineAmUtc().toISOString();
+      } else {
+        const cooldownHours = LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS[retryCount - 1] || 8;
+        retryAt = new Date(Date.now() + cooldownHours * 60 * 60 * 1000).toISOString();
+      }
+
+      const shouldNotify = weeklyLimitHit && !providerLimitState?.notifiedAt;
       const nextNotes = appendProviderLimitState(contact?.notes, {
         count: retryCount,
         blockedUntil: retryAt,
@@ -1229,7 +1280,7 @@ export async function processLinkedInInvite({
 
       try {
         await sb.from('contacts').update({
-          pipeline_stage: contact.pipeline_stage,
+          pipeline_stage: weeklyLimitHit ? 'linkedin_weekly_limit' : contact.pipeline_stage,
           invite_sent_at: null,
           outreach_channel: null,
           follow_up_due_at: retryAt,
@@ -1242,10 +1293,14 @@ export async function processLinkedInInvite({
         logActivity,
         deal,
         contact,
-        type: retryCount >= 3 ? 'warning' : 'invite',
-        action: retryCount >= 3 ? 'LinkedIn invite paused for manual review' : 'LinkedIn invite deferred by provider limit',
-        note: `${contact.name || 'Contact'} · retry ${retryCount}/3 · next attempt ${retryAt}`,
-        eventType: retryCount >= 3 ? 'LINKEDIN_INVITE_PROVIDER_LIMIT_ESCALATED' : 'LINKEDIN_INVITE_PROVIDER_LIMIT',
+        type: weeklyLimitHit ? 'warning' : 'invite',
+        action: weeklyLimitHit
+          ? 'LinkedIn weekly invite quota exhausted — deferred to Monday reset'
+          : 'LinkedIn invite deferred by provider limit',
+        note: weeklyLimitHit
+          ? `${contact.name || 'Contact'} · retry ${retryCount} · weekly limit hit · retrying ${retryAt}`
+          : `${contact.name || 'Contact'} · retry ${retryCount}/2 · next attempt ${retryAt}`,
+        eventType: weeklyLimitHit ? 'LINKEDIN_INVITE_WEEKLY_LIMIT' : 'LINKEDIN_INVITE_PROVIDER_LIMIT',
         detail: {
           channel: 'linkedin_invite',
           provider_id: providerId,
@@ -1255,24 +1310,26 @@ export async function processLinkedInInvite({
           error: summarizeInviteError(err),
           retry_count: retryCount,
           retry_at: retryAt,
+          weekly_limit: weeklyLimitHit,
         },
       });
 
       if (shouldNotify) {
         try {
           const { sendTelegram } = await import('../approval/telegramBot.js');
+          const resetDate = new Date(retryAt).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
           await sendTelegram(
-            `⚠️ *LinkedIn invite limit reached*\n\n` +
-            `Unipile/LinkedIn returned \`cannot_resend_yet\` for *${contact.name || 'Unknown contact'}* at *${contact.company_name || 'Unknown firm'}*.\n` +
-            `Roco retried 3 times and paused further invite attempts until manual review.\n` +
+            `⚠️ *LinkedIn weekly invite quota exhausted*\n\n` +
+            `Tried 3× to invite *${contact.name || 'Unknown contact'}* at *${contact.company_name || 'Unknown firm'}* — ` +
+            `LinkedIn returned \`cannot_resend_yet\` each time.\n` +
             `${linkedinUrl || rawLinkedInValue ? `LinkedIn: ${linkedinUrl || rawLinkedInValue}\n` : ''}` +
             `${contact.email ? `Email on file: ${contact.email}\n` : ''}` +
-            `Next automatic retry not before: ${retryAt}`
+            `Roco will automatically retry on *${resetDate}* when the weekly quota resets. No action needed.`
           );
         } catch {}
       }
 
-      return { status: 'deferred_provider_limit', providerId, publicId, error: err, retryAt, retryCount };
+      return { status: 'deferred_provider_limit', providerId, publicId, error: err, retryAt, retryCount, weeklyLimitHit };
     }
 
     await recordInviteActivity({

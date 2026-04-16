@@ -3704,8 +3704,10 @@ function registerRoutes(app) {
           if (queueKey && seenQueueIds.has(queueKey)) continue;
           const localKey = item.telegramMsgId ? `i:${item.telegramMsgId}` : null;
           if (localKey && seenLocalIds.has(localKey)) continue;
-          // Filter out items that were just approved/skipped via Telegram
-          if (item.id && recentlyResolved.has(String(item.id))) continue;
+          // Filter out *pending* items that were just approved/skipped via Telegram
+          // but whose DB commit is still in flight.  Never filter approved_waiting_for_window —
+          // those should show on the dashboard immediately after approval.
+          if (item.id && item.status === 'pending' && recentlyResolved.has(String(item.id))) continue;
           merged.push(item);
         }
 

@@ -10,6 +10,7 @@ import OpenAI from 'openai';
 import { getSupabase } from '../core/supabase.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import { getOutreachContext } from '../core/agentContext.js';
+import { retrieveLinkedInProfile } from '../integrations/unipileClient.js';
 
 let _anthropic, _openai;
 function getAnthropic() { if (!_anthropic) _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }); return _anthropic; }
@@ -88,16 +89,47 @@ export async function constructOutreachMessage(contact, firm, dealId, messageTyp
   const contactTypeLabel = isAngel ? 'angel investor' : 'investor';
   const firmLine = resolvedFirmName ? `at ${resolvedFirmName}` : '';
 
-  const pastInvestments = Array.isArray(firm?.past_investments)
-    ? firm.past_investments.slice(0, 3).join(', ')
-    : (firm?.past_investments || 'Not on record');
+  const pastInvestmentsArr = Array.isArray(firm?.past_investments)
+    ? firm.past_investments.filter(Boolean)
+    : (firm?.past_investments ? [firm.past_investments] : []);
+  const pastInvestments = pastInvestmentsArr.length
+    ? pastInvestmentsArr.slice(0, 8).join(', ')
+    : 'Not on record';
   const investmentThesis = firm?.investment_thesis || firm?.thesis || 'not available';
   const whyThisFirm = firm?.match_rationale || firm?.justification || contact?.why_this_firm || 'strong sector and geography alignment';
+  const aumLine = firm?.aum || firm?.aum_fund_size || firm?.fund_size ? `- Fund size / AUM: ${firm?.aum || firm?.aum_fund_size || firm?.fund_size}` : null;
+  const stageOfInvestment = firm?.stage_focus || firm?.investment_stage || null;
 
   // Load phase-specific guidance — investor outreach gets only identity + voice + outreach rules
   const guidanceBlock = mode === 'investor_outreach'
     ? await getOutreachContext()
     : await buildGuidanceBlock(mode);
+
+  // Best-effort LinkedIn profile fetch for hyper-personalisation.
+  // Uses the contact's stored provider_id or LinkedIn URL. Never blocks — failure = skip.
+  let linkedInProfileContext = '';
+  const liIdentifier = contact.linkedin_provider_id || contact.linkedin_url || null;
+  if (liIdentifier) {
+    try {
+      const profile = await Promise.race([
+        retrieveLinkedInProfile(liIdentifier),
+        new Promise(resolve => setTimeout(() => resolve(null), 5000)),
+      ]);
+      if (profile) {
+        const parts = [];
+        if (profile.headline) parts.push(`- Headline: ${profile.headline}`);
+        if (profile.current_title) parts.push(`- Current role: ${profile.current_title}${profile.current_company ? ` at ${profile.current_company}` : ''}`);
+        if (profile.summary) parts.push(`- Summary: ${profile.summary.slice(0, 300)}`);
+        if (profile.experience?.length) {
+          const recent = profile.experience.slice(0, 2).map(e =>
+            [e.title, e.company_name || e.company].filter(Boolean).join(' @ ')
+          ).filter(Boolean);
+          if (recent.length) parts.push(`- Recent roles: ${recent.join('; ')}`);
+        }
+        if (parts.length) linkedInProfileContext = '\nLINKEDIN PROFILE (live data):\n' + parts.join('\n');
+      }
+    } catch {}
+  }
 
   let editNote = '';
   if (editInstructions) {
@@ -121,27 +153,28 @@ PROSPECT:
 - Full name: ${contact.name}
 - Title: ${contact.job_title || contact.title || 'investor'}
 - Type: ${contactTypeLabel}${firmLine ? ` (${firmLine})` : ''}
-- LinkedIn: ${contact.linkedin_url || 'unknown'}
+- LinkedIn: ${contact.linkedin_url || 'unknown'}${linkedInProfileContext}
 
 FIRM RESEARCH:
 ${resolvedFirmName
   ? `- Firm: ${resolvedFirmName}
-- Firm type: ${firm?.firm_type || 'investment firm'}
+- Firm type: ${firm?.firm_type || 'investment firm'}${stageOfInvestment ? `\n- Investment stage focus: ${stageOfInvestment}` : ''}${aumLine ? `\n${aumLine}` : ''}
 - Investment thesis: ${investmentThesis}
-- Past investments: ${pastInvestments}
+- Past investments (portfolio): ${pastInvestments}
 - Why this deal matches them: ${whyThisFirm}`
   : `- ${firstName} is an independent/angel investor — do NOT reference a firm. Reference their investing background directly.`
 }
 
-RULES:
+PERSONALISATION RULES (follow strictly):
 1. Use "${firstName}" as salutation — never "null", never "there"
-2. Reference a SPECIFIC past investment from their portfolio if available
-3. Message must be about "${freshDeal.name}" ONLY
-4. Ultra-conversational — as if Dom has known this person for years
-5. No em-dashes. No hashtags. No bullet points in body.
-6. Sign off as "Dom"
-7. ${isLinkedIn ? 'LinkedIn DM: 3-5 sentences max. No subject lines needed.' : 'Email: 5-8 sentences. Generate TWO subject line options (A and B), curiosity-driven, under 8 words.'}
-8. Return ONLY valid JSON: ${isLinkedIn ? '{ "subject_a": null, "subject_b": null, "body": "..." }' : '{ "subject_a": "...", "subject_b": "...", "body": "..." }'}
+2. MUST reference at least one SPECIFIC named company from their portfolio/past investments — make it feel like you've done your homework
+3. Connect that portfolio company to why ${freshDeal.name} is a natural next bet for them
+4. Message must be about "${freshDeal.name}" ONLY
+5. Ultra-conversational — as if Dom has known this person for years
+6. No em-dashes. No hashtags. No bullet points in body.
+7. Sign off as "Dom"
+8. ${isLinkedIn ? 'LinkedIn DM: 3-5 sentences max. No subject lines needed.' : 'Email: 5-8 sentences. Generate TWO subject line options (A and B), curiosity-driven, under 8 words.'}
+9. Return ONLY valid JSON: ${isLinkedIn ? '{ "subject_a": null, "subject_b": null, "body": "..." }' : '{ "subject_a": "...", "subject_b": "...", "body": "..." }'}
 
 IF you cannot construct a proper message, return: { "error": "insufficient_data", "reason": "brief explanation" }
 ${editNote}`;

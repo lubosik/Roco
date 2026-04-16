@@ -828,12 +828,13 @@ export async function updateApprovalStatus(id, status, approvedSubject = null) {
   try {
     const updates = { status };
     if (approvedSubject) updates.approved_subject = approvedSubject;
-    // Only update if the item hasn't already been claimed/sent — prevents a race where
-    // sendApprovedLinkedInDM claims the 'pending' item and marks it 'sent' before this
-    // fire-and-forget call completes, which would otherwise overwrite 'sent' with 'approved'.
+    // Only transition from 'pending' → approved/skipped.  Never overwrite
+    // 'approved_waiting_for_window', 'sending', or 'sent' — those are
+    // set by sendApprovedLinkedInDM / executeOutreach and must not be
+    // clobbered by this fire-and-forget call from resolveApproval.
     await sb.from('approval_queue').update(updates)
       .eq('id', id)
-      .in('status', ['pending', 'approved', 'approved_waiting_for_window']);
+      .in('status', ['pending']);
   } catch {}
 }
 

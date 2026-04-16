@@ -403,6 +403,12 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
         chat_id: chatId,
         message_id: sent.message_id,
       }).catch(() => {});
+      // Persist the Telegram message ID so that after a server restart the item
+      // can be found in the in-memory map (via reloadPendingInvestorApprovals) and
+      // reloadApprovalForTelegramMessage can match button presses on old messages.
+      if (sb && queueId) {
+        sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).catch(() => {});
+      }
       info(`LinkedIn DM draft sent to Telegram for approval: ${name}`);
     } catch (err) {
       error('Failed to send LinkedIn DM draft to Telegram', { err: err.message });
