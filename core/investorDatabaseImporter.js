@@ -104,9 +104,9 @@ const KB_ENRICH_FIELDS = [
 
 async function flushBatch(supabase, dedupedBatch, isKB, listId, listName) {
   if (!isKB) {
-    // Standard investor list upload: upsert everything including list_id
+    // Standard investor list upload: insert new firms only — existing firms keep their current list_id
     const { error } = await supabase.from('investors_db')
-      .upsert(dedupedBatch, { onConflict: 'pitchbook_id' });
+      .upsert(dedupedBatch, { onConflict: 'pitchbook_id', ignoreDuplicates: true });
     if (error) { console.warn('[DB IMPORT] Batch error:', error.message); return 0; }
     return dedupedBatch.length;
   }

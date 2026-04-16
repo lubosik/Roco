@@ -8328,7 +8328,7 @@ async function flushReplyBatch(batchKey) {
   });
 }
 
-async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUrn, threadId, chatId }) {
+async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUrn, fromName, threadId, chatId }) {
   const sb = getSupabase();
   if (!sb) return { contact: null, deal: null, campaign: null, mode: null };
 
@@ -8382,6 +8382,18 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
       if (priorReply?.contact_id) {
         const contact = await fetchInvestorContactById(priorReply.contact_id);
         if (contact && String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE') return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
+      }
+    }
+    // Name-based fallback — catches replies from alternate email addresses (e.g. gcampbell@ vs bcampbell@)
+    if (channel === 'email' && fromName && fromName.trim().split(/\s+/).length >= 2) {
+      const { data: nameMatches } = await sb.from('contacts')
+        .select('*, deals(*)')
+        .ilike('name', fromName.trim())
+        .limit(5);
+      const contact = pickBestInvestorContact(nameMatches || [], { requireActiveDeal: true });
+      if (contact) {
+        console.log(`[RESOLVE] Matched by name "${fromName}" → ${contact.name} (email mismatch fallback)`);
+        return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
       }
     }
   } catch {}
