@@ -6292,7 +6292,22 @@ async function phaseFollowUps(deal, state) {
     }
 
     // Channel switch from LinkedIn → email is always an INTRO (not a numbered follow-up)
+    // In no_follow_ups mode: skip the channel switch entirely — just advance to next person
     if (LINKEDIN_STAGES.has(contact.pipeline_stage) && followUpChannel === 'email') {
+      const noFollowUps = deal?.settings?.no_follow_ups || deal?.no_follow_ups;
+      if (noFollowUps) {
+        await sb.from('contacts').update({ follow_up_due_at: null, pipeline_stage: 'Inactive' }).eq('id', contact.id);
+        info(`[${deal.name}] ${contact.name}: LinkedIn no response (no_follow_ups) — advancing to next contact`);
+        pushActivity({
+          type: 'outreach',
+          action: `[WATERFALL] No response — moving to next contact at firm`,
+          note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''} · LinkedIn unanswered, moving on`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
+        await queueNextFirmWaterfallContact(deal, contact).catch(() => {});
+        continue;
+      }
       info(`[${deal.name}] ${contact.name}: LinkedIn no response — switching to email intro`);
       pushActivity({
         type: 'outreach',
