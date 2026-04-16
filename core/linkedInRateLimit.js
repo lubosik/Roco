@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '..', 'linkedin_ratelimit.json');
 
-const COOLDOWN_MS = 45 * 60 * 1000; // 45 minutes
+const COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
 function readState() {
   try {
@@ -37,7 +37,7 @@ export function markLinkedInRateLimited(source = 'LINKEDIN') {
   const state = readState();
   state.rateLimitedUntil = until;
   writeState(state);
-  console.warn(`[${source}] LinkedIn rate limited — pausing all searches for 45 minutes (until ${new Date(until).toISOString()})`);
+  console.warn(`[${source}] LinkedIn rate limited — pausing all searches for 15 minutes (until ${new Date(until).toISOString()})`);
 }
 
 /**

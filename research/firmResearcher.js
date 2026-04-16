@@ -1981,9 +1981,11 @@ async function findDecisionMakersViaUnipile(firm, deal) {
       });
       (salesResults || []).forEach(person => pushCandidate(person, 'unipile_sales_navigator'));
     } catch (err) {
-      if (isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
       const message = String(err?.message || '');
-      if (!/403|501|feature_not_subscribed|subscription_required|not implemented/i.test(message)) {
+      // 401/403/auth errors are credential issues — do NOT trigger rate-limit cooldown
+      const isAuthError = /401|403|unauthorized|expired|credential|not_authorized/i.test(message);
+      if (!isAuthError && isFirm429Error(err)) { markFirmLinkedInRateLimited(); break; }
+      if (!/401|403|501|feature_not_subscribed|subscription_required|not implemented|unauthorized|expired/i.test(message)) {
         console.warn(`[FIRM RESEARCH] Sales Navigator search failed for "${pass.keywords || 'company ID'}": ${message}`);
       }
     }
