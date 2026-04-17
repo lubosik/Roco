@@ -2099,6 +2099,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
         created_at: new Date().toISOString(),
       }).catch(() => {});
     }
+    sendTelegram(`❌ *LinkedIn DM failed* → *${contact.name || 'contact'}* (${contact.company_name || 'unknown firm'})${deal?.name ? ` · *${deal.name}*` : ''}\n_${String(err.message || 'Unknown failure').slice(0, 160)}_`).catch(() => {});
     notifyQueueUpdated();
     throw err;
   }
@@ -2106,9 +2107,11 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
   const stageLabel = String(queueItem?.stage || '').toLowerCase();
   const followUpMatch = stageLabel.match(/follow[- ]up\s*(\d+)/i);
   const followUpNumber = followUpMatch ? Number(followUpMatch[1] || 1) : 0;
+  // Use the deal's configured follow-up days, fall back to 7-day default
+  const liFollowUpDays = Number(deal?.followup_days_li) || 7;
   const nextFollowUpDueAt = followUpNumber >= 1
     ? null
-    : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    : new Date(Date.now() + liFollowUpDays * 24 * 60 * 60 * 1000).toISOString();
 
   const updates = {
     pipeline_stage: 'DM Sent',

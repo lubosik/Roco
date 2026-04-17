@@ -6174,10 +6174,10 @@ async function phaseOutreach(deal, state) {
     }
   };
 
-  await cleanupPendingFirmQueueConflicts();
-  await queueInviteAcceptedLinkedInDrafts();
-  await flushApprovedLinkedInDms();
-  await flushApprovedEmails();
+  await cleanupPendingFirmQueueConflicts().catch(err => warn(`[${deal.name}] cleanupPendingFirmQueueConflicts error: ${err.message}`));
+  await queueInviteAcceptedLinkedInDrafts().catch(err => warn(`[${deal.name}] queueInviteAcceptedLinkedInDrafts error: ${err.message}`));
+  await flushApprovedLinkedInDms().catch(err => warn(`[${deal.name}] flushApprovedLinkedInDms error: ${err.message}`));
+  await flushApprovedEmails().catch(err => warn(`[${deal.name}] flushApprovedEmails error: ${err.message}`));
 
   // Day-1 firm lane: send one junior / mid-level email intro per firm if we have an email,
   // even while LinkedIn connection requests are going to the rest of the firm.
