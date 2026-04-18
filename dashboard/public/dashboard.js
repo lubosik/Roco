@@ -586,15 +586,14 @@ function applyHealth(h) {
 
 async function loadActivityLog(renderToOverview = true) {
   try {
-    // Use /api/activity/recent for overview widget (fast, no pagination)
-    const data = await api('/api/activity/recent', 'GET', null, { silent: true }).catch(async () => {
-      // Fallback to legacy endpoint if recent isn't available yet
-      const d = await api('/api/activity/log', 'GET', null, { silent: true });
-      return Array.isArray(d) ? d : (d.log || d.items || []);
-    });
-    const items = Array.isArray(data) ? data : (data.log || data.items || []);
-    activityLog = items;
-    if (renderToOverview) renderActivityFeed('overview-activity', items.slice(0, 10));
+    const [recentData, fullData] = await Promise.all([
+      api('/api/activity/recent', 'GET', null, { silent: true }).catch(() => []),
+      api('/api/activity/log?limit=200', 'GET', null, { silent: true }).catch(() => []),
+    ]);
+    const recentItems = Array.isArray(recentData) ? recentData : (recentData.log || recentData.items || recentData.events || []);
+    const fullItems = Array.isArray(fullData) ? fullData : (fullData.log || fullData.items || fullData.events || []);
+    activityLog = fullItems.length ? fullItems : recentItems;
+    if (renderToOverview) renderActivityFeed('overview-activity', recentItems.slice(0, 10));
   } catch { /* silent */ }
 }
 

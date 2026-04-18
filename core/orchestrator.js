@@ -1953,10 +1953,62 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   const estNow = DateTime.now().setZone('America/New_York');
   const topUpKey = `${deal.id}:${estNow.toISODate()}`;
-  if (approvedBatchTopUpState.get(topUpKey)) return;
 
   const sb = getSupabase();
   if (!sb) return;
+
+  const { data: pendingPriorityLists } = await sb.from('deal_list_priorities')
+    .select('id, list_id, list_name, status')
+    .eq('deal_id', deal.id)
+    .not('status', 'eq', 'exhausted')
+    .order('priority_order', { ascending: true });
+
+  const hasPriorityLists = !!pendingPriorityLists?.length;
+  const priorityStatuses = new Set((pendingPriorityLists || []).map(row => String(row.status || '').toLowerCase()));
+  const hasUnprocessedPriorityList = hasPriorityLists && (priorityStatuses.has('pending') || !priorityStatuses.has('active'));
+
+  if (hasUnprocessedPriorityList) {
+    const priorityKey = `${topUpKey}:priority-list`;
+    if (!approvedBatchTopUpState.get(priorityKey)) {
+      approvedBatchTopUpState.set(priorityKey, true);
+      pushActivity({
+        type: 'research',
+        action: `Checking attached priority lists for ${deal.name}`,
+        note: (pendingPriorityLists || []).map(row => row.list_name).join(', '),
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      const priorityTopUp = await getPriorityListShortlist(deal, {
+        limit: 20,
+        emitActivity: true,
+      }).catch(() => ({ shortlisted: [], activePriorityList: null }));
+
+      if (priorityTopUp.shortlisted?.length) {
+        const inserted = await addPriorityInvestorsToBatch(deal, priorityTopUp.shortlisted, priorityTopUp.activePriorityList)
+          .catch(() => ({ added: 0, skipped: priorityTopUp.shortlisted.length }));
+        pushActivity({
+          type: 'research',
+          action: inserted.added > 0 ? 'Priority-list top-up added fresh firms' : 'Priority-list top-up found no insertable firms',
+          note: inserted.added > 0
+            ? `${deal.name} · ${inserted.added} firm${inserted.added === 1 ? '' : 's'} from "${priorityTopUp.activePriorityList?.list_name || 'priority list'}"`
+            : `${deal.name} · all shortlisted firms were already queued or already contacted`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
+        if (inserted.added > 0) return;
+      } else {
+        pushActivity({
+          type: 'research',
+          action: 'Priority-list check found no shortlistable firms',
+          note: `${deal.name} · falling back to standard top-up logic`,
+          deal_name: deal.name,
+          dealId: deal.id,
+        });
+      }
+    }
+  }
+
+  if (approvedBatchTopUpState.get(topUpKey)) return;
 
   // Use invite-ready count at unblocked firms as the real pipeline health signal.
   // "Total contacts" overstates health — contacts waiting for invite-accepts block their firm
@@ -5601,6 +5653,12 @@ async function phaseTopUpPipeline(deal, state) {
   const sb = getSupabase();
   if (!sb) return;
   const deadStatuses = ['skipped_no_linkedin', 'skipped_no_name'];
+  const { data: activePriorityLists } = await sb.from('deal_list_priorities')
+    .select('id')
+    .eq('deal_id', deal.id)
+    .not('status', 'eq', 'exhausted')
+    .limit(1);
+  const hasPriorityList = !!activePriorityLists?.length;
 
   // Contacts ready for LinkedIn invites (Ranked/Enriched, has URL, not yet invited)
   const { count: pipelineReady } = await sb.from('contacts')
@@ -5624,13 +5682,14 @@ async function phaseTopUpPipeline(deal, state) {
   info(`[${deal.name}] Pipeline: ${ready} ready for invite, ${eligible} eligible archived`);
 
   // Step 1: Promote borderline archived contacts if pipeline is running low
-  if (ready < PIPELINE_LOW_THRESHOLD && eligible > 0) {
-    const needed = Math.max(PIPELINE_LOW_THRESHOLD - ready, 5);
+  if (ready < PIPELINE_LOW_THRESHOLD && eligible > 0 && !hasPriorityList) {
+    const needed = Math.max(PIPELINE_LOW_THRESHOLD - ready, 1);
     const { data: toPromote } = await sb.from('contacts')
       .select('id, name, investor_score')
       .eq('deal_id', deal.id)
       .eq('pipeline_stage', 'Archived')
       .not('enrichment_status', 'in', `(${deadStatuses.join(',')})`)
+      .or('linkedin_url.not.is.null,email.not.is.null')
       .gte('investor_score', REACTIVATION_MIN_SCORE)
       .order('investor_score', { ascending: false })
       .limit(needed);
@@ -5642,6 +5701,8 @@ async function phaseTopUpPipeline(deal, state) {
       info(`[${deal.name}] Auto-reactivated ${toPromote.length} archived contacts`);
       pushActivity({ type: 'PIPELINE', action: 'Pipeline Top-Up', note: `${toPromote.length} borderline contacts reactivated for ${deal.name}` });
     }
+  } else if (ready < PIPELINE_LOW_THRESHOLD && hasPriorityList) {
+    info(`[${deal.name}] Skipping archived contact reactivation — priority list attached`);
   }
 
   // Step 2: If pipeline still critically low (no archived eligible either), run new research
