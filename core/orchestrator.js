@@ -5600,6 +5600,7 @@ async function setLastResearchTime(sb, dealId) {
 async function phaseTopUpPipeline(deal, state) {
   const sb = getSupabase();
   if (!sb) return;
+  const deadStatuses = ['skipped_no_linkedin', 'skipped_no_name'];
 
   // Contacts ready for LinkedIn invites (Ranked/Enriched, has URL, not yet invited)
   const { count: pipelineReady } = await sb.from('contacts')
@@ -5614,6 +5615,7 @@ async function phaseTopUpPipeline(deal, state) {
     .select('id', { count: 'exact', head: true })
     .eq('deal_id', deal.id)
     .eq('pipeline_stage', 'Archived')
+    .not('enrichment_status', 'in', `(${deadStatuses.join(',')})`)
     .gte('investor_score', REACTIVATION_MIN_SCORE);
 
   const ready = pipelineReady || 0;
@@ -5628,6 +5630,7 @@ async function phaseTopUpPipeline(deal, state) {
       .select('id, name, investor_score')
       .eq('deal_id', deal.id)
       .eq('pipeline_stage', 'Archived')
+      .not('enrichment_status', 'in', `(${deadStatuses.join(',')})`)
       .gte('investor_score', REACTIVATION_MIN_SCORE)
       .order('investor_score', { ascending: false })
       .limit(needed);
