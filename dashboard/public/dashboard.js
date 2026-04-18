@@ -5770,7 +5770,10 @@ function renderQueueCard(item) {
       </div>
     </div>
     <div class="queue-body">
-      <div class="queue-subject" id="qsubject-${id}">${subA || '(no subject)'}</div>
+      <div class="queue-subject-row">
+        <div class="queue-subject" id="qsubject-${id}">${subA || '(no subject)'}</div>
+        <button class="subject-edit-btn" onclick="editSubjectInline('${id}')" title="Edit subject">&#9998;</button>
+      </div>
       <div class="queue-preview">${body}</div>
     </div>
     <div class="queue-actions">
@@ -5814,6 +5817,35 @@ function switchSubject(id, variant) {
 
 function currentQueueVariant(id) {
   return window._qSubjects?.[id]?.current || 'a';
+}
+
+function editSubjectInline(id) {
+  const subjects = window._qSubjects?.[id];
+  if (!subjects) return;
+  const variant = currentQueueVariant(id);
+  const original = subjects[variant] || '';
+  const el = document.getElementById(`qsubject-${id}`);
+  if (!el || el.querySelector('input')) return;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = original;
+  input.className = 'subject-edit-input';
+  el.textContent = '';
+  el.appendChild(input);
+  input.focus();
+  input.select();
+
+  const save = () => {
+    const val = input.value.trim() || original;
+    subjects[variant] = val;
+    el.textContent = val || '(no subject)';
+  };
+  input.addEventListener('blur', save);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { input.value = original; input.blur(); }
+  });
 }
 
 function previewQueueItem(id) {

@@ -3778,7 +3778,7 @@ function registerRoutes(app) {
 
   // POST /api/approve — approve an email from dashboard
   app.post('/api/approve', async (req, res) => {
-    const { id, subjectChoice, editedBody, subject, sendNow = false } = req.body;
+    const { id, subjectChoice, variant, editedBody, subject, sendNow = false } = req.body;
     if (!id) return res.status(400).json({ error: 'id required' });
 
     const sb = getSupabase();
@@ -3906,7 +3906,8 @@ function registerRoutes(app) {
             }
 
             const queueDealId = queueItem.deal_id || contactRow?.deal_id || null;
-            const chosenSubject = subjectChoice === 'b' ? queueItem.subject_b : (queueItem.subject_a || queueItem.subject || '');
+            const activeVariant = variant || subjectChoice;
+            const chosenSubject = subject || (activeVariant === 'b' ? queueItem.subject_b : '') || queueItem.subject_a || queueItem.subject || '';
             const finalSubject  = editedBody ? chosenSubject : (chosenSubject || '');
             const bodyToSend    = sanitizeApprovalText(editedBody || queueItem.edited_body || queueItem.body || '');
             await sb.from('contacts').update({

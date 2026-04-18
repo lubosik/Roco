@@ -1179,7 +1179,35 @@ select.form-input option { background: var(--bg-card-2); }
 .subject-toggle-btn:last-child { border-right: none; }
 .subject-toggle-btn.active { background: var(--gold-faint); color: var(--gold); }
 
+.queue-subject-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+.subject-edit-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 10px;
+  flex-shrink: 0;
+  transition: color var(--transition), border-color var(--transition);
+}
+.subject-edit-btn:hover { color: var(--gold); border-color: var(--gold); }
+.subject-edit-input {
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-bright);
+  font-family: 'DM Mono', monospace;
+  font-size: 12px;
+  padding: 0;
+}
 .queue-subject {
+  flex: 1;
   font-family: 'DM Mono', monospace;
   font-size: 12px;
   color: var(--text-bright);
