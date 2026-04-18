@@ -3626,7 +3626,7 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (sb) {
         const { data: sbItems, error: sbErr } = await sb.from('approval_queue')
-          .select('id, contact_id, candidate_id, contact_name, contact_email, firm, stage, body, message_type, channel, reply_to_id, created_at, subject_a, subject_b, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode, status')
+          .select('id, contact_id, candidate_id, contact_name, contact_email, firm, stage, body, message_type, channel, reply_to_id, created_at, subject_a, subject_b, approved_subject, score, research_summary, edited_body, edit_instructions, deal_name, outreach_mode, status')
           .in('status', ['pending', 'approved_waiting_for_window'])
           .order('created_at', { ascending: true });
         if (sbErr) console.warn('[/api/queue] Supabase query error:', sbErr.message);
@@ -3668,7 +3668,7 @@ function registerRoutes(app) {
             channel:         r.channel || (isLinkedIn ? 'linkedin' : 'email'),
             queuedAt:        r.created_at,
             contact_id:      r.contact_id || r.candidate_id,
-            subjectA:        r.subject_a || null,
+            subjectA:        (r.status === 'approved_waiting_for_window' ? (r.approved_subject || r.subject_a) : r.subject_a) || null,
             subjectB:        r.subject_b || null,
             score:           r.score ?? contactScoreMap[r.contact_id] ?? null,
             researchSummary: r.research_summary || null,

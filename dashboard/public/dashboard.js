@@ -5763,7 +5763,7 @@ function renderQueueCard(item) {
         ${scoreHt}
         ${stage ? `<span class="status-badge">${stage}</span>` : ''}
         ${waitingBadge}
-        ${hasAB && !isWaiting ? `<div class="subject-toggle">
+        ${hasAB ? `<div class="subject-toggle">
           <button class="subject-toggle-btn active" id="stb-a-${id}" onclick="switchSubject('${id}','a')">A</button>
           <button class="subject-toggle-btn" id="stb-b-${id}" onclick="switchSubject('${id}','b')">B</button>
         </div>` : ''}
@@ -5813,6 +5813,10 @@ function switchSubject(id, variant) {
   if (el) el.textContent = subjects[variant] || '(no subject)';
   document.getElementById(`stb-a-${id}`)?.classList.toggle('active', variant === 'a');
   document.getElementById(`stb-b-${id}`)?.classList.toggle('active', variant === 'b');
+  const item = window._qItems?.[id] || {};
+  if (item.waitingForWindow) {
+    api('/api/edit-approval', 'POST', { id, subject: subjects[variant] || '' }).catch(() => {});
+  }
 }
 
 function currentQueueVariant(id) {
@@ -5840,6 +5844,7 @@ function editSubjectInline(id) {
     const val = input.value.trim() || original;
     subjects[variant] = val;
     el.textContent = val || '(no subject)';
+    api('/api/edit-approval', 'POST', { id, subject: val }).catch(() => {});
   };
   input.addEventListener('blur', save);
   input.addEventListener('keydown', e => {
