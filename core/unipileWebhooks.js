@@ -102,7 +102,10 @@ function buildLinkedInIdentityClauses(payload) {
   const clauses = [];
   if (payload?.provider_id) clauses.push(`linkedin_provider_id.eq.${payload.provider_id}`);
   if (payload?.profile_url) clauses.push(`linkedin_url.eq.${payload.profile_url}`);
-  if (payload?.public_identifier) clauses.push(`linkedin_url.ilike.%${payload.public_identifier}%`);
+  if (payload?.public_identifier) {
+    clauses.push(`linkedin_url.ilike.%${payload.public_identifier}%`);
+    clauses.push(`linkedin_public_id.eq.${payload.public_identifier}`);
+  }
   return [...new Set(clauses)].filter(Boolean);
 }
 

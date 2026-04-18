@@ -916,7 +916,7 @@ function buildFallbackDailyReport(window, activityEntries, dealSnapshots, previo
     headline,
     executive_summary: executiveSummary,
     telegram_caption: `Daily log ready · ${activityEntries.length} activity events · ${dealSections.length} deal${dealSections.length === 1 ? '' : 's'} covered`,
-    voice_script: sanitizeNarrationText(`Hey Dom, here is what I got through today. ${executiveSummary} ${dealSections.map(section => `${section.deal_name}: ${section.summary} Next I will focus on ${section.next_move}.`).join(' ')}${thinPipeline ? ' We need to feed more firms into the top of funnel tomorrow.' : ''}`).slice(0, 1100),
+    voice_script: sanitizeNarrationText(`Hey Dom, here is what I got through today. ${executiveSummary} ${dealSections.map(section => `${section.deal_name}: ${section.summary} Next I will focus on ${section.next_move}.`).join(' ')}${thinPipeline ? ' We need to feed more firms into the top of funnel tomorrow.' : ''}`).slice(0, 1300),
     deal_sections: dealSections,
     raw_context: {
       action_counts: actionCounts,
@@ -960,7 +960,7 @@ function sanitizeDailyReport(aiReport = {}) {
     headline: sanitizeNarrationText(aiReport.headline || ''),
     executive_summary: sanitizeNarrationText(aiReport.executive_summary || ''),
     telegram_caption: sanitizeNarrationText(aiReport.telegram_caption || ''),
-    voice_script: sanitizeNarrationText(aiReport.voice_script || '').slice(0, 1150),
+    voice_script: sanitizeNarrationText(aiReport.voice_script || '').slice(0, 1300),
     deal_sections: dealSections.map(section => ({
       ...section,
       deal_id: section.deal_id || null,
@@ -1139,7 +1139,7 @@ Return ONLY valid JSON:
   "headline": "short title",
   "executive_summary": "2-4 sentences",
   "telegram_caption": "1 sentence",
-  "voice_script": "spoken script under 1200 characters",
+  "voice_script": "spoken script under 950 characters — must end on a complete sentence",
   "deal_sections": [
     {
       "deal_name": "Project name",
@@ -1155,7 +1155,7 @@ Return ONLY valid JSON:
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1600,
+    max_tokens: 2500,
     messages: [{ role: 'user', content: prompt }],
   });
   const parsed = extractJSONObject(response.content?.[0]?.text || '');
@@ -1418,7 +1418,7 @@ async function synthesizeElevenLabsVoice(voiceId, text) {
     },
     body: JSON.stringify({
       model_id: modelId,
-      text: normalizeWhitespace(text).slice(0, 1150),
+      text: normalizeWhitespace(text).slice(0, 1300),
       voice_settings: {
         stability: 0.45,
         similarity_boost: 0.8,

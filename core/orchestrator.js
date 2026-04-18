@@ -5700,6 +5700,12 @@ async function phaseLinkedInInvites(deal, state) {
             warn(`[${deal.name}] Provider-limit email fallback queue failed for ${contact.name}: ${err.message}`);
           });
         }
+        if (outcome.weeklyLimitHit) {
+          info(`[${deal.name}] LinkedIn weekly quota confirmed — stopping invite loop until ${outcome.retryAt}`);
+          break;
+        }
+        // Even on first/second retry, stop the loop — provider limit means LinkedIn is throttling this session
+        break;
       } else if (outcome.status === 'suppressed_no_match') {
         info(`[${deal.name}] ${contact.name} invite retry suppressed after recent LinkedIn mismatch until ${outcome.retryAt || 'later'}`);
       } else if (outcome.status === 'routed_to_email') {
@@ -5718,6 +5724,10 @@ async function phaseLinkedInInvites(deal, state) {
         }
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
+        // Defer this contact for 4 hours so it doesn't re-enter the queue every cycle
+        await sb.from('contacts').update({
+          follow_up_due_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+        }).eq('id', contact.id).catch(() => {});
       }
     } catch (e) {
       warn(`[${deal.name}] Unexpected LinkedIn invite processing error for ${contact.name}: ${e.message}`);
