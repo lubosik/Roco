@@ -4899,7 +4899,7 @@ function registerRoutes(app) {
         if (sb) {
           const [
             { data: doc },
-            { data: linkedLists },
+            linkedListsResult,
             { count: comparablesCount },
           ] = await Promise.all([
             sb.from('deal_documents')
@@ -4916,6 +4916,21 @@ function registerRoutes(app) {
               .select('id', { count: 'exact', head: true })
               .eq('deal_id', deal.id),
           ]);
+          let linkedLists = linkedListsResult?.data || [];
+          if (linkedListsResult?.error) {
+            const fallback = await sb.from('deal_list_priorities')
+              .select('list_id, list_name, priority_order, status')
+              .eq('deal_id', deal.id)
+              .order('priority_order', { ascending: true });
+            linkedLists = fallback?.data || [];
+            if (fallback?.error) {
+              const minimal = await sb.from('deal_list_priorities')
+                .select('list_id, list_name, priority_order')
+                .eq('deal_id', deal.id)
+                .order('priority_order', { ascending: true });
+              linkedLists = minimal?.data || [];
+            }
+          }
           parsed_deal_info = doc?.parsed_deal_info || null;
           const kbListId   = deal.knowledge_base_list_id   || deal.settings?.knowledge_base_list_id   || null;
           const kbListName = deal.knowledge_base_list_name || deal.settings?.knowledge_base_list_name || null;
@@ -4927,7 +4942,7 @@ function registerRoutes(app) {
             if (kbRec) kbList = { ...kbRec, investor_count: kbCount || 0 };
           }
           pitchbook = {
-            investor_universe_lists: (linkedLists || []).filter(list => list.source === 'pitchbook'),
+            investor_universe_lists: (linkedLists || []).filter(list => !list.source || list.source === 'pitchbook'),
             comparable_deals_count: comparablesCount || 0,
             priority_lists: linkedLists || [],
             kb_list: kbList || (kbListId ? { id: kbListId, name: kbListName, investor_count: 0 } : null),
