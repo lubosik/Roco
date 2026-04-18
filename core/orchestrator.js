@@ -1504,6 +1504,181 @@ async function addNewsLeadsToBatch(deal, leads) {
   return { added, skipped, batch };
 }
 
+async function loadDealInfoForInvestorMatching(deal) {
+  const sb = getSupabase();
+  if (!sb) {
+    return {
+      deal_name: deal.name,
+      deal_type: deal.raise_type || 'Buyout',
+      sector: deal.sector || 'General',
+      sub_sector: null,
+      geography: deal.geography || 'United States',
+      hq_location: deal.geography || '',
+      ebitda_usd_m: null,
+      revenue_usd_m: null,
+      enterprise_value_usd_m: null,
+      equity_required_usd_m: deal.min_cheque ? deal.min_cheque / 1_000_000 : null,
+      ideal_investor_types: ['PE/Buyout', 'Family Office'],
+      ideal_investor_profile: `Investor interested in ${deal.sector || 'general'} deals`,
+      disqualified_investor_types: [],
+    };
+  }
+
+  const { data: docs } = await sb.from('deal_documents')
+    .select('parsed_deal_info')
+    .eq('deal_id', deal.id)
+    .limit(1);
+
+  return docs?.[0]?.parsed_deal_info || {
+    deal_name: deal.name,
+    deal_type: deal.raise_type || 'Buyout',
+    sector: deal.sector || 'General',
+    sub_sector: null,
+    geography: deal.geography || 'United States',
+    hq_location: deal.geography || '',
+    ebitda_usd_m: null,
+    revenue_usd_m: null,
+    enterprise_value_usd_m: null,
+    equity_required_usd_m: deal.min_cheque ? deal.min_cheque / 1_000_000 : null,
+    ideal_investor_types: ['PE/Buyout', 'Family Office'],
+    ideal_investor_profile: `Investor interested in ${deal.sector || 'general'} deals`,
+    disqualified_investor_types: [],
+  };
+}
+
+async function getPriorityListShortlist(deal, { limit = 20, emitActivity = false } = {}) {
+  const sb = getSupabase();
+  if (!sb) return { shortlisted: [], activePriorityList: null };
+
+  const threshold = deal.min_investor_score || 60;
+  const dealInfo = await loadDealInfoForInvestorMatching(deal);
+
+  const { data: alreadyContacted } = await sb.from('contacts')
+    .select('investors_db_id, company_name')
+    .eq('deal_id', deal.id);
+  const contactedDbIds = new Set((alreadyContacted || []).map(c => c.investors_db_id).filter(Boolean));
+  const contactedFirms = new Set((alreadyContacted || []).map(c => normalizeFirmForDedup(c.company_name)).filter(Boolean));
+
+  const { data: priorityLists } = await sb.from('deal_list_priorities')
+    .select('*')
+    .eq('deal_id', deal.id)
+    .not('status', 'eq', 'exhausted')
+    .order('priority_order', { ascending: true });
+
+  let activePriorityList = null;
+  let shortlisted = [];
+
+  for (const pl of (priorityLists || [])) {
+    const LIST_PAGE = 1000;
+    let listFrom = 0;
+    const listInvestors = [];
+    while (true) {
+      const { data: page } = await sb.from('investors_db')
+        .select('*')
+        .eq('list_id', pl.list_id)
+        .range(listFrom, listFrom + LIST_PAGE - 1);
+      if (!page?.length) break;
+      listInvestors.push(...page);
+      if (page.length < LIST_PAGE) break;
+      listFrom += LIST_PAGE;
+    }
+
+    if (!listInvestors.length) {
+      await sb.from('deal_list_priorities')
+        .update({ status: 'exhausted', exhausted_at: new Date().toISOString() })
+        .eq('id', pl.id);
+      continue;
+    }
+
+    const fresh = listInvestors.filter(inv =>
+      !contactedDbIds.has(inv.id) &&
+      !contactedFirms.has(normalizeFirmForDedup(inv.name))
+    );
+
+    if (!fresh.length) {
+      await sb.from('deal_list_priorities')
+        .update({ status: 'exhausted', exhausted_at: new Date().toISOString() })
+        .eq('id', pl.id);
+      continue;
+    }
+
+    await sb.from('deal_list_priorities').update({ status: 'active' }).eq('id', pl.id);
+    activePriorityList = pl;
+
+    if (emitActivity) {
+      pushActivity({
+        type: 'research',
+        action: `Scoring ${fresh.length} candidates from list "${pl.list_name}"`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+    }
+
+    const scored = await batchScoreInvestors(fresh, dealInfo, deal);
+    const disqualified = (dealInfo.disqualified_investor_types || []).map(t => t.toLowerCase());
+    shortlisted = scored
+      .filter(s => {
+        if (s.score < threshold) return false;
+        if (disqualified.some(d => (s.investor_type || '').toLowerCase().includes(d))) return false;
+        return true;
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, Math.max(1, limit));
+    break;
+  }
+
+  return { shortlisted, activePriorityList };
+}
+
+async function addPriorityInvestorsToBatch(deal, investors, activePriorityList) {
+  const sb = getSupabase();
+  if (!sb || !deal?.id || !investors?.length) return { added: 0, skipped: 0, batch: null };
+
+  const batch = await ensureBatchExists(deal);
+  if (!batch) return { added: 0, skipped: investors.length, batch: null };
+
+  const existingNames = await getExcludedFirmNames(deal.id);
+  let added = 0;
+  let skipped = 0;
+
+  for (const investor of investors) {
+    const firmName = String(investor?.firm_name || investor?.name || '').trim();
+    const normalized = normalizeFirmName(firmName);
+    if (!normalized || existingNames.has(normalized)) {
+      skipped += 1;
+      continue;
+    }
+
+    const { error: insertError } = await sb.from('batch_firms').insert({
+      batch_id: batch.id,
+      deal_id: deal.id,
+      investor_id: investor.id || null,
+      firm_name: firmName,
+      score: Number(investor.score || investor.investor_score || 0),
+      justification: investor.score_reason || investor.justification || null,
+      thesis: investor.description || investor.thesis || null,
+      past_investments: Array.isArray(investor.past_investments) ? investor.past_investments : [],
+      aum: investor.aum_millions ? `$${investor.aum_millions}M` : (investor.aum || null),
+      source_list: activePriorityList?.list_name || investor.list_name || 'Priority List',
+      firm_researched: true,
+      enrichment_status: 'pending',
+      status: 'pending',
+      created_at: new Date().toISOString(),
+    });
+
+    if (insertError) {
+      skipped += 1;
+      continue;
+    }
+
+    existingNames.add(normalized);
+    added += 1;
+  }
+
+  await updateBatchResearchCount(batch.id);
+  return { added, skipped, batch };
+}
+
 async function triggerAutoFeedForDeal(deal, { reason = 'pipeline_depth', requestedCount = 24 } = {}) {
   const sb = getSupabase();
   if (!sb || !deal?.id) return { researched: 0, added: 0, skipped: 0 };
@@ -1817,6 +1992,34 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
   approvedBatchTopUpState.set(topUpKey, true);
+
+  pushActivity({
+    type: 'research',
+    action: `Pipeline low — checking attached priority lists for ${deal.name}`,
+    note: `${inviteReadyCount} invite-ready contacts · target gap ${pipelineGap}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  const priorityTopUp = await getPriorityListShortlist(deal, {
+    limit: Math.min(20, pipelineGap),
+    emitActivity: true,
+  }).catch(() => ({ shortlisted: [], activePriorityList: null }));
+
+  if (priorityTopUp.shortlisted?.length) {
+    const inserted = await addPriorityInvestorsToBatch(deal, priorityTopUp.shortlisted, priorityTopUp.activePriorityList)
+      .catch(() => ({ added: 0, skipped: priorityTopUp.shortlisted.length }));
+    if (inserted.added > 0) {
+      pushActivity({
+        type: 'research',
+        action: 'Priority-list top-up added fresh firms',
+        note: `${deal.name} · ${inserted.added} firm${inserted.added === 1 ? '' : 's'} from "${priorityTopUp.activePriorityList?.list_name || 'priority list'}"`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      return;
+    }
+  }
 
   const existingNames = await getExcludedFirmNames(deal.id);
   const grokLeads = await searchInvestorsWithGrok(deal, existingNames, pushActivity).catch(() => []);
