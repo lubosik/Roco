@@ -4399,7 +4399,7 @@ async function phaseDatabaseQuery(deal, batch) {
         // Score this list's candidates with Haiku 4.5 (gpt-5.4-mini fallback)
         info(`[${deal.name}] DB QUERY: scoring ${fresh.length} candidates from "${pl.list_name}"`);
         pushActivity({ type: 'research', action: `Scoring ${fresh.length} candidates from list "${pl.list_name}"`, deal_name: deal.name, dealId: deal.id });
-        const scored = await batchScoreInvestors(fresh, dealInfo);
+        const scored = await batchScoreInvestors(fresh, dealInfo, deal);
         const disqualified = (dealInfo.disqualified_investor_types || []).map(t => t.toLowerCase());
         shortlisted = scored
           .filter(s => {

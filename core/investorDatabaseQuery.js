@@ -22,6 +22,7 @@
 
 import { getSupabase } from './supabase.js';
 import { haikuComplete } from './aiClient.js';
+import { researchFirmOnly } from '../research/firmResearcher.js';
 
 // ─── deal type detection ───────────────────────────────────────────────────
 function getDealTypeFlags(dealInfo) {
@@ -358,6 +359,57 @@ function normToM(val) {
   return n > 10_000 ? n / 1_000_000 : n;
 }
 
+function isSparseInvestorForScoring(investor) {
+  const richText = [
+    investor?.description,
+    investor?.thesis,
+    investor?.research_notes,
+    investor?.other_preferences,
+  ].filter(Boolean).join(' ').trim();
+
+  const structuredSignals = [
+    investor?.investor_type,
+    investor?.preferred_industries,
+    investor?.preferred_verticals,
+    investor?.preferred_geographies,
+    investor?.preferred_investment_types,
+    investor?.preferred_deal_size_min,
+    investor?.preferred_deal_size_max,
+    investor?.preferred_investment_amount_min,
+    investor?.preferred_investment_amount_max,
+    investor?.aum_millions,
+    investor?.dry_powder_millions,
+    investor?.investments_last_12m,
+    investor?.last_investment_date,
+  ].filter(v => v != null && String(v).trim() !== '').length;
+
+  const hasHistory = Array.isArray(investor?.past_investments) && investor.past_investments.length > 0;
+  const alreadyResearched = !!(investor?.person_researched || investor?.last_researched_at);
+
+  if (alreadyResearched || hasHistory) return false;
+  return richText.length < 120 || structuredSignals < 4;
+}
+
+function mergeGapFillIntoInvestor(investor, gapFill) {
+  if (!gapFill) return investor;
+  return {
+    ...investor,
+    investor_type: investor.investor_type || gapFill.investor_type || gapFill.firm_type || null,
+    description: investor.description || gapFill.description || gapFill.thesis || null,
+    thesis: investor.thesis || gapFill.thesis || null,
+    research_notes: investor.research_notes || gapFill.justification || null,
+    preferred_industries: investor.preferred_industries || gapFill.sector_focus || null,
+    preferred_geographies: investor.preferred_geographies || gapFill.geography_focus || null,
+    aum_millions: investor.aum_millions || normToM(gapFill.aum) || null,
+    website: investor.website || gapFill.website || null,
+    hq_country: investor.hq_country || gapFill.country || null,
+    past_investments: (Array.isArray(investor.past_investments) && investor.past_investments.length)
+      ? investor.past_investments
+      : (gapFill.past_investments || []),
+    last_researched_at: investor.last_researched_at || new Date().toISOString(),
+  };
+}
+
 // ─── main export ──────────────────────────────────────────────────────────────
 export async function queryInvestorDatabase(dealInfo, deal) {
   console.log(`[DB QUERY] Full-universe scan for: ${dealInfo.deal_name || deal?.name}`);
@@ -471,7 +523,7 @@ export async function queryInvestorDatabase(dealInfo, deal) {
   }
 
   // ── Phase 4: AI batch refinement ─────────────────────────────────────────
-  const aiRefined = await batchScoreInvestors(forAI, dealInfo);
+  const aiRefined = await batchScoreInvestors(forAI, dealInfo, deal);
   const disqualified = (dealInfo.disqualified_investor_types || []).map(t => t.toLowerCase());
 
   const result = aiRefined
@@ -490,7 +542,7 @@ export async function queryInvestorDatabase(dealInfo, deal) {
 // Keep legacy export name for callers outside this module
 export { batchScoreInvestors as batchScoreWithKimi };
 
-export async function batchScoreInvestors(investors, dealInfo) {
+export async function batchScoreInvestors(investors, dealInfo, deal = null) {
   const results = [];
   const BATCH = 20;
   const { isISSponsor, isBuyout, isVC } = getDealTypeFlags(dealInfo);
@@ -521,7 +573,30 @@ Archive if: pure VC/angel/accelerator; deal size clearly out of range; status in
   }
 
   for (let i = 0; i < investors.length; i += BATCH) {
-    const batch = investors.slice(i, i + BATCH);
+    const rawBatch = investors.slice(i, i + BATCH);
+    const batch = [];
+
+    for (const investor of rawBatch) {
+      if (!isSparseInvestorForScoring(investor)) {
+        batch.push(investor);
+        continue;
+      }
+
+      try {
+        const gapFill = await researchFirmOnly(investor, {
+          ...dealInfo,
+          ...(deal || {}),
+          id: deal?.id || null,
+          name: deal?.name || dealInfo.deal_name || 'Deal',
+          sector: deal?.sector || dealInfo.sector || null,
+          geography: deal?.geography || dealInfo.geography || dealInfo.hq_location || null,
+        });
+        batch.push(mergeGapFillIntoInvestor(investor, gapFill));
+      } catch (err) {
+        console.warn(`[BATCH SCORE] Sparse-profile research failed for ${investor?.name || investor?.firm_name || 'investor'}:`, err.message);
+        batch.push(investor);
+      }
+    }
 
     const summaries = batch.map((inv, idx) => {
       const currentYear = new Date().getFullYear();
