@@ -6587,6 +6587,17 @@ function registerRoutes(app) {
         status: 'pending',
       }, { onConflict: 'deal_id,list_id' });
       if (error) return res.status(500).json({ error: error.message });
+      const { data: primaryList } = await sb.from('deal_list_priorities')
+        .select('list_id, list_name')
+        .eq('deal_id', req.params.id)
+        .order('priority_order', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      await sb.from('deals').update({
+        priority_list_id: primaryList?.list_id || null,
+        priority_list_name: primaryList?.list_name || null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.id);
       res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -6597,6 +6608,17 @@ function registerRoutes(app) {
       const sb = getSupabase();
       if (!sb) return res.status(503).json({ error: 'Database unavailable' });
       await sb.from('deal_list_priorities').delete().eq('deal_id', req.params.id).eq('list_id', req.params.listId);
+      const { data: primaryList } = await sb.from('deal_list_priorities')
+        .select('list_id, list_name')
+        .eq('deal_id', req.params.id)
+        .order('priority_order', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      await sb.from('deals').update({
+        priority_list_id: primaryList?.list_id || null,
+        priority_list_name: primaryList?.list_name || null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.id);
       res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -7545,6 +7567,15 @@ function registerRoutes(app) {
         listType,
         broadcastFn: (msg) => pushActivity({ type: 'research', action: msg, note: '' }),
       });
+      if (sbList && listId) {
+        const { count: listCount } = await sbList.from('investors_db')
+          .select('id', { count: 'exact', head: true })
+          .eq('list_id', listId);
+        await sbList.from('investor_lists').update({
+          investor_count: listCount || 0,
+          updated_at: new Date().toISOString(),
+        }).eq('id', listId);
+      }
       fs.unlinkSync(req.file.path);
       invalidateInvestorDbSummaryCache();
       res.json({ success: true, list_id: listId, list_name: listName, ...result });
