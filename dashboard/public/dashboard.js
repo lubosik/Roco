@@ -5693,7 +5693,15 @@ function renderQueueList(containerId, items, type) {
     return;
   }
   window._qItems = window._qItems || {};
-  items.forEach(item => { window._qItems[item.id || item._id] = item; });
+  window._qSubjects = window._qSubjects || {};
+  items.forEach(item => {
+    const id = item.id || item._id;
+    window._qItems[id] = item;
+    const subA = item.subjectA || item.subject || '';
+    const subB = item.subjectB || '';
+    const existing = window._qSubjects[id];
+    window._qSubjects[id] = { a: subA, b: subB, current: existing?.current || 'a' };
+  });
   el.innerHTML = items.map(item => renderQueueCard(item)).join('');
 }
 
@@ -5772,7 +5780,7 @@ function renderQueueCard(item) {
     <div class="queue-body">
       <div class="queue-subject-row">
         <div class="queue-subject" id="qsubject-${id}">${subA || '(no subject)'}</div>
-        <button class="subject-edit-btn" onclick="editSubjectInline('${id}')" title="Edit subject">&#9998;</button>
+        <button class="subject-edit-btn" onclick="openSubjectModal('${id}')" title="Edit subject">&#9998;</button>
       </div>
       <div class="queue-preview">${body}</div>
     </div>
@@ -5784,7 +5792,7 @@ function renderQueueCard(item) {
       ${item.linkedinUrl ? `<a href="${esc(item.linkedinUrl)}" target="_blank" class="btn btn-ghost btn-sm" onclick="event.stopPropagation()">LinkedIn ↗</a>` : ''}
     </div>
   </div>
-  <script>window._qSubjects = window._qSubjects || {}; window._qSubjects['${id}'] = {a:'${subA.replace(/'/g,"\\'")}',b:'${subB.replace(/'/g,"\\'")}',current:'a'};<\/script>`;
+`;
 }
 
 window.decidePriorChat = async function(approvalId, contactId, decision) {
@@ -5813,44 +5821,83 @@ function switchSubject(id, variant) {
   if (el) el.textContent = subjects[variant] || '(no subject)';
   document.getElementById(`stb-a-${id}`)?.classList.toggle('active', variant === 'a');
   document.getElementById(`stb-b-${id}`)?.classList.toggle('active', variant === 'b');
-  const item = window._qItems?.[id] || {};
-  if (item.waitingForWindow) {
-    api('/api/edit-approval', 'POST', { id, subject: subjects[variant] || '' }).catch(() => {});
-  }
+  api('/api/edit-approval', 'POST', { id, subject: subjects[variant] || '' }).catch(() => {});
 }
 
 function currentQueueVariant(id) {
   return window._qSubjects?.[id]?.current || 'a';
 }
 
-function editSubjectInline(id) {
+let _subjectEditId = null;
+
+function openSubjectModal(id) {
   const subjects = window._qSubjects?.[id];
   if (!subjects) return;
-  const variant = currentQueueVariant(id);
-  const original = subjects[variant] || '';
-  const el = document.getElementById(`qsubject-${id}`);
-  if (!el || el.querySelector('input')) return;
+  _subjectEditId = id;
+  const current = subjects.current || 'a';
+  const hasB = !!(subjects.b);
 
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.value = original;
-  input.className = 'subject-edit-input';
-  el.textContent = '';
-  el.appendChild(input);
-  input.focus();
-  input.select();
+  document.getElementById('subject-modal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'subject-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.82);z-index:2000;display:flex;align-items:center;justify-content:center;padding:24px';
+  modal.addEventListener('click', e => { if (e.target === modal) closeSubjectModal(); });
+  modal.innerHTML = `
+    <div class="modal" style="max-width:540px;width:100%">
+      <div class="modal-header">
+        <h3 class="modal-title">Edit Subject Line</h3>
+        <button class="modal-close" onclick="closeSubjectModal()">&#215;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:18px">
+        <div>
+          <label class="form-label" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;cursor:pointer">
+            <input type="radio" name="subj-pick" value="a" ${current === 'a' || !hasB ? 'checked' : ''} style="accent-color:var(--gold)">
+            <span>Subject A ${!hasB ? '' : '— select to send this one'}</span>
+          </label>
+          <input type="text" id="subj-val-a" class="form-input" value="${(subjects.a || '').replace(/"/g, '&quot;').replace(/</g, '&lt;')}" style="width:100%">
+        </div>
+        ${hasB ? `<div>
+          <label class="form-label" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;cursor:pointer">
+            <input type="radio" name="subj-pick" value="b" ${current === 'b' ? 'checked' : ''} style="accent-color:var(--gold)">
+            <span>Subject B — select to send this one</span>
+          </label>
+          <input type="text" id="subj-val-b" class="form-input" value="${(subjects.b || '').replace(/"/g, '&quot;').replace(/</g, '&lt;')}" style="width:100%">
+        </div>` : ''}
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeSubjectModal()">Cancel</button>
+        <button class="btn btn-gold" onclick="confirmSubjectEdit()">Confirm</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
 
-  const save = () => {
-    const val = input.value.trim() || original;
-    subjects[variant] = val;
-    el.textContent = val || '(no subject)';
-    api('/api/edit-approval', 'POST', { id, subject: val }).catch(() => {});
-  };
-  input.addEventListener('blur', save);
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-    if (e.key === 'Escape') { input.value = original; input.blur(); }
-  });
+function closeSubjectModal() {
+  document.getElementById('subject-modal')?.remove();
+  _subjectEditId = null;
+}
+
+function confirmSubjectEdit() {
+  const id = _subjectEditId;
+  if (!id) return;
+  const subjects = window._qSubjects?.[id];
+  if (!subjects) { closeSubjectModal(); return; }
+
+  const picked = document.querySelector('input[name="subj-pick"]:checked')?.value || 'a';
+  const newA = document.getElementById('subj-val-a')?.value?.trim();
+  const newB = document.getElementById('subj-val-b')?.value?.trim();
+
+  if (newA) subjects.a = newA;
+  if (newB) subjects.b = newB;
+  subjects.current = picked;
+
+  const displayEl = document.getElementById(`qsubject-${id}`);
+  if (displayEl) displayEl.textContent = subjects[picked] || '(no subject)';
+  document.getElementById(`stb-a-${id}`)?.classList.toggle('active', picked === 'a');
+  document.getElementById(`stb-b-${id}`)?.classList.toggle('active', picked === 'b');
+
+  api('/api/edit-approval', 'POST', { id, subject: subjects[picked] }).catch(() => {});
+  closeSubjectModal();
 }
 
 function previewQueueItem(id) {
