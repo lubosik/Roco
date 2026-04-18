@@ -1242,7 +1242,11 @@ export async function processLinkedInInvite({
     }
 
     if (isPendingInviteError(message)) {
-      // Stage is already invite_sent from the pre-call stamp — just log it
+      await sb.from('contacts').update({
+        pipeline_stage: 'invite_sent',
+        outreach_channel: 'linkedin_invite',
+        follow_up_due_at: followUpDueAt,
+      }).eq('id', contact.id);
       await recordInviteActivity({
         pushActivity,
         logActivity,
