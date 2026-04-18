@@ -6140,25 +6140,86 @@ function registerRoutes(app) {
       const sb = getSupabase();
       const { firm_name, investors_db_id } = req.body || {};
       if (!firm_name?.trim()) return res.status(400).json({ error: 'firm_name required' });
+      const dealId = req.params.id;
+      const normalizedFirm = normalizeFirmLookupName(firm_name);
 
-      const { data: batch } = await sb.from('campaign_batches')
-        .select('id, status')
+      let { data: batch } = await sb.from('campaign_batches')
+        .select('id, status, batch_number')
         .eq('id', req.params.batchId)
-        .eq('deal_id', req.params.id)
+        .eq('deal_id', dealId)
         .maybeSingle();
-      if (!batch || batch.status !== 'pending_approval') {
-        return res.status(400).json({ error: 'Batch is not pending approval' });
+
+      if (!batch || !['pending_approval', 'approved'].includes(batch.status)) {
+        const { data: fallbackBatch } = await sb.from('campaign_batches')
+          .select('id, status, batch_number')
+          .eq('deal_id', dealId)
+          .in('status', ['pending_approval', 'approved'])
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        batch = fallbackBatch || null;
+      }
+
+      if (!batch) {
+        const { data: maxBatch } = await sb.from('campaign_batches')
+          .select('batch_number')
+          .eq('deal_id', dealId)
+          .order('batch_number', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const { data: createdBatch, error: batchError } = await sb.from('campaign_batches')
+          .insert({
+            deal_id: dealId,
+            batch_number: (maxBatch?.batch_number || 0) + 1,
+            status: 'pending_approval',
+            target_firms: 1,
+            ranked_firms: 0,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .select('id, status, batch_number')
+          .single();
+        if (batchError) throw batchError;
+        batch = createdBatch;
+      }
+
+      const { data: existingBatchFirm } = await sb.from('batch_firms')
+        .select('id, firm_name')
+        .eq('deal_id', dealId)
+        .eq('batch_id', batch.id);
+      const firmAlreadyQueued = (existingBatchFirm || []).some(row =>
+        normalizeFirmLookupName(row.firm_name) === normalizedFirm
+      );
+      if (firmAlreadyQueued) {
+        return res.json({ success: true, batch_id: batch.id, duplicate: true, researched: !!investors_db_id });
+      }
+
+      const { data: existingContact } = await sb.from('contacts')
+        .select('id, pipeline_stage')
+        .eq('deal_id', dealId)
+        .ilike('company_name', firm_name.trim())
+        .limit(1)
+        .maybeSingle();
+      if (existingContact) {
+        return res.json({
+          success: true,
+          batch_id: batch.id,
+          duplicate: true,
+          existing_contact: true,
+          pipeline_stage: existingContact.pipeline_stage || null,
+          researched: !!investors_db_id,
+        });
       }
 
       const { data: investor } = investors_db_id
         ? await sb.from('investors_db').select('*').eq('id', investors_db_id).maybeSingle()
         : { data: null };
 
-      const score = Number(investor?.score || 50);
+      const score = Number(investor?.investor_score || investor?.score || 50);
       const contactType = investor?.is_angel ? 'angel' : (investor?.contact_type || 'individual_at_firm');
       const insertPayload = {
-        batch_id: req.params.batchId,
-        deal_id: req.params.id,
+        batch_id: batch.id,
+        deal_id: dealId,
         investor_id: investor?.id || null,
         firm_name: firm_name.trim(),
         contact_type: contactType,
@@ -6181,12 +6242,30 @@ function registerRoutes(app) {
 
       const { count } = await sb.from('batch_firms')
         .select('id', { count: 'exact', head: true })
-        .eq('batch_id', req.params.batchId);
+        .eq('batch_id', batch.id);
       await sb.from('campaign_batches')
         .update({ ranked_firms: count || 0, updated_at: new Date().toISOString() })
-        .eq('id', req.params.batchId);
+        .eq('id', batch.id);
 
-      res.json({ success: true, id: inserted?.id, researched: !!investor });
+      pushActivity({
+        type: 'system',
+        action: `Firm manually added: ${firm_name.trim()}`,
+        note: `Batch ${batch.batch_number || 'manual'} · ${batch.status}`,
+        dealId,
+      });
+
+      if (batch.status === 'approved') {
+        setImmediate(async () => {
+          try {
+            const { triggerImmediateRun } = await import('../core/orchestrator.js');
+            await triggerImmediateRun(dealId);
+          } catch (err) {
+            console.error('[MANUAL FIRM ADD] Immediate run failed:', err.message);
+          }
+        });
+      }
+
+      res.json({ success: true, id: inserted?.id, batch_id: batch.id, researched: !!investor });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
