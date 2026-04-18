@@ -5593,6 +5593,23 @@ async function phaseLinkedInInvites(deal, state) {
     return;
   }
 
+  // Reactivate any contacts deferred by weekly LinkedIn limit whose retry window has passed
+  try {
+    const { data: weeklyLimitExpired } = await sb.from('contacts')
+      .select('id, enrichment_status')
+      .eq('deal_id', deal.id)
+      .eq('pipeline_stage', 'linkedin_weekly_limit')
+      .lt('follow_up_due_at', new Date().toISOString())
+      .not('linkedin_url', 'is', null);
+    if (weeklyLimitExpired?.length) {
+      for (const c of weeklyLimitExpired) {
+        const stage = c.enrichment_status === 'enriched' || c.enrichment_status === 'enriched_apify' ? 'Enriched' : 'Ranked';
+        await sb.from('contacts').update({ pipeline_stage: stage, follow_up_due_at: null }).eq('id', c.id);
+      }
+      info(`[${deal.name}] Reactivated ${weeklyLimitExpired.length} contact(s) after LinkedIn weekly limit reset`);
+    }
+  } catch {}
+
   // Check how many invites already sent today
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
