@@ -744,6 +744,7 @@ export async function addApprovalToQueue(data) {
         body: data.body || null,
         score: data.score || null,
         research_summary: data.researchSummary || null,
+        outreach_mode: data.outreachMode || null,
         status: 'pending',
       }])
       .select()

@@ -32,7 +32,7 @@ import {
   getAllDeals, getActiveDeals, getDeal, createDeal, updateDeal,
   getTemplates, getTemplate, updateTemplate, seedDefaultTemplates,
   getActivityLog, logActivity as sbLogActivity,
-  getBatches, deleteApprovalFromQueue,
+  getBatches, deleteApprovalFromQueue, addApprovalToQueue,
 } from '../core/supabaseSync.js';
 import { getWindowStatus, getWindowVisualization, isWithinChannelWindow, getNextWindowOpenForChannel } from '../core/scheduleChecker.js';
 import { getBatchSummary } from '../core/batchManager.js';
@@ -1844,6 +1844,54 @@ function truncateInline(value, max = 140) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function normalizeReplyClassification(parsed = {}) {
+  const rawIntent = String(parsed?.intent || '').trim();
+  const rawSentiment = String(parsed?.sentiment || '').trim().toLowerCase();
+  const intentKey = rawIntent.toLowerCase().replace(/\s+/g, '_');
+  const intentMap = {
+    interested: 'interested',
+    wants_more_info: 'asking_question',
+    meeting_request: 'interested',
+    positive: 'interested',
+    not_interested: 'not_interested',
+    opt_out: 'not_interested',
+    asking_question: 'asking_question',
+    providing_info: 'providing_info',
+    considering: 'considering',
+    neutral: 'neutral',
+    conversation_end: 'conversation_end',
+  };
+  const sentimentMap = {
+    positive: 'positive',
+    negative: 'negative',
+    neutral: 'neutral',
+  };
+  return {
+    ...parsed,
+    intent: intentMap[intentKey] || intentKey || 'neutral',
+    sentiment: sentimentMap[rawSentiment] || 'neutral',
+  };
+}
+
+async function collapseDuplicateLinkedInDmQueueRows(sb, contactId, canonicalRowId) {
+  if (!sb || !contactId || !canonicalRowId) return;
+  try {
+    const { data: duplicates } = await sb.from('approval_queue')
+      .select('id')
+      .eq('contact_id', contactId)
+      .eq('stage', 'LinkedIn DM')
+      .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
+      .neq('id', canonicalRowId);
+    const duplicateIds = (duplicates || []).map(row => row.id).filter(Boolean);
+    if (!duplicateIds.length) return;
+    await sb.from('approval_queue').update({
+      status: 'skipped',
+      resolved_at: new Date().toISOString(),
+      edit_instructions: 'Auto-skipped duplicate LinkedIn DM approval',
+    }).in('id', duplicateIds);
+  } catch {}
+}
+
 export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
   const payload = await buildLinkedInDmDraftPayload(contactId, { body });
   if (!payload) return null;
@@ -1855,7 +1903,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   // Only block re-queuing on active (not yet terminal) statuses.
   // Terminal statuses (sent, skipped, failed, closed) allow re-queuing after a stage reset.
   const { data: existingRows } = await sb.from('approval_queue')
-    .select('id, status')
+    .select('id, status, created_at')
     .eq('contact_id', contact.id)
     .eq('stage', 'LinkedIn DM')
     .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
@@ -1866,22 +1914,22 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     return existingRows[0];
   }
 
-  const { data: row, error } = await sb.from('approval_queue').insert([{
-    contact_id:        contact.id,
-    contact_name:      contact.name || '',
-    contact_email:     contact.email || null,
-    firm:              contact.company_name || '',
-    deal_id:           contact.deal_id || null,
-    deal_name:         contact.deals?.name || null,
-    stage:             'LinkedIn DM',
-    body:              messageBody,
-    score:             contact.investor_score || null,
-    status:            'pending',
-    outreach_mode:     'investor_outreach',
-    research_summary:  researchSummary,
-    created_at:        new Date().toISOString(),
-  }]).select().single();
-  if (error) throw error;
+  const row = await addApprovalToQueue({
+    contactId: contact.id,
+    contactName: contact.name || '',
+    contactEmail: contact.email || null,
+    firm: contact.company_name || '',
+    dealId: contact.deal_id || null,
+    dealName: contact.deals?.name || null,
+    stage: 'LinkedIn DM',
+    body: messageBody,
+    score: contact.investor_score || null,
+    researchSummary,
+    outreachMode: 'investor_outreach',
+  });
+  if (!row?.id) throw new Error(`Failed to create LinkedIn approval queue row for ${contact.name || contact.id}`);
+
+  await collapseDuplicateLinkedInDmQueueRows(sb, contact.id, row.id);
 
   // Mark as pending_dm_approval so the orchestrator doesn't re-draft on the next cycle.
   // Stage advances to 'DM Approved' only after Dom presses approve in Telegram/dashboard.
@@ -2764,7 +2812,7 @@ export function initDashboard(state) {
       // Look up the contact in our pipeline — include paused deals so we still record the accepted connection.
       // We check paused state later and hold the DM until resume, but always update the stage.
       let contactQuery = sb.from('contacts')
-        .select('id, name, deal_id, pipeline_stage, response_received, deals!inner(id, name, status, paused)')
+        .select('id, name, company_name, deal_id, pipeline_stage, response_received, linkedin_provider_id, linkedin_url, updated_at, deals!inner(id, name, status, paused)')
         .eq('deals.status', 'ACTIVE');
 
       // Match by provider_id first (most reliable), then URL slug, then name as last resort.
@@ -2787,8 +2835,8 @@ export function initDashboard(state) {
         return;
       }
 
-      const { data: contacts } = await contactQuery.limit(1);
-      const contact = contacts?.[0];
+      const { data: contacts } = await contactQuery.limit(10);
+      const contact = pickBestInvestorContact(contacts || [], { requireActiveDeal: true });
 
       if (contact) {
         // ── Investor pipeline contact ──────────────────────────────────────────
@@ -9043,7 +9091,7 @@ Return ONLY valid JSON (no markdown):
   try {
     const text = await aiComplete(prompt, { maxTokens: 1000, task: `reply_classify:${contact.id}` });
     const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-    return parsed;
+    return normalizeReplyClassification(parsed);
   } catch (err) {
     console.error(`[REPLY] classifyAndDraftRocoReply failed for ${contact.name}:`, err.message);
     return null;
@@ -9102,13 +9150,15 @@ async function conductMidConversationResearch(content, contact, deal, campaign, 
 async function handleNegativeReplyResponse(contact, deal, campaign, mode, contextName) {
   const table = mode === 'investor_outreach' ? 'contacts' : 'company_contacts';
   const sb = getSupabase();
+  const now = new Date().toISOString();
   await sb?.from(table).update({
     pipeline_stage:   mode === 'investor_outreach' ? 'Inactive' : 'declined',
     conversation_state: mode === 'investor_outreach' ? 'conversation_ended_negative' : undefined,
-    conversation_ended_at: mode === 'investor_outreach' ? new Date().toISOString() : undefined,
+    conversation_ended_at: mode === 'investor_outreach' ? now : undefined,
     conversation_ended_reason: mode === 'investor_outreach' ? 'Not interested' : undefined,
     response_received: true,
     response_summary:  'Not interested',
+    ...(table === 'contacts' ? { last_intent: 'not_interested', last_intent_label: 'negative' } : {}),
     ...(table === 'contacts' ? { follow_up_due_at: null } : {}),
   }).eq('id', contact.id);
 
@@ -9128,7 +9178,7 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
       firm_id:    contact.firm_id,
       deal_id:    deal.id,
       reason:     'declined',
-      suppressed_at: new Date().toISOString(),
+      suppressed_at: now,
     }, { onConflict: 'firm_id,deal_id' }).catch(() => {});
   } else if (mode === 'investor_outreach' && isAngel) {
     // Angel — they represent only themselves, no firm suppression
@@ -9141,13 +9191,23 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
   }
 
   if (mode === 'investor_outreach' && deal?.id && contact.company_name) {
-    await sb?.from('contacts').update({
+    const peerUpdate = {
       pipeline_stage: 'Inactive',
       response_received: true,
       follow_up_due_at: null,
-    }).eq('deal_id', deal.id)
-      .eq('company_name', contact.company_name)
-      .neq('id', contact.id);
+      last_intent: 'not_interested',
+      last_intent_label: 'negative',
+      conversation_state: 'conversation_ended_negative',
+      conversation_ended_at: now,
+      conversation_ended_reason: `Firm suppressed after ${contact.name} passed`,
+    };
+    let peerQuery = sb?.from('contacts').update(peerUpdate).eq('deal_id', deal.id).neq('id', contact.id);
+    if (contact.firm_id) {
+      peerQuery = peerQuery.eq('firm_id', contact.firm_id);
+    } else {
+      peerQuery = peerQuery.eq('company_name', contact.company_name);
+    }
+    await peerQuery;
     await sb?.from('batch_firms').update({ status: 'suppressed' })
       .eq('deal_id', deal.id)
       .ilike('firm_name', contact.company_name);
@@ -9160,14 +9220,28 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
       : 'company suppressed';
   await sendTelegram(
     `⛔ *Not interested* — ${contact.name} (${contact.company_name || 'unknown'})\n` +
+    `Intent: not_interested\n` +
     `[${contextName}] — ${suppressionScope}.`
   ).catch(() => {});
+
+  pushActivity({
+    type: 'warning',
+    action: `Firm suppressed after pass: ${contact.company_name || contact.name || 'contact'}`,
+    note: `${contact.name || 'Contact'} classified as not interested · ${contextName}`,
+    dealId: deal?.id || null,
+    deal_name: deal?.name || null,
+  });
 
   await sb?.from('activity_log').insert({
     deal_id:    deal?.id || null,
     contact_id: contact.id,
     event_type: 'OUTREACH_SUPPRESSED',
     summary:    `[${contextName}]: ${contact.name} declined — suppressed from further outreach`,
+    detail:     {
+      classification: 'not_interested',
+      suppression_scope: suppressionScope,
+      company_name: contact.company_name || null,
+    },
   }).catch(() => {});
 }
 

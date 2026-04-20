@@ -349,40 +349,24 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
 
   return new Promise(async (resolve) => {
     try {
+      const sb = getSupabase();
       if (!queueId && contact?.id) {
-        const sb = getSupabase();
-        if (sb) {
-          try {
-            const { data: existingRow } = await sb.from('approval_queue')
-              .select('id')
-              .eq('contact_id', contact.id)
-              .eq('stage', stage)
-              .eq('status', 'pending')
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            queueId = existingRow?.id || null;
-
-            if (!queueId) {
-              const { data: inserted } = await sb.from('approval_queue').insert([{
-                contact_id: contact.id,
-                contact_name: name,
-                contact_email: contact.email || null,
-                firm,
-                deal_id: dealId || null,
-                stage,
-                body: body || '',
-                score,
-                status: 'pending',
-                outreach_mode: 'investor_outreach',
-                research_summary: researchSummary,
-                created_at: new Date().toISOString(),
-              }]).select('id').single();
-              queueId = inserted?.id || null;
-            }
-          } catch (err) {
-            warn('Could not create LinkedIn approval queue row', { err: err.message, contactId: contact.id });
-          }
+        try {
+          const queueRow = await addApprovalToQueue({
+            dealId: dealId || null,
+            contactId: contact.id,
+            contactName: name,
+            contactEmail: contact.email || null,
+            firm,
+            stage,
+            body: body || '',
+            score,
+            researchSummary,
+            outreachMode: 'investor_outreach',
+          });
+          queueId = queueRow?.id || null;
+        } catch (err) {
+          warn('Could not create LinkedIn approval queue row', { err: err.message, contactId: contact.id });
         }
       }
 

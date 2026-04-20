@@ -109,6 +109,26 @@ function buildLinkedInIdentityClauses(payload) {
   return [...new Set(clauses)].filter(Boolean);
 }
 
+function scoreRelationCandidate(contact, payload = {}) {
+  let score = 0;
+  const providerId = String(payload.provider_id || '').trim().toLowerCase();
+  const profileUrl = String(payload.profile_url || '').trim().toLowerCase();
+  const publicId = String(payload.public_identifier || '').trim().toLowerCase();
+  const name = normalizeComparableName(payload.name || '');
+  const contactProviderId = String(contact?.linkedin_provider_id || '').trim().toLowerCase();
+  const contactUrl = String(contact?.linkedin_url || '').trim().toLowerCase();
+  const contactName = normalizeComparableName(contact?.name || '');
+  const dealStatus = String(contact?.deals?.status || contact?.deal_status || '').toUpperCase();
+
+  if (providerId && contactProviderId === providerId) score += 1000;
+  if (profileUrl && contactUrl === profileUrl) score += 500;
+  if (publicId && (contactUrl.includes(publicId) || String(contact?.linkedin_public_id || '').trim().toLowerCase() === publicId)) score += 250;
+  if (name && contactName === name) score += 150;
+  if (dealStatus === 'ACTIVE') score += 100;
+  score += new Date(contact?.updated_at || 0).getTime() / 1e13;
+  return score;
+}
+
 async function findUniqueContactByName(sb, rawName) {
   const normalizedTarget = normalizeComparableName(rawName);
   if (!normalizedTarget) return null;
@@ -510,8 +530,8 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
           .or(orClauses.join(','))
           .limit(10);
         const candidates = data || [];
-        const activeCandidates = candidates.filter(row => String(row?.deals?.status || row?.deal_status || '').toUpperCase() === 'ACTIVE');
-        contact = activeCandidates[0] || candidates[0] || null;
+        contact = [...candidates]
+          .sort((a, b) => scoreRelationCandidate(b, payload) - scoreRelationCandidate(a, payload))[0] || null;
       } catch {}
     }
   }

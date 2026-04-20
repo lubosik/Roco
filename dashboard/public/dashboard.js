@@ -184,12 +184,18 @@ async function api(path, method = 'GET', body = null, options = {}) {
       const text = await res.text();
       throw new Error(`HTTP ${res.status}: ${text}`);
     }
+    hideApiAlert();
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('application/json')) return res.json();
     return res.text();
   } catch (err) {
     console.error(`[ROCO] API error ${method} ${path}:`, err);
-    if (!options.silent) showApiAlert(err.message);
+    if (!options.silent) {
+      const message = String(err?.message || '').trim() === 'Failed to fetch'
+        ? 'Dashboard connection dropped briefly. Retrying…'
+        : err.message;
+      showApiAlert(message);
+    }
     throw err;
   }
 }
@@ -199,6 +205,11 @@ function showApiAlert(msg) {
   const msgEl = document.getElementById('api-alert-msg');
   if (msgEl) msgEl.textContent = `⚠ ${msg}`;
   el.classList.remove('hidden');
+}
+
+function hideApiAlert() {
+  const el = document.getElementById('api-alert');
+  if (el) el.classList.add('hidden');
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
