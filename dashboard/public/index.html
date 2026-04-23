@@ -1854,6 +1854,29 @@
   display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:999;
 "></div>
 
+<!-- ── JARVIS ORB ────────────────────────────────────────────────────────── -->
+<div id="jarvis-orb" title="Talk to JARVIS" onclick="jarvisOrb.toggle()">
+  <div class="orb-ring"></div>
+  <div class="orb-core">J</div>
+</div>
+
+<div id="jarvis-panel" class="jarvis-panel">
+  <div class="jarvis-panel-header">
+    <div class="jarvis-title">
+      <span class="jarvis-dot" id="jarvis-status-dot"></span>
+      JARVIS
+    </div>
+    <button class="jarvis-close" onclick="jarvisOrb.close()">&#215;</button>
+  </div>
+  <div class="jarvis-messages" id="jarvis-messages"></div>
+  <div class="jarvis-input-row">
+    <button class="jarvis-mic" id="jarvis-mic" title="Voice input" onclick="jarvisOrb.toggleMic()">&#127908;</button>
+    <input type="text" id="jarvis-input" class="jarvis-input" placeholder="Ask JARVIS anything…"
+      onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); jarvisOrb.send(); }" />
+    <button class="jarvis-send" onclick="jarvisOrb.send()">&#10148;</button>
+  </div>
+</div>
+
 <script src="dashboard.js"></script>
 </body>
 </html>

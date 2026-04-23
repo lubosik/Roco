@@ -2,22 +2,16 @@
 // Weekly analytics computation + recommendation generation.
 // Accepted recommendations update roco_learned_settings to influence agent behaviour.
 
-import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { DateTime } from 'luxon';
 import { getSupabase } from './supabase.js';
 import { gatherCurrentMetrics } from './fundraiserBrain.js';
+import { orComplete } from './openRouterClient.js';
 
 const ANALYTICS_TIMEZONE = 'America/New_York';
 const ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io/v1';
-
-function getAnthropicClient() {
-  return process.env.ANTHROPIC_API_KEY
-    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-    : null;
-}
 
 function getElevenLabsConfig() {
   return {
@@ -369,8 +363,7 @@ function toPersistedAnalyticsRow(snapshot) {
 }
 
 async function requestAiRecommendations(analyticsData) {
-  const anthropic = getAnthropicClient();
-  if (!anthropic) return null;
+  if (!process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY) return null;
 
   const dataStr = JSON.stringify(analyticsData, null, 2);
   const templateData = JSON.stringify(analyticsData.map(row => ({
@@ -412,13 +405,8 @@ Return ONLY valid JSON array:
 ]
 Use null for suggested_setting_change if no direct setting maps to this recommendation.`;
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 2000,
-    messages: [{ role: 'user', content: prompt }],
-  });
-
-  return parseClaudeJson(response.content?.[0]?.text || '');
+  const text = await orComplete(prompt, { tier: 'classify', maxTokens: 2000 });
+  return parseClaudeJson(text || '');
 }
 
 async function persistRecommendations(supabase, recommendations, weekStarting, dealsAnalysed) {
@@ -1089,8 +1077,6 @@ function buildPreviousReportContext(previousReport) {
 }
 
 async function buildAiDailyReport(window, activityEntries, dealSnapshots, previousReport = null) {
-  const anthropic = getAnthropicClient();
-  if (!anthropic) throw new Error('Anthropic unavailable');
   const globalMetrics = buildDailyGlobalMetrics(dealSnapshots, activityEntries);
   const previousContext = buildPreviousReportContext(previousReport);
   const prompt = `You are writing ROCO's end-of-day operating log for Dom.
@@ -1153,12 +1139,8 @@ Return ONLY valid JSON:
   ]
 }`;
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 2500,
-    messages: [{ role: 'user', content: prompt }],
-  });
-  const parsed = extractJSONObject(response.content?.[0]?.text || '');
+  const text = await orComplete(prompt, { tier: 'classify', maxTokens: 2500 });
+  const parsed = extractJSONObject(text || '');
   if (!parsed) throw new Error('Daily activity report JSON parse failed');
   return sanitizeDailyReport(parsed);
 }

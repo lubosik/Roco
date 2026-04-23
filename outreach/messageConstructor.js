@@ -5,16 +5,11 @@
  * Never references a wrong deal. Never sends null names.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 import { getSupabase } from '../core/supabase.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import { getOutreachContext } from '../core/agentContext.js';
 import { retrieveLinkedInProfile } from '../integrations/unipileClient.js';
-
-let _anthropic, _openai;
-function getAnthropic() { if (!_anthropic) _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }); return _anthropic; }
-function getOpenAI() { if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); return _openai; }
+import { orComplete } from '../core/openRouterClient.js';
 
 const SYSTEM_PROMPT = `You are Dom's personal writing assistant. Dom is a senior fundraising professional. You write outreach messages on his behalf to potential investors.
 
@@ -194,40 +189,13 @@ PERSONALISATION RULES (follow strictly):
 IF you cannot construct a proper message, return: { "error": "insufficient_data", "reason": "brief explanation" }
 ${editNote}`;
 
-  // Try Claude first
   let parsed = null;
   try {
-    const response = await Promise.race([
-      getAnthropic().messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Claude timeout')), 15000)),
-    ]);
-    const text = response.content[0].text;
+    const text = await orComplete(userPrompt, { tier: 'draft', maxTokens: 1024, systemPrompt: SYSTEM_PROMPT });
     parsed = extractJSON(text);
   } catch (err) {
-    console.warn(`[MSG] Claude failed for ${contact.name} — trying GPT:`, err.message);
-  }
-
-  // GPT fallback
-  if (!parsed) {
-    try {
-      const response = await getOpenAI().chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-        max_tokens: 1024,
-      });
-      parsed = extractJSON(response.choices[0].message.content);
-    } catch (err) {
-      console.error(`[MSG] Both AI models failed for ${contact.name}:`, err.message);
-      return null;
-    }
+    console.error(`[MSG] Draft failed for ${contact.name}:`, err.message);
+    return null;
   }
 
   if (!parsed) {

@@ -5,14 +5,13 @@
  * guidance, deal assets, investor research, and prior conversation context.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 import { getDeal } from '../core/dealContext.js';
 import { getSupabase } from '../core/supabase.js';
 import { getContactProp } from '../crm/notionContacts.js';
 import { info, warn } from '../core/logger.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
 import { retrieveLinkedInProfile } from '../integrations/unipileClient.js';
+import { orComplete } from '../core/openRouterClient.js';
 
 const LINKEDIN_SYSTEM_PROMPT = `You are Dom's writing assistant for LinkedIn messages. Dom raises capital for private deals. You produce the FINAL, send-ready LinkedIn message exactly as Dom would send it.
 
@@ -38,19 +37,6 @@ const TEMPLATE_NAME_PATTERNS = {
   intro: ['linkedin intro', 'intro dm', 'intro'],
   followup: ['linkedin follow', 'follow up dm', 'follow-up dm', 'follow up', 'follow-up'],
 };
-
-let anthropicClient;
-let openaiClient;
-
-function getAnthropic() {
-  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  return anthropicClient;
-}
-
-function getOpenAI() {
-  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return openaiClient;
-}
 
 function clip(value, max = 400) {
   const text = String(value || '').trim();
@@ -270,42 +256,15 @@ INSTRUCTIONS:
 Return only the message text.`;
 
   try {
-    const response = await Promise.race([
-      getAnthropic().messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 512,
-        system: LINKEDIN_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000)),
-    ]);
-    const text = response.content?.[0]?.text?.trim() || '';
-    if (text && text.length <= maxChars + 20) {
-      info(`LinkedIn DM drafted via Claude for ${firstName}`);
-      return { body: text.slice(0, maxChars), type, templateName: template?.name || null };
+    const text = await orComplete(userPrompt, { tier: 'draft', maxTokens: 512, systemPrompt: LINKEDIN_SYSTEM_PROMPT });
+    const trimmed = text.trim();
+    if (trimmed) {
+      info(`LinkedIn DM drafted for ${firstName}`);
+      return { body: trimmed.slice(0, maxChars), type, templateName: template?.name || null };
     }
-    throw new Error('Response too long or empty');
+    throw new Error('Empty model response');
   } catch (err) {
-    warn(`Claude failed for LinkedIn DM (${firstName}) — trying GPT`);
-  }
-
-  try {
-    const response = await getOpenAI().chat.completions.create({
-      model: 'gpt-5.2',
-      messages: [
-        { role: 'system', content: LINKEDIN_SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-      max_completion_tokens: 256,
-    });
-    const text = response.choices?.[0]?.message?.content?.trim() || '';
-    if (text) {
-      info(`LinkedIn DM drafted via GPT for ${firstName}`);
-      return { body: text.slice(0, maxChars), type, templateName: template?.name || null };
-    }
-    throw new Error('Empty GPT response');
-  } catch (err) {
-    warn(`GPT also failed for LinkedIn DM (${firstName}) — using filled template`);
+    warn(`LinkedIn DM draft failed for ${firstName}: ${err.message} — using filled template`);
   }
 
   if (templateBody) {

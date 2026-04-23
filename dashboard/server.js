@@ -8265,6 +8265,24 @@ function registerRoutes(app) {
     }
   });
 
+  // ─── JARVIS ORB ──────────────────────────────────────────────────────────────
+
+  app.post('/api/jarvis', requireAuth, async (req, res) => {
+    try {
+      const { message, chatId, dealId } = req.body || {};
+      if (!message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ error: 'message required' });
+      }
+      const { handleMessage } = await import('../core/jarvis.js');
+      const effectiveChatId = chatId || 'dashboard-orb';
+      const reply = await handleMessage(effectiveChatId, message.trim(), dealId || null);
+      res.json({ reply: reply || '' });
+    } catch (err) {
+      console.error('[JARVIS ORB]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 404 handler — JSON for API/webhook paths, index.html for everything else
   app.use((req, res) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/webhook')) {

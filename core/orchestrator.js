@@ -20,7 +20,6 @@ import {
 import { isWithinSendingWindow, isGloballyPaused, getNextWindowOpen, isWithinChannelWindow } from './scheduleChecker.js';
 import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } from './sendingWindow.js';
 import { rankInvestor } from '../research/investorRanker.js';
-import { enrichWithKaspr } from '../enrichment/kaspEnricher.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
 import { findLinkedInUrl } from '../enrichment/linkedinFinder.js';
 import {
@@ -5155,50 +5154,31 @@ async function enrichSingleContact(sb, contact, deal, state) {
         return;
       }
 
-      pushActivity({ type: 'enrichment', action: `Enriching: ${contact.name}`, note: `${contact.company_name || ''} — trying KASPR...`, deal_name: deal.name, dealId: deal.id });
+      pushActivity({ type: 'enrichment', action: `Enriching: ${contact.name}`, note: `${contact.company_name || ''} — trying Apify...`, deal_name: deal.name, dealId: deal.id });
 
-      // Step 2: enrich email/phone via KASPR first
-      const kasprResult = await enrichWithKaspr({ linkedinUrl, fullName: contact.name });
+      let enrichResult = null;
+      let enrichSource = 'apify';
 
-      if (kasprResult === 'RATE_LIMITED') {
-        warn('[ENRICH] KASPR rate limited — skipping enrichment for this contact');
-        return;
-      }
-
-      let enrichResult = kasprResult;
-      let enrichSource = 'kaspr';
-
-      if (!kasprResult?.email && !kasprResult?.phone) {
-        // KASPR returned nothing — try Apify
-        logStep(`KASPR no data for ${contact.name} — trying Apify...`, deal.name, 'enrichment', deal);
-        pushActivity({ type: 'enrichment', action: `KASPR returned no data`, note: `${contact.name} — trying Apify...`, deal_name: deal.name, dealId: deal.id });
-
-        try {
-          const apifyResult = await enrichWithApify({ linkedin_url: linkedinUrl, name: contact.name });
-          if (apifyResult?.email || apifyResult?.phone) {
-            enrichResult = apifyResult;
-            enrichSource = 'apify';
-            logStep(`Apify found email for ${contact.name}`, deal.name, 'enrichment', deal);
-            pushActivity({ type: 'enrichment', action: `Apify found email`, note: `${contact.name} — ${apifyResult?.email || ''}`, deal_name: deal.name, dealId: deal.id });
-          } else {
-            // No email/phone — save any profile fields Apify returned and advance to Enriched (linkedin_only)
-            const profileUpdates = { enrichment_status: 'linkedin_only', enrichment_source: null, pipeline_stage: 'Enriched' };
-            if (apifyResult?.headline && !contact.job_title)     profileUpdates.job_title = apifyResult.headline;
-            if (apifyResult?.company_name && !contact.company_name) profileUpdates.company_name = apifyResult.company_name;
-            if (apifyResult?.linkedin_provider_id && !contact.linkedin_provider_id) profileUpdates.linkedin_provider_id = apifyResult.linkedin_provider_id;
-            await sb.from('contacts').update(profileUpdates).eq('id', contact.id);
-            logStep(`No email found for ${contact.name} — LinkedIn-only outreach`, deal.name, 'enrichment', deal);
-            pushActivity({ type: 'enrichment', action: `No email found`, note: `${contact.name} at ${contact.company_name || ''} — queued for LinkedIn-only outreach`, deal_name: deal.name, dealId: deal.id });
-            return;
-          }
-        } catch (apifyErr) {
-          warn(`[ENRICH] Apify error for ${contact.name}: ${apifyErr.message}`);
-          await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
+      try {
+        const apifyResult = await enrichWithApify({ linkedin_url: linkedinUrl, name: contact.name });
+        if (apifyResult?.email || apifyResult?.phone) {
+          enrichResult = apifyResult;
+          logStep(`Apify found email for ${contact.name}`, deal.name, 'enrichment', deal);
+          pushActivity({ type: 'enrichment', action: `Apify found email`, note: `${contact.name} — ${apifyResult?.email || ''}`, deal_name: deal.name, dealId: deal.id });
+        } else {
+          const profileUpdates = { enrichment_status: 'linkedin_only', enrichment_source: null, pipeline_stage: 'Enriched' };
+          if (apifyResult?.headline && !contact.job_title)     profileUpdates.job_title = apifyResult.headline;
+          if (apifyResult?.company_name && !contact.company_name) profileUpdates.company_name = apifyResult.company_name;
+          if (apifyResult?.linkedin_provider_id && !contact.linkedin_provider_id) profileUpdates.linkedin_provider_id = apifyResult.linkedin_provider_id;
+          await sb.from('contacts').update(profileUpdates).eq('id', contact.id);
+          logStep(`No email found for ${contact.name} — LinkedIn-only outreach`, deal.name, 'enrichment', deal);
+          pushActivity({ type: 'enrichment', action: `No email found`, note: `${contact.name} at ${contact.company_name || ''} — queued for LinkedIn-only outreach`, deal_name: deal.name, dealId: deal.id });
           return;
         }
-      } else {
-        logStep(`KASPR found data for ${contact.name}`, deal.name, 'enrichment', deal);
-        pushActivity({ type: 'enrichment', action: `KASPR found email`, note: `${contact.name} — ${kasprResult?.email || ''}`, deal_name: deal.name, dealId: deal.id });
+      } catch (apifyErr) {
+        warn(`[ENRICH] Apify error for ${contact.name}: ${apifyErr.message}`);
+        await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
+        return;
       }
 
       // Step: MillionVerifier — validate email before saving
@@ -5446,7 +5426,7 @@ export async function runManualEnrich(deal, state) {
   pushActivity({
     type: 'enrichment',
     action: 'Manual Enrichment Running',
-    note: `${candidates.length} Ranked contact(s) queued for KASPR → Apify — ${deal.name}`,
+    note: `${candidates.length} Ranked contact(s) queued for Apify enrichment — ${deal.name}`,
     deal_name: deal.name,
   });
   console.log(`[MANUAL ENRICH] Processing ${candidates.length} Ranked contacts for ${deal.name}`);
@@ -5480,45 +5460,29 @@ export async function runManualEnrich(deal, state) {
         continue;
       }
 
-      pushActivity({ type: 'enrichment', action: `Enriching: ${contact.name}`, note: `${contact.company_name || ''} — trying KASPR...`, deal_name: deal.name });
+      pushActivity({ type: 'enrichment', action: `Enriching: ${contact.name}`, note: `${contact.company_name || ''} — trying Apify...`, deal_name: deal.name });
 
-      // Step 2: KASPR first
-      const kasprResult = await enrichWithKaspr({ linkedinUrl, fullName: contact.name });
+      let enrichResult = null;
+      let enrichSource = 'apify';
 
-      if (kasprResult === 'RATE_LIMITED') {
-        warn('[MANUAL ENRICH] KASPR rate limited — stopping this batch');
-        pushActivity({ type: 'enrichment', action: 'KASPR Rate Limited', note: 'Manual enrichment paused — retry later', deal_name: deal.name });
-        break;
-      }
-
-      let enrichResult = kasprResult;
-      let enrichSource = 'kaspr';
-
-      if (!kasprResult?.email && !kasprResult?.phone) {
-        // Step 3: Apify fallback
-        pushActivity({ type: 'enrichment', action: `KASPR: no data`, note: `${contact.name} — trying Apify...`, deal_name: deal.name });
-        try {
-          const apifyResult = await enrichWithApify({ linkedin_url: linkedinUrl, name: contact.name });
-          if (apifyResult?.email || apifyResult?.phone) {
-            enrichResult = apifyResult;
-            enrichSource = 'apify';
-            pushActivity({ type: 'enrichment', action: `Apify: email found`, note: `${contact.name}`, deal_name: deal.name });
-          } else {
-            const profileUpdates = { enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' };
-            if (apifyResult?.headline && !contact.job_title)             profileUpdates.job_title = apifyResult.headline;
-            if (apifyResult?.company_name && !contact.company_name)      profileUpdates.company_name = apifyResult.company_name;
-            if (apifyResult?.linkedin_provider_id && !contact.linkedin_provider_id) profileUpdates.linkedin_provider_id = apifyResult.linkedin_provider_id;
-            await sb.from('contacts').update(profileUpdates).eq('id', contact.id);
-            pushActivity({ type: 'enrichment', action: `No email found`, note: `${contact.name} — LinkedIn-only outreach`, deal_name: deal.name });
-            continue;
-          }
-        } catch (apifyErr) {
-          warn(`[MANUAL ENRICH] Apify error for ${contact.name}: ${apifyErr.message}`);
-          await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
+      try {
+        const apifyResult = await enrichWithApify({ linkedin_url: linkedinUrl, name: contact.name });
+        if (apifyResult?.email || apifyResult?.phone) {
+          enrichResult = apifyResult;
+          pushActivity({ type: 'enrichment', action: `Apify: email found`, note: `${contact.name}`, deal_name: deal.name });
+        } else {
+          const profileUpdates = { enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' };
+          if (apifyResult?.headline && !contact.job_title)             profileUpdates.job_title = apifyResult.headline;
+          if (apifyResult?.company_name && !contact.company_name)      profileUpdates.company_name = apifyResult.company_name;
+          if (apifyResult?.linkedin_provider_id && !contact.linkedin_provider_id) profileUpdates.linkedin_provider_id = apifyResult.linkedin_provider_id;
+          await sb.from('contacts').update(profileUpdates).eq('id', contact.id);
+          pushActivity({ type: 'enrichment', action: `No email found`, note: `${contact.name} — LinkedIn-only outreach`, deal_name: deal.name });
           continue;
         }
-      } else {
-        pushActivity({ type: 'enrichment', action: `KASPR: email found`, note: `${contact.name}`, deal_name: deal.name });
+      } catch (apifyErr) {
+        warn(`[MANUAL ENRICH] Apify error for ${contact.name}: ${apifyErr.message}`);
+        await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
+        continue;
       }
 
       const updates = { enrichment_status: enrichResult?.email ? (enrichSource === 'apify' ? 'enriched_apify' : 'enriched') : 'linkedin_only', enrichment_source: enrichSource };

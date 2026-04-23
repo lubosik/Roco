@@ -1,13 +1,10 @@
 /**
  * sourcing/companyEnricher.js
- * Enriches company_contacts with email/phone data.
- * Chain: KASPR → Apify → LinkedIn-only fallback
- * Mirrors the investor enrichment chain exactly.
+ * Enriches company_contacts with email/phone data via Apify.
  */
 
 import { getSupabase } from '../core/supabase.js';
 import { pushActivity } from '../dashboard/server.js';
-import { enrichWithKaspr } from '../enrichment/kaspEnricher.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
 
 const MV_API_KEY = () => process.env.MILLIONVERIFIER_API_KEY;
@@ -69,54 +66,7 @@ export async function enrichCompanyContact(contact, campaign) {
   pushActivity({ type: 'enrichment', action: 'Enriching', note: `[${campaign.name}]: ${contact.name}` });
   console.log(`[SOURCING ENRICH] Enriching: ${contact.name}`);
 
-  // ── KASPR ──────────────────────────────────────────────────────
-  if (contact.linkedin_url) {
-    try {
-      const kaspResult = await enrichWithKaspr({ linkedinUrl: contact.linkedin_url, fullName: contact.name });
-
-      if (kaspResult && kaspResult !== 'RATE_LIMITED') {
-        let email = kaspResult.email || null;
-        let validEmail = email;
-
-        if (email) {
-          const { valid, suggestion } = await verifyEmail(email);
-          if (!valid && suggestion) {
-            validEmail = suggestion;
-          } else if (!valid) {
-            validEmail = null;
-          }
-        }
-
-        if (validEmail) {
-          await sb.from('company_contacts').update({
-            email: validEmail,
-            phone: kaspResult.phone || null,
-            enrichment_status: 'enriched',
-            enrichment_source: 'kaspr',
-            pipeline_stage: 'enriched',
-            updated_at: new Date().toISOString(),
-          }).eq('id', contact.id).then(null, () => {});
-
-          pushActivity({ type: 'enrichment', action: 'Enriched via KASPR', note: `[${campaign.name}]: ${contact.name} — email found` });
-          return;
-        }
-
-        if (email && !validEmail) {
-          // Email found but failed validation — try Apify
-          console.log(`[SOURCING ENRICH] KASPR email invalid for ${contact.name} — trying Apify`);
-        }
-      }
-
-      if (kaspResult === 'RATE_LIMITED') {
-        console.log(`[SOURCING ENRICH] KASPR rate limited — pausing enrichment`);
-        return;
-      }
-    } catch (err) {
-      console.warn(`[SOURCING ENRICH] KASPR error for ${contact.name}:`, err.message);
-    }
-  }
-
-  // ── APIFY FALLBACK ─────────────────────────────────────────────
+  // ── APIFY ──────────────────────────────────────────────────────
   if (contact.linkedin_url) {
     try {
       const apifyResult = await enrichWithApify({ linkedinUrl: contact.linkedin_url, fullName: contact.name });

@@ -1,66 +1,14 @@
 /**
  * research/investorRanker.js
- * Scores an investor/LP's fit for a deal using GPT-5.4 (medium reasoning) + Claude fallback.
- * Handles both PitchBook LP CSV imports and Gemini/LinkedIn-sourced contacts.
+ * Scores an investor/LP's fit for a deal using Gemini Flash via OpenRouter.
  * Returns: { score: 0-100, grade: 'Hot'|'Warm'|'Possible'|'Archive', rationale }
  */
 
 import { getScoringContext } from '../core/agentContext.js';
-import { pushActivity } from '../dashboard/server.js';
+import { orComplete } from '../core/openRouterClient.js';
 
-// Haiku 4.5 primary → gpt-5.4-mini-2026-03-17 fallback
 async function haikuscore(prompt) {
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (anthropicKey) {
-    try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 250,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`Haiku ${res.status}: ${t.substring(0, 200)}`);
-      }
-      const data = await res.json();
-      const text = data.content?.[0]?.text || '';
-      if (text) return text;
-      throw new Error('Haiku returned empty response');
-    } catch (err) {
-      console.warn(`[RANKER] Haiku failed: ${err.message} — falling back to gpt-5.4-mini`);
-      pushActivity({ type: 'error', action: 'Ranker Fallback', note: `Haiku 4.5 failed — ${err.message}` });
-    }
-  }
-
-  // Fallback: gpt-5.4-mini-2026-03-17
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) throw new Error('No AI keys available for ranking');
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-5.4-mini-2026-03-17',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 250,
-      temperature: 0.1,
-    }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    const errMsg = `gpt-5.4-mini ${res.status}: ${t.substring(0, 200)}`;
-    pushActivity({ type: 'error', action: 'Ranker Fallback Failed', note: errMsg });
-    throw new Error(errMsg);
-  }
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || '';
+  return orComplete(prompt, { tier: 'classify', maxTokens: 250 });
 }
 
 function buildScoringCriteria(deal) {

@@ -70,103 +70,22 @@ export async function researchCompaniesForCampaign(campaign) {
 }
 
 // ─────────────────────────────────────────────────────────
-// STREAM 1: GROK / GEMINI COMPANY RESEARCH
+// STREAM 1: PERPLEXITY COMPANY RESEARCH
 // ─────────────────────────────────────────────────────────
 
 async function runGrokCompanyResearch(campaign) {
-  const key = process.env.GROK_API_KEY;
-  if (!key) {
-    console.warn('[SOURCING RESEARCH] GROK_API_KEY not set — trying Gemini');
-    return runGeminiCompanyResearch(campaign);
-  }
-
-  console.log('[SOURCING RESEARCH] Using Grok with web_search...');
+  const { orComplete } = await import('../core/openRouterClient.js');
+  console.log('[SOURCING RESEARCH] Using Perplexity with web search...');
   const prompt = buildCompanyResearchPrompt(campaign);
-
   try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({
-        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-        input: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text().catch(() => '');
-      console.warn(`[SOURCING RESEARCH] Grok failed (${res.status}): ${err.substring(0, 150)} — falling back to Gemini`);
-      return runGeminiCompanyResearch(campaign);
-    }
-
-    const data = await res.json();
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-    const companies = parseCompanyResults(text, process.env.RESEARCH_GROK_MODEL || 'grok-3-fast');
-
-    if (companies.length > 0) {
-      console.log(`[SOURCING RESEARCH] Grok returned ${companies.length} companies`);
-      return companies;
-    }
-
-    console.warn('[SOURCING RESEARCH] Grok returned 0 companies — falling back to Gemini');
-    return runGeminiCompanyResearch(campaign);
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 4096 });
+    const companies = parseCompanyResults(text, 'perplexity/sonar-pro');
+    console.log(`[SOURCING RESEARCH] Perplexity returned ${companies.length} companies`);
+    return companies;
   } catch (err) {
-    console.warn('[SOURCING RESEARCH] Grok error:', err.message, '— falling back to Gemini');
-    return runGeminiCompanyResearch(campaign);
-  }
-}
-
-async function runGeminiCompanyResearch(campaign) {
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  const GEMINI_FALLBACK = process.env.GEMINI_API_KEY_FALLBACK;
-  if (!GEMINI_KEY && !GEMINI_FALLBACK) {
-    console.warn('[SOURCING RESEARCH] No Gemini keys — skipping');
+    console.warn('[SOURCING RESEARCH] Perplexity error:', err.message);
     return [];
   }
-
-  console.log('[SOURCING RESEARCH] Using Gemini with google_search...');
-  const prompt = buildCompanyResearchPrompt(campaign);
-  const models = ['gemini-2.5-pro', 'gemini-1.5-pro'];
-  const keys = [GEMINI_KEY, GEMINI_FALLBACK].filter(Boolean);
-
-  for (const key of keys) {
-    for (const model of models) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              tools: [{ googleSearch: {} }],
-              generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
-            }),
-          }
-        );
-
-        if (res.ok) {
-          const data = await res.json();
-          const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-          const companies = parseCompanyResults(text, `gemini/${model}`);
-          if (companies.length > 0) {
-            console.log(`[SOURCING RESEARCH] Gemini (${model}) returned ${companies.length} companies`);
-            return companies;
-          }
-        } else {
-          const errText = await res.text().catch(() => '');
-          console.warn(`[SOURCING RESEARCH] Gemini ${model} failed (${res.status}): ${errText.substring(0, 100)}`);
-        }
-      } catch (err) {
-        console.warn(`[SOURCING RESEARCH] Gemini ${model} error:`, err.message);
-      }
-    }
-  }
-
-  console.error('[SOURCING RESEARCH] All Gemini models failed');
-  return [];
 }
 
 function buildCompanyResearchPrompt(campaign) {
@@ -330,62 +249,39 @@ No explanation.`;
 async function runIntentSignalSearch(campaign) {
   if (!campaign.intent_signals) return [];
 
-  const key = process.env.GROK_API_KEY;
-  if (!key) return [];
-
+  const { orComplete } = await import('../core/openRouterClient.js');
   const signals = campaign.intent_signals.split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);
   const allResults = [];
 
   for (const signal of signals) {
-    const query = `${campaign.target_sector} companies ${campaign.target_geography} "${signal}" 2025 2026`;
-
-    const prompt = `Search the web for: "${query}"
-
-Return real company names that appear in results showing this specific intent signal: "${signal}"
-Only include companies in the ${campaign.target_sector} sector located in ${campaign.target_geography}.
+    const prompt = `Search the web for ${campaign.target_sector} companies in ${campaign.target_geography} showing intent signal: "${signal}" (2025 or 2026).
 
 For each company found, return:
 - company_name
 - website (if found)
 - geography
-- intent_signal_evidence (the specific text or evidence showing the signal)
+- intent_signal_evidence (specific text or evidence showing the signal)
 
 Return ONLY a valid JSON array of up to 10 companies. If nothing relevant found, return [].`;
 
     try {
-      const res = await fetch('https://api.x.ai/v1/responses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-        body: JSON.stringify({
-          model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-          input: [{ role: 'user', content: prompt }],
-          tools: [{ type: 'web_search' }],
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const outputMsg = (data.output || []).find(o => o.type === 'message');
-        const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-        const companies = extractJSON(text);
-
-        if (Array.isArray(companies)) {
-          for (const c of companies) {
-            if (c.company_name) {
-              allResults.push({
-                company_name:        c.company_name.trim(),
-                website:             c.website || null,
-                geography:           c.geography || campaign.target_geography,
-                sector:              campaign.target_sector,
-                intent_signals_found: c.intent_signal_evidence || signal,
-                source:              'research',
-                research_status:     'researched',
-              });
-            }
+      const text = await orComplete(prompt, { tier: 'web', maxTokens: 1000 });
+      const companies = extractJSON(text);
+      if (Array.isArray(companies)) {
+        for (const c of companies) {
+          if (c.company_name) {
+            allResults.push({
+              company_name:         c.company_name.trim(),
+              website:              c.website || null,
+              geography:            c.geography || campaign.target_geography,
+              sector:               campaign.target_sector,
+              intent_signals_found: c.intent_signal_evidence || signal,
+              source:               'research',
+              research_status:      'researched',
+            });
           }
         }
       }
-      await sleep(2000);
     } catch (err) {
       console.warn(`[SOURCING RESEARCH] Intent signal search error for "${signal}":`, err.message);
     }
@@ -443,7 +339,6 @@ export async function findDecisionMakersAtCompany(company, campaign) {
   const sb = getSupabase();
   if (!sb) return 0;
 
-  const key = process.env.GROK_API_KEY;
   const prompt = `Find the key decision makers at this company who would handle investment conversations:
 
 Company: ${company.company_name}
@@ -467,37 +362,12 @@ Never fabricate names, URLs, or emails.`;
 
   let contacts = [];
 
-  if (key) {
-    try {
-      const res = await fetch('https://api.x.ai/v1/responses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-        body: JSON.stringify({
-          model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-          input: [{ role: 'user', content: prompt }],
-          tools: [{ type: 'web_search' }],
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const outputMsg = (data.output || []).find(o => o.type === 'message');
-        const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-        contacts = extractJSON(text) || [];
-      }
-    } catch (err) {
-      console.warn(`[SOURCING RESEARCH] Grok DM research error for ${company.company_name}:`, err.message);
-    }
-  }
-
-  if (!contacts.length) {
-    // Gemini fallback
-    try {
-      const text = await aiComplete(prompt, { maxTokens: 1000, task: `dm-research-${company.company_name}` });
-      contacts = extractJSON(text) || [];
-    } catch (err) {
-      console.warn(`[SOURCING RESEARCH] AI fallback failed for ${company.company_name}:`, err.message);
-    }
+  try {
+    const { orComplete } = await import('../core/openRouterClient.js');
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 1000 });
+    contacts = extractJSON(text) || [];
+  } catch (err) {
+    console.warn(`[SOURCING RESEARCH] Web DM research error for ${company.company_name}:`, err.message);
   }
 
   let added = 0;

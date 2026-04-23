@@ -28,7 +28,8 @@ import { gatherCurrentMetrics }            from './fundraiserBrain.js';
 // use any model (Opus 4.7, Kimi K2.5, etc.) by changing MODEL_BRAIN below.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MODEL_BRAIN = process.env.JARVIS_BRAIN_MODEL || 'claude-sonnet-4-6';
+const MODEL_BRAIN = process.env.JARVIS_BRAIN_MODEL
+  || (process.env.OPENROUTER_API_KEY ? 'anthropic/claude-opus-4-7' : 'claude-sonnet-4-6');
 
 function getClient() {
   if (process.env.OPENROUTER_API_KEY) {
@@ -222,11 +223,13 @@ async function runAgentLoop(systemPrompt, messages, dealId) {
 // PUBLIC: handleMessage  — called from Telegram
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function handleMessage(chatId, text) {
+export async function handleMessage(chatId, text, overrideDealId = null) {
   const session = getSession(chatId);
 
-  // Resolve active deal
-  if (!session.dealId) {
+  // Resolve active deal — let caller override (e.g. dashboard orb with a specific deal selected)
+  if (overrideDealId) {
+    session.dealId = overrideDealId;
+  } else if (!session.dealId) {
     const deals = await getActiveDeals().catch(() => []);
     session.dealId = deals[0]?.id || null;
   }

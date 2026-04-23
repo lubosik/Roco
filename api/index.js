@@ -184,14 +184,13 @@ app.post('/api/edit-approval', async (req, res) => {
 
 app.get('/api/health', (req, res) => {
   const services = [
-    { name: 'anthropic', configured: !!process.env.ANTHROPIC_API_KEY },
-    { name: 'openai',    configured: !!process.env.OPENAI_API_KEY },
-    { name: 'gemini',    configured: !!process.env.GEMINI_API_KEY },
-    { name: 'notion',    configured: !!process.env.NOTION_API_KEY },
-    { name: 'telegram',  configured: !!process.env.TELEGRAM_BOT_TOKEN },
-    { name: 'kaspr',     configured: !!process.env.KASPR_API_KEY },
-    { name: 'supabase',  configured: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) },
-    { name: 'gmail',     configured: false },
+    { name: 'openrouter', configured: !!process.env.OPENROUTER_API_KEY },
+    { name: 'anthropic',  configured: !!process.env.ANTHROPIC_API_KEY },
+    { name: 'gemini',     configured: !!process.env.GEMINI_API_KEY },
+    { name: 'telegram',   configured: !!process.env.TELEGRAM_BOT_TOKEN },
+    { name: 'apify',      configured: !!process.env.APIFY_API_TOKEN },
+    { name: 'supabase',   configured: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) },
+    { name: 'gmail',      configured: false },
   ].map(s => ({
     name: s.name,
     status: s.configured ? 'ok' : 'unconfigured',

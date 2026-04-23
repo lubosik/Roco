@@ -1,9 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 import { getDeal } from '../core/dealContext.js';
 import { getContactProp } from '../crm/notionContacts.js';
 import { info, error, warn } from '../core/logger.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
+import { orComplete } from '../core/openRouterClient.js';
 
 const SYSTEM_PROMPT = `You are Dom's personal writing assistant. Dom is a senior fundraising professional who has been operating in private markets for 15 years. You produce the FINAL, send-ready email — it must read exactly like Dom typed it himself.
 
@@ -35,18 +34,6 @@ const EMAIL_LENGTH = {
   'FOLLOW-UP 3': { min: 30, max: 50 },
 };
 
-let anthropicClient;
-let openaiClient;
-
-function getAnthropic() {
-  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  return anthropicClient;
-}
-
-function getOpenAI() {
-  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return openaiClient;
-}
 
 export async function draftEmail(contactPage, researchData, stage = 'INTRO', editInstructions = null) {
   const name = getContactProp(contactPage, 'Name');
@@ -61,45 +48,14 @@ export async function draftEmail(contactPage, researchData, stage = 'INTRO', edi
   const guidanceBlock = await buildGuidanceBlock('investor_outreach').catch(() => '');
   const userPrompt = buildUserPrompt(contactPage, firstName, name, researchData, deal, stage, len, editInstructions, guidanceBlock);
 
-  // Try Claude Sonnet first
   try {
-    const response = await Promise.race([
-      getAnthropic().messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Anthropic timeout')), 10000)),
-    ]);
-
-    const text = response.content[0].text;
+    const text = await orComplete(userPrompt, { tier: 'draft', maxTokens: 1024, systemPrompt: SYSTEM_PROMPT });
     const parsed = extractJSON(text);
-    if (!parsed?.subject || !parsed?.body) throw new Error('Invalid email JSON from Claude');
-    info(`Email drafted via Claude for ${firstName}`);
+    if (!parsed?.subject || !parsed?.body) throw new Error('Invalid email JSON from model');
+    info(`Email drafted for ${firstName}`);
     return parsed;
   } catch (err) {
-    warn(`Claude failed for ${firstName} — trying GPT fallback`, { err: err.message });
-  }
-
-  // GPT-5.2 fallback
-  try {
-    const response = await getOpenAI().chat.completions.create({
-      model: 'gpt-5.2',
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-      max_completion_tokens: 1024,
-    });
-
-    const text = response.choices[0].message.content;
-    const parsed = extractJSON(text);
-    if (!parsed?.subject || !parsed?.body) throw new Error('Invalid email JSON from GPT');
-    info(`Email drafted via GPT for ${firstName}`);
-    return parsed;
-  } catch (err) {
-    error(`Both AI models failed for ${firstName}`, { err: err.message });
+    error(`Email draft failed for ${firstName}`, { err: err.message });
     return null;
   }
 }

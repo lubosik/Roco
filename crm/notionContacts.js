@@ -1,5 +1,7 @@
 import { NOTION_VERSION, NOTION_BASE, ENRICHMENT_STATUS } from '../config/constants.js';
 
+function hasKey() { return !!process.env.NOTION_API_KEY; }
+
 function headers() {
   return {
     Authorization: `Bearer ${process.env.NOTION_API_KEY}`,
@@ -11,6 +13,7 @@ function headers() {
 const DB = () => process.env.NOTION_CONTACTS_DB_ID;
 
 async function query(filter = {}, sorts = []) {
+  if (!hasKey()) return [];
   const body = {};
   if (Object.keys(filter).length) body.filter = filter;
   if (sorts.length) body.sorts = sorts;
@@ -96,6 +99,7 @@ export async function getContactsByDeal(dealName) {
 }
 
 export async function archiveContact(pageId) {
+  if (!hasKey()) return null;
   const res = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
     headers: headers(),
@@ -107,6 +111,7 @@ export async function archiveContact(pageId) {
 }
 
 export async function createContact(fields) {
+  if (!hasKey()) return null;
   const res = await fetch(`${NOTION_BASE}/pages`, {
     method: 'POST',
     headers: headers(),
@@ -121,6 +126,7 @@ export async function createContact(fields) {
 }
 
 export async function updateContact(pageId, fields) {
+  if (!hasKey()) return null;
   const res = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
     headers: headers(),

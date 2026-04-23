@@ -2,10 +2,8 @@
 import fs from 'fs';
 import path from 'path';
 import pdfParse from '@cedrugs/pdf-parse';
-import Anthropic from '@anthropic-ai/sdk';
 import { getSupabase } from './supabase.js';
-
-const anthropic = new Anthropic();
+import { orComplete } from './openRouterClient.js';
 
 async function parseWithClaude(documentText, agentContext) {
   const truncated = documentText.substring(0, 55000);
@@ -73,15 +71,9 @@ Return ONLY valid JSON — no markdown, no explanation:
   "additional_context": null
 }`;
 
-  const msg = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 6000,
-    messages: [{ role: 'user', content: prompt }],
-  });
-
-  const responseText = msg.content[0].text;
+  const responseText = await orComplete(prompt, { tier: 'draft', maxTokens: 6000 });
   const match = responseText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-  if (!match) throw new Error('No JSON in Claude response');
+  if (!match) throw new Error('No JSON in model response');
   return JSON.parse(match[0]);
 }
 

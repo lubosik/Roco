@@ -1,23 +1,14 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { orComplete } from '../core/openRouterClient.js';
 import { getDeal } from '../core/dealContext.js';
 import { info, error } from '../core/logger.js';
 import { updateContact, getContactProp } from '../crm/notionContacts.js';
 import { RESEARCH_CACHE_DAYS } from '../config/constants.js';
-import { webSearch } from './webSearcher.js';
-
-let genai;
-
-function getClient() {
-  if (!genai) genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  return genai;
-}
 
 export async function researchInvestor(contactPage) {
   const name = getContactProp(contactPage, 'Name');
   const firm = getContactProp(contactPage, 'Company Name') || 'Unknown Firm';
   const lastResearch = getContactProp(contactPage, 'Notes');
 
-  // Check cache — only re-research after RESEARCH_CACHE_DAYS
   if (lastResearch?.includes('[RESEARCHED:')) {
     const match = lastResearch.match(/\[RESEARCHED:(\d{4}-\d{2}-\d{2})\]/);
     if (match) {
@@ -32,24 +23,17 @@ export async function researchInvestor(contactPage) {
 
   info(`Researching investor: ${name} at ${firm}`);
   const deal = getDeal();
-
   const prompt = buildResearchPrompt(name, firm, deal);
 
   try {
-    const client = getClient();
-    const model = client.getGenerativeModel({ model: 'gemini-2.5-pro' });
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
-
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 1024 });
     const json = extractJSON(text);
-    if (!json) throw new Error('No valid JSON in Gemini response');
-
+    if (!json) throw new Error('No valid JSON in response');
     await saveResearch(contactPage.id, name, json);
     info(`Research complete for ${name}`, { score: json.confidenceScore });
     return json;
   } catch (err) {
-    error(`Gemini research failed for ${name}`, { err: err.message });
-    // Fall back to web search
+    error(`Research failed for ${name}`, { err: err.message });
     return fallbackWebResearch(name, firm, deal, contactPage.id);
   }
 }
@@ -57,13 +41,15 @@ export async function researchInvestor(contactPage) {
 async function fallbackWebResearch(name, firm, deal, pageId) {
   info(`Falling back to web search for ${name}`);
   try {
-    const results = await webSearch(`${name} ${firm} investor investments portfolio`);
-    const summary = results.slice(0, 3).map(r => r.snippet).join(' ');
+    const summary = await orComplete(
+      `${name} ${firm} investor investments portfolio background`,
+      { tier: 'web', maxTokens: 500 }
+    );
     const json = {
       comparableDeals: [],
-      investmentCriteria: summary.slice(0, 500),
-      approachAngle: `Research via web search — manual review recommended.`,
-      recentActivity: summary.slice(0, 300),
+      investmentCriteria: (summary || '').slice(0, 500),
+      approachAngle: 'Research via web search — manual review recommended.',
+      recentActivity: (summary || '').slice(0, 300),
       confidenceScore: 20,
     };
     await saveResearch(pageId, name, json);

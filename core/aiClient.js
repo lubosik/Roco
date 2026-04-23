@@ -10,9 +10,9 @@
  * - aiComplete: GPT-5.4 → gpt-4o → Claude Sonnet fallback (outreach drafting)
  */
 
-import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { pushActivity } from '../dashboard/server.js';
+import { orComplete } from './openRouterClient.js';
 
 // ── Semaphore ─────────────────────────────────────────────────────────────────
 class Semaphore {
@@ -128,11 +128,14 @@ async function withRetry(fn, modelName, maxAttempts = 4) {
   throw lastErr;
 }
 
-// ── Claude Haiku 4.5 (batch scoring, parsing) with gpt-5.4-mini fallback ──────
+// ── Claude Haiku 4.5 / Gemini Flash via OpenRouter (batch scoring, parsing) ────
 export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = null } = {}) {
+  if (process.env.OPENROUTER_API_KEY) {
+    return orComplete(prompt, { tier: 'classify', maxTokens, systemPrompt });
+  }
+
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
 
-  // Primary: Claude Haiku 4.5
   if (anthropicKey && !haikuCB.isOpen()) {
     try {
       const text = await haikuSem.run(() => withRetry(async () => {
@@ -168,7 +171,6 @@ export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = nu
       }, 'Haiku 4.5'));
 
       haikuCB.recordSuccess();
-      console.log('[AI] Haiku 4.5 OK');
       return text;
     } catch (err) {
       haikuCB.recordFailure();
@@ -178,7 +180,6 @@ export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = nu
     }
   }
 
-  // Fallback: gpt-5.4-mini-2026-03-17
   if (gptMiniCB.isOpen()) throw new Error('gpt-5.4-mini circuit breaker open — both AI paths unavailable');
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!openaiKey) throw new Error('No AI keys available (ANTHROPIC_API_KEY and OPENAI_API_KEY both missing)');
@@ -217,7 +218,6 @@ export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = nu
     }, 'gpt-5.4-mini'));
 
     gptMiniCB.recordSuccess();
-    console.log('[AI] gpt-5.4-mini-2026-03-17 OK');
     return text;
   } catch (err) {
     gptMiniCB.recordFailure();
@@ -226,89 +226,12 @@ export async function haikuComplete(prompt, { maxTokens = 300, systemPrompt = nu
   }
 }
 
-export async function claudeWebSearch(
-  prompt,
-  {
-    maxTokens = 700,
-    maxUses = 3,
-    model = 'claude-haiku-4-5-20251001',
-    systemPrompt = null,
-    allowedDomains = null,
-    blockedDomains = null,
-    userLocation = null,
-  } = {},
-) {
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (!anthropicKey) throw new Error('ANTHROPIC_API_KEY not set');
-  if (sonnetCB.isOpen()) throw new Error('Claude web search unavailable: Sonnet circuit breaker open');
-
-  try {
-    const text = await sonnetSem.run(() => withRetry(async () => {
-      const tool = {
-        type: 'web_search_20250305',
-        name: 'web_search',
-        max_uses: Math.min(Math.max(Number(maxUses) || 1, 1), 5),
-      };
-      if (Array.isArray(allowedDomains) && allowedDomains.length) tool.allowed_domains = allowedDomains;
-      if (Array.isArray(blockedDomains) && blockedDomains.length) tool.blocked_domains = blockedDomains;
-      if (userLocation) tool.user_location = userLocation;
-
-      const body = {
-        model,
-        max_tokens: Math.min(maxTokens, 4096),
-        messages: [{ role: 'user', content: prompt }],
-        tools: [tool],
-      };
-      if (systemPrompt) body.system = systemPrompt;
-
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        const e = new Error(`Claude web search ${res.status}: ${errBody.substring(0, 200)}`);
-        e.status = res.status;
-        throw e;
-      }
-
-      const data = await res.json();
-      const combined = Array.isArray(data.content)
-        ? data.content.filter(item => item?.type === 'text').map(item => item.text || '').filter(Boolean).join('\n').trim()
-        : '';
-      if (!combined) throw new Error('Claude web search returned empty response');
-      return combined;
-    }, 'Claude web search'));
-
-    sonnetCB.recordSuccess();
-    return text;
-  } catch (err) {
-    sonnetCB.recordFailure();
-    throw err;
-  }
+export async function claudeWebSearch(prompt, { maxTokens = 700, systemPrompt = null } = {}) {
+  return orComplete(prompt, { tier: 'web', maxTokens, systemPrompt });
 }
 
-// ── Grok via xAI API (live web access for per-investor research) ──────────────
 export async function grokResearch(prompt, { maxTokens = 1000 } = {}) {
-  const apiKey = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!apiKey) throw new Error('No xAI API key set (XAI_API_KEY or GROK_API_KEY)');
-
-  return gptSem.run(() => withRetry(async () => {
-    const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
-    const response = await client.chat.completions.create({
-      model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: maxTokens,
-      temperature: 0.2,
-    });
-    return response.choices?.[0]?.message?.content || '';
-  }, 'Grok-4.1-fast'));
+  return orComplete(prompt, { tier: 'web', maxTokens });
 }
 
 // ── GPT-5.4 via OpenAI Responses API (outreach drafting) ─────────────────────
@@ -362,6 +285,14 @@ async function gptComplete(prompt, { reasoning = 'medium', maxTokens = 2000 } = 
   throw new Error('All GPT models failed');
 }
 
+// ── Claude Haiku via OpenRouter (draft quality) ───────────────────────────────
+export async function draftComplete(prompt, { maxTokens = 1024, systemPrompt = null } = {}) {
+  if (process.env.OPENROUTER_API_KEY) {
+    return orComplete(prompt, { tier: 'draft', maxTokens, systemPrompt });
+  }
+  return haikuComplete(prompt, { maxTokens, systemPrompt });
+}
+
 // ── Claude Sonnet fallback / structured reasoning ────────────────────────────
 export async function sonnetComplete(prompt, { maxTokens = 2000, model = 'claude-sonnet-4-5-20251001' } = {}) {
   const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
@@ -389,8 +320,11 @@ export async function sonnetComplete(prompt, { maxTokens = 2000, model = 'claude
   }
 }
 
-// ── Main router — GPT first, Claude as fallback ───────────────────────────────
+// ── Main router — OpenRouter classify tier, GPT/Claude fallback ──────────────
 export async function aiComplete(prompt, { reasoning = 'low', maxTokens = 500, task = 'task' } = {}) {
+  if (process.env.OPENROUTER_API_KEY) {
+    return orComplete(prompt, { tier: 'classify', maxTokens });
+  }
   try {
     return await gptComplete(prompt, { reasoning, maxTokens });
   } catch (err) {

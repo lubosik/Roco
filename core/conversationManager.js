@@ -3,15 +3,9 @@
  * Manages conversation state, intent classification, temp closes, and waterfall progression.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
 import { getSupabase } from './supabase.js';
 import { getIntentContext, getReplyContext, getTempCloseContext } from './agentContext.js';
-
-let _anthropic;
-function getAnthropic() {
-  if (!_anthropic) _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  return _anthropic;
-}
+import { orComplete } from './openRouterClient.js';
 
 // ── CONVERSATION HISTORY ──────────────────────────────────────────────────────
 
@@ -116,13 +110,9 @@ Return ONLY valid JSON:
   "tone_notes": "string"
 }`;
 
-  const response = await getAnthropic().messages.create({
-    model:      'claude-sonnet-4-6',
-    max_tokens: 1500,
-    messages:   [{ role: 'user', content: prompt }],
-  });
+  const rawText = await orComplete(prompt, { tier: 'classify', maxTokens: 1500 });
 
-  const text  = response.content[0]?.text || '';
+  const text  = rawText || '';
   const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
   if (!match) throw new Error('No JSON from intent classifier');
   const result = JSON.parse(match[0]);
@@ -205,13 +195,8 @@ ${intent?.is_conversation_ended
 
 Draft the reply now. Reply text only — no subject line, no labels, no explanation:`;
 
-  const response = await getAnthropic().messages.create({
-    model:      'claude-sonnet-4-6',
-    max_tokens: 400,
-    messages:   [{ role: 'user', content: prompt }],
-  });
-
-  return response.content[0]?.text?.trim() || null;
+  const text = await orComplete(prompt, { tier: 'conversation', maxTokens: 400 });
+  return text?.trim() || null;
 }
 
 // ── CONVERSATION STATE ────────────────────────────────────────────────────────
@@ -331,11 +316,6 @@ ${historyText || 'No history available.'}
 
 Draft the re-engagement message now (reply text only):`;
 
-  const response = await getAnthropic().messages.create({
-    model:      'claude-sonnet-4-6',
-    max_tokens: 200,
-    messages:   [{ role: 'user', content: prompt }],
-  });
-
-  return response.content[0]?.text?.trim() || null;
+  const text = await orComplete(prompt, { tier: 'conversation', maxTokens: 200 });
+  return text?.trim() || null;
 }

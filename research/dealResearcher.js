@@ -114,100 +114,15 @@ export async function runDealResearch(deal) {
   return saved;
 }
 
-// ── DEEP RESEARCH ORCHESTRATOR — Grok primary, Gemini fallback ────────
+// ── DEEP RESEARCH VIA PERPLEXITY ─────────────────────────────────────
 
 async function runDeepResearch(deal) {
-  // Try Grok first
-  const grokResults = await runGrokDeepResearch(deal);
-  if (grokResults.length > 0) return grokResults;
-
-  console.warn('[RESEARCH] Grok deep research returned 0 results — falling back to Gemini');
-  return runGeminiDeepResearch(deal);
+  return runWebDeepResearch(deal);
 }
 
-// ── GROK DEEP RESEARCH ────────────────────────────────────────────────
-
-async function runGrokDeepResearch(deal) {
-  const key = process.env.GROK_API_KEY;
-  if (!key) return [];
-
-  console.log('[RESEARCH] Starting Grok Deep Research...');
-
-  const prompt = `Research the top 25 most relevant investors for this fundraising deal.
-
-DEAL DETAILS:
-Name: ${deal.name}
-Sector: ${deal.sector || 'Technology'}
-Geography: ${deal.geography || 'UK'}
-Stage: ${deal.raise_type || 'Pre-Seed/Seed'}
-Target: £${Number(deal.target_amount || 0).toLocaleString()}
-Cheque range: £${Number(deal.min_cheque || 0).toLocaleString()}–£${Number(deal.max_cheque || 0).toLocaleString()}
-Description: ${deal.description || ''}
-Ideal investor: ${deal.investor_profile || ''}
-
-Find REAL, currently active investors (VCs, family offices, angels, PE) who:
-- Have invested in ${deal.sector || 'technology'} companies in the last 3 years
-- Are active in ${deal.geography || 'UK'}
-- Typically write cheques in the target range
-- Include their specific partner/decision-maker names with LinkedIn URLs
-- Include 2-3 specific past portfolio companies similar to this deal
-
-Return ONLY a JSON array, no markdown:
-[{
-  "firm_name": "",
-  "contact_name": "",
-  "contact_title": "",
-  "contact_linkedin": "",
-  "sector_focus": "",
-  "geography": "",
-  "typical_cheque": "",
-  "aum": "",
-  "past_investments": "",
-  "why_relevant": "",
-  "source": "Grok Research"
-}]`;
-
-  try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-        input: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      console.warn(`[RESEARCH] Grok failed (${res.status}): ${errText.substring(0, 150)}`);
-      return [];
-    }
-
-    const data = await res.json();
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-    return parseDeepResearchResults(text, 'Grok Research');
-  } catch (err) {
-    console.warn('[RESEARCH] Grok deep research error:', err.message);
-    return [];
-  }
-}
-
-// ── GEMINI DEEP RESEARCH ──────────────────────────────────────────────
-
-async function runGeminiDeepResearch(deal) {
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  const GEMINI_FALLBACK = process.env.GEMINI_API_KEY_FALLBACK;
-  if (!GEMINI_KEY && !GEMINI_FALLBACK) {
-    console.warn('[RESEARCH] GEMINI_API_KEY not set — skipping Gemini research');
-    return [];
-  }
-
-  console.log('[RESEARCH] Starting Gemini Deep Research...');
+async function runWebDeepResearch(deal) {
+  const { orComplete } = await import('../core/openRouterClient.js');
+  console.log('[RESEARCH] Starting Perplexity Deep Research...');
 
   const prompt = `Research the top 25 most relevant investors for this fundraising deal.
 
@@ -242,51 +157,16 @@ Return ONLY a JSON array, no markdown:
   "aum": "",
   "past_investments": "",
   "why_relevant": "",
-  "source": "Gemini Research"
+  "source": "Web Research"
 }]`;
 
-  const models = [
-    'gemini-2.5-pro-preview-06-05',
-    'gemini-1.5-pro',
-  ];
-  const keys = [GEMINI_KEY, GEMINI_FALLBACK].filter(Boolean);
-
-  for (const key of keys) {
-    for (const model of models) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
-            }),
-          }
-        );
-
-        if (res.ok) {
-          const data = await res.json();
-          const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-          const results = parseDeepResearchResults(text, 'Gemini Research');
-          if (results.length > 0) return results;
-          console.warn(`[RESEARCH] ${model} returned 0 results — trying next`);
-        } else {
-          const errText = await res.text().catch(() => '');
-          console.warn(`[RESEARCH] ${model} failed (${res.status}): ${errText.substring(0, 100)}`);
-        }
-      } catch (err) {
-        console.warn(`[RESEARCH] ${model} error: ${err.message}`);
-      }
-    }
-    if (key !== keys[keys.length - 1]) {
-      console.warn('[RESEARCH] Primary Gemini key exhausted — trying fallback key');
-    }
+  try {
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 4096 });
+    return parseDeepResearchResults(text, 'Web Research');
+  } catch (err) {
+    console.warn('[RESEARCH] Perplexity deep research error:', err.message);
+    return [];
   }
-
-  console.error('[RESEARCH] All Gemini models/keys failed');
-  return [];
 }
 
 function parseDeepResearchResults(text, source) {

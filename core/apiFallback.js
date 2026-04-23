@@ -19,10 +19,9 @@ const require = createRequire(import.meta.url);
 
 export const apiHealth = {
   anthropic:         { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
+  openrouter:        { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
   openai:            { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
   gemini:            { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
-  kaspr:             { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
-  notion:            { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
   gmail:             { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
   telegram:          { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
   serpapi:           { status: 'ok', lastCheck: null, lastError: null, fallbackActive: false },
@@ -118,11 +117,10 @@ export async function withFallback(name, attempts, context = {}) {
 function updateHealthFromName(name, failedIndex, errorMsg = null) {
   // Map operation names to API service names
   const serviceMap = {
-    'email_generation': failedIndex === 0 ? 'anthropic' : failedIndex === 1 ? 'openai' : 'gemini',
+    'email_generation': failedIndex === 0 ? 'openrouter' : failedIndex === 1 ? 'anthropic' : 'openai',
     'research': failedIndex === 0 ? 'gemini' : failedIndex === 1 ? 'serpapi' : 'apify',
-    'enrichment': failedIndex === 0 ? 'kaspr' : null,
+    'enrichment': failedIndex === 0 ? 'apify' : null,
     'email_send': failedIndex === 0 ? 'gmail' : null,
-    'notion': 'notion',
     'telegram': 'telegram',
   };
 
@@ -285,35 +283,16 @@ async function runHealthChecks() {
     updateHealth('gemini', 'unconfigured', 'GEMINI_API_KEY not set');
   }
 
-  // KASPR — ping search endpoint (401 = reachable, bad key; 200 = ok)
-  if (process.env.KASPR_API_KEY) {
-    checks.push(pingService('kaspr', async () => {
-      const res = await fetchWithTimeout('https://api.kaspr.io/v1/linkedin/person/email-address', {
-        method: 'POST',
-        headers: { 'X-API-Key': process.env.KASPR_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ linkedin_url: 'https://linkedin.com/in/ping' }),
-      }, 6000);
-      // 400/422 = API up, key valid, bad input — fine. 401/403 = bad key. 5xx = down.
-      if (res.status === 401 || res.status === 403) throw new Error(`Auth failed (HTTP ${res.status}) — check KASPR_API_KEY`);
-      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
-    }));
-  } else {
-    updateHealth('kaspr', 'unconfigured', 'KASPR_API_KEY not set');
-  }
-
-  // Notion
-  if (process.env.NOTION_API_KEY) {
-    checks.push(pingService('notion', async () => {
-      const res = await fetchWithTimeout('https://api.notion.com/v1/users/me', {
-        headers: {
-          'Authorization': `Bearer ${process.env.NOTION_API_KEY}`,
-          'Notion-Version': '2022-06-28',
-        },
+  // OpenRouter
+  if (process.env.OPENROUTER_API_KEY) {
+    checks.push(pingService('openrouter', async () => {
+      const res = await fetchWithTimeout('https://openrouter.ai/api/v1/auth/key', {
+        headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}` },
       }, 8000);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     }));
   } else {
-    updateHealth('notion', 'unconfigured', 'NOTION_API_KEY not set');
+    updateHealth('openrouter', 'unconfigured', 'OPENROUTER_API_KEY not set');
   }
 
   // Unipile (Gmail + LinkedIn) — ping accounts list
@@ -368,17 +347,17 @@ async function runHealthChecks() {
     updateHealth('apify', 'unconfigured', 'APIFY_API_TOKEN not set');
   }
 
-  // Grok (xAI) — ping models endpoint to confirm key is valid
-  if (process.env.GROK_API_KEY) {
-    checks.push(pingService('grok', async () => {
-      const res = await fetchWithTimeout('https://api.x.ai/v1/models', {
-        headers: { 'Authorization': `Bearer ${process.env.GROK_API_KEY}` },
+  // OpenRouter — check models endpoint
+  if (process.env.OPENROUTER_API_KEY) {
+    checks.push(pingService('openrouter', async () => {
+      const res = await fetchWithTimeout('https://openrouter.ai/api/v1/models', {
+        headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}` },
       }, 8000);
-      if (res.status === 401 || res.status === 403) throw new Error(`Auth failed (HTTP ${res.status}) — check GROK_API_KEY`);
+      if (res.status === 401 || res.status === 403) throw new Error(`Auth failed (HTTP ${res.status}) — check OPENROUTER_API_KEY`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     }));
   } else {
-    updateHealth('grok', 'unconfigured', 'GROK_API_KEY not set');
+    updateHealth('openrouter', 'unconfigured', 'OPENROUTER_API_KEY not set');
   }
 
   // MillionVerifier — verify API key with a test email

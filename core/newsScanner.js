@@ -1,18 +1,10 @@
 import { getSupabase } from './supabase.js';
 import { sendTelegram } from '../approval/telegramBot.js';
 import { buildGuidanceBlock } from '../services/guidanceService.js';
-import { claudeWebSearch } from './aiClient.js';
-import { webSearch, formatWebResultsForPrompt } from '../research/webSearcher.js';
 import { getInvestorSearchProviderOrder } from './hardeningHelpers.js';
-import Anthropic from '@anthropic-ai/sdk';
+import { orComplete } from './openRouterClient.js';
 import { DateTime } from 'luxon';
 
-const GROK_API_KEY = process.env.GROK_API_KEY || process.env.XAI_API_KEY;
-const GROK_BASE = 'https://api.x.ai/v1';
-const anthropic = process.env.ANTHROPIC_API_KEY
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  : null;
-const NEWS_SUMMARY_MODEL = process.env.ROCO_NEWS_SUMMARY_MODEL || 'claude-sonnet-4-6';
 const dailyNewsScanFailureState = new Map();
 
 function getNewsFailureKey(dealId) {
@@ -35,75 +27,6 @@ async function recordDailyNewsScanFailure(deal, pushActivity, message) {
   ).catch(() => {});
 }
 
-async function runSerpInvestorSearch(query, num = 5) {
-  const results = await webSearch(query, num, { engine: 'google', gl: 'us', hl: 'en' });
-  return results.filter(item => item.title || item.snippet);
-}
-
-async function summarizeSerpInvestorResults(deal, queryPlan, serpResults, mode = 'investor_batch') {
-  if (!anthropic || !serpResults.length) return null;
-
-  const modeInstructions = mode === 'news_scan'
-    ? `Return valid JSON with keys:
-{
-  "search_summary": "short operator summary",
-  "findings": [
-    {
-      "firm_name": "string",
-      "news_event": "string",
-      "why_relevant": "string",
-      "source_url": "string or null",
-      "source_hint": "string or null",
-      "published_at": "string or null",
-      "relevance_score": 1-10,
-      "investor_type": "string or null",
-      "hq_country": "string or null"
-    }
-  ]
-}`
-    : `Return valid JSON array:
-[
-  {
-    "firm_name": "string",
-    "investor_type": "string or null",
-    "hq_country": "string or null",
-    "reason_fit": "string",
-    "recent_activity": "string",
-    "confidence": 1-10
-  }
-]`;
-
-  const prompt = `You are ROCO's investor research analyst.
-
-Deal:
-- Name: ${deal.name}
-- Sector: ${deal.sector || 'General'}
-- Geography: ${deal.target_geography || deal.geography || 'United States'}
-- Type: ${deal.deal_type || deal.raise_type || 'N/A'}
-
-Queries attempted:
-${queryPlan.join('\n')}
-
-SERP RESULTS
-${formatWebResultsForPrompt(serpResults)}
-
-Task:
-- Identify real investors only.
-- Ignore pure media, advisors, or irrelevant operators.
-- Use the search snippets as source material.
-- Be conservative.
-- ${mode === 'news_scan' ? 'Focus on recent investor/news signals relevant to the current deal.' : 'Focus on investors that should be added to the current pipeline or batch.'}
-
-${modeInstructions}`;
-
-  const response = await anthropic.messages.create({
-    model: NEWS_SUMMARY_MODEL,
-    max_tokens: 1200,
-    messages: [{ role: 'user', content: prompt }],
-  });
-
-  return String(response.content?.[0]?.text || '').trim();
-}
 
 function extractJSONArray(text) {
   const str = String(text || '');
@@ -256,38 +179,14 @@ async function executeGrokNewsQueries(deal, queries = [], pushActivity) {
 }
 
 export async function grokWebSearch(query, systemContext = '', maxTokens = 1000) {
-  // Read key at call time — module-level GROK_API_KEY may be undefined if dotenv loaded after module init
-  const apiKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY;
-  if (!apiKey) return null;
-
   try {
-    const response = await fetch(`${GROK_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-        max_tokens: maxTokens,
-        messages: [
-          ...(systemContext ? [{ role: 'system', content: systemContext }] : []),
-          { role: 'user', content: query },
-        ],
-        search: true,
-      }),
+    return await orComplete(query, {
+      tier: 'web',
+      maxTokens,
+      systemPrompt: systemContext || null,
     });
-
-    if (!response.ok) {
-      const err = await response.text().catch(() => '');
-      console.warn('[GROK SEARCH]', response.status, err.slice(0, 120));
-      return null;
-    }
-
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || null;
   } catch (err) {
-    console.warn('[GROK SEARCH]', err.message);
+    console.warn('[WEB SEARCH]', err.message);
     return null;
   }
 }
@@ -500,27 +399,8 @@ Return ONLY valid JSON:
 }
 Maximum 5 recommended investors.`;
 
-  if (!anthropic) {
-    return {
-      summary: `${deal.name}: ${findings.length || rawResults.length} market signal${(findings.length || rawResults.length) === 1 ? '' : 's'} reviewed for this sector today.`,
-      is_relevant: findings.length > 0,
-      notes: findings.length ? 'Fresh investor activity was identified.' : 'Market context was reviewed even though source data was sparse.',
-      recommended_investors: findings.filter(lead => lead.relevance_score >= 7).slice(0, 5).map(lead => ({
-        name: null,
-        firm: lead.firm_name,
-        reason: lead.why_relevant || lead.news_event,
-      })),
-      telegram_summary: `${deal.name}: ${findings.length || rawResults.length} investor or market signal${(findings.length || rawResults.length) === 1 ? '' : 's'} reviewed. ${findings.slice(0, 2).map(lead => `${lead.firm_name} looks relevant because ${truncate(lead.why_relevant, 80)}`).join(' ')}`.trim(),
-    };
-  }
-
   try {
-    const response = await anthropic.messages.create({
-      model: NEWS_SUMMARY_MODEL,
-      max_tokens: 1600,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const json = extractJSONObject(response.content?.[0]?.text || '');
+    const json = extractJSONObject(await orComplete(prompt, { tier: 'classify', maxTokens: 1600 }) || '');
     return {
       summary: String(json?.summary || '').trim() || `${deal.name}: investor-news scan completed.`,
       is_relevant: json?.is_relevant !== false,
@@ -552,7 +432,7 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
   if (dailyNewsScanFailureState.has(getNewsFailureKey(deal.id))) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: 'News scan skipped after today’s failure.', recommendedInvestors: [] };
   }
-  if (!deal?.id || !(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) {
+  if (!deal?.id) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: '', recommendedInvestors: [] };
   }
 
@@ -562,51 +442,9 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
   const successfulResults = grokRawResults.filter(item => item.success && item.raw_result).map(item => item.raw_result);
 
   if (!successfulResults.length) {
-    const failureReason = grokRawResults.map(item => item.raw_result).filter(Boolean).slice(0, 2).join(' | ') || 'Grok web search returned no successful results';
-    try {
-      const fallbackSummary = await claudeWebSearch(
-        `Use live web search to find current investor and market signals relevant to this deal.\nDeal: ${deal.name}\nSector: ${deal.sector || 'General'}\nGeography: ${deal.target_geography || deal.geography || 'United States'}\nQueries attempted:\n${queryPlan.join('\n')}\nReturn a concise operator summary only.`,
-        { maxTokens: 500, maxUses: 3, model: 'claude-sonnet-4-6', systemPrompt: 'Use web search to produce a concise investor-news summary for the deal.' }
-      );
-      await recordDailyNewsScanFailure(deal, pushActivity, `${failureReason}. Claude web search fallback was used instead. Top up Grok/xAI credits if needed.`);
-      return {
-        leads: [],
-        summary: fallbackSummary || '',
-        rawSummary: '',
-        rejectedFindings: [],
-        grokQueries: queryPlan,
-        grokRawResults,
-        isRelevant: false,
-        notes: 'Grok failed today; Claude web search fallback used.',
-        recommendedInvestors: [],
-      };
-    } catch (fallbackErr) {
-      try {
-        const serpResults = [];
-        for (const query of queryPlan.slice(0, 3)) {
-          const rows = await runSerpInvestorSearch(query, 5).catch(() => []);
-          serpResults.push(...rows);
-        }
-        const serpSummary = await summarizeSerpInvestorResults(deal, queryPlan, serpResults, 'news_scan');
-        const serpPayload = serpSummary ? extractJSONObject(serpSummary) : null;
-        if (serpPayload) {
-          return {
-            leads: safeArray(serpPayload.findings || []).map(normalizeDealLead),
-            summary: String(serpPayload.search_summary || '').trim(),
-            rawSummary: formatWebResultsForPrompt(serpResults).slice(0, 4000),
-            rejectedFindings: [],
-            grokQueries: queryPlan,
-            grokRawResults,
-            isRelevant: safeArray(serpPayload.findings).length > 0,
-            notes: 'Grok and Claude web search failed; SerpApi fallback used.',
-            recommendedInvestors: [],
-          };
-        }
-      } catch {}
-
-      await recordDailyNewsScanFailure(deal, pushActivity, `${failureReason}. Claude fallback also failed: ${fallbackErr.message}`);
-      return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
-    }
+    const failureReason = grokRawResults.map(item => item.raw_result).filter(Boolean).slice(0, 2).join(' | ') || 'Web search returned no successful results';
+    await recordDailyNewsScanFailure(deal, pushActivity, failureReason);
+    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
   }
 
   let searchPayload = null;
@@ -698,12 +536,6 @@ export async function summarizePortfolioNewsDigest(scanRows = []) {
 
   if (!rows.length) return '';
 
-  if (!anthropic) {
-    return rows
-      .map(row => `${row.deal_name}: ${row.summary || `${row.leads_added} fresh signal${row.leads_added === 1 ? '' : 's'} reviewed.`}`)
-      .join(' ');
-  }
-
   try {
     const prompt = `You are writing ROCO's top-level daily market brief across all active deals.
 
@@ -718,12 +550,7 @@ Mention which sectors look active, cautious, or quiet.
 If some deals had no meaningful fresh items, say that cleanly.
 No bullets. No markdown.`;
 
-    const response = await anthropic.messages.create({
-      model: NEWS_SUMMARY_MODEL,
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    return String(response.content?.[0]?.text || '').trim();
+    return String(await orComplete(prompt, { tier: 'classify', maxTokens: 300 }) || '').trim();
   } catch (err) {
     console.warn('[NEWS DIGEST]', err.message);
     return rows
@@ -805,54 +632,15 @@ Return 25-30 results. Every single firm MUST be different from the exclusion lis
   }
 
   if (!deal?.id) return [];
-  console.log(`[GROK SEARCH] Starting investor search for ${deal.name} (${Array.from(existingFirmNames || []).length} excluded)`);
+  console.log(`[WEB SEARCH] Starting investor search for ${deal.name} (${Array.from(existingFirmNames || []).length} excluded)`);
 
-
-  // Try Grok first (if key available — read at call time to handle dotenv loading order)
-  const grokKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY;
-  if (grokKey) {
-    const result = await grokWebSearch(
-      query,
-      'You are a PE research analyst. Return only valid JSON and only genuinely relevant firms.',
-      3000
-    ).catch(() => null);
-    if (result) {
-      try {
-        const rawCount = (result.match(/"firm_name"/g) || []).length;
-        const firms = await parseFirmResults(result, 'grok_web_search', 'Grok Web Research', 'Grok');
-        console.log(`[GROK SEARCH] ${deal.name}: ${rawCount} Grok results → ${firms.length} new firms`);
-        if (firms.length) {
-          pushActivity?.({
-            type: 'research',
-            action: `Grok web search found ${firms.length} investor lead${firms.length === 1 ? '' : 's'} for ${deal.name}`,
-            note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
-            deal_id: deal.id,
-          });
-          return firms;
-        }
-        // Grok responded but all results were excluded/low-confidence — fall through to Claude
-      } catch {
-        // parse error — fall through to Claude
-      }
-    } else {
-      // Grok returned null — fall through to Claude
-    }
-    // Grok returned nothing or all filtered out — try Claude as fallback
-  }
-
-  // Claude web search (used when Grok key missing OR Grok call itself failed)
   try {
-    const result = await claudeWebSearch(
-      `${query}\n\nIMPORTANT: Your ENTIRE response must be a raw JSON array starting with [ and ending with ]. No prose, no explanation, no markdown, no code fences. Just the JSON array.`,
-      {
-        maxTokens: 4096,
-        maxUses: 5,
-        model: 'claude-sonnet-4-6',
-        systemPrompt: 'You are a PE research analyst. You MUST return ONLY a valid JSON array — no text before or after the JSON. Start your response with [ and end with ].',
-      }
+    const result = await orComplete(
+      `${query}\n\nIMPORTANT: Your ENTIRE response must be a raw JSON array starting with [ and ending with ]. No prose, no explanation, no markdown. Just the JSON array.`,
+      { tier: 'web', maxTokens: 4096 }
     );
     if (!result) return [];
-    const firms = await parseFirmResults(result, 'claude_web_search', 'Claude Web Research', 'Claude');
+    const firms = await parseFirmResults(result, 'perplexity_web_search', 'Perplexity Web Research', 'Perplexity');
     if (firms.length) {
       pushActivity?.({
         type: 'research',
@@ -863,29 +651,8 @@ Return 25-30 results. Every single firm MUST be different from the exclusion lis
     }
     return firms;
   } catch (err) {
-    try {
-      const serpResults = [];
-      for (const queryVariant of [query, `${deal.name} investors ${deal.sector || ''} ${deal.target_geography || deal.geography || 'US'}`].filter(Boolean)) {
-        const rows = await runSerpInvestorSearch(queryVariant, 5).catch(() => []);
-        serpResults.push(...rows);
-      }
-      if (!serpResults.length) return [];
-
-      const summarized = await summarizeSerpInvestorResults(deal, ['serpapi_fallback'], serpResults, 'investor_batch');
-      if (!summarized) return [];
-      const firms = await parseFirmResults(summarized, 'serpapi_web_search', 'SerpApi Web Research', 'SerpApi');
-      if (firms.length) {
-        pushActivity?.({
-          type: 'research',
-          action: `SerpApi found ${firms.length} investor lead${firms.length === 1 ? '' : 's'} for ${deal.name}`,
-          note: firms.map(f => f.firm_name || f.name).slice(0, 4).join(' · '),
-          deal_id: deal.id,
-        });
-      }
-      return firms;
-    } catch {
-      return [];
-    }
+    pushActivity?.({ type: 'error', action: 'Investor web search failed', note: err.message?.slice(0, 100), deal_id: deal.id });
+    return [];
   }
 }
 
@@ -899,7 +666,7 @@ export async function scanInvestorNewsForDeal(deal, optionsOrPushActivity, maybe
       ? safeArray(optionsOrPushActivity?.portfolioDeals)
       : [deal];
 
-  if (!deal?.id || !(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) return [];
+  if (!deal?.id) return [];
 
   try {
     pushActivity?.({
@@ -961,7 +728,7 @@ export async function saveDealNewsLeads(dealId, leads) {
 }
 
 export async function scanGeneralInvestorSignals(pushActivity) {
-  if (!(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY)) return [];
+  if (!process.env.OPENROUTER_API_KEY) return [];
 
   try {
     const guidanceBlock = await buildGuidanceBlock('investor_outreach').catch(() => '');
@@ -1091,7 +858,7 @@ const PUBLIC_INVESTOR_DIRECTORIES = [
 ];
 
 export async function scrapePublicInvestorDirectories(deal, existingNames, pushActivity) {
-  if (!(process.env.GROK_API_KEY || process.env.XAI_API_KEY || GROK_API_KEY) || !deal?.id) return [];
+  if (!deal?.id) return [];
 
   const relevantUrls = [];
   const ebitda = parseFloat(deal.ebitda_usd_m || deal.ebitda || 0);

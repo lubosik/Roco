@@ -38,21 +38,7 @@ function boolFromEnv(value, fallback = false) {
 }
 
 function getResearchConfig() {
-  const configuredGeminiModels = (process.env.RESEARCH_FIRM_GEMINI_MODELS || '')
-    .split(',')
-    .map(v => v.trim())
-    .filter(Boolean)
-    .filter(model => !['gemini-2.0-flash', 'gemini-1.5-pro'].includes(model));
-
-  return {
-    primaryProvider: (process.env.RESEARCH_PRIMARY_PROVIDER || 'grok').toLowerCase(),
-    enableGrokFallback: boolFromEnv(process.env.RESEARCH_ENABLE_GROK_FALLBACK, true),
-    geminiModels: configuredGeminiModels
-      .slice(0, 5)
-      .concat(['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'])
-      .filter((model, index, all) => all.indexOf(model) === index),
-    grokModel: process.env.RESEARCH_FIRM_GROK_MODEL || process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-  };
+  return {};
 }
 
 // Labels that describe a role, not a real firm — don't persist as company_name
@@ -485,105 +471,38 @@ async function importFirmsFromCSV(deal) {
   return firms;
 }
 
-// ── STREAM 2: GEMINI/GROK DEEP RESEARCH ───────────────────────────────
+// ── STREAM 2: PERPLEXITY DEEP RESEARCH ────────────────────────────────
 
 async function runPrimaryFirmResearch(deal) {
-  const config = getResearchConfig();
-  if (config.primaryProvider === 'grok') {
-    const grokFirst = await runGrokFirmResearch(deal);
-    if (grokFirst.length > 0 || !config.enableGrokFallback) return grokFirst;
-    return runGeminiFirmResearch(deal);
-  }
-
-  const geminiFirst = await runGeminiFirmResearch(deal);
-  if (geminiFirst.length > 0 || !config.enableGrokFallback) return geminiFirst;
-  return runGrokFirmResearch(deal);
+  return runWebFirmResearch(deal);
 }
 
-async function runGrokFirmResearch(deal) {
-  const { grokModel } = getResearchConfig();
-  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) {
-    console.warn('[FIRM RESEARCH] No Grok key set — skipping Grok firm research');
-    return [];
-  }
-
-  console.log('[FIRM RESEARCH] Using Grok Responses API with web_search tool...');
-
+async function runWebFirmResearch(deal) {
+  const { orComplete } = await import('../core/openRouterClient.js');
   const prompt = buildFirmResearchPrompt(deal);
   const query = buildResearchSearchLabel(deal);
-  await emitFirmResearchTrace({
-    deal,
-    provider: 'Grok web search',
-    query,
-    prompt,
-    status: 'started',
-  });
+  await emitFirmResearchTrace({ deal, provider: 'Perplexity web search', query, prompt, status: 'started' });
 
   try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({
-        model: grokModel,
-        input: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text().catch(() => '');
-      console.warn(`[FIRM RESEARCH] Grok failed (${res.status}): ${err.substring(0, 150)}`);
-      await emitFirmResearchTrace({
-        deal,
-        provider: 'Grok web search',
-        query,
-        prompt,
-        status: 'failed',
-        errorMessage: `HTTP ${res.status}: ${err.substring(0, 150)}`,
-        sendTelegramUpdate: true,
-      });
-      return [];
-    }
-
-    const data = await res.json();
-    // Responses API: output[] contains message objects with content[]
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-    const firms = parseFirmResearchResults(text, grokModel);
-    const sources = extractGrokSources(data);
-    if (firms.length > 0) {
-      console.log(`[FIRM RESEARCH] Grok returned ${firms.length} firms`);
-      await emitFirmResearchTrace({
-        deal,
-        provider: 'Grok web search',
-        query,
-        prompt,
-        firms,
-        sources,
-        status: 'completed',
-        sendTelegramUpdate: true,
-      });
-      return firms;
-    }
-
-    console.warn('[FIRM RESEARCH] Grok returned 0 firms');
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 4096 });
+    const firms = parseFirmResearchResults(text, 'perplexity/sonar-pro');
     await emitFirmResearchTrace({
       deal,
-      provider: 'Grok web search',
+      provider: 'Perplexity web search',
       query,
       prompt,
-      firms: [],
-      sources,
+      firms,
+      sources: [],
       status: 'completed',
       sendTelegramUpdate: true,
     });
-    return [];
+    console.log(`[FIRM RESEARCH] Perplexity returned ${firms.length} firms`);
+    return firms;
   } catch (err) {
-    console.warn('[FIRM RESEARCH] Grok error:', err.message);
+    console.warn('[FIRM RESEARCH] Perplexity error:', err.message);
     await emitFirmResearchTrace({
       deal,
-      provider: 'Grok web search',
+      provider: 'Perplexity web search',
       query,
       prompt,
       status: 'failed',
@@ -594,152 +513,11 @@ async function runGrokFirmResearch(deal) {
   }
 }
 
-async function researchFirmWithGrok(firmName, deal, investor = {}) {
-  const { grokModel } = getResearchConfig();
-  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) throw new Error('No Grok key set');
-
+async function researchFirmWithWeb(firmName, deal, investor = {}) {
+  const { orComplete } = await import('../core/openRouterClient.js');
   const prompt = buildSingleFirmPrompt(firmName, deal, investor);
-  const res = await fetch('https://api.x.ai/v1/responses', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-    body: JSON.stringify({
-      model: grokModel,
-      input: [{ role: 'user', content: prompt }],
-      tools: [{ type: 'web_search' }],
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text().catch(() => '');
-    throw new Error(`Grok ${res.status}: ${err.substring(0, 150)}`);
-  }
-
-  const data = await res.json();
-  const outputMsg = (data.output || []).find(o => o.type === 'message');
-  const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '{}';
-  return parseSingleFirmResult(text, `grok/${grokModel}`);
-}
-
-async function runGeminiFirmResearch(deal) {
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  const GEMINI_FALLBACK = process.env.GEMINI_API_KEY_FALLBACK;
-  if (!GEMINI_KEY && !GEMINI_FALLBACK) {
-    console.warn('[FIRM RESEARCH] No Gemini keys — skipping');
-    return [];
-  }
-
-  const { geminiModels } = getResearchConfig();
-  console.log('[FIRM RESEARCH] Using Gemini with google_search...');
-
-  const prompt = buildFirmResearchPrompt(deal);
-  const query = buildResearchSearchLabel(deal);
-  const keys = [GEMINI_KEY, GEMINI_FALLBACK].filter(Boolean);
-  await emitFirmResearchTrace({
-    deal,
-    provider: 'Gemini web search',
-    query,
-    prompt,
-    status: 'started',
-  });
-
-  for (const key of keys) {
-    for (const model of geminiModels) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              tools: [{ google_search: {} }],
-              generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
-            }),
-          }
-        );
-
-        if (res.ok) {
-          const data = await res.json();
-          const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-          const firms = parseFirmResearchResults(text, `gemini/${model}`);
-          const sources = extractGeminiSources(data);
-          if (firms.length > 0) {
-            console.log(`[FIRM RESEARCH] Gemini (${model}) returned ${firms.length} firms`);
-            await emitFirmResearchTrace({
-              deal,
-              provider: `Gemini web search (${model})`,
-              query,
-              prompt,
-              firms,
-              sources,
-              status: 'completed',
-              sendTelegramUpdate: true,
-            });
-            return firms;
-          }
-        } else {
-          const errText = await res.text().catch(() => '');
-          console.warn(`[FIRM RESEARCH] Gemini ${model} failed (${res.status}): ${errText.substring(0, 100)}`);
-        }
-      } catch (err) {
-        console.warn(`[FIRM RESEARCH] Gemini ${model} error:`, err.message);
-      }
-    }
-  }
-
-  console.error('[FIRM RESEARCH] All Gemini models failed');
-  await emitFirmResearchTrace({
-    deal,
-    provider: 'Gemini web search',
-    query,
-    prompt,
-    firms: [],
-    status: 'completed',
-    sendTelegramUpdate: true,
-  });
-  return [];
-}
-
-async function researchFirmWithGemini(firmName, deal, investor = {}) {
-  const { geminiModels } = getResearchConfig();
-  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
-  if (!keys.length) throw new Error('No Gemini keys set');
-
-  const prompt = buildSingleFirmPrompt(firmName, deal, investor);
-  let lastError = null;
-
-  for (const key of keys) {
-    for (const model of geminiModels) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              tools: [{ google_search: {} }],
-              generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
-            }),
-          }
-        );
-
-        if (!res.ok) {
-          const errText = await res.text().catch(() => '');
-          throw new Error(`Gemini ${model} ${res.status}: ${errText.substring(0, 150)}`);
-        }
-
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-        return parseSingleFirmResult(text, `gemini/${model}`);
-      } catch (err) {
-        lastError = err;
-      }
-    }
-  }
-
-  throw lastError || new Error('All Gemini models failed');
+  const text = await orComplete(prompt, { tier: 'web', maxTokens: 2048 });
+  return parseSingleFirmResult(text, 'perplexity/sonar-pro');
 }
 
 function buildFirmResearchPrompt(deal) {
@@ -913,56 +691,13 @@ export async function researchFirmOnly(investor, deal) {
     }, deal);
   }
 
-  const config = getResearchConfig();
-
-  if (config.primaryProvider === 'grok') {
-    try {
-      return await researchFirmWithGrok(firmName, deal, investor);
-    } catch (grokErr) {
-      console.warn(`[FIRM RESEARCH] Grok failed for ${firmName} — trying Gemini:`, grokErr.message);
-      pushActivity({
-        type: 'error',
-        action: `Grok failed for ${firmName} — falling back to Gemini`,
-        note: grokErr.message?.slice(0, 60),
-        deal_name: deal.name,
-        dealId: deal.id,
-      });
-    }
-
-    try {
-      return await researchFirmWithGemini(firmName, deal, investor);
-    } catch (geminiErr) {
-      pushActivity({
-        type: 'error',
-        action: `Research failed: ${firmName} — both Grok and Gemini unavailable`,
-        note: geminiErr.message?.slice(0, 60),
-        deal_name: deal.name,
-        dealId: deal.id,
-      });
-      return buildMinimalFirmData(investor, deal);
-    }
-  }
-
   try {
-    return await researchFirmWithGemini(firmName, deal, investor);
-  } catch (geminiErr) {
-    console.warn(`[FIRM RESEARCH] Gemini failed for ${firmName} — trying Grok:`, geminiErr.message);
+    return await researchFirmWithWeb(firmName, deal, investor);
+  } catch (webErr) {
     pushActivity({
       type: 'error',
-      action: `Gemini failed for ${firmName} — falling back to Grok`,
-      note: geminiErr.message?.slice(0, 60),
-      deal_name: deal.name,
-      dealId: deal.id,
-    });
-  }
-
-  try {
-    return await researchFirmWithGrok(firmName, deal, investor);
-  } catch (grokErr) {
-    pushActivity({
-      type: 'error',
-      action: `Research failed: ${firmName} — both Gemini and Grok unavailable`,
-      note: grokErr.message?.slice(0, 60),
+      action: `Research failed: ${firmName} — web research unavailable`,
+      note: webErr.message?.slice(0, 60),
       deal_name: deal.name,
       dealId: deal.id,
     });
@@ -1834,10 +1569,7 @@ async function findContactsViaWebsiteScrape(firm) {
 
   if (!pageText) return [];
 
-  // Step 3: Use Gemini to extract person names + titles from the page text
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_FALLBACK;
-  if (!geminiKey) return [];
-
+  // Step 3: Use Perplexity/classify to extract person names + titles from the page text
   const extractPrompt = `You are reading a webpage from the investment firm "${firmName}" (URL: ${usedUrl}).
 Extract the names and titles of all current team members who are investment decision-makers (Partners, MDs, Principals, Founders, Directors).
 
@@ -1856,21 +1588,9 @@ Rules:
 - No prose, no explanation, just the JSON array`;
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: extractPrompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
-        }),
-      }
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const { orComplete } = await import('../core/openRouterClient.js');
+    const text = await orComplete(extractPrompt, { tier: 'classify', maxTokens: 1024 });
+    const jsonMatch = (text || '').match(/\[[\s\S]*\]/);
     if (!jsonMatch) return [];
     const people = JSON.parse(jsonMatch[0]);
     if (!Array.isArray(people)) return [];
@@ -1885,7 +1605,7 @@ Rules:
         linkedin_provider_id: null,
         email: null,
         source: 'website_scrape',
-        _score: 6, // treat website names as high-confidence
+        _score: 6,
       }));
 
     if (results.length > 0) {
@@ -1893,7 +1613,7 @@ Rules:
     }
     return results;
   } catch (err) {
-    console.warn(`[FIRM RESEARCH] Gemini extraction failed for ${firmName}:`, err.message?.slice(0, 80));
+    console.warn(`[FIRM RESEARCH] Extraction failed for ${firmName}:`, err.message?.slice(0, 80));
     return [];
   }
 }
@@ -1903,25 +1623,13 @@ Rules:
  * Returns a URL string or null.
  */
 async function resolveWebsiteViaGrok(firmName) {
-  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) return null;
-  const { grokModel } = getResearchConfig();
   try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({
-        model: grokModel,
-        input: [{ role: 'user', content: `What is the official website URL for the investment firm "${firmName}"? Return ONLY the URL (e.g. https://example.com), nothing else. If you cannot find it, return null.` }],
-        tools: [{ type: 'web_search' }],
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = (outputMsg?.content?.find(c => c.type === 'output_text')?.text || '').trim();
-    const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/);
+    const { orComplete } = await import('../core/openRouterClient.js');
+    const text = await orComplete(
+      `What is the official website URL for the investment firm "${firmName}"? Return ONLY the URL (e.g. https://example.com), nothing else. If you cannot find it, return null.`,
+      { tier: 'web', maxTokens: 100 }
+    );
+    const urlMatch = (text || '').match(/https?:\/\/[^\s"'<>]+/);
     return urlMatch ? urlMatch[0].replace(/[.,;]+$/, '') : null;
   } catch { return null; }
 }
@@ -2048,10 +1756,7 @@ function dedupeDecisionMakers(people) {
 
 async function findContactsAtFirm(firm, deal, options = {}) {
   const sb = getSupabase();
-  const grokKey = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   const shouldPersist = options.persist !== false;
-  const { geminiModels, grokModel } = getResearchConfig();
-  const geminiKeys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
 
   const prompt = `Search for the investment firm "${firm.name}" (${firm.firm_type || 'investment firm'}${firm.website ? `, website: ${firm.website}` : ''}) and find the 2-4 current decision-makers who actively evaluate and make investment decisions at THIS firm.
 
@@ -2081,70 +1786,14 @@ Return ONLY a valid JSON array. No prose, no explanation. If you cannot find ver
     modelUsed = 'stored_contacts';
   }
 
-  // Try Grok first (Responses API with web_search tool)
-  if (people.length === 0 && grokKey) {
+  if (people.length === 0) {
     try {
-      const res = await fetch('https://api.x.ai/v1/responses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${grokKey}` },
-        body: JSON.stringify({
-          model: grokModel,
-          input: [{ role: 'user', content: prompt }],
-          tools: [{ type: 'web_search' }],
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const outputMsg = (data.output || []).find(o => o.type === 'message');
-        const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '[]';
-          people = parseContactsFromFirm(text);
-          if (people.length > 0) modelUsed = grokModel;
-      } else {
-        const errText = await res.text().catch(() => '');
-        console.warn(`[FIRM RESEARCH] Grok contact search failed (${res.status}) for ${firm.name}: ${errText.substring(0, 100)}`);
-      }
+      const { orComplete } = await import('../core/openRouterClient.js');
+      const text = await orComplete(prompt, { tier: 'web', maxTokens: 2048 });
+      people = parseContactsFromFirm(text);
+      if (people.length > 0) modelUsed = 'perplexity/sonar-pro';
     } catch (err) {
-      console.warn(`[FIRM RESEARCH] Grok contact search error for ${firm.name}:`, err.message);
-    }
-  }
-
-  // Fallback to Gemini
-  if (people.length === 0 && geminiKeys.length > 0) {
-    for (const key of geminiKeys) {
-      for (const model of geminiModels) {
-        try {
-          const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                tools: [{ google_search: {} }],
-                generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
-              }),
-            }
-          );
-
-          if (!res.ok) {
-            const errText = await res.text().catch(() => '');
-            console.warn(`[FIRM RESEARCH] Gemini ${model} contact search failed (${res.status}) for ${firm.name}: ${errText.substring(0, 100)}`);
-            continue;
-          }
-
-          const data = await res.json();
-          const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-          people = parseContactsFromFirm(text);
-          if (people.length > 0) {
-            modelUsed = model;
-            break;
-          }
-        } catch (err) {
-          console.warn(`[FIRM RESEARCH] Gemini ${model} contact search error for ${firm.name}:`, err.message);
-        }
-      }
-      if (people.length > 0) break;
+      console.warn(`[FIRM RESEARCH] Web contact search error for ${firm.name}:`, err.message);
     }
   }
 

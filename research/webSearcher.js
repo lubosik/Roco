@@ -1,47 +1,23 @@
-function getSerpApiKey() {
-  return process.env.SERP_API_KEY || process.env.SERPAPI_KEY || '';
-}
+import { orComplete } from '../core/openRouterClient.js';
 
-function normalizeOrganicResult(result = {}) {
-  return {
-    position: result.position || null,
-    title: result.title || '',
-    link: result.link || result.redirect_link || '',
-    source: result.source || result.displayed_link || '',
-    snippet: result.snippet || '',
-    date: result.date || '',
-  };
-}
-
-export async function webSearch(query, num = 5, options = {}) {
-  const key = getSerpApiKey();
-  if (!key) return [];
-
-  const url = new URL('https://serpapi.com/search.json');
-  url.searchParams.set('engine', options.engine || 'google');
-  url.searchParams.set('q', query);
-  url.searchParams.set('num', String(Math.min(Math.max(Number(num) || 5, 1), 10)));
-  url.searchParams.set('api_key', key);
-  if (options.hl) url.searchParams.set('hl', options.hl);
-  if (options.gl) url.searchParams.set('gl', options.gl);
-  if (options.location) url.searchParams.set('location', options.location);
-
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`SerpAPI error: ${res.status}`);
-  const data = await res.json();
-  if (data?.error) throw new Error(`SerpAPI error: ${data.error}`);
-
-  return (data.organic_results || []).map(normalizeOrganicResult);
+/**
+ * Web search via Perplexity sonar-pro (OpenRouter web tier).
+ * Returns an array with a single result whose `snippet` holds the full response.
+ * Format matches the old SerpAPI shape so callers don't need changes.
+ */
+export async function webSearch(query, _num = 5, _options = {}) {
+  try {
+    const result = await orComplete(query, { tier: 'web', maxTokens: 1500 });
+    if (!result) return [];
+    return [{ title: 'Web Research', source: 'perplexity', snippet: result, link: '', date: '' }];
+  } catch (err) {
+    console.warn('[WEB SEARCH] Perplexity failed:', err.message);
+    return [];
+  }
 }
 
 export async function getSerpAccountStatus() {
-  const key = getSerpApiKey();
-  if (!key) return null;
-  const url = new URL('https://serpapi.com/account.json');
-  url.searchParams.set('api_key', key);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`SerpAPI account error: ${res.status}`);
-  return res.json();
+  return null;
 }
 
 export function formatWebResultsForPrompt(results = []) {

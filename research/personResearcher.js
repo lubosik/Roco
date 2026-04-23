@@ -148,90 +148,16 @@ function parseJsonFromText(text) {
   return JSON.parse(match[0]);
 }
 
-/** Try Gemini with all models and both keys. Returns result or null. Pushes errors into `errors` array. */
-async function tryGemini(prompt, contactName, errors) {
-  const { geminiModels } = getResearchConfig();
-  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
-  if (!keys.length) return null;
-
-  for (const key of keys) {
-    for (const model of geminiModels) {
-      try {
-        const body = {
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
-          tools: [{ google_search: {} }],
-        };
-
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-        );
-
-        if (!res.ok) {
-          const errText = await res.text();
-          const err = new Error(`${model} ${res.status}: ${errText.substring(0, 150)}`);
-          err.status = res.status;
-          throw err;
-        }
-
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const result = parseJsonFromText(text);
-        console.log(`[PERSON RESEARCH] ${contactName}: Gemini ${model} success (${result.confidence || '?'} confidence)`);
-        return result;
-      } catch (err) {
-        errors.push({ api: 'gemini', model, status: err.status, message: err.message });
-        console.warn(`[PERSON RESEARCH] Gemini ${model} failed for ${contactName}: ${err.message}`);
-      }
-    }
-    if (key !== keys[keys.length - 1]) {
-      console.warn(`[PERSON RESEARCH] Primary Gemini key exhausted for ${contactName} — trying fallback key`);
-    }
-  }
-
-  return null;
-}
-
-/** Try Grok with web search via Responses API. Returns result or null. Pushes errors into `errors` array. */
-async function tryGrok(prompt, contactName, errors) {
-  const { grokModel } = getResearchConfig();
-  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) return null;
-
+async function tryWebSearch(prompt, contactName, errors) {
   try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: grokModel,
-        input: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      const err = new Error(`Grok ${grokModel} ${res.status}: ${errText.substring(0, 150)}`);
-      err.status = res.status;
-      throw err;
-    }
-
-    const data = await res.json();
-    // Responses API format: output[] contains message objects
-    const outputMsg = (data.output || []).find(o => o.type === 'message');
-    const text = outputMsg?.content?.find(c => c.type === 'output_text')?.text || '';
-    if (!text) throw new Error('Empty response from Grok');
-
+    const { orComplete } = await import('../core/openRouterClient.js');
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 1024 });
     const result = parseJsonFromText(text);
-    console.log(`[PERSON RESEARCH] ${contactName}: Grok success (${result.confidence || '?'} confidence)`);
+    console.log(`[PERSON RESEARCH] ${contactName}: Perplexity success (${result.confidence || '?'} confidence)`);
     return result;
   } catch (err) {
-    errors.push({ api: 'grok', model: grokModel, status: err.status, message: err.message });
-    console.warn(`[PERSON RESEARCH] Grok failed for ${contactName}: ${err.message}`);
+    errors.push({ api: 'perplexity', model: 'sonar-pro', status: err.status, message: err.message });
+    console.warn(`[PERSON RESEARCH] Perplexity failed for ${contactName}: ${err.message}`);
     return null;
   }
 }
@@ -250,17 +176,9 @@ export async function researchPerson({ contact, deal }) {
   const normalized = normalizePersonResearch(contact);
   const canReuseStoredResearch = hasCoreResearchFields(contact) || hasFreshResearch(contact, config.cacheTtlDays);
 
-  const hasGemini = !!(process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_FALLBACK);
-  const hasGrok = !!(process.env.XAI_API_KEY || process.env.GROK_API_KEY);
-
   if (canReuseStoredResearch) {
     console.log(`[PERSON RESEARCH] ${contact.name}: using cached/structured data`);
     return normalized;
-  }
-
-  if (!hasGemini && !hasGrok) {
-    console.warn('[PERSON RESEARCH] No API keys configured (XAI_API_KEY, GROK_API_KEY, or GEMINI_API_KEY) — skipping');
-    return null;
   }
 
   const firm = contact.company_name || '';
@@ -270,19 +188,10 @@ export async function researchPerson({ contact, deal }) {
   const basePrompt = buildPrompt(contact, deal);
   const prompt = agentCtx ? `${agentCtx}${basePrompt}` : basePrompt;
   const errors = [];
-  const providers = config.primaryProvider === 'grok'
-    ? ['grok', 'gemini']
-    : ['gemini', 'grok'];
 
-  for (const provider of providers) {
-    if (provider === 'grok' && !config.enableGrokFallback && config.primaryProvider !== 'grok') continue;
-    const result = provider === 'gemini'
-      ? await tryGemini(prompt, contact.name, errors)
-      : await tryGrok(prompt, contact.name, errors);
+  {
+    const result = await tryWebSearch(prompt, contact.name, errors);
     if (result) return result;
-    if (errors.length > 0) {
-      console.warn(`[PERSON RESEARCH] ${provider} failed for ${contact.name}`);
-    }
   }
 
   if (hasCoreResearchFields(contact)) {

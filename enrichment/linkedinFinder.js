@@ -168,55 +168,10 @@ function parseFallbackCandidateUrl(text) {
   return validateLinkedInProfileUrl(directUrl);
 }
 
-async function tryGeminiFallback(prompt) {
-  const models = ['gemini-2.5-flash', 'gemini-2.5-pro'];
-  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(Boolean);
-  for (const key of keys) {
-    for (const model of models) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              tools: [{ google_search: {} }],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 300 },
-            }),
-          },
-        );
-        if (!res.ok) continue;
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const url = parseFallbackCandidateUrl(text);
-        if (url) return url;
-      } catch {}
-    }
-  }
-  return null;
-}
-
-async function tryGrokFallback(prompt) {
-  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) return null;
+async function tryWebFallback(prompt) {
   try {
-    const res = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: process.env.RESEARCH_GROK_MODEL || 'grok-3-fast',
-        input: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const outputMsg = (data.output || []).find(item => item.type === 'message');
-    const text = outputMsg?.content?.find(item => item.type === 'output_text')?.text || '';
+    const { orComplete } = await import('../core/openRouterClient.js');
+    const text = await orComplete(prompt, { tier: 'web', maxTokens: 300 });
     return parseFallbackCandidateUrl(text);
   } catch {
     return null;
@@ -371,7 +326,7 @@ export async function findLinkedInUrl({ name, company, title }) {
   }
 
   const fallbackPrompt = buildFallbackPrompt(expected);
-  const fallbackUrl = await tryGeminiFallback(fallbackPrompt) || await tryGrokFallback(fallbackPrompt);
+  const fallbackUrl = await tryWebFallback(fallbackPrompt);
   if (!fallbackUrl) return null;
 
   return verifyFallbackUrl(fallbackUrl, expected);

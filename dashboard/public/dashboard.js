@@ -9998,3 +9998,166 @@ async function uploadInvestorXLSX(file) {
     resultEl.textContent     = `✗ Import failed: ${err.message}`;
   }
 }
+
+// ── JARVIS ORB ───────────────────────────────────────────────────────────────
+
+const jarvisOrb = (() => {
+  let isOpen = false;
+  let recognition = null;
+  let isListening = false;
+
+  const orb = () => document.getElementById('jarvis-orb');
+  const panel = () => document.getElementById('jarvis-panel');
+  const messages = () => document.getElementById('jarvis-messages');
+  const input = () => document.getElementById('jarvis-input');
+  const dot = () => document.getElementById('jarvis-status-dot');
+  const mic = () => document.getElementById('jarvis-mic');
+
+  function setOrbState(state) {
+    const el = orb();
+    if (!el) return;
+    el.classList.remove('listening', 'thinking', 'speaking');
+    if (state) el.classList.add(state);
+  }
+
+  function setDotState(state) {
+    const el = dot();
+    if (!el) return;
+    el.classList.remove('active', 'busy', 'listening');
+    if (state) el.classList.add(state);
+  }
+
+  function addMessage(role, text) {
+    const container = messages();
+    if (!container) return;
+    const row = document.createElement('div');
+    row.className = `jarvis-msg ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'jarvis-bubble';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  function showTyping() {
+    const container = messages();
+    if (!container) return null;
+    const row = document.createElement('div');
+    row.className = 'jarvis-msg bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'jarvis-bubble jarvis-typing';
+    bubble.innerHTML = '<span></span><span></span><span></span>';
+    row.appendChild(bubble);
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  function getActiveDealId() {
+    const sel = document.querySelector('[data-active-deal-id]');
+    return sel ? sel.dataset.activeDealId : null;
+  }
+
+  async function send() {
+    const inp = input();
+    if (!inp) return;
+    const text = (inp.value || '').trim();
+    if (!text) return;
+    inp.value = '';
+    addMessage('user', text);
+    setOrbState('thinking');
+    setDotState('busy');
+    const typing = showTyping();
+    try {
+      const res = await fetch('/api/jarvis', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ message: text, dealId: getActiveDealId() }),
+      });
+      const data = await res.json();
+      if (typing) typing.remove();
+      addMessage('bot', data.reply || data.error || 'No response');
+    } catch (err) {
+      if (typing) typing.remove();
+      addMessage('bot', `Error: ${err.message}`);
+    } finally {
+      setOrbState(null);
+      setDotState('active');
+    }
+  }
+
+  function setupSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return null;
+    const r = new SpeechRecognition();
+    r.continuous = false;
+    r.interimResults = false;
+    r.lang = 'en-US';
+    r.onresult = (e) => {
+      const transcript = e.results[0]?.[0]?.transcript || '';
+      const inp = input();
+      if (inp && transcript) inp.value = transcript;
+      stopListening();
+      send();
+    };
+    r.onerror = () => stopListening();
+    r.onend   = () => stopListening();
+    return r;
+  }
+
+  function startListening() {
+    if (!recognition) recognition = setupSpeechRecognition();
+    if (!recognition) { alert('Speech recognition not supported in this browser.'); return; }
+    try {
+      recognition.start();
+      isListening = true;
+      setOrbState('listening');
+      setDotState('listening');
+      const m = mic();
+      if (m) m.classList.add('active');
+    } catch {}
+  }
+
+  function stopListening() {
+    isListening = false;
+    setOrbState(null);
+    if (isOpen) setDotState('active');
+    const m = mic();
+    if (m) m.classList.remove('active');
+    try { recognition?.stop(); } catch {}
+  }
+
+  function toggleMic() {
+    if (isListening) stopListening();
+    else startListening();
+  }
+
+  function open() {
+    isOpen = true;
+    const p = panel();
+    if (p) p.classList.add('open');
+    setDotState('active');
+    const inp = input();
+    if (inp) setTimeout(() => inp.focus(), 150);
+    if (!messages()?.children.length) {
+      addMessage('bot', 'Hey — what\'s on your mind? Ask me about the pipeline, a specific deal, or tell me what you need.');
+    }
+  }
+
+  function close() {
+    isOpen = false;
+    const p = panel();
+    if (p) p.classList.remove('open');
+    setDotState(null);
+    stopListening();
+  }
+
+  function toggle() {
+    if (isOpen) close(); else open();
+  }
+
+  return { open, close, toggle, send, toggleMic };
+})();

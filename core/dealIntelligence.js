@@ -3,10 +3,8 @@
 // Builds intelligence_boost scores so Roco ranks investors with proven
 // track records in similar deals higher for every campaign batch.
 
-import Anthropic from '@anthropic-ai/sdk';
 import { getSupabase } from './supabase.js';
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { orComplete } from './openRouterClient.js';
 
 export async function analyzeDealIntelligence(dealId, pushActivity = null) {
   const sb = getSupabase();
@@ -55,13 +53,7 @@ Return ONLY this JSON, no other text:
 {"results":[{"index":1,"score":75,"investors":["Firm A","Firm B"],"rationale":"..."}]}`;
 
     try {
-      const response = await anthropic.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      const raw = (response.content[0]?.text || '').replace(/```json|```/g, '').trim();
+      const raw = (await orComplete(prompt, { tier: 'classify', maxTokens: 2000 }) || '').replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(raw);
 
       for (const item of parsed.results || []) {

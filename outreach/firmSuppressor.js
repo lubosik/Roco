@@ -1,16 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { getContactsByFirm, updateContact, getContactProp } from '../crm/notionContacts.js';
 import { suppressFirm, getCompanyByName, getCompanyProp } from '../crm/notionCompanies.js';
 import { logActivity } from '../crm/notionLogger.js';
 import { sendTelegram } from '../approval/telegramBot.js';
 import { PIPELINE_STAGES, REPLY_CLASSIFICATIONS } from '../config/constants.js';
 import { info, error } from '../core/logger.js';
-
-let client;
-function getClient() {
-  if (!client) client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  return client;
-}
+import { orComplete } from '../core/openRouterClient.js';
 
 export async function classifyReply(emailBody) {
   const prompt = `You are analysing an email reply from an investor. Classify it as one of:
@@ -24,12 +18,7 @@ ${emailBody.slice(0, 1000)}
 Return ONLY valid JSON: { "classification": "...", "confidence": 0-100, "reason": "one sentence" }`;
 
   try {
-    const response = await getClient().messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 256,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const text = response.content[0].text;
+    const text = await orComplete(prompt, { tier: 'classify', maxTokens: 256 });
     const match = text.match(/\{[\s\S]*\}/);
     if (match) return JSON.parse(match[0]);
   } catch (err) {

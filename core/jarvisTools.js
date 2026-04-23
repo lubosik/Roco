@@ -452,20 +452,10 @@ async function toolGetContactsByStage({ deal_id, stage, limit = 20 }) {
 // ── web_search ────────────────────────────────────────────────────────────────
 async function toolWebSearch({ query, num_results = 5 }) {
   try {
-    const { webSearch } = await import('../research/webSearcher.js');
-    const results = await webSearch(query, Math.min(num_results || 5, 8));
-    if (!results.length) {
-      return { message: 'No results found. SERP_API_KEY may not be configured.', results: [] };
-    }
-    return {
-      results: results.map(r => ({
-        title:   r.title,
-        source:  r.source,
-        snippet: r.snippet,
-        url:     r.link,
-        date:    r.date || null,
-      })),
-    };
+    const { orComplete } = await import('./openRouterClient.js');
+    const result = await orComplete(query, { tier: 'web', maxTokens: Math.min((num_results || 5) * 300, 1500) });
+    if (!result) return { message: 'No results returned.', results: [] };
+    return { results: [{ snippet: result, title: 'Web Research', source: 'perplexity', url: '' }] };
   } catch (err) {
     return { error: `Web search failed: ${err.message}` };
   }
