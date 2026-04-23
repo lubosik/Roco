@@ -63,11 +63,60 @@ function touchSession(chatId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PIPELINE HIGHLIGHTS  (rich live context injected into every system prompt)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildPipelineHighlights(dealId) {
+  const sb = getSupabase();
+  if (!sb || !dealId) return '';
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const [repliesRes, acceptedRes, meetingsRes, emailCountRes, dmCountRes, inviteCountRes] = await Promise.all([
+      sb.from('contacts').select('name, company_name, last_reply_at, pipeline_stage')
+        .eq('deal_id', dealId).not('last_reply_at', 'is', null)
+        .gte('last_reply_at', sevenDaysAgo).order('last_reply_at', { ascending: false }).limit(5),
+      sb.from('contacts').select('name, company_name, invite_accepted_at')
+        .eq('deal_id', dealId).not('invite_accepted_at', 'is', null).is('dm_sent_at', null)
+        .order('invite_accepted_at', { ascending: false }).limit(12),
+      sb.from('contacts').select('name, company_name, meeting_booked_at')
+        .eq('deal_id', dealId).not('meeting_booked_at', 'is', null).limit(10),
+      sb.from('contacts').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).not('last_email_sent_at', 'is', null),
+      sb.from('contacts').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).not('dm_sent_at', 'is', null),
+      sb.from('contacts').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).not('invite_sent_at', 'is', null),
+    ]);
+
+    const lines = [];
+    const replies = repliesRes.data || [];
+    if (replies.length) {
+      lines.push(`Recent replies (7 days): ${replies.map(c => `${c.name} at ${c.company_name} [${c.pipeline_stage || '?'}]`).join(', ')}`);
+    }
+    const accepted = acceptedRes.data || [];
+    if (accepted.length) {
+      lines.push(`LinkedIn accepted — DM not yet sent (${accepted.length}): ${accepted.slice(0, 6).map(c => c.name).join(', ')}${accepted.length > 6 ? ` +${accepted.length - 6} more` : ''}`);
+    }
+    const meetings = meetingsRes.data || [];
+    if (meetings.length) {
+      lines.push(`Meetings booked (${meetings.length}): ${meetings.map(c => `${c.name} at ${c.company_name}`).join(', ')}`);
+    }
+    lines.push(`Emails sent total: ${emailCountRes.count || 0}`);
+    lines.push(`LinkedIn DMs sent total: ${dmCountRes.count || 0}`);
+    lines.push(`LinkedIn invites sent total: ${inviteCountRes.count || 0}`);
+    return lines.join('\n');
+  } catch {
+    return '';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function buildSystemPrompt(deal, metrics) {
-  const memoryCtx = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
+  const memoryCtx  = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
+  const highlights = deal ? await buildPipelineHighlights(deal.id) : '';
 
   const dealSection = deal ? `
 ACTIVE DEAL: ${deal.name}
@@ -94,7 +143,7 @@ LIVE PIPELINE:
 You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
 
 ${dealSection}
-${metricsSection}
+${metricsSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 
@@ -226,10 +275,20 @@ export async function handleMessage(chatId, text) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const VOLUME_THRESHOLDS = {
-  min_pending_approvals:    3,   // below this → investigate
-  min_firms_in_pipeline:    10,  // below this → trigger research
-  response_rate_drop_pct:   30,  // drop by this % vs last week → flag
+  min_pending_approvals:    3,
+  min_firms_in_pipeline:    10,
+  response_rate_drop_pct:   30,
 };
+
+// Prevent the same alert type from firing more than once every 2 hours per deal
+const _alertCooldowns = new Map();
+function _canAlert(dealId, type) {
+  const key = `${dealId}:${type}`;
+  const last = _alertCooldowns.get(key) || 0;
+  if (Date.now() - last < 2 * 60 * 60 * 1000) return false;
+  _alertCooldowns.set(key, Date.now());
+  return true;
+}
 
 export async function runAutonomousCheck(deals) {
   if (!deals?.length) return;
@@ -250,29 +309,20 @@ async function runDealAutonomousCheck(deal) {
   const alerts = [];
 
   // Rule 1: Pipeline running thin
-  if ((metrics.firms_in_pipeline || 0) < VOLUME_THRESHOLDS.min_firms_in_pipeline) {
+  if ((metrics.firms_in_pipeline || 0) < VOLUME_THRESHOLDS.min_firms_in_pipeline && _canAlert(deal.id, 'volume')) {
     alerts.push({
       type:   'volume',
-      msg:    `Pipeline thin — only ${metrics.firms_in_pipeline} active firms. Triggering research.`,
+      msg:    `Pipeline is thin — ${metrics.firms_in_pipeline} active contacts. I've triggered a research cycle to refill it.`,
       action: async () => {
         const { triggerImmediateRun } = await import('./orchestrator.js');
         triggerImmediateRun(deal.id).catch(() => {});
         await writeMemory(deal.id, {
           type:    'ACTION',
-          subject: 'Auto-triggered research',
-          content: `Pipeline dropped to ${metrics.firms_in_pipeline} active firms — triggered immediate research cycle.`,
+          subject: 'Auto-triggered research (thin pipeline)',
+          content: `Pipeline dropped to ${metrics.firms_in_pipeline} active contacts — triggered immediate research cycle.`,
           tags:    ['autonomous', 'research'],
         });
       },
-    });
-  }
-
-  // Rule 2: Approval queue empty and outreach is on
-  if ((metrics.pending_approvals || 0) < VOLUME_THRESHOLDS.min_pending_approvals) {
-    alerts.push({
-      type: 'queue',
-      msg:  `Approval queue has ${metrics.pending_approvals || 0} items — orchestrator should draft more shortly.`,
-      action: null,
     });
   }
 

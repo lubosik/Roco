@@ -145,6 +145,29 @@ export const JARVIS_TOOLS = [
       required: ['deal_id', 'firm_name', 'reason'],
     },
   },
+  {
+    name: 'web_search',
+    description: 'Search the web for real-time information about a firm, investor, recent fund closes, partner moves, or any topic. Use this to look up someone before outreach, check recent news about a firm, or research anything not in the pipeline database.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query:       { type: 'string', description: 'What to search for (e.g. "Greenvolt Capital fund close 2026", "Sarah Chen VC partner background")' },
+        num_results: { type: 'number', description: 'Number of results (default 5, max 8)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'get_contacts_breakdown',
+    description: 'Get a detailed breakdown of contacts in the pipeline grouped by stage. Shows how many contacts are at each stage (invite_sent, invite_accepted, Email Sent, Replied, etc.) for a deal.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'The deal UUID' },
+      },
+      required: ['deal_id'],
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,16 +176,18 @@ export const JARVIS_TOOLS = [
 
 export async function executeTool(name, input) {
   switch (name) {
-    case 'get_status':             return toolGetStatus(input);
-    case 'get_pending_approvals':  return toolGetPendingApprovals(input);
-    case 'approve_message':        return toolApproveMessage(input);
-    case 'skip_message':           return toolSkipMessage(input);
-    case 'get_recent_activity':    return toolGetRecentActivity(input);
-    case 'control_module':         return toolControlModule(input);
-    case 'trigger_research':       return toolTriggerResearch(input);
-    case 'search_pipeline':        return toolSearchPipeline(input);
-    case 'get_contacts_by_stage':  return toolGetContactsByStage(input);
-    case 'suppress_firm':          return toolSuppressFirm(input);
+    case 'get_status':              return toolGetStatus(input);
+    case 'get_pending_approvals':   return toolGetPendingApprovals(input);
+    case 'approve_message':         return toolApproveMessage(input);
+    case 'skip_message':            return toolSkipMessage(input);
+    case 'get_recent_activity':     return toolGetRecentActivity(input);
+    case 'control_module':          return toolControlModule(input);
+    case 'trigger_research':        return toolTriggerResearch(input);
+    case 'search_pipeline':         return toolSearchPipeline(input);
+    case 'get_contacts_by_stage':   return toolGetContactsByStage(input);
+    case 'suppress_firm':           return toolSuppressFirm(input);
+    case 'web_search':              return toolWebSearch(input);
+    case 'get_contacts_breakdown':  return toolGetContactsBreakdown(input);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -418,6 +443,62 @@ async function toolGetContactsByStage({ deal_id, stage, limit = 20 }) {
         has_linkedin:  !!c.linkedin_url,
         last_outreach: c.last_outreach_at,
       })),
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── web_search ────────────────────────────────────────────────────────────────
+async function toolWebSearch({ query, num_results = 5 }) {
+  try {
+    const { webSearch } = await import('../research/webSearcher.js');
+    const results = await webSearch(query, Math.min(num_results || 5, 8));
+    if (!results.length) {
+      return { message: 'No results found. SERP_API_KEY may not be configured.', results: [] };
+    }
+    return {
+      results: results.map(r => ({
+        title:   r.title,
+        source:  r.source,
+        snippet: r.snippet,
+        url:     r.link,
+        date:    r.date || null,
+      })),
+    };
+  } catch (err) {
+    return { error: `Web search failed: ${err.message}` };
+  }
+}
+
+// ── get_contacts_breakdown ────────────────────────────────────────────────────
+async function toolGetContactsBreakdown({ deal_id }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const { data } = await sb.from('contacts')
+      .select('pipeline_stage, tier')
+      .eq('deal_id', deal_id);
+
+    const stageCounts = {};
+    const tierCounts = { hot: 0, warm: 0, possible: 0, archive: 0, other: 0 };
+
+    for (const c of data || []) {
+      const stage = c.pipeline_stage || 'unknown';
+      stageCounts[stage] = (stageCounts[stage] || 0) + 1;
+      const tier = c.tier?.toLowerCase();
+      if (tier && tierCounts[tier] !== undefined) tierCounts[tier]++;
+      else tierCounts.other++;
+    }
+
+    const sortedStages = Object.entries(stageCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([stage, count]) => ({ stage, count }));
+
+    return {
+      total: (data || []).length,
+      by_stage: sortedStages,
+      by_tier: tierCounts,
     };
   } catch (err) {
     return { error: err.message };
