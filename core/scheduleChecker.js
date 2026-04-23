@@ -122,7 +122,8 @@ export function getNextWindowOpenForChannel(deal, channel) {
 
   let startStr;
   if (channel === 'linkedin_dm') {
-    startStr = deal.li_dm_from || '20:00';
+    startStr = deal.li_dm_from || null;
+    if (!startStr || !deal.li_dm_until) return 'Now (any time)';
   } else if (channel === 'linkedin_invite') {
     startStr = deal.li_connect_from || null;
     if (!startStr) return 'Now (any time)';
@@ -241,11 +242,9 @@ export function isWithinChannelWindow(deal, channel) {
   }
 
   if (channel === 'linkedin_dm') {
-    // Respect active deal days (DMs are evening sends on working days)
-    if (!sendingDays.includes(dayName)) return false;
-    const startStr = deal.li_dm_from  || '20:00';
-    const endStr   = deal.li_dm_until || '23:00';
-    return minutesInRange(startStr, endStr);
+    // No window configured → always open (send immediately after approval)
+    if (!deal.li_dm_from || !deal.li_dm_until) return true;
+    return minutesInRange(deal.li_dm_from, deal.li_dm_until);
   }
 
   // email — full window including active days check

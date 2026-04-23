@@ -2046,32 +2046,36 @@ async function executeReloadedApproval(item, decision) {
       last_outreach_at: new Date().toISOString(),
     }).eq('id', item.contact_id);
 
-    await sb.from('conversation_messages').insert({
-      contact_id: item.contact_id,
-      deal_id: dealId,
-      direction: 'outbound',
-      channel: 'email',
-      body: bodyToSend,
-      subject: approvedSubject,
-      sent_at: new Date().toISOString(),
-    }).catch(() => {});
+    try {
+      await sb.from('conversation_messages').insert({
+        contact_id: item.contact_id,
+        deal_id: dealId,
+        direction: 'outbound',
+        channel: 'email',
+        body: bodyToSend,
+        subject: approvedSubject,
+        sent_at: new Date().toISOString(),
+      });
+    } catch {}
   }
 
   if (dealId) {
-    await sb.from('activity_log').insert({
-      deal_id: dealId,
-      event_type: 'EMAIL_SENT',
-      summary: `Email sent to ${item.contact_name || ''} at ${item.firm || ''}`,
-      detail: {
-        channel: 'email',
-        account_id: sendResult?.accountId || null,
-        provider_id: sendResult?.providerId || null,
-        message_id: sendResult?.emailId || null,
-        thread_id: sendResult?.threadId || null,
-        to: toEmail,
-      },
-      created_at: new Date().toISOString(),
-    }).catch(() => {});
+    try {
+      await sb.from('activity_log').insert({
+        deal_id: dealId,
+        event_type: 'EMAIL_SENT',
+        summary: `Email sent to ${item.contact_name || ''} at ${item.firm || ''}`,
+        detail: {
+          channel: 'email',
+          account_id: sendResult?.accountId || null,
+          provider_id: sendResult?.providerId || null,
+          message_id: sendResult?.emailId || null,
+          thread_id: sendResult?.threadId || null,
+          to: toEmail,
+        },
+        created_at: new Date().toISOString(),
+      });
+    } catch {}
   }
 
   pushActivity({ type: 'email', action: `Email sent: ${item.contact_name || ''}`, note: `${item.firm || ''} · ${approvedSubject}` });
