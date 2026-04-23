@@ -168,6 +168,70 @@ export const JARVIS_TOOLS = [
       required: ['deal_id'],
     },
   },
+  {
+    name: 'update_contact',
+    description: 'Update a contact\'s pipeline stage, tier, notes, email, or LinkedIn URL. Use this when Dom tells you someone replied, moved stages, gave new info, or should be re-classified. Fuzzy name match — partial names work.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:        { type: 'string', description: 'The deal UUID' },
+        contact_name:   { type: 'string', description: 'Name or partial name of the contact to update' },
+        pipeline_stage: { type: 'string', description: 'New pipeline stage: Researched, invite_sent, invite_accepted, Email Sent, Replied, Meeting Booked, Archived' },
+        tier:           { type: 'string', description: 'Contact tier: hot, warm, possible, archive' },
+        notes:          { type: 'string', description: 'Notes to append (added to existing notes, not overwritten)' },
+        email:          { type: 'string', description: 'Update or set email address' },
+        linkedin_url:   { type: 'string', description: 'Update or set LinkedIn profile URL' },
+      },
+      required: ['deal_id', 'contact_name'],
+    },
+  },
+  {
+    name: 'record_reply',
+    description: 'Record that a contact replied — what they said, their intent, and any action to take. Moves them to the Replied stage and saves the message. Use when Dom pastes or summarises a reply.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:      { type: 'string', description: 'The deal UUID' },
+        contact_name: { type: 'string', description: 'Name or partial name of the contact who replied' },
+        message:      { type: 'string', description: 'The reply content or summary of what they said' },
+        intent:       { type: 'string', description: 'Intent classification: interested, not_interested, more_info, meeting_request, follow_up_later, unsubscribe, other' },
+        action_note:  { type: 'string', description: 'Optional: what Dom wants to do next (e.g. "follow up in 2 weeks", "book a call")' },
+      },
+      required: ['deal_id', 'contact_name', 'message'],
+    },
+  },
+  {
+    name: 'add_intelligence',
+    description: 'Store a piece of intelligence or observation Dom shares — about a firm, a contact, the market, or the deal strategy. Saved to JARVIS memory so it informs future decisions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'The deal UUID (optional — omit for general intelligence)' },
+        subject: { type: 'string', description: 'What this intelligence is about (e.g. "Blackstone Capital", "Meeting with Sarah Chen", "Market signal")' },
+        content: { type: 'string', description: 'The intelligence itself — what Dom observed, learned, or wants remembered' },
+        tags:    { type: 'array', items: { type: 'string' }, description: 'Optional tags for retrieval, e.g. ["firm:blackstone", "hot_lead"]' },
+      },
+      required: ['subject', 'content'],
+    },
+  },
+  {
+    name: 'update_deal',
+    description: 'Update deal-level information — EBITDA, equity target, sector, geography, investor profile, or any settings. Use when Dom provides new deal details.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:          { type: 'string', description: 'The deal UUID' },
+        sector:           { type: 'string', description: 'Deal sector' },
+        geography:        { type: 'string', description: 'Target geography' },
+        target_amount:    { type: 'number', description: 'Total raise target in USD/GBP' },
+        ebitda_usd_m:     { type: 'number', description: 'EBITDA in millions' },
+        equity_required_usd_m: { type: 'number', description: 'Equity required in millions' },
+        investor_profile: { type: 'string', description: 'Description of ideal investor' },
+        description:      { type: 'string', description: 'Updated deal description' },
+      },
+      required: ['deal_id'],
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +252,10 @@ export async function executeTool(name, input) {
     case 'suppress_firm':           return toolSuppressFirm(input);
     case 'web_search':              return toolWebSearch(input);
     case 'get_contacts_breakdown':  return toolGetContactsBreakdown(input);
+    case 'update_contact':          return toolUpdateContact(input);
+    case 'record_reply':            return toolRecordReply(input);
+    case 'add_intelligence':        return toolAddIntelligence(input);
+    case 'update_deal':             return toolUpdateDeal(input);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -523,6 +591,164 @@ async function toolSuppressFirm({ deal_id, firm_name, reason }) {
     });
 
     return { suppressed: true, firm: firm_name };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── update_contact ────────────────────────────────────────────────────────────
+async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, notes, email, linkedin_url }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    // Fuzzy match on name
+    const { data: matches } = await sb.from('contacts')
+      .select('id, name, company_name, pipeline_stage, tier, notes, email, linkedin_url')
+      .eq('deal_id', deal_id)
+      .ilike('name', `%${contact_name.split(' ')[0]}%`)
+      .limit(5);
+
+    if (!matches?.length) return { error: `No contact found matching "${contact_name}"` };
+
+    // Pick best match (prefer exact name start)
+    const contact = matches.find(c =>
+      c.name.toLowerCase().startsWith(contact_name.toLowerCase().split(' ')[0])
+    ) || matches[0];
+
+    const patch = {};
+    if (pipeline_stage) patch.pipeline_stage = pipeline_stage;
+    if (tier) patch.tier = tier;
+    if (email) patch.email = email;
+    if (linkedin_url) patch.linkedin_url = linkedin_url;
+    if (notes) {
+      const existing = contact.notes ? `${contact.notes}\n\n` : '';
+      patch.notes = `${existing}[JARVIS ${new Date().toISOString().slice(0, 10)}] ${notes}`;
+    }
+    patch.updated_at = new Date().toISOString();
+
+    if (!Object.keys(patch).length) return { error: 'No fields provided to update' };
+
+    await sb.from('contacts').update(patch).eq('id', contact.id);
+
+    await writeMemory(deal_id, {
+      type:    'UPDATE',
+      subject: `Updated contact: ${contact.name}`,
+      content: `JARVIS updated ${contact.name} at ${contact.company_name || 'unknown firm'}. Changes: ${Object.entries(patch).filter(([k]) => k !== 'updated_at').map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(', ')}`,
+      tags:    [`contact:${(contact.name || '').toLowerCase().replace(/\s+/g, '_')}`],
+    });
+
+    return {
+      updated: true,
+      contact: contact.name,
+      firm: contact.company_name,
+      changes: Object.keys(patch).filter(k => k !== 'updated_at'),
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── record_reply ──────────────────────────────────────────────────────────────
+async function toolRecordReply({ deal_id, contact_name, message, intent, action_note }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    // Find contact
+    const { data: matches } = await sb.from('contacts')
+      .select('id, name, company_name, pipeline_stage')
+      .eq('deal_id', deal_id)
+      .ilike('name', `%${contact_name.split(' ')[0]}%`)
+      .limit(5);
+
+    if (!matches?.length) return { error: `No contact found matching "${contact_name}"` };
+    const contact = matches[0];
+
+    // Save to conversation_messages
+    await sb.from('conversation_messages').insert({
+      deal_id,
+      contact_id:   contact.id,
+      contact_name: contact.name,
+      direction:    'inbound',
+      channel:      'manual_entry',
+      body:         message,
+      intent:       intent || 'other',
+      sent_at:      new Date().toISOString(),
+    }).then(null, () => {});
+
+    // Move to Replied stage (don't downgrade if already at a later stage)
+    const laterStages = ['Meeting Booked'];
+    const newStage = laterStages.includes(contact.pipeline_stage) ? contact.pipeline_stage : 'Replied';
+    const noteParts = [`[Reply recorded ${new Date().toISOString().slice(0, 10)}] "${message.slice(0, 300)}"`];
+    if (action_note) noteParts.push(`Action: ${action_note}`);
+
+    await sb.from('contacts').update({
+      pipeline_stage: newStage,
+      notes: noteParts.join('\n'),
+      last_reply_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id);
+
+    await writeMemory(deal_id, {
+      type:    'REPLY',
+      subject: `Reply from ${contact.name} at ${contact.company_name}`,
+      content: `${contact.name} (${contact.company_name}) replied. Intent: ${intent || 'unknown'}. Message: "${message.slice(0, 400)}".${action_note ? ` Planned action: ${action_note}` : ''}`,
+      tags:    [`contact:${(contact.name || '').toLowerCase().replace(/\s+/g, '_')}`, `intent:${intent || 'other'}`],
+    });
+
+    return {
+      recorded: true,
+      contact: contact.name,
+      firm: contact.company_name,
+      stage_now: newStage,
+      intent: intent || 'other',
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── add_intelligence ──────────────────────────────────────────────────────────
+async function toolAddIntelligence({ deal_id, subject, content, tags }) {
+  try {
+    await writeMemory(deal_id || 'global', {
+      type:    'INTELLIGENCE',
+      subject,
+      content,
+      tags:    tags || [],
+    });
+    return { saved: true, subject };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── update_deal ───────────────────────────────────────────────────────────────
+async function toolUpdateDeal({ deal_id, sector, geography, target_amount, ebitda_usd_m, equity_required_usd_m, investor_profile, description }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const patch = {};
+    if (sector !== undefined)                  patch.sector = sector;
+    if (geography !== undefined)               patch.geography = geography;
+    if (target_amount !== undefined)           patch.target_amount = target_amount;
+    if (ebitda_usd_m !== undefined)            patch.ebitda_usd_m = ebitda_usd_m;
+    if (equity_required_usd_m !== undefined)   patch.equity_required_usd_m = equity_required_usd_m;
+    if (investor_profile !== undefined)        patch.investor_profile = investor_profile;
+    if (description !== undefined)             patch.description = description;
+    patch.updated_at = new Date().toISOString();
+
+    if (Object.keys(patch).length <= 1) return { error: 'No fields provided to update' };
+
+    await sb.from('deals').update(patch).eq('id', deal_id);
+
+    await writeMemory(deal_id, {
+      type:    'UPDATE',
+      subject: 'Deal details updated',
+      content: `Deal settings updated by JARVIS: ${Object.entries(patch).filter(([k]) => k !== 'updated_at').map(([k, v]) => `${k}=${String(v).slice(0, 80)}`).join(', ')}`,
+      tags:    ['deal_update'],
+    });
+
+    return { updated: true, changes: Object.keys(patch).filter(k => k !== 'updated_at') };
   } catch (err) {
     return { error: err.message };
   }
