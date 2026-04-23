@@ -665,6 +665,14 @@ async function runCycle(state) {
     console.error('[WEEKLY INTEL] Check failed:', err.message)
   );
 
+  // JARVIS post-cycle check — volume rules + morning brief (non-blocking)
+  try {
+    const { runAutonomousCheck, checkMorningBriefTimer } = await import('./jarvis.js');
+    const activeDeals = await getActiveDeals();
+    runAutonomousCheck(activeDeals).catch(() => {});
+    checkMorningBriefTimer(activeDeals);
+  } catch {}
+
   info('--- Orchestrator cycle complete ---');
 }
 

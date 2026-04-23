@@ -1,0 +1,367 @@
+/**
+ * core/jarvis.js
+ * JARVIS — the cognitive agent powering Roco.
+ *
+ * JARVIS is not a chatbot layered on top of the system.
+ * JARVIS IS the intelligence running the system.
+ *
+ * Three entry points:
+ *   handleMessage(chatId, text)      — you spoke to it via Telegram
+ *   runAutonomousCheck(deals, state) — post-orchestrator-cycle health check
+ *   sendMorningBrief(deal)           — 08:00 daily briefing
+ *
+ * Model: claude-sonnet-4-6 now. Swap to Opus 4.7 via OpenRouter when key is set.
+ * The OPENROUTER_API_KEY env var enables OpenRouter. If absent, falls back to
+ * ANTHROPIC_API_KEY direct.
+ */
+
+import Anthropic from '@anthropic-ai/sdk';
+import { getSupabase }        from './supabase.js';
+import { getActiveDeals }     from './supabaseSync.js';
+import { buildMemoryContext, writeMemory } from './jarvisMemory.js';
+import { JARVIS_TOOLS, executeTool }       from './jarvisTools.js';
+import { gatherCurrentMetrics }            from './fundraiserBrain.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLIENT
+// When OPENROUTER_API_KEY is set, all calls route through OpenRouter so you can
+// use any model (Opus 4.7, Kimi K2.5, etc.) by changing MODEL_BRAIN below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MODEL_BRAIN = process.env.JARVIS_BRAIN_MODEL || 'claude-sonnet-4-6';
+
+function getClient() {
+  if (process.env.OPENROUTER_API_KEY) {
+    return new Anthropic({
+      apiKey:  process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+    });
+  }
+  return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION STORE  (in-memory, keyed by chatId — survives within one process)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min inactivity → fresh session
+
+const sessions = new Map();
+// { chatId: { messages: [], dealId: string|null, lastAt: number } }
+
+function getSession(chatId) {
+  const s = sessions.get(chatId);
+  if (s && Date.now() - s.lastAt < SESSION_TTL_MS) return s;
+  const fresh = { messages: [], dealId: null, lastAt: Date.now() };
+  sessions.set(chatId, fresh);
+  return fresh;
+}
+
+function touchSession(chatId) {
+  const s = sessions.get(chatId);
+  if (s) s.lastAt = Date.now();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM PROMPT BUILDER
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildSystemPrompt(deal, metrics) {
+  const memoryCtx = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
+
+  const dealSection = deal ? `
+ACTIVE DEAL: ${deal.name}
+What's being raised: ${deal.description || deal.parsed_deal_info?.description || 'Not specified'}
+Target investors: ${deal.parsed_deal_info?.target_investor_profile || 'Not specified'}
+Target raise: ${deal.parsed_deal_info?.raise_amount || deal.target_raise || 'Not specified'}
+` : 'NO ACTIVE DEAL — ask the user to set one up.';
+
+  const metricsSection = metrics ? `
+LIVE PIPELINE:
+  Emails sent: ${metrics.emails_sent || 0} (${metrics.emails_sent_today || 0} today)
+  LinkedIn invites: ${metrics.li_invites_sent || 0} sent · ${metrics.li_pending || 0} pending acceptance
+  LinkedIn DMs: ${metrics.dms_sent || 0} sent
+  Total replies: ${metrics.total_replies || 0}
+  Response rate: ${metrics.response_rate || 0}%
+  Meetings booked: ${metrics.meetings_booked || 0}
+  Active firms: ${metrics.firms_in_pipeline || 0}
+  Pending approvals: ${metrics.pending_approvals || 0}
+  Status: ${metrics.goal_status || 'UNKNOWN'}
+` : '';
+
+  return `You are JARVIS — the AI agent running Roco, an autonomous PE/VC fundraising platform.
+
+You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
+
+${dealSection}
+${metricsSection}
+MEMORY (what you've done and learned on this deal):
+${memoryCtx}
+
+TODAY: ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+
+PERSONALITY:
+- Direct and sharp. Like a senior analyst who knows this deal inside out.
+- Short confident sentences. No fluff, no filler.
+- Always reference specific names, numbers, and dates from context.
+- When you take an action via a tool, confirm it concisely — one sentence.
+- When you see something worth flagging, flag it clearly with a recommendation.
+- When asked to do something, do it via tools — don't just describe what you'd do.
+- If you don't have enough information to act, ask one focused question.
+
+IMPORTANT:
+- You control the orchestration cycle — you can pause, resume, or redirect it at any time.
+- When you use a tool and get a result, respond naturally based on the result.
+- Keep responses concise. This is a Telegram conversation, not a report.
+- Never say "I'll need to" — either do it now with a tool or say why you can't.`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENTIC LOOP  (tool_use cycle)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runAgentLoop(systemPrompt, messages, dealId) {
+  const client  = getClient();
+  const maxIter = 6; // safety cap — JARVIS won't call tools more than 6 times per turn
+
+  let loopMessages = [...messages];
+
+  for (let i = 0; i < maxIter; i++) {
+    const response = await client.messages.create({
+      model:      MODEL_BRAIN,
+      max_tokens: 1024,
+      system:     systemPrompt,
+      tools:      JARVIS_TOOLS,
+      messages:   loopMessages,
+    });
+
+    // Always add the assistant turn
+    loopMessages.push({ role: 'assistant', content: response.content });
+
+    if (response.stop_reason !== 'tool_use') {
+      // Final text response
+      const text = response.content.find(b => b.type === 'text')?.text || '';
+      return { text, finalMessages: loopMessages };
+    }
+
+    // Execute all tool calls in this response
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type !== 'tool_use') continue;
+      console.log(`[JARVIS] Tool call: ${block.name}`, JSON.stringify(block.input));
+      let result;
+      try {
+        result = await executeTool(block.name, { ...block.input, deal_id: block.input.deal_id || dealId });
+      } catch (err) {
+        result = { error: err.message };
+      }
+      console.log(`[JARVIS] Tool result: ${block.name}`, JSON.stringify(result).slice(0, 200));
+      toolResults.push({
+        type:        'tool_result',
+        tool_use_id: block.id,
+        content:     typeof result === 'string' ? result : JSON.stringify(result),
+      });
+    }
+
+    loopMessages.push({ role: 'user', content: toolResults });
+  }
+
+  return { text: 'I hit my action limit on this turn. Let me know if you need me to continue.', finalMessages: loopMessages };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC: handleMessage  — called from Telegram
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function handleMessage(chatId, text) {
+  const session = getSession(chatId);
+
+  // Resolve active deal
+  if (!session.dealId) {
+    const deals = await getActiveDeals().catch(() => []);
+    session.dealId = deals[0]?.id || null;
+  }
+
+  const deal    = session.dealId ? await getDeal(session.dealId) : null;
+  const metrics = deal ? await gatherCurrentMetrics(deal.id).catch(() => null) : null;
+
+  const systemPrompt = await buildSystemPrompt(deal, metrics);
+
+  // Add user message to session history
+  session.messages.push({ role: 'user', content: text });
+
+  let responseText = '';
+  try {
+    const { text: reply, finalMessages } = await runAgentLoop(
+      systemPrompt,
+      session.messages,
+      session.dealId,
+    );
+    responseText = reply;
+
+    // Persist conversation history (cap at last 20 turns to avoid token bloat)
+    session.messages = finalMessages.slice(-20);
+    touchSession(chatId);
+
+    // Write conversation to persistent memory (async, non-blocking)
+    if (session.dealId) {
+      writeMemory(session.dealId, {
+        type:    'ACTION',
+        subject: `Conversation: ${text.slice(0, 60)}`,
+        content: `User: ${text.slice(0, 200)} → JARVIS: ${responseText.slice(0, 200)}`,
+        tags:    ['conversation'],
+        metadata: { chatId },
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[JARVIS] handleMessage error:', err.message);
+    responseText = `Something went wrong on my end — ${err.message.slice(0, 100)}. Try again.`;
+  }
+
+  return responseText;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC: runAutonomousCheck  — called post-orchestrator-cycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VOLUME_THRESHOLDS = {
+  min_pending_approvals:    3,   // below this → investigate
+  min_firms_in_pipeline:    10,  // below this → trigger research
+  response_rate_drop_pct:   30,  // drop by this % vs last week → flag
+};
+
+export async function runAutonomousCheck(deals) {
+  if (!deals?.length) return;
+
+  for (const deal of deals) {
+    try {
+      await runDealAutonomousCheck(deal);
+    } catch (err) {
+      console.warn(`[JARVIS] Autonomous check failed for ${deal.name}:`, err.message);
+    }
+  }
+}
+
+async function runDealAutonomousCheck(deal) {
+  const metrics = await gatherCurrentMetrics(deal.id).catch(() => null);
+  if (!metrics) return;
+
+  const alerts = [];
+
+  // Rule 1: Pipeline running thin
+  if ((metrics.firms_in_pipeline || 0) < VOLUME_THRESHOLDS.min_firms_in_pipeline) {
+    alerts.push({
+      type:   'volume',
+      msg:    `Pipeline thin — only ${metrics.firms_in_pipeline} active firms. Triggering research.`,
+      action: async () => {
+        const { triggerImmediateRun } = await import('./orchestrator.js');
+        triggerImmediateRun(deal.id).catch(() => {});
+        await writeMemory(deal.id, {
+          type:    'ACTION',
+          subject: 'Auto-triggered research',
+          content: `Pipeline dropped to ${metrics.firms_in_pipeline} active firms — triggered immediate research cycle.`,
+          tags:    ['autonomous', 'research'],
+        });
+      },
+    });
+  }
+
+  // Rule 2: Approval queue empty and outreach is on
+  if ((metrics.pending_approvals || 0) < VOLUME_THRESHOLDS.min_pending_approvals) {
+    alerts.push({
+      type: 'queue',
+      msg:  `Approval queue has ${metrics.pending_approvals || 0} items — orchestrator should draft more shortly.`,
+      action: null,
+    });
+  }
+
+  if (!alerts.length) return;
+
+  // Only send Telegram if actionable
+  const actionableAlerts = alerts.filter(a => a.action);
+  if (!actionableAlerts.length) return;
+
+  for (const alert of actionableAlerts) {
+    if (alert.action) await alert.action().catch(() => {});
+  }
+
+  const { sendTelegram } = await import('../approval/telegramBot.js');
+  const lines = actionableAlerts.map(a => `• ${a.msg}`).join('\n');
+  await sendTelegram(`🤖 *JARVIS — ${deal.name}*\n${lines}`).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC: sendMorningBrief  — 08:00 daily
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendMorningBrief(deal) {
+  try {
+    const metrics      = await gatherCurrentMetrics(deal.id);
+    const systemPrompt = await buildSystemPrompt(deal, metrics);
+
+    const prompt = `Generate a morning brief for the team. Cover:
+1. Key numbers (what happened yesterday / overnight)
+2. Top 2-3 priorities for today
+3. Anything needing immediate attention
+4. One observation or recommendation
+
+Keep it tight — this is read on a phone. Use *bold* for key names/numbers. Max 200 words.`;
+
+    const { text } = await runAgentLoop(
+      systemPrompt,
+      [{ role: 'user', content: prompt }],
+      deal.id,
+    );
+
+    const { sendTelegram } = await import('../approval/telegramBot.js');
+    await sendTelegram(`🌅 *JARVIS Morning Brief — ${deal.name}*\n\n${text}`);
+
+    await writeMemory(deal.id, {
+      type:    'ACTION',
+      subject: 'Morning brief sent',
+      content: text.slice(0, 300),
+      tags:    ['morning_brief'],
+    });
+  } catch (err) {
+    console.error('[JARVIS] Morning brief failed:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getDeal(dealId) {
+  const sb = getSupabase();
+  if (!sb || !dealId) return null;
+  try {
+    const { data } = await sb.from('deals').select('*').eq('id', dealId).single();
+    return data || null;
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MORNING BRIEF TIMER  — checks once per cycle if it's brief-time
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BRIEF_HOUR_EST = Number(process.env.JARVIS_BRIEF_HOUR_EST || 8);
+const briefSentToday = new Set(); // dealId → sent today flag
+
+export function checkMorningBriefTimer(deals) {
+  if (!deals?.length) return;
+  const nowEst  = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const hour    = nowEst.getHours();
+  const dateKey = nowEst.toDateString();
+
+  if (hour !== BRIEF_HOUR_EST) return;
+
+  for (const deal of deals) {
+    const key = `${deal.id}:${dateKey}`;
+    if (briefSentToday.has(key)) continue;
+    briefSentToday.add(key);
+    sendMorningBrief(deal).catch(err => console.warn('[JARVIS] Brief failed:', err.message));
+  }
+}

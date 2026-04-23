@@ -713,15 +713,49 @@ async function handleMessage(msg) {
 
   // Strip @botname suffix — Telegram adds this in groups and sometimes DMs
   const text = rawText.replace(/@\w+$/, '').trim();
+  if (!text) return;
 
-  // Handle commands
+  // Slash commands
   if (text.startsWith('/')) {
     await handleCommand(text, chatId);
     return;
   }
 
-  // Route non-command text to approval handler
-  await handleApprovalResponse(text, chatId);
+  // Route to approval handler if: waiting for edit input OR message is an
+  // explicit approval command (STOP / APPROVE N A / SKIP N / EDIT N ...)
+  const upper = text.toUpperCase().trim();
+  const isApprovalCommand = pendingEditReqs.has(chatId)
+    || upper === 'STOP'
+    || upper === 'APPROVE A'
+    || upper === 'APPROVE B'
+    || upper === 'SKIP'
+    || /^APPROVE\s+\d+/.test(upper)
+    || /^SKIP\s+\d+/.test(upper)
+    || /^EDIT\s+\d+/.test(upper);
+
+  if (isApprovalCommand) {
+    await handleApprovalResponse(text, chatId);
+    return;
+  }
+
+  // Everything else → JARVIS
+  await routeToJarvis(chatId, text);
+}
+
+async function routeToJarvis(chatId, text) {
+  try {
+    const { handleMessage: jarvisHandle } = await import('../core/jarvis.js');
+    await bot.sendChatAction(chatId, 'typing').catch(() => {});
+    const reply = await jarvisHandle(chatId, text);
+    if (!reply) return;
+    await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' }).catch(async () => {
+      // Fallback: send without markdown if parse fails
+      await bot.sendMessage(chatId, reply.replace(/[*_`[\]()~>#+=|{}.!-]/g, '\\$&')).catch(() => {});
+    });
+  } catch (err) {
+    console.error('[JARVIS] Telegram handler error:', err.message);
+    await bot.sendMessage(chatId, `Something went wrong — ${err.message.slice(0, 80)}. Try again.`).catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────
