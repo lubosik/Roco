@@ -10166,11 +10166,21 @@ const jarvisOrb = (() => {
     return sel ? sel.dataset.activeDealId : null;
   }
 
+  // ── classify whether text is an action request (no API call needed) ─────────
+  function isActionRequest(text) {
+    const actionKeywords = ['find', 'search', 'check', 'look', 'get', 'show', 'pull', 'run', 'trigger',
+      'send', 'research', 'enrich', 'approve', 'skip', 'pause', 'resume', 'status', 'what is',
+      'how many', 'list', 'who', 'which', 'update', 'dm', 'email', 'contact'];
+    const lower = text.toLowerCase();
+    return actionKeywords.some(k => lower.includes(k));
+  }
+
   // ── dispatch transcript to JARVIS ─────────────────────────────────────────
   async function dispatch(text) {
     if (!text) { afterSpeak(); return; }
     setOrbState('thinking', 'Thinking...');
-    speakAck();  // plays cached filler immediately — zero added latency
+    const needsAck = isActionRequest(text);
+    if (needsAck) speakAck();  // plays cached filler immediately — zero added latency
     try {
       const res = await fetch('/api/jarvis', {
         method: 'POST',
@@ -10180,7 +10190,7 @@ const jarvisOrb = (() => {
       });
       const data  = await res.json();
       const reply = data.reply || data.error || '';
-      await waitForAck();          // let ack phrase finish before main response
+      if (needsAck) await waitForAck();  // let ack phrase finish before main response
       await speakText(reply);
     } catch { afterSpeak(); }
   }

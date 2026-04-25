@@ -232,6 +232,86 @@ export const JARVIS_TOOLS = [
       required: ['deal_id'],
     },
   },
+  {
+    name: 'enrich_contact',
+    description: 'Enrich a contact with LinkedIn data via Apify. Finds their LinkedIn URL, job title, company details, and connection info.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:      { type: 'string', description: 'The deal UUID' },
+        contact_name: { type: 'string', description: 'Name or partial name of the contact to enrich' },
+      },
+      required: ['deal_id', 'contact_name'],
+    },
+  },
+  {
+    name: 'find_decision_makers',
+    description: 'Find decision makers at a specific firm using LinkedIn search via Unipile. Returns people with relevant titles (Partner, MD, Principal, etc.).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:   { type: 'string', description: 'The deal UUID' },
+        firm_name: { type: 'string', description: 'Name of the firm to find decision makers at' },
+      },
+      required: ['deal_id', 'firm_name'],
+    },
+  },
+  {
+    name: 'search_linkedin_people',
+    description: 'Search LinkedIn for people by keyword, company, or role. Useful for finding contacts at specific firms not yet in the pipeline.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        keywords: { type: 'string', description: 'Search keywords (e.g. "Partner Sequoia Capital", "Managing Director infrastructure fund")' },
+        limit:    { type: 'number', description: 'Max results to return (default 10)' },
+      },
+      required: ['keywords'],
+    },
+  },
+  {
+    name: 'send_linkedin_dm',
+    description: 'Send a LinkedIn DM to a specific contact already connected. Only use for contacts with invite_accepted_at set.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:      { type: 'string', description: 'The deal UUID' },
+        contact_name: { type: 'string', description: 'Name or partial name of the connected contact' },
+        message:      { type: 'string', description: 'The DM message to send' },
+      },
+      required: ['deal_id', 'contact_name', 'message'],
+    },
+  },
+  {
+    name: 'send_email',
+    description: 'Send an email to a specific contact. Constructs and sends via Unipile Outlook account. Always show the draft to user before sending unless explicitly told to send immediately.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:      { type: 'string', description: 'The deal UUID' },
+        contact_name: { type: 'string', description: 'Name or partial name of the contact to email' },
+        subject:      { type: 'string', description: 'Email subject line' },
+        body:         { type: 'string', description: 'Full email body text' },
+      },
+      required: ['deal_id', 'contact_name', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'get_pipeline_contacts',
+    description: 'Get contacts in a specific pipeline state or with specific properties. Use to find who has replied, who is warm, who needs follow-up.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'The deal UUID' },
+        filter:  {
+          type: 'string',
+          enum: ['replied', 'warm', 'accepted_no_dm', 'meetings', 'all_active'],
+          description: 'Filter: replied=has last_reply_at, warm=hot/warm tier, accepted_no_dm=connected but no DM yet, meetings=has meeting booked, all_active=exclude archived',
+        },
+        limit: { type: 'number', description: 'Max contacts to return (default 20)' },
+      },
+      required: ['deal_id', 'filter'],
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +336,12 @@ export async function executeTool(name, input) {
     case 'record_reply':            return toolRecordReply(input);
     case 'add_intelligence':        return toolAddIntelligence(input);
     case 'update_deal':             return toolUpdateDeal(input);
+    case 'enrich_contact':          return toolEnrichContact(input);
+    case 'find_decision_makers':    return toolFindDecisionMakers(input);
+    case 'search_linkedin_people':  return toolSearchLinkedInPeople(input);
+    case 'send_linkedin_dm':        return toolSendLinkedInDM(input);
+    case 'send_email':              return toolSendEmail(input);
+    case 'get_pipeline_contacts':   return toolGetPipelineContacts(input);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -834,6 +920,235 @@ async function toolUpdateDeal({ deal_id, sector, geography, target_amount, ebitd
     });
 
     return { updated: true, changes: Object.keys(patch).filter(k => k !== 'updated_at') };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── enrich_contact ────────────────────────────────────────────────────────────
+async function toolEnrichContact({ deal_id, contact_name }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const { data: matches } = await sb.from('contacts')
+      .select('id, name, company_name, email, linkedin_url, enrichment_status')
+      .eq('deal_id', deal_id)
+      .ilike('name', `%${contact_name.split(' ')[0]}%`)
+      .limit(5);
+
+    if (!matches?.length) return { error: `No contact found matching "${contact_name}"` };
+    const contact = matches.find(c =>
+      c.name.toLowerCase().startsWith(contact_name.toLowerCase().split(' ')[0])
+    ) || matches[0];
+
+    const { enrichWithApify } = await import('../enrichment/apifyEnricher.js');
+    const result = await enrichWithApify(contact);
+
+    return {
+      contact: contact.name,
+      firm: contact.company_name,
+      enrichment_result: result,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── find_decision_makers ──────────────────────────────────────────────────────
+async function toolFindDecisionMakers({ deal_id, firm_name }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const [{ data: firmRows }, { data: dealRows }] = await Promise.all([
+      sb.from('firms')
+        .select('id, name, website, description, hq_city, hq_country, fund_size_usd_m, focus_sectors, focus_geographies')
+        .ilike('name', `%${firm_name.split(' ')[0]}%`)
+        .limit(3),
+      sb.from('deals')
+        .select('id, name, sector, geography, description, investor_profile, ebitda_usd_m, equity_required_usd_m')
+        .eq('id', deal_id)
+        .single(),
+    ]);
+
+    const firm = firmRows?.[0] || { name: firm_name };
+    const deal = dealRows || { id: deal_id };
+
+    const { findDecisionMakers } = await import('../research/firmResearcher.js');
+    const people = await findDecisionMakers(firm, deal);
+
+    return {
+      firm: firm.name,
+      people_found: Array.isArray(people) ? people.length : 0,
+      people: Array.isArray(people) ? people : [],
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── search_linkedin_people ────────────────────────────────────────────────────
+async function toolSearchLinkedInPeople({ keywords, limit = 10 }) {
+  try {
+    const { searchLinkedInPeople } = await import('../integrations/unipileClient.js');
+    const results = await searchLinkedInPeople({ keywords, limit: Math.min(limit, 20) });
+    return {
+      count: Array.isArray(results) ? results.length : 0,
+      results: Array.isArray(results) ? results : [],
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── send_linkedin_dm ──────────────────────────────────────────────────────────
+async function toolSendLinkedInDM({ deal_id, contact_name, message }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const { data: matches } = await sb.from('contacts')
+      .select('id, name, company_name, invite_accepted_at, linkedin_provider_id, linkedin_urn, dm_sent_at')
+      .eq('deal_id', deal_id)
+      .ilike('name', `%${contact_name.split(' ')[0]}%`)
+      .not('invite_accepted_at', 'is', null)
+      .limit(5);
+
+    if (!matches?.length) {
+      return { error: `No connected contact found matching "${contact_name}". Contact must have accepted a LinkedIn invite first.` };
+    }
+    const contact = matches.find(c =>
+      c.name.toLowerCase().startsWith(contact_name.toLowerCase().split(' ')[0])
+    ) || matches[0];
+
+    const providerId = contact.linkedin_provider_id || contact.linkedin_urn;
+    if (!providerId) {
+      return { error: `Contact ${contact.name} has no LinkedIn provider ID. Cannot send DM.` };
+    }
+
+    const { sendLinkedInDM } = await import('../integrations/unipileClient.js');
+    await sendLinkedInDM({ attendeeProviderId: providerId, message });
+
+    await sb.from('contacts').update({
+      dm_sent_at:     new Date().toISOString(),
+      pipeline_stage: 'DM Sent',
+      updated_at:     new Date().toISOString(),
+    }).eq('id', contact.id);
+
+    return {
+      sent: true,
+      contact_name: contact.name,
+      firm: contact.company_name,
+      message_preview: message.slice(0, 80),
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── send_email ────────────────────────────────────────────────────────────────
+async function toolSendEmail({ deal_id, contact_name, subject, body }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    const [{ data: matches }, { data: deal }] = await Promise.all([
+      sb.from('contacts')
+        .select('id, name, company_name, email')
+        .eq('deal_id', deal_id)
+        .ilike('name', `%${contact_name.split(' ')[0]}%`)
+        .not('email', 'is', null)
+        .limit(5),
+      sb.from('deals')
+        .select('id, name, sender_name')
+        .eq('id', deal_id)
+        .single(),
+    ]);
+
+    if (!matches?.length) {
+      return { error: `No contact with an email found matching "${contact_name}". Contact must have an email address set.` };
+    }
+    const contact = matches.find(c =>
+      c.name.toLowerCase().startsWith(contact_name.toLowerCase().split(' ')[0])
+    ) || matches[0];
+
+    const { sendEmail } = await import('../integrations/unipileClient.js');
+    await sendEmail({
+      to:        contact.email,
+      toName:    contact.name,
+      subject,
+      body,
+      fromName:  deal?.sender_name || 'Dom',
+      accountId: 'q0z5aYSiRG-fteyP-ZnmPA',
+    });
+
+    await sb.from('contacts').update({
+      last_email_sent_at: new Date().toISOString(),
+      email_sent:         true,
+      updated_at:         new Date().toISOString(),
+    }).eq('id', contact.id);
+
+    return {
+      sent: true,
+      to:      contact.email,
+      contact: contact.name,
+      firm:    contact.company_name,
+      subject,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── get_pipeline_contacts ─────────────────────────────────────────────────────
+async function toolGetPipelineContacts({ deal_id, filter, limit = 20 }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  const cap = Math.min(limit, 50);
+  try {
+    const base = sb.from('contacts')
+      .select('id, name, company_name, pipeline_stage, tier, last_reply_at, last_email_sent_at, dm_sent_at, invite_accepted_at, email')
+      .eq('deal_id', deal_id)
+      .limit(cap);
+
+    let query;
+    switch (filter) {
+      case 'replied':
+        query = base.not('last_reply_at', 'is', null).order('last_reply_at', { ascending: false });
+        break;
+      case 'warm':
+        query = base.in('tier', ['hot', 'warm']).order('tier', { ascending: true });
+        break;
+      case 'accepted_no_dm':
+        query = base.not('invite_accepted_at', 'is', null).is('dm_sent_at', null).order('invite_accepted_at', { ascending: false });
+        break;
+      case 'meetings':
+        query = base.or('pipeline_stage.ilike.%meeting%,meeting_count.gt.0').order('updated_at', { ascending: false });
+        break;
+      case 'all_active':
+        query = base
+          .not('pipeline_stage', 'in', '("Archived","ARCHIVED","archived","Skipped","Inactive","Suppressed — Opt Out","Deleted — Do Not Contact","skipped_no_name","skipped_no_linkedin","skipped_duplicate_email")')
+          .order('updated_at', { ascending: false });
+        break;
+      default:
+        return { error: `Unknown filter "${filter}". Use: replied, warm, accepted_no_dm, meetings, all_active` };
+    }
+
+    const { data, error } = await query;
+    if (error) return { error: error.message };
+
+    return {
+      filter,
+      count: (data || []).length,
+      contacts: (data || []).map(c => ({
+        name:               c.name,
+        firm:               c.company_name,
+        stage:              c.pipeline_stage,
+        tier:               c.tier,
+        has_email:          !!c.email,
+        last_reply_at:      c.last_reply_at,
+        last_email_sent_at: c.last_email_sent_at,
+        dm_sent_at:         c.dm_sent_at,
+        invite_accepted_at: c.invite_accepted_at,
+      })),
+    };
   } catch (err) {
     return { error: err.message };
   }
