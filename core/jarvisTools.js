@@ -263,21 +263,40 @@ export async function executeTool(name, input) {
 
 // ── get_status ────────────────────────────────────────────────────────────────
 async function toolGetStatus({ deal_id }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
   try {
-    const { gatherCurrentMetrics } = await import('./fundraiserBrain.js');
-    const metrics = await gatherCurrentMetrics(deal_id);
+    const safeCount = async (query) => {
+      try { const r = await query; return r.count || 0; } catch { return 0; }
+    };
+
+    const [emails, dms, invites, accepted, replies, meetings, pendingApprovals, pendingDmApprovals, activeContacts] = await Promise.all([
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('last_email_sent_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('dm_sent_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('invite_sent_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('invite_accepted_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('last_reply_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('meeting_booked_at', 'is', null)),
+      safeCount(sb.from('approval_queue').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).eq('status', 'pending')),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).eq('pipeline_stage', 'pending_dm_approval')),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('pipeline_stage', 'in', '("Archived","ARCHIVED","archived","Skipped","skipped_no_name","skipped_no_linkedin","skipped_duplicate_email","Inactive","Suppressed — Opt Out","Deleted — Do Not Contact")')),
+    ]);
+
+    const invitesPending = invites - accepted;
+    const responseRate = (emails + dms) > 0 ? Math.round((replies / (emails + dms)) * 100) : 0;
+
     return {
-      emails_sent_total:    metrics.emails_sent         || 0,
-      emails_sent_today:    metrics.emails_sent_today   || 0,
-      dms_sent_total:       metrics.dms_sent            || 0,
-      invites_sent:         metrics.li_invites_sent     || 0,
-      invites_pending:      metrics.li_pending          || 0,
-      total_replies:        metrics.total_replies       || 0,
-      meetings_booked:      metrics.meetings_booked     || 0,
-      active_firms:         metrics.firms_in_pipeline   || 0,
-      pending_approvals:    metrics.pending_approvals   || 0,
-      response_rate_pct:    metrics.response_rate       || 0,
-      goal_status:          metrics.goal_status         || 'UNKNOWN',
+      emails_sent_total:    emails,
+      dms_sent_total:       dms,
+      invites_sent:         invites,
+      invites_accepted:     accepted,
+      invites_pending:      Math.max(0, invitesPending),
+      total_replies:        replies,
+      meetings_booked:      meetings,
+      active_firms:         activeContacts,
+      pending_approvals:    pendingApprovals,
+      pending_dm_approvals: pendingDmApprovals,
+      response_rate_pct:    responseRate,
     };
   } catch (err) {
     return { error: err.message };

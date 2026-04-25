@@ -10007,6 +10007,15 @@ const jarvisOrb = (() => {
   let isListening = false;
   let voiceEnabled = true;
   let currentAudio = null;
+  let audioUnlocked = false;
+
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    const silent = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+    silent.volume = 0;
+    silent.play().catch(() => {});
+  }
 
   const orb = () => document.getElementById('jarvis-orb');
   const panel = () => document.getElementById('jarvis-panel');
@@ -10034,13 +10043,17 @@ const jarvisOrb = (() => {
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         currentAudio = audio;
-        audio.onended = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; };
-        audio.onerror = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; speakFallback(clean); };
-        audio.play().catch(() => speakFallback(clean));
+        audio.onended = () => {
+          setOrbState(null);
+          URL.revokeObjectURL(url);
+          currentAudio = null;
+          if (isOpen && voiceEnabled) setTimeout(() => { if (isOpen && !isListening) startListening(); }, 300);
+        };
+        audio.onerror = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; };
+        audio.play().catch(() => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; });
         return;
       }
-    } catch {}
-    speakFallback(clean);
+    } catch { setOrbState(null); }
   }
 
   function speakFallback(text) {
@@ -10102,6 +10115,7 @@ const jarvisOrb = (() => {
   }
 
   async function send() {
+    unlockAudio();
     const inp = input();
     if (!inp) return;
     const text = (inp.value || '').trim();
@@ -10157,8 +10171,9 @@ const jarvisOrb = (() => {
       stopListening();
       send();
     };
-    r.onerror = () => stopListening();
-    r.onend   = () => stopListening();
+    r.onerror      = () => stopListening();
+    r.onend        = () => stopListening();
+    r.onspeechend  = () => { recognition?.stop(); };
     return r;
   }
 
@@ -10185,11 +10200,13 @@ const jarvisOrb = (() => {
   }
 
   function toggleMic() {
+    unlockAudio();
     if (isListening) stopListening();
     else startListening();
   }
 
   function open() {
+    unlockAudio();
     isOpen = true;
     const p = panel();
     if (p) p.classList.add('open');
