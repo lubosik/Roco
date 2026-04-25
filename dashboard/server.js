@@ -49,6 +49,16 @@ const STATE_FILE = path.join(__dirname, '../state.json');
 let rocoState;
 let wss;
 let app;
+let jarvisVoiceStatus = {
+  ok: null,
+  provider: 'elevenlabs',
+  configured: false,
+  voice_id: null,
+  model_id: 'eleven_flash_v2_5',
+  checked_at: null,
+  error: null,
+  upstream_status: null,
+};
 
 const activityFeed = [];
 const MAX_FEED = 200;
@@ -98,6 +108,31 @@ function mergeActivityEntries(dbEntries = [], liveEntries = []) {
   }
 
   return merged.sort((a, b) => getActivityTimestamp(b) - getActivityTimestamp(a));
+}
+
+function updateJarvisVoiceStatus(next = {}) {
+  jarvisVoiceStatus = {
+    ...jarvisVoiceStatus,
+    ...next,
+    checked_at: new Date().toISOString(),
+  };
+}
+
+async function hydrateActivityFeed(limit = 100) {
+  const sb = getSupabase();
+  if (!sb) return activityFeed;
+  try {
+    const { data } = await sb.from('activity_log')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    const merged = mergeActivityEntries(data || [], activityFeed.slice().reverse()).slice(0, limit);
+    activityFeed.length = 0;
+    for (const entry of merged.slice().reverse()) activityFeed.push(entry);
+  } catch (err) {
+    console.warn('[ACTIVITY] hydrate failed:', err.message);
+  }
+  return activityFeed;
 }
 
 function normalizeFirmLinkName(value) {
@@ -3203,7 +3238,15 @@ export function initDashboard(state) {
   // WebSocket — push live activity
   wss.on('connection', (ws) => {
     info('Dashboard WebSocket client connected');
-    ws.send(JSON.stringify({ type: 'init', feed: activityFeed.slice(-100) }));
+    const sendInit = async () => {
+      if (!activityFeed.length) {
+        await hydrateActivityFeed(100).catch(() => {});
+      }
+      ws.send(JSON.stringify({ type: 'init', feed: activityFeed.slice(-100) }));
+    };
+    sendInit().catch(() => {
+      ws.send(JSON.stringify({ type: 'init', feed: activityFeed.slice(-100) }));
+    });
     ws.on('error', () => {});
   });
 
@@ -3214,6 +3257,7 @@ export function initDashboard(state) {
 
   // Start API health checks
   startHealthChecks();
+  hydrateActivityFeed(100).catch(() => {});
 
   // Recreate LinkedIn webhooks — auto-discover Cloudflare tunnel URL if running
   (async () => {
@@ -4278,6 +4322,10 @@ function registerRoutes(app) {
         memory_mb: Math.floor(process.memoryUsage().heapUsed / 1024 / 1024),
         websocket_clients: wss ? wss.clients.size : 0,
         node_version: process.version,
+        elevenlabs_tts: jarvisVoiceStatus.ok === false
+          ? 'error'
+          : (jarvisVoiceStatus.configured ? 'ok' : 'unconfigured'),
+        jarvis_voice: jarvisVoiceStatus,
         ...serviceStatuses,
       });
     } catch (err) {
@@ -8367,9 +8415,21 @@ function registerRoutes(app) {
     const { text } = req.body || {};
     if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text required' });
     const apiKey = process.env.ELEVENLABS_API_KEY;
-    if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
+    const configuredVoiceId = process.env.ELEVENLABS_VOICE_ID || 'CwhRBWXzGAHq8TQ4Fs17';
+    const modelId = 'eleven_flash_v2_5';
+    if (!apiKey) {
+      updateJarvisVoiceStatus({
+        ok: false,
+        configured: false,
+        voice_id: configuredVoiceId,
+        model_id: modelId,
+        upstream_status: 503,
+        error: 'ElevenLabs not configured on this service',
+      });
+      return res.status(503).json({ error: 'ElevenLabs not configured on this service' });
+    }
     try {
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb'; // George — British, most natural premade male
+      const voiceId = configuredVoiceId;
       // eleven_flash_v2_5 = ~75ms latency (vs 2000ms+ for multilingual_v2)
       // optimize_streaming_latency=3 removes audio normalizers for faster first byte
       const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3`, {
@@ -8381,19 +8441,59 @@ function registerRoutes(app) {
         },
         body: JSON.stringify({
           text: text.slice(0, 2500),
-          model_id: 'eleven_flash_v2_5',
+          model_id: modelId,
           voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.35, use_speaker_boost: true },
         }),
       });
       if (!elevenRes.ok) {
         const msg = await elevenRes.text().catch(() => '');
-        return res.status(502).json({ error: `ElevenLabs error ${elevenRes.status}: ${msg.slice(0, 120)}` });
+        const compactMsg = msg.slice(0, 220);
+        const paymentIssue = compactMsg.toLowerCase().includes('payment_issue');
+        const clientError = paymentIssue
+          ? 'ElevenLabs billing issue: complete the latest invoice to restore Jarvis voice'
+          : `ElevenLabs error ${elevenRes.status}: ${compactMsg}`;
+        updateJarvisVoiceStatus({
+          ok: false,
+          configured: true,
+          voice_id: voiceId,
+          model_id: modelId,
+          upstream_status: elevenRes.status,
+          error: clientError,
+        });
+        return res.status(paymentIssue ? 402 : 502).json({ error: clientError, upstream_status: elevenRes.status });
       }
+      updateJarvisVoiceStatus({
+        ok: true,
+        configured: true,
+        voice_id: voiceId,
+        model_id: modelId,
+        upstream_status: 200,
+        error: null,
+      });
       res.set('Content-Type', 'audio/mpeg');
       Readable.fromWeb(elevenRes.body).pipe(res);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      updateJarvisVoiceStatus({
+        ok: false,
+        configured: true,
+        voice_id: configuredVoiceId,
+        model_id: modelId,
+        upstream_status: 500,
+        error: err.message,
+      });
+      res.status(500).json({ error: `ElevenLabs request failed: ${err.message}` });
     }
+  });
+
+  app.get('/api/jarvis/voice-status', requireAuth, async (req, res) => {
+    const configured = !!process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || 'CwhRBWXzGAHq8TQ4Fs17';
+    res.json({
+      ...jarvisVoiceStatus,
+      configured,
+      voice_id: voiceId,
+      model_id: 'eleven_flash_v2_5',
+    });
   });
 
   // 404 handler — JSON for API/webhook paths, index.html for everything else

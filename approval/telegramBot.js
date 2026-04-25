@@ -6,6 +6,7 @@ import {
 } from '../core/supabaseSync.js';
 import { getSupabase } from '../core/supabase.js';
 import { aiComplete } from '../core/aiClient.js';
+import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from '../core/runtimeCoordination.js';
 
 let bot;
 let rocoState; // injected from orchestrator
@@ -134,6 +135,76 @@ const editLoops         = new Map(); // contactPageId -> count
 const pendingEditReqs   = new Map(); // chatId -> msgId  (waiting for edit instructions after button press)
 const processingApprovals     = new Set(); // msgIds currently being handled (dedup guard)
 const recentlyResolvedQueueIds = new Set(); // queue IDs resolved via Telegram, awaiting DB commit
+const EDIT_REQUESTS_KEY = 'GLOBAL_TELEGRAM_EDIT_REQUESTS';
+const EDIT_LOOPS_KEY = 'GLOBAL_TELEGRAM_EDIT_LOOPS';
+
+function getApprovalEditKey(approval) {
+  return String(approval?.contactPage?.id || approval?.contactId || approval?.queueId || '');
+}
+
+async function readSharedMap(key) {
+  const value = await readGlobalRuntimeSetting(key).catch(() => null);
+  return value && typeof value === 'object' ? value : {};
+}
+
+function persistSharedMap(key, map) {
+  const payload = Object.fromEntries([...map.entries()].map(([entryKey, value]) => [String(entryKey), value]));
+  return writeGlobalRuntimeSetting(key, payload).catch(() => false);
+}
+
+async function getPendingEditRequest(chatId) {
+  const local = pendingEditReqs.get(String(chatId));
+  if (local !== undefined) return local;
+  const shared = await readSharedMap(EDIT_REQUESTS_KEY);
+  const sharedValue = shared[String(chatId)];
+  if (sharedValue !== undefined) pendingEditReqs.set(String(chatId), sharedValue);
+  return sharedValue;
+}
+
+function setPendingEditRequest(chatId, msgId) {
+  pendingEditReqs.set(String(chatId), msgId);
+  persistSharedMap(EDIT_REQUESTS_KEY, pendingEditReqs);
+}
+
+function clearPendingEditRequest(chatId) {
+  pendingEditReqs.delete(String(chatId));
+  persistSharedMap(EDIT_REQUESTS_KEY, pendingEditReqs);
+}
+
+function clearPendingEditRequestForMsg(msgId) {
+  let changed = false;
+  for (const [chatId, value] of pendingEditReqs.entries()) {
+    if (String(value) === String(msgId)) {
+      pendingEditReqs.delete(chatId);
+      changed = true;
+    }
+  }
+  if (changed) persistSharedMap(EDIT_REQUESTS_KEY, pendingEditReqs);
+}
+
+async function getEditLoopCount(approval) {
+  const key = getApprovalEditKey(approval);
+  if (!key) return 0;
+  if (editLoops.has(key)) return Number(editLoops.get(key) || 0);
+  const shared = await readSharedMap(EDIT_LOOPS_KEY);
+  const count = Number(shared[key] || 0);
+  editLoops.set(key, count);
+  return count;
+}
+
+function setEditLoopCount(approval, count) {
+  const key = getApprovalEditKey(approval);
+  if (!key) return;
+  editLoops.set(key, Number(count || 0));
+  persistSharedMap(EDIT_LOOPS_KEY, editLoops);
+}
+
+function clearEditLoopCount(approval) {
+  const key = getApprovalEditKey(approval);
+  if (!key) return;
+  editLoops.delete(key);
+  persistSharedMap(EDIT_LOOPS_KEY, editLoops);
+}
 
 /** Called by /api/queue to filter out items whose Telegram approval is still committing. */
 export function getRecentlyResolvedQueueIds() {
@@ -650,6 +721,7 @@ async function handleReplyEdit(chatId, oldMsgId, approval, instructions) {
       '```',
     ].join('\n');
 
+    clearPendingEditRequestForMsg(oldMsgId);
     pendingApprovals.delete(oldMsgId);
     const newSent = await bot.sendMessage(chatId, revisedMsg, { parse_mode: 'Markdown' });
     pendingApprovals.set(newSent.message_id, { ...approval, replyApproval: ra });
@@ -675,6 +747,7 @@ async function handleLinkedInDMEdit(chatId, oldMsgId, approval, instructions) {
     );
     if (!revised?.trim()) throw new Error('Empty revision from AI');
     approval.emailDraft.body = sanitizeApprovalText(revised);
+    clearPendingEditRequestForMsg(oldMsgId);
     pendingApprovals.delete(oldMsgId);
     const msg = [
       `*ROCO — LINKEDIN DM Revised*`,
@@ -702,6 +775,7 @@ async function handleLinkedInDMEdit(chatId, oldMsgId, approval, instructions) {
  * Keeps the original Promise active under the new message_id.
  */
 async function resendUpdatedApproval(chatId, oldMsgId, approval) {
+  clearPendingEditRequestForMsg(oldMsgId);
   pendingApprovals.delete(oldMsgId);
   const draft = approval.emailDraft;
   draft.body = sanitizeApprovalText(draft.body);
@@ -876,8 +950,9 @@ async function handleCallbackQuery(query) {
       }).eq('id', approval.queueId);
     }
     await clearTelegramApprovalControls(msgId);
+    clearPendingEditRequestForMsg(msgId);
     pendingApprovals.delete(msgId);
-    editLoops.delete(approval.contactPage?.id);
+    clearEditLoopCount(approval);
     processingApprovals.delete(msgId);
     try { approval.resolve?.({ action: 'skip' }); } catch {}
     await bot.sendMessage(chatId, `📝 *Manual* — *${approval.name}* will be ignored for this step. If they reply later, Roco can still pick that up.`, { parse_mode: 'Markdown' });
@@ -903,8 +978,9 @@ async function handleCallbackQuery(query) {
       }).eq('id', approval.queueId);
     }
     await clearTelegramApprovalControls(msgId);
+    clearPendingEditRequestForMsg(msgId);
     pendingApprovals.delete(msgId);
-    editLoops.delete(approval.contactPage?.id);
+    clearEditLoopCount(approval);
     processingApprovals.delete(msgId);
     try { approval.resolve?.({ action: 'skip' }); } catch {}
     await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* will not be picked up by Roco again.`, { parse_mode: 'Markdown' });
@@ -933,7 +1009,7 @@ async function handleCallbackQuery(query) {
 
   } else if (action === 'ed') {
     processingApprovals.delete(msgId);
-    pendingEditReqs.set(chatId, msgId);
+    setPendingEditRequest(chatId, msgId);
     await bot.sendMessage(chatId,
       `✏ *Edit draft for ${approval.name}*\n\nType your instructions and I'll redraft:`,
       { parse_mode: 'Markdown' }
@@ -964,6 +1040,7 @@ async function handleCallbackQuery(query) {
         bodyOverride: ra.replyBody,
       });
       await clearTelegramApprovalControls(msgId);
+      clearPendingEditRequestForMsg(msgId);
       pendingApprovals.delete(msgId);
       processingApprovals.delete(msgId);
       if (result?.deferred) {
@@ -980,7 +1057,7 @@ async function handleCallbackQuery(query) {
   } else if (action === 're') {
     // Reply edit — wait for instructions
     processingApprovals.delete(msgId);
-    pendingEditReqs.set(chatId, msgId);
+    setPendingEditRequest(chatId, msgId);
     await bot.sendMessage(chatId,
       `✏ *Edit reply for ${approval.name}*\n\nType your edit instructions:`,
       { parse_mode: 'Markdown' }
@@ -994,6 +1071,7 @@ async function handleCallbackQuery(query) {
       await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', ra.queueItemId);
     }
     await clearTelegramApprovalControls(msgId);
+    clearPendingEditRequestForMsg(msgId);
     pendingApprovals.delete(msgId);
     processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `✗ Reply to *${approval.name}* skipped.`, { parse_mode: 'Markdown' });
@@ -1010,6 +1088,7 @@ async function handleCallbackQuery(query) {
       }).eq('id', ra.queueItemId);
     }
     await clearTelegramApprovalControls(msgId);
+    clearPendingEditRequestForMsg(msgId);
     pendingApprovals.delete(msgId);
     processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `📝 *Manual mode* — auto-reply dismissed for *${approval.name}*. Future replies will still be tracked and re-queued.`, { parse_mode: 'Markdown' });
@@ -1043,6 +1122,7 @@ async function handleCallbackQuery(query) {
       }).eq('id', ra.queueItemId);
     }
     await clearTelegramApprovalControls(msgId);
+    clearPendingEditRequestForMsg(msgId);
     pendingApprovals.delete(msgId);
     processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `🔚 *Closed* — *${approval.name}* moved to Inactive and this conversation is finished.`, { parse_mode: 'Markdown' });
@@ -1055,8 +1135,9 @@ async function handleCallbackQuery(query) {
 
 function resolveApproval(msgId, approval, action, extra = {}) {
   clearTelegramApprovalControls(msgId).catch(() => {});
+  clearPendingEditRequestForMsg(msgId);
   pendingApprovals.delete(msgId);
-  editLoops.delete(approval.contactPage?.id);
+  clearEditLoopCount(approval);
   if (approval.queueId) {
     const status = action === 'approve' ? 'approved' : 'telegram_skipped';
     const subject = action === 'approve' ? (extra.subject || null) : null;
@@ -1100,10 +1181,13 @@ async function handleApprovalResponse(text, chatId) {
   const upper = text.toUpperCase().trim();
 
   // ── If we're waiting for edit instructions after a button press ──
-  const editMsgId = pendingEditReqs.get(chatId);
+  const editMsgId = await getPendingEditRequest(chatId);
   if (editMsgId !== undefined) {
-    pendingEditReqs.delete(chatId);
-    const approval = pendingApprovals.get(editMsgId);
+    clearPendingEditRequest(chatId);
+    let approval = pendingApprovals.get(editMsgId);
+    if (!approval && editMsgId !== undefined) {
+      approval = await reloadApprovalForTelegramMessage(editMsgId);
+    }
     if (!approval) {
       await bot.sendMessage(chatId, 'That draft is no longer in the queue.');
       return;
@@ -1137,13 +1221,13 @@ async function handleApprovalResponse(text, chatId) {
       return;
     }
     // Normal email edit — resolve and let orchestrator redraft with AI
-    const loops = (editLoops.get(approval.contactPage?.id) || 0) + 1;
+    const loops = (await getEditLoopCount(approval)) + 1;
     if (loops > 3) {
       await bot.sendMessage(chatId, `Max edits reached for ${approval.name}. Skipping.`);
       resolveApproval(editMsgId, approval, 'skip');
       return;
     }
-    editLoops.set(approval.contactPage?.id, loops);
+    setEditLoopCount(approval, loops);
     resolveApproval(editMsgId, approval, 'edit', { instructions: text });
     await bot.sendMessage(chatId, `Got it — redrafting for *${approval.name}* (edit ${loops}/3)...`, { parse_mode: 'Markdown' });
     return;
@@ -1213,13 +1297,13 @@ async function handleApprovalResponse(text, chatId) {
       return;
     }
     const [msgId, approval] = entries[idx];
-    const loops = (editLoops.get(approval.contactPage?.id) || 0) + 1;
+    const loops = (await getEditLoopCount(approval)) + 1;
     if (loops > 3) {
       await bot.sendMessage(chatId, `Max edits reached for ${approval.name}. Skipping.`);
       resolveApproval(msgId, approval, 'skip');
       return;
     }
-    editLoops.set(approval.contactPage?.id, loops);
+    setEditLoopCount(approval, loops);
     resolveApproval(msgId, approval, 'edit', { instructions });
     await bot.sendMessage(chatId, `Got it — redrafting for *${approval.name}* (edit ${loops}/3)...`, { parse_mode: 'Markdown' });
     return;
@@ -1244,13 +1328,13 @@ async function handleApprovalResponse(text, chatId) {
 
   if (upper.startsWith('EDIT ')) {
     const instructions = text.slice(5).trim();
-    const loops = (editLoops.get(approval.contactPage?.id) || 0) + 1;
+    const loops = (await getEditLoopCount(approval)) + 1;
     if (loops > 3) {
       await bot.sendMessage(chatId, `Max edits reached for ${approval.name}. Skipping.`);
       resolveApproval(lastMsgId, approval, 'skip');
       return;
     }
-    editLoops.set(approval.contactPage?.id, loops);
+    setEditLoopCount(approval, loops);
     resolveApproval(lastMsgId, approval, 'edit', { instructions });
     await bot.sendMessage(chatId, `Got it — redrafting for *${approval.name}* (edit ${loops}/3)...`, { parse_mode: 'Markdown' });
     return;
@@ -1982,8 +2066,9 @@ export async function dismissPendingApproval(id) {
   if (matchedKey == null) return null;
   const approval = pendingApprovals.get(matchedKey);
   await clearTelegramApprovalControls(matchedKey).catch(() => {});
+  clearPendingEditRequestForMsg(matchedKey);
   pendingApprovals.delete(matchedKey);
-  editLoops.delete(approval?.contactPage?.id);
+  clearEditLoopCount(approval);
   return { key: matchedKey, approval };
 }
 
@@ -2282,6 +2367,7 @@ export function clearApprovalsForDeal(dealId) {
     if (String(entry.dealId) === String(dealId)) {
       // Resolve as 'skip' so any awaiting Promise chains exit cleanly
       try { entry.resolve?.({ action: 'skip' }); } catch {}
+      clearPendingEditRequestForMsg(msgId);
       pendingApprovals.delete(msgId);
       cleared++;
     }
@@ -2369,8 +2455,9 @@ export function startSupabaseApprovalPoller() {
           const matchByTg = item.telegram_msg_id && String(msgId) === String(item.telegram_msg_id);
           if (!matchById && !matchByTg) continue;
 
+          clearPendingEditRequestForMsg(msgId);
           pendingApprovals.delete(msgId);
-          editLoops.delete(approval.contactPage?.id);
+          clearEditLoopCount(approval);
           await markApprovalProcessing(item.id);
 
           if (item.status === 'approved') {
@@ -2408,8 +2495,9 @@ export function approveLatestPending({ subject } = {}) {
   // Get the most recently added approval (last entry in Map insertion order)
   const entries = [...pendingApprovals.entries()];
   const [msgId, approval] = entries[entries.length - 1];
+  clearPendingEditRequestForMsg(msgId);
   pendingApprovals.delete(msgId);
-  editLoops.delete(approval.contactPage?.id);
+  clearEditLoopCount(approval);
   approval.resolve({
     action: 'approve',
     variant: 'A',
@@ -2504,6 +2592,7 @@ export function resolveApprovalFromDashboard(id, action, subject, editedBody) {
   }
   if (!approval) return false;
   clearTelegramApprovalControls(key).catch(() => {});
+  clearPendingEditRequestForMsg(key);
   pendingApprovals.delete(key);
 
   if (approval.queueId) {
@@ -2515,7 +2604,7 @@ export function resolveApprovalFromDashboard(id, action, subject, editedBody) {
   }
 
   if (action === 'approve') {
-    editLoops.delete(approval.contactPage?.id);
+    clearEditLoopCount(approval);
     approval.resolve({
       action: 'approve',
       queueId: approval.queueId || null,
@@ -2524,7 +2613,7 @@ export function resolveApprovalFromDashboard(id, action, subject, editedBody) {
       body: sanitizeApprovalText(editedBody || approval.emailDraft?.body),
     });
   } else if (action === 'skip') {
-    editLoops.delete(approval.contactPage?.id);
+    clearEditLoopCount(approval);
     approval.resolve({ action: 'skip' });
   } else if (action === 'edit') {
     approval.resolve({ action: 'edit', instructions: editedBody || '' });

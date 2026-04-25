@@ -10009,7 +10009,6 @@ const jarvisOrb = (() => {
   let isListening       = false;
   let currentAudio      = null;
   let audioCtx          = null;
-  let fallbackUtterance = null;
   let pendingTranscript = '';
   let bargeInRecognition = null;
   let bargeInTriggered  = false;
@@ -10089,52 +10088,10 @@ const jarvisOrb = (() => {
       try { currentAudio.pause(); } catch {}
       currentAudio = null;
     }
-    if (fallbackUtterance && window.speechSynthesis) {
-      try { window.speechSynthesis.cancel(); } catch {}
-      fallbackUtterance = null;
-    }
   }
 
   function invalidatePlayback() {
     playbackVersion += 1;
-  }
-
-  function pickBrowserVoice() {
-    if (!window.speechSynthesis || typeof window.speechSynthesis.getVoices !== 'function') return null;
-    const voices = window.speechSynthesis.getVoices() || [];
-    if (!voices.length) return null;
-    return voices.find(v => /^en-GB/i.test(v.lang || ''))
-      || voices.find(v => /^en-US/i.test(v.lang || ''))
-      || voices.find(v => /^en/i.test(v.lang || ''))
-      || voices[0];
-  }
-
-  async function speakWithBrowser(text) {
-    if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') return false;
-    return new Promise((resolve) => {
-      try { window.speechSynthesis.cancel(); } catch {}
-      const utterance = new SpeechSynthesisUtterance(text);
-      const voice = pickBrowserVoice();
-      if (voice) utterance.voice = voice;
-      utterance.rate = 1.02;
-      utterance.pitch = 0.95;
-      utterance.volume = 1;
-      utterance.onend = () => {
-        fallbackUtterance = null;
-        resolve(true);
-      };
-      utterance.onerror = () => {
-        fallbackUtterance = null;
-        resolve(false);
-      };
-      fallbackUtterance = utterance;
-      try {
-        window.speechSynthesis.speak(utterance);
-      } catch {
-        fallbackUtterance = null;
-        resolve(false);
-      }
-    });
   }
 
   // ── MediaSource streaming TTS — plays audio as chunks arrive ─────────────
@@ -10260,10 +10217,6 @@ const jarvisOrb = (() => {
       if (speakVersion !== playbackVersion) return;
       afterSpeak();
     };
-    const fallbackToBrowser = async () => {
-      await speakWithBrowser(clean).catch(() => false);
-      finishCurrentSpeak();
-    };
     try {
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       const timeoutId = controller ? setTimeout(() => controller.abort(), 5000) : null;
@@ -10275,15 +10228,26 @@ const jarvisOrb = (() => {
         body: JSON.stringify({ text: clean }),
       });
       if (timeoutId) clearTimeout(timeoutId);
-      if (!res.ok) { await fallbackToBrowser(); return; }
+      if (!res.ok) {
+        let detail = 'ElevenLabs voice unavailable';
+        try {
+          const data = await res.json();
+          detail = data?.error || detail;
+        } catch {}
+        showToast(detail, 'error', 5000);
+        finishCurrentSpeak();
+        return;
+      }
       const played = await playStream(res);
       if (!played) {
-        await fallbackToBrowser();
+        showToast('Jarvis voice playback failed', 'error', 5000);
+        finishCurrentSpeak();
         return;
       }
       finishCurrentSpeak();
     } catch {
-      await fallbackToBrowser();
+      showToast('Jarvis voice request failed', 'error', 5000);
+      finishCurrentSpeak();
     }
   }
 
