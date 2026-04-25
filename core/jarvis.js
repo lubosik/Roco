@@ -133,9 +133,10 @@ Target raise: ${deal.parsed_deal_info?.raise_amount || deal.target_raise || 'Not
 
   const metricsSection = metrics ? `
 LIVE PIPELINE:
-  Emails sent: ${metrics.emails_sent || 0} (${metrics.emails_sent_today || 0} today)
+  Emails sent: ${metrics.emails_sent || 0} total (${metrics.emails_sent_today || 0} today) — includes contacts now inactive/archived after no reply
   LinkedIn invites: ${metrics.li_invites_sent || 0} sent · ${metrics.li_accepted || 0} accepted · ${metrics.li_pending || 0} still pending
   LinkedIn DMs: ${metrics.dms_sent || 0} sent
+  Total unique replies (email + LinkedIn combined): ${metrics.total_replies || 0}
   Total replies: ${metrics.total_replies || 0}
   Response rate: ${metrics.response_rate || 0}%
   Meetings booked: ${metrics.meetings_booked || 0}

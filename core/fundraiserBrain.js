@@ -110,7 +110,7 @@ export async function gatherCurrentMetrics(dealId) {
     pendingApprovalsRes,
   ] = await Promise.all([
     sb.from('contacts')
-      .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, last_meeting_date, meeting_count')
+      .select('id, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, last_meeting_date, meeting_count')
       .eq('deal_id', dealId),
     sb.from('activity_log')
       .select('event_type, created_at')
@@ -118,7 +118,7 @@ export async function gatherCurrentMetrics(dealId) {
       .gte('created_at', today.start)
       .lte('created_at', today.end),
     sb.from('conversation_messages')
-      .select('direction, channel, received_at')
+      .select('contact_id, direction, channel, received_at')
       .eq('deal_id', dealId)
       .eq('direction', 'inbound'),
     sb.from('approval_queue')
@@ -164,7 +164,10 @@ export async function gatherCurrentMetrics(dealId) {
     const stage = String(row.pipeline_stage || '').toLowerCase();
     return row.last_meeting_date || Number(row.meeting_count) > 0 || stage.includes('meeting');
   }).length;
-  const totalReplies = contacts.filter(row => row.last_reply_at || row.reply_channel).length + inboundMessages.length;
+  // Deduplicated reply count: union of contacts flagged as replied + distinct contact_ids in inbound messages
+  const repliedContactIds = new Set(contacts.filter(row => row.last_reply_at || row.reply_channel).map(row => row.id).filter(Boolean));
+  inboundMessages.forEach(msg => { if (msg.contact_id) repliedContactIds.add(msg.contact_id); });
+  const totalReplies = repliedContactIds.size;
 
   const lastInviteAt = contacts
     .map(row => row.invite_sent_at)
