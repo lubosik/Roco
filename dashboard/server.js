@@ -3304,7 +3304,7 @@ async function generateWelcomeAudio(displayName) {
   info(`[VOICE] Generating welcome audio for ${displayName}...`);
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB', {
+    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb', {
       method: 'POST',
       headers: {
         'xi-api-key': apiKey,
@@ -8328,7 +8328,7 @@ function registerRoutes(app) {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
     try {
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB'; // Adam — natural male voice
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb'; // George — British, most natural premade male
       // eleven_flash_v2_5 = ~75ms latency (vs 2000ms+ for multilingual_v2)
       // optimize_streaming_latency=3 removes audio normalizers for faster first byte
       const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3`, {
