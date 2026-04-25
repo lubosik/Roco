@@ -10017,6 +10017,7 @@ const jarvisOrb = (() => {
   let activeDispatchController = null;
   let activeSpeakController = null;
   let activeSpeechText  = '';
+  let playbackDuckState = null;
   const INTERRUPT_WORDS = new Set(['ok', 'okay', 'yeah', 'yep', 'yup', 'wait', 'stop', 'sorry', 'actually', 'fine', 'no', 'nah', 'hold']);
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
@@ -10084,14 +10085,24 @@ const jarvisOrb = (() => {
     return overlap.length >= Math.min(heardWords.length, 3);
   }
 
-  function shouldTriggerBargeIn(text, confidence) {
+  function hasExplicitInterruptIntent(text) {
+    const words = normalizeSpeechText(text).split(/\s+/).filter(Boolean);
+    if (!words.length) return false;
+    if (words.some(word => INTERRUPT_WORDS.has(word))) return true;
+    const joined = words.join(' ');
+    return joined.includes('hold on') || joined.includes('one sec') || joined.includes('one second');
+  }
+
+  function shouldTriggerBargeIn(text, confidence, isFinal) {
     const clean = String(text || '').trim().toLowerCase();
     if (!clean) return false;
     if (isLikelySelfSpeech(clean)) return false;
+    if (hasExplicitInterruptIntent(clean)) return true;
+    if (!isFinal) return false;
     const words = clean.split(/\s+/).filter(Boolean);
-    if (words.length >= 2) return true;
+    if (words.length >= 3 && Number(confidence || 0) >= 0.45) return true;
+    if (words.length >= 2 && Number(confidence || 0) >= 0.75) return true;
     const first = words[0] || '';
-    if (INTERRUPT_WORDS.has(first)) return true;
     if (first.length >= 4 && Number(confidence || 0) >= 0.9) return true;
     return false;
   }
@@ -10132,6 +10143,22 @@ const jarvisOrb = (() => {
       try { activeSpeakController.abort(); } catch {}
       activeSpeakController = null;
     }
+  }
+
+  function applyPlaybackDuck(enabled) {
+    if (enabled) {
+      playbackDuckState = {
+        currentAudioVolume: currentAudio ? currentAudio.volume : null,
+        ackAudioVolume: ackAudio ? ackAudio.volume : null,
+      };
+      if (currentAudio) currentAudio.volume = 0.35;
+      if (ackAudio) ackAudio.volume = 0.25;
+      return;
+    }
+    if (!playbackDuckState) return;
+    if (currentAudio && playbackDuckState.currentAudioVolume != null) currentAudio.volume = playbackDuckState.currentAudioVolume;
+    if (ackAudio && playbackDuckState.ackAudioVolume != null) ackAudio.volume = playbackDuckState.ackAudioVolume;
+    playbackDuckState = null;
   }
 
   // ── MediaSource streaming TTS — plays audio as chunks arrive ─────────────
@@ -10193,18 +10220,21 @@ const jarvisOrb = (() => {
     if (!SR) return;
     if (bargeInRecognition) { try { bargeInRecognition.stop(); } catch (e) {} }
     var r = new SR();
-    r.continuous     = false;
+    r.continuous     = true;
     r.interimResults = true;
     r.lang           = 'en-US';
     var bargeInText  = '';
     var bargeInConfidence = 0;
+    var sawFinalResult = false;
     bargeInTriggered = false;
+    applyPlaybackDuck(true);
     r.onresult = function(e) {
       var result = e.results[e.results.length - 1];
       var alt = result && result[0];
       bargeInText = (alt && alt.transcript) || bargeInText || '';
       bargeInConfidence = Math.max(bargeInConfidence, Number(alt && alt.confidence) || 0);
-      if (!bargeInTriggered && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
+      sawFinalResult = sawFinalResult || !!(result && result.isFinal);
+      if (!bargeInTriggered && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence, !!(result && result.isFinal))) {
         bargeInTriggered = true;
         invalidatePlayback();
         stopPlayback();
@@ -10216,18 +10246,23 @@ const jarvisOrb = (() => {
     r.maxAlternatives = 1;
     r.onend = function() {
       bargeInRecognition = null;
-      if (!bargeInTriggered && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
+      applyPlaybackDuck(false);
+      if (!bargeInTriggered && sawFinalResult && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence, true)) {
         invalidatePlayback();
         stopPlayback();
         if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
         dispatch(bargeInText);
       }
     };
-    r.onerror = function() { bargeInRecognition = null; };
+    r.onerror = function() {
+      bargeInRecognition = null;
+      applyPlaybackDuck(false);
+    };
     try { r.start(); bargeInRecognition = r; } catch (e) {}
   }
 
   function stopBargeIn() {
+    applyPlaybackDuck(false);
     if (bargeInRecognition) {
       try { bargeInRecognition.stop(); } catch (e) {}
       bargeInRecognition = null;
