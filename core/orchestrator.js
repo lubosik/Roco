@@ -51,6 +51,7 @@ import { runFundraiserReasoning, gatherCurrentMetrics } from './fundraiserBrain.
 import { writeMemory } from './rocoMemory.js';
 import { searchInvestorsWithGrok, scanInvestorNewsForDeal, saveDealNewsLeads, scanGeneralInvestorSignals, storeGeneralInvestorSignals, buildDealNewsScan, summarizePortfolioNewsDigest, scrapePublicInvestorDirectories } from './newsScanner.js';
 import { buildDailyActivityReport, persistDailyActivityReport, renderDailyVoiceNoteFromText } from './analyticsEngine.js';
+import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from './runtimeCoordination.js';
 
 export const rocoState = {
   status: 'ACTIVE',
@@ -58,6 +59,13 @@ export const rocoState = {
   emailsSent: 0,
   startedAt: new Date().toISOString(),
 };
+
+const ORCHESTRATOR_LEASE_KEY = 'GLOBAL_ORCHESTRATOR_LEASE';
+const ORCHESTRATOR_INSTANCE_ID = process.env.ROCO_INSTANCE_ID
+  || process.env.RAILWAY_REPLICA_ID
+  || process.env.RAILWAY_DEPLOYMENT_ID
+  || `local-${process.pid}`;
+const ORCHESTRATOR_LEASE_MS = Math.max(ORCHESTRATOR_INTERVAL_MS * 3, 90_000);
 
 /** Strip em-dashes (and similar fancy punctuation) from outreach text. */
 function sanitizeOutreach(text) {
@@ -585,17 +593,59 @@ export async function triggerImmediateRun(dealId) {
 async function runLoop() {
   while (true) {
     try {
-      const state = await loadState();
-      if (state.roco_status === 'ACTIVE') {
-        await runCycle(state);
+      const hasLease = await acquireOrchestratorLease();
+      if (!hasLease) {
+        info(`[ORCHESTRATOR] Lease held by another instance — ${ORCHESTRATOR_INSTANCE_ID} standing by`);
       } else {
-        info(`Orchestrator ${state.roco_status} — waiting...`);
+        const state = await loadState();
+        if (state.roco_status === 'ACTIVE') {
+          await runCycle(state);
+        } else {
+          info(`Orchestrator ${state.roco_status} — waiting...`);
+        }
       }
     } catch (err) {
       error('Orchestrator cycle threw unexpectedly', { err: err.message, stack: err.stack });
     }
     await sleep(ORCHESTRATOR_INTERVAL_MS);
   }
+}
+
+async function acquireOrchestratorLease() {
+  const now = Date.now();
+  const current = await readGlobalRuntimeSetting(ORCHESTRATOR_LEASE_KEY).catch(() => null);
+  const currentOwner = String(current?.owner || '').trim();
+  const currentExpiresAt = Number(current?.expires_at || 0);
+  const leaseIsLive = currentOwner && currentExpiresAt > now;
+
+  if (leaseIsLive && currentOwner !== ORCHESTRATOR_INSTANCE_ID) {
+    return false;
+  }
+
+  const nextLease = {
+    owner: ORCHESTRATOR_INSTANCE_ID,
+    acquired_at: currentOwner === ORCHESTRATOR_INSTANCE_ID ? (current?.acquired_at || new Date(now).toISOString()) : new Date(now).toISOString(),
+    expires_at: now + ORCHESTRATOR_LEASE_MS,
+    updated_at: new Date(now).toISOString(),
+  };
+
+  const wrote = await writeGlobalRuntimeSetting(ORCHESTRATOR_LEASE_KEY, nextLease).catch(() => false);
+  if (!wrote) return true;
+
+  const confirmed = await readGlobalRuntimeSetting(ORCHESTRATOR_LEASE_KEY).catch(() => null);
+  return String(confirmed?.owner || '') === ORCHESTRATOR_INSTANCE_ID;
+}
+
+export async function releaseOrchestratorLease() {
+  const current = await readGlobalRuntimeSetting(ORCHESTRATOR_LEASE_KEY).catch(() => null);
+  if (String(current?.owner || '') !== ORCHESTRATOR_INSTANCE_ID) return false;
+  return writeGlobalRuntimeSetting(ORCHESTRATOR_LEASE_KEY, {
+    owner: ORCHESTRATOR_INSTANCE_ID,
+    acquired_at: current?.acquired_at || new Date().toISOString(),
+    expires_at: 0,
+    released_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).catch(() => false);
 }
 
 async function runCycle(state) {

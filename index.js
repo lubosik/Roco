@@ -228,12 +228,14 @@ process.on('SIGTERM', async () => {
   console.log('SIGTERM received — shutting down gracefully');
   info('Received SIGTERM — shutting down gracefully');
   rocoState.status = 'CLOSED';
+  await import('./core/orchestrator.js').then(m => m.releaseOrchestratorLease?.()).catch(() => {});
   await sendTelegram('ROCO is shutting down (SIGTERM received).').catch(() => {});
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('SIGINT received — shutting down gracefully');
+  import('./core/orchestrator.js').then(m => m.releaseOrchestratorLease?.()).catch(() => {});
   process.exit(0);
 });
 
