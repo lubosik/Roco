@@ -2,6 +2,7 @@ import express from 'express';
 import session from 'express-session';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
+import { Readable } from 'stream';
 import multer from 'multer';
 import * as XLSX from 'xlsx';
 import path from 'path';
@@ -8331,7 +8332,7 @@ function registerRoutes(app) {
         return res.status(502).json({ error: `ElevenLabs error ${elevenRes.status}: ${msg.slice(0, 120)}` });
       }
       res.set('Content-Type', 'audio/mpeg');
-      elevenRes.body.pipe(res);
+      Readable.fromWeb(elevenRes.body).pipe(res);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

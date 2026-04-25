@@ -10059,11 +10059,9 @@ const jarvisOrb = (() => {
   }
 
   function afterSpeak() {
-    if (isActive) {
-      setTimeout(() => { if (isActive && !isListening) startListening(); }, 400);
-    } else {
-      setOrbState(null, '');
-    }
+    // Return to idle after each exchange — user taps orb to start the next one
+    isActive = false;
+    setOrbState(null, '');
   }
 
   // ── deal context ──────────────────────────────────────────────────────────
@@ -10074,8 +10072,13 @@ const jarvisOrb = (() => {
 
   // ── send transcript to JARVIS ─────────────────────────────────────────────
   async function dispatch(text) {
-    if (!text) { if (isActive) startListening(); return; }
+    if (!text) { afterSpeak(); return; }
     setOrbState('thinking', 'Thinking...');
+    // Play a brief acknowledgment immediately so the user knows we heard them,
+    // while the JARVIS API (which may run tool calls) processes in the background.
+    const ackPhrases = ['On it.', 'Got it.', 'Let me check.', 'One moment.'];
+    const ack = ackPhrases[Math.floor(Math.random() * ackPhrases.length)];
+    speakAck(ack);  // non-blocking — fires and forgets
     try {
       const res = await fetch('/api/jarvis', {
         method: 'POST',
@@ -10085,8 +10088,33 @@ const jarvisOrb = (() => {
       });
       const data = await res.json();
       const reply = data.reply || data.error || '';
-      await speakText(reply);
+      // Wait for ack to finish before playing main response
+      if (ackAudio && !ackAudio.ended) {
+        ackAudio.onended = () => speakText(reply);
+      } else {
+        await speakText(reply);
+      }
     } catch { afterSpeak(); }
+  }
+
+  let ackAudio = null;
+  async function speakAck(text) {
+    try {
+      const res = await fetch('/api/jarvis/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      ackAudio = audio;
+      audio.onended = () => { URL.revokeObjectURL(url); ackAudio = null; };
+      audio.onerror = () => { URL.revokeObjectURL(url); ackAudio = null; };
+      audio.play().catch(() => { ackAudio = null; });
+    } catch { ackAudio = null; }
   }
 
   // ── speech recognition ────────────────────────────────────────────────────
