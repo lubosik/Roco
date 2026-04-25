@@ -1844,6 +1844,19 @@ function truncateInline(value, max = 140) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function preservesAcceptedProgress(stage) {
+  return [
+    'pending_dm_approval',
+    'dm approved',
+    'dm sent',
+    'in conversation',
+    'prior_chat_review',
+    'replied',
+    'meeting booked',
+    'meeting scheduled',
+  ].includes(String(stage || '').trim().toLowerCase());
+}
+
 function normalizeReplyClassification(parsed = {}) {
   const rawIntent = String(parsed?.intent || '').trim();
   const rawSentiment = String(parsed?.sentiment || '').trim().toLowerCase();
@@ -1924,7 +1937,18 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
   }
 
   const payload = await buildLinkedInDmDraftPayload(contactId, { body });
-  if (!payload) return null;
+  if (!payload) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'invite_accepted',
+      pending_linkedin_dm: true,
+    }).eq('id', contactId).catch(() => {});
+    pushActivity({
+      type: 'warning',
+      action: 'LinkedIn DM queue stalled',
+      note: `No draft payload could be built for contact ${contactId}, flagged for retry`,
+    });
+    return null;
+  }
 
   const { contact, messageBody, researchSummary } = payload;
 
@@ -1941,7 +1965,13 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     researchSummary,
     outreachMode: 'investor_outreach',
   });
-  if (!row?.id) throw new Error(`Failed to create LinkedIn approval queue row for ${contact.name || contact.id}`);
+  if (!row?.id) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'invite_accepted',
+      pending_linkedin_dm: true,
+    }).eq('id', contact.id).catch(() => {});
+    throw new Error(`Failed to create LinkedIn approval queue row for ${contact.name || contact.id}`);
+  }
 
   await collapseDuplicateLinkedInDmQueueRows(sb, contact.id, row.id);
 
@@ -2878,7 +2908,12 @@ export function initDashboard(state) {
         // Always record the accepted connection — even if deal is paused.
         // The stage update ensures the orchestrator picks it up on resume.
         if (!alreadyResponded) {
-          await sb.from('contacts').update({ pipeline_stage: 'invite_accepted' }).eq('id', contact.id);
+          const patch = preservesAcceptedProgress(contact.pipeline_stage)
+            ? {}
+            : { pipeline_stage: 'invite_accepted' };
+          if (Object.keys(patch).length) {
+            await sb.from('contacts').update(patch).eq('id', contact.id);
+          }
         } else {
           console.log(`[WEBHOOK/LINKEDIN/REL] ${contact.name} already responded (${contact.pipeline_stage}) — not overwriting stage`);
         }

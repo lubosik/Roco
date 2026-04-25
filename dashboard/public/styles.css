@@ -48,6 +48,25 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+  background:
+    radial-gradient(circle at calc(100% - 72px) calc(100% - 72px),
+      rgba(201,168,76,0.18) 0%,
+      rgba(96,165,250,0.08) 18%,
+      rgba(8,12,21,0) 42%);
+  z-index: 45;
+}
+
+body.jarvis-engaged::before {
+  opacity: 1;
+}
+
 a { color: inherit; text-decoration: none; }
 button { cursor: pointer; font-family: inherit; }
 input, textarea, select { font-family: inherit; }
@@ -233,6 +252,16 @@ input, textarea, select { font-family: inherit; }
   top: 0;
   z-index: 50;
   flex-shrink: 0;
+}
+
+body.jarvis-engaged .topbar,
+body.jarvis-engaged .sidebar {
+  border-color: rgba(201,168,76,0.38);
+  box-shadow: inset 0 0 0 1px rgba(201,168,76,0.08);
+}
+
+body.jarvis-engaged .main-wrapper {
+  filter: saturate(1.05);
 }
 
 .hamburger {
@@ -2141,6 +2170,10 @@ mark.gold-match {
   user-select: none;
   filter: drop-shadow(0 0 18px rgba(201,168,76,0.35));
   transition: filter 0.3s, transform 0.2s;
+}
+
+body.jarvis-engaged #jarvis-orb {
+  filter: drop-shadow(0 0 26px rgba(201,168,76,0.55));
 }
 #jarvis-orb:hover {
   filter: drop-shadow(0 0 28px rgba(201,168,76,0.6));

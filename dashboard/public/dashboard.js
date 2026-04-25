@@ -10011,6 +10011,7 @@ const jarvisOrb = (() => {
   let audioCtx          = null;
   let pendingTranscript = '';
   let bargeInRecognition = null;
+  const INTERRUPT_WORDS = new Set(['ok', 'okay', 'yeah', 'yep', 'yup', 'wait', 'stop', 'sorry', 'actually', 'fine', 'no', 'nah', 'hold']);
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
   // Must run synchronously inside a user gesture handler.
@@ -10052,11 +10053,27 @@ const jarvisOrb = (() => {
   const orb   = () => document.getElementById('jarvis-orb');
   const label = () => document.getElementById('jarvis-status-label');
 
+  function syncActiveVisuals() {
+    document.body.classList.toggle('jarvis-engaged', !!isActive);
+  }
+
+  function shouldTriggerBargeIn(text, confidence) {
+    const clean = String(text || '').trim().toLowerCase();
+    if (!clean) return false;
+    const words = clean.split(/\s+/).filter(Boolean);
+    if (words.length >= 2) return true;
+    const first = words[0] || '';
+    if (INTERRUPT_WORDS.has(first)) return true;
+    if (first.length >= 4 && Number(confidence || 0) >= 0.9) return true;
+    return false;
+  }
+
   function setOrbState(state, text) {
     const el = orb();
     if (!el) return;
     el.classList.remove('listening', 'thinking', 'speaking');
     if (state) el.classList.add(state);
+    syncActiveVisuals();
     const lbl = label();
     if (lbl) {
       lbl.textContent = text || '';
@@ -10123,24 +10140,23 @@ const jarvisOrb = (() => {
     if (bargeInRecognition) { try { bargeInRecognition.stop(); } catch (e) {} }
     var r = new SR();
     r.continuous     = false;
-    r.interimResults = false;
+    r.interimResults = true;
     r.lang           = 'en-US';
     var bargeInText  = '';
+    var bargeInConfidence = 0;
     r.onresult = function(e) {
-      bargeInText = (e.results[0] && e.results[0][0] && e.results[0][0].transcript) || '';
+      var result = e.results[e.results.length - 1];
+      var alt = result && result[0];
+      bargeInText = (alt && alt.transcript) || bargeInText || '';
+      bargeInConfidence = Math.max(bargeInConfidence, Number(alt && alt.confidence) || 0);
     };
     r.maxAlternatives = 1;
     r.onend = function() {
       bargeInRecognition = null;
-      if (bargeInText && isActive) {
-        var words = bargeInText.trim().split(/\s+/).filter(function(w) { return w.length > 0; });
-        if (words.length >= 2) {
-          // User interrupted with at least 2 words — stop audio and dispatch
-          if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-          if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
-          dispatch(bargeInText);
-        }
-        // fewer than 2 words — likely background noise, ignore
+      if (bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
+        dispatch(bargeInText);
       }
     };
     r.onerror = function() { bargeInRecognition = null; };
@@ -10297,12 +10313,14 @@ const jarvisOrb = (() => {
     unlockAudio();  // must be synchronous inside this gesture handler
     if (isActive) {
       isActive = false;
+      syncActiveVisuals();
       stopListening();
       if (ackAudio)     { ackAudio.pause();     ackAudio = null; }
       if (currentAudio) { currentAudio.pause(); currentAudio = null; }
       setOrbState(null, '');
     } else {
       isActive = true;
+      syncActiveVisuals();
       startListening();
     }
   }

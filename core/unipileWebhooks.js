@@ -109,6 +109,24 @@ function buildLinkedInIdentityClauses(payload) {
   return [...new Set(clauses)].filter(Boolean);
 }
 
+function normalizePipelineStage(stage) {
+  return String(stage || '').trim().toLowerCase();
+}
+
+function shouldPreserveAcceptedStage(stage) {
+  const normalized = normalizePipelineStage(stage);
+  return [
+    'pending_dm_approval',
+    'dm approved',
+    'dm sent',
+    'in conversation',
+    'prior_chat_review',
+    'replied',
+    'meeting booked',
+    'meeting scheduled',
+  ].includes(normalized);
+}
+
 function scoreRelationCandidate(contact, payload = {}) {
   let score = 0;
   const providerId = String(payload.provider_id || '').trim().toLowerCase();
@@ -470,31 +488,40 @@ export async function handleLinkedInAcceptance(contact, deal, pushActivity, queu
         reason: within ? 'accepted_in_window' : 'accepted_outside_window',
       });
 
+      if (workflowResult?.id) {
+        pushActivity({
+          type:   'linkedin',
+          action: `DM drafted for approval: ${contact.name}`,
+          note:   within
+            ? 'Connection accepted, opening LinkedIn DM queued for approval'
+            : 'Connection accepted outside window, DM queued for approval and will wait for the DM window after approval',
+          deal_name: deal?.name || null,
+          dealId: deal?.id || contact.deal_id || null,
+        });
+        return;
+      }
+
       if (workflowResult?.deferred) {
         await queueLinkedInDM(contact.id);
       }
 
-      pushActivity({
-        type:   'linkedin',
-        action: `DM drafted for approval: ${contact.name}`,
-        note:   within
-          ? 'Connection accepted → opening LinkedIn DM queued for approval'
-          : 'Connection accepted outside window → DM queued for approval and will wait for the DM window after approval',
-        deal_name: deal?.name || null,
-        dealId: deal?.id || contact.deal_id || null,
-      });
-      return;
+      console.warn(`[UNIPILE/REL] queueForApproval returned no approval row for ${contact.name} (${contact.id})`);
     } catch (err) {
       console.warn('[UNIPILE/REL] queueForApproval failed:', err.message);
     }
   }
 
   await queueLinkedInDM(contact.id);
-  try { await sb.from('contacts').update({ pending_linkedin_dm: true }).eq('id', contact.id); } catch {}
+  try {
+    await sb.from('contacts').update({
+      pending_linkedin_dm: true,
+      pipeline_stage: shouldPreserveAcceptedStage(contact.pipeline_stage) ? contact.pipeline_stage : 'invite_accepted',
+    }).eq('id', contact.id);
+  } catch {}
   pushActivity({
-    type:   'linkedin',
-    action: `DM queued: ${contact.name}`,
-    note:   'Connection accepted → draft will be created next cycle',
+    type:   'warning',
+    action: `DM queue fallback armed: ${contact.name}`,
+    note:   'Connection accepted, immediate DM approval queue did not materialise, flagged for retry',
     deal_name: deal?.name || null,
     dealId: deal?.id || contact.deal_id || null,
   });
@@ -586,15 +613,19 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
     return { matchStatus: 'inactive_deal', contactId: contact.id, dealId: contact.deal_id || null };
   }
 
-  // Mark connection accepted
+  const preserveStage = shouldPreserveAcceptedStage(contact.pipeline_stage);
+
+  // Mark connection accepted without regressing a contact that is already
+  // further along in the post-acceptance workflow.
   try {
-    await sb.from('contacts').update({
+    const patch = {
       invite_accepted_at:  new Date().toISOString(),
-      pipeline_stage:      'invite_accepted',
       linkedin_provider_id: payload.provider_id || contact.linkedin_provider_id || null,
       linkedin_public_id: payload.public_identifier || contact.linkedin_public_id || null,
       linkedin_url: payload.profile_url || contact.linkedin_url || null,
-    }).eq('id', contact.id);
+    };
+    if (!preserveStage) patch.pipeline_stage = 'invite_accepted';
+    await sb.from('contacts').update(patch).eq('id', contact.id);
   } catch {}
 
   // Log the acceptance event
