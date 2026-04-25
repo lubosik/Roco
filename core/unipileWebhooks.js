@@ -589,7 +589,6 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
   // Mark connection accepted
   try {
     await sb.from('contacts').update({
-      linkedin_connected:  true,
       invite_accepted_at:  new Date().toISOString(),
       pipeline_stage:      'invite_accepted',
       linkedin_provider_id: payload.provider_id || contact.linkedin_provider_id || null,
