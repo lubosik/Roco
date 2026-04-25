@@ -3297,7 +3297,7 @@ async function generateWelcomeAudio(displayName) {
       },
       body: JSON.stringify({
         text: `Welcome back, ${displayName}.`,
-        model_id: 'eleven_multilingual_v2',
+        model_id: 'eleven_flash_v2_5',
         voice_settings: {
           stability: 0.45,
           similarity_boost: 0.85,
@@ -8314,7 +8314,9 @@ function registerRoutes(app) {
     if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
     try {
       const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Rachel — female voice
-      const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
+      // eleven_flash_v2_5 = ~75ms latency (vs 2000ms+ for multilingual_v2)
+      // optimize_streaming_latency=3 removes audio normalizers for faster first byte
+      const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3`, {
         method: 'POST',
         headers: {
           'xi-api-key': apiKey,
@@ -8323,7 +8325,7 @@ function registerRoutes(app) {
         },
         body: JSON.stringify({
           text: text.slice(0, 500),
-          model_id: 'eleven_multilingual_v2',
+          model_id: 'eleven_flash_v2_5',
           voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.2 },
         }),
       });

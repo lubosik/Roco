@@ -10002,21 +10002,48 @@ async function uploadInvestorXLSX(file) {
 // ── JARVIS ORB ───────────────────────────────────────────────────────────────
 
 const jarvisOrb = (() => {
-  let isActive = false;     // orb is "on" — mic cycles until user presses again
-  let recognition = null;
-  let isListening = false;
-  let currentAudio = null;
-  let audioUnlocked = false;
+  let isActive         = false;
+  let recognition      = null;
+  let isListening      = false;
+  let currentAudio     = null;
+  let audioCtx         = null;
   let pendingTranscript = '';
 
-  // ── audio context unlock ──────────────────────────────────────────────────
+  // ── AudioContext unlock (proper gesture registration) ─────────────────────
+  // Must run synchronously inside a user gesture handler.
+  // Primes a silent buffer so all subsequent Audio() play() calls are allowed.
   function unlockAudio() {
-    if (audioUnlocked) return;
-    audioUnlocked = true;
-    const silent = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
-    silent.volume = 0;
-    silent.play().catch(() => {});
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+      return;
+    }
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const buf = audioCtx.createBuffer(1, 1, 22050);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      src.start(0);
+    } catch {}
   }
+
+  // ── filler audio — pre-cached at page load for zero-latency acks ──────────
+  const FILLERS = ['On it.', 'Got it.', 'One moment.', 'Let me check.'];
+  const fillerCache = new Map();  // text -> Blob
+
+  function prewarmFillers() {
+    FILLERS.forEach(async (text) => {
+      try {
+        const res = await fetch('/api/jarvis/speak', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin', body: JSON.stringify({ text }),
+        });
+        if (res.ok) fillerCache.set(text, await res.blob());
+      } catch {}
+    });
+  }
+  // Prewarm 3 seconds after page load (non-blocking)
+  setTimeout(prewarmFillers, 3000);
 
   // ── orb element helpers ───────────────────────────────────────────────────
   const orb   = () => document.getElementById('jarvis-orb');
@@ -10030,8 +10057,60 @@ const jarvisOrb = (() => {
     const lbl = label();
     if (lbl) {
       lbl.textContent = text || '';
-      lbl.className = 'jarvis-label' + (text ? ' visible' : '');
+      lbl.className = text ? 'jarvis-label visible' : 'jarvis-label';
     }
+  }
+
+  // ── MediaSource streaming TTS — plays audio as chunks arrive ─────────────
+  // Falls back to blob if MediaSource not supported (Safari quirks)
+  async function playStream(fetchResponse) {
+    return new Promise((resolve) => {
+      const done = () => { currentAudio = null; resolve(); };
+
+      if (window.MediaSource && MediaSource.isTypeSupported('audio/mpeg')) {
+        const ms    = new MediaSource();
+        const audio = new Audio();
+        audio.src   = URL.createObjectURL(ms);
+        currentAudio = audio;
+        audio.onended = done;
+        audio.onerror = done;
+
+        ms.addEventListener('sourceopen', async () => {
+          let sb;
+          try { sb = ms.addSourceBuffer('audio/mpeg'); } catch { done(); return; }
+
+          const waitUpdate = () => new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+          const reader = fetchResponse.body.getReader();
+          audio.play().catch(() => {});
+
+          const pump = async () => {
+            try {
+              const { done: streamDone, value } = await reader.read();
+              if (streamDone) {
+                if (sb.updating) await waitUpdate();
+                try { ms.endOfStream(); } catch {}
+                return;
+              }
+              if (sb.updating) await waitUpdate();
+              sb.appendBuffer(value);
+              await waitUpdate();
+              pump();
+            } catch { done(); }
+          };
+          pump();
+        }, { once: true });
+      } else {
+        // Safari / fallback: buffer whole response then play
+        fetchResponse.blob().then(blob => {
+          const url   = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          currentAudio = audio;
+          audio.onended = () => { URL.revokeObjectURL(url); done(); };
+          audio.onerror = () => { URL.revokeObjectURL(url); done(); };
+          audio.play().catch(() => { URL.revokeObjectURL(url); done(); });
+        }).catch(done);
+      }
+    });
   }
 
   // ── ElevenLabs TTS ────────────────────────────────────────────────────────
@@ -10048,20 +10127,37 @@ const jarvisOrb = (() => {
         body: JSON.stringify({ text: clean }),
       });
       if (!res.ok) { afterSpeak(); return; }
-      const blob = await res.blob();
-      const url  = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      currentAudio = audio;
-      audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); };
-      audio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); };
-      audio.play().catch(() => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); });
+      await playStream(res);
+      afterSpeak();
     } catch { afterSpeak(); }
   }
 
   function afterSpeak() {
-    // Return to idle after each exchange — user taps orb to start the next one
     isActive = false;
     setOrbState(null, '');
+  }
+
+  // ── instant ack from pre-cached filler ────────────────────────────────────
+  let ackAudio = null;
+  function speakAck() {
+    const text = FILLERS[Math.floor(Math.random() * FILLERS.length)];
+    const blob = fillerCache.get(text);
+    if (!blob) return;
+    if (ackAudio) { ackAudio.pause(); ackAudio = null; }
+    const url   = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    ackAudio = audio;
+    audio.onended = () => { URL.revokeObjectURL(url); ackAudio = null; };
+    audio.onerror = () => { URL.revokeObjectURL(url); ackAudio = null; };
+    audio.play().catch(() => { ackAudio = null; });
+  }
+
+  function waitForAck() {
+    return new Promise(r => {
+      if (!ackAudio || ackAudio.ended || ackAudio.paused) { r(); return; }
+      ackAudio.addEventListener('ended',  r, { once: true });
+      ackAudio.addEventListener('error',  r, { once: true });
+    });
   }
 
   // ── deal context ──────────────────────────────────────────────────────────
@@ -10070,15 +10166,11 @@ const jarvisOrb = (() => {
     return sel ? sel.dataset.activeDealId : null;
   }
 
-  // ── send transcript to JARVIS ─────────────────────────────────────────────
+  // ── dispatch transcript to JARVIS ─────────────────────────────────────────
   async function dispatch(text) {
     if (!text) { afterSpeak(); return; }
     setOrbState('thinking', 'Thinking...');
-    // Play a brief acknowledgment immediately so the user knows we heard them,
-    // while the JARVIS API (which may run tool calls) processes in the background.
-    const ackPhrases = ['On it.', 'Got it.', 'Let me check.', 'One moment.'];
-    const ack = ackPhrases[Math.floor(Math.random() * ackPhrases.length)];
-    speakAck(ack);  // non-blocking — fires and forgets
+    speakAck();  // plays cached filler immediately — zero added latency
     try {
       const res = await fetch('/api/jarvis', {
         method: 'POST',
@@ -10086,35 +10178,11 @@ const jarvisOrb = (() => {
         credentials: 'same-origin',
         body: JSON.stringify({ message: text, dealId: getActiveDealId() }),
       });
-      const data = await res.json();
+      const data  = await res.json();
       const reply = data.reply || data.error || '';
-      // Wait for ack to finish before playing main response
-      if (ackAudio && !ackAudio.ended) {
-        ackAudio.onended = () => speakText(reply);
-      } else {
-        await speakText(reply);
-      }
+      await waitForAck();          // let ack phrase finish before main response
+      await speakText(reply);
     } catch { afterSpeak(); }
-  }
-
-  let ackAudio = null;
-  async function speakAck(text) {
-    try {
-      const res = await fetch('/api/jarvis/speak', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ text }),
-      });
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const url  = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      ackAudio = audio;
-      audio.onended = () => { URL.revokeObjectURL(url); ackAudio = null; };
-      audio.onerror = () => { URL.revokeObjectURL(url); ackAudio = null; };
-      audio.play().catch(() => { ackAudio = null; });
-    } catch { ackAudio = null; }
   }
 
   // ── speech recognition ────────────────────────────────────────────────────
@@ -10122,12 +10190,10 @@ const jarvisOrb = (() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
     const r = new SR();
-    r.continuous      = false;
-    r.interimResults  = false;
-    r.lang            = 'en-US';
-    r.onresult = (e) => {
-      pendingTranscript = e.results[0]?.[0]?.transcript || '';
-    };
+    r.continuous     = false;
+    r.interimResults = false;
+    r.lang           = 'en-US';
+    r.onresult  = (e) => { pendingTranscript = e.results[0]?.[0]?.transcript || ''; };
     r.onspeechend = () => { try { r.stop(); } catch {} };
     r.onend = () => {
       isListening = false;
@@ -10135,18 +10201,18 @@ const jarvisOrb = (() => {
       pendingTranscript = '';
       if (isActive) dispatch(t);
     };
-    r.onerror = (e) => {
+    r.onerror = () => {
       isListening = false;
       pendingTranscript = '';
-      if (isActive && e.error !== 'aborted') setTimeout(() => { if (isActive) startListening(); }, 600);
+      // Don't auto-retry — user must tap orb again
+      afterSpeak();
     };
     return r;
   }
 
   function startListening() {
     if (!recognition) recognition = buildRecognition();
-    if (!recognition) return;
-    if (isListening) return;
+    if (!recognition || isListening) return;
     try {
       recognition.start();
       isListening = true;
@@ -10159,12 +10225,13 @@ const jarvisOrb = (() => {
     try { recognition?.stop(); } catch {}
   }
 
-  // ── toggle: press orb to start / stop ────────────────────────────────────
+  // ── toggle: press orb ─────────────────────────────────────────────────────
   function toggle() {
-    unlockAudio();
+    unlockAudio();  // must be synchronous inside this gesture handler
     if (isActive) {
       isActive = false;
       stopListening();
+      if (ackAudio)     { ackAudio.pause();     ackAudio = null; }
       if (currentAudio) { currentAudio.pause(); currentAudio = null; }
       setOrbState(null, '');
     } else {
@@ -10173,12 +10240,12 @@ const jarvisOrb = (() => {
     }
   }
 
-  // legacy shim — kept so any existing callers don't break
-  function open()         { if (!isActive) toggle(); }
-  function close()        { if (isActive)  toggle(); }
-  function toggleMic()    { toggle(); }
-  function toggleVoice()  { toggle(); }
-  function send()         { /* voice only */ }
+  // legacy shims
+  function open()        { if (!isActive) toggle(); }
+  function close()       { if (isActive)  toggle(); }
+  function toggleMic()   { toggle(); }
+  function toggleVoice() { toggle(); }
+  function send()        {}
 
   return { open, close, toggle, send, toggleMic, toggleVoice };
 })();
