@@ -1856,8 +1856,11 @@
 
 <!-- ── JARVIS ORB ────────────────────────────────────────────────────────── -->
 <div id="jarvis-orb" title="Talk to JARVIS" onclick="jarvisOrb.toggle()">
-  <div class="orb-ring"></div>
-  <div class="orb-core">J</div>
+  <div class="orb-glow"></div>
+  <div class="orb-sphere">
+    <div class="orb-highlight"></div>
+    <div class="orb-shimmer"></div>
+  </div>
 </div>
 
 <div id="jarvis-panel" class="jarvis-panel">
@@ -1866,7 +1869,10 @@
       <span class="jarvis-dot" id="jarvis-status-dot"></span>
       JARVIS
     </div>
-    <button class="jarvis-close" onclick="jarvisOrb.close()">&#215;</button>
+    <div class="jarvis-header-actions">
+      <button id="jarvis-voice-toggle" class="jarvis-icon-btn" title="Mute voice" onclick="jarvisOrb.toggleVoice()">&#128264;</button>
+      <button class="jarvis-close" onclick="jarvisOrb.close()">&#215;</button>
+    </div>
   </div>
   <div class="jarvis-messages" id="jarvis-messages"></div>
   <div class="jarvis-input-row">

@@ -378,19 +378,85 @@ async function toolSkipMessage({ deal_id, contact_name }) {
 async function toolGetRecentActivity({ deal_id, limit = 15 }) {
   const sb = getSupabase();
   if (!sb) return { error: 'Database unavailable' };
+  const cap = Math.min(limit, 40);
+  const events = [];
+
   try {
-    const { data } = await sb.from('activity_log')
+    // 1. activity_log (may be empty — don't rely on it alone)
+    const { data: logRows } = await sb.from('activity_log')
       .select('event_type, summary, detail, created_at')
       .eq('deal_id', deal_id)
       .order('created_at', { ascending: false })
-      .limit(Math.min(limit, 40));
+      .limit(cap);
+    for (const e of logRows || []) {
+      events.push({ type: e.event_type, summary: e.summary, when: e.created_at, source: 'log' });
+    }
+
+    // 2. Inbound replies from conversation_messages
+    const { data: replies } = await sb.from('conversation_messages')
+      .select('contact_name, body, sent_at, intent, channel')
+      .eq('deal_id', deal_id)
+      .eq('direction', 'inbound')
+      .order('sent_at', { ascending: false })
+      .limit(cap);
+    for (const r of replies || []) {
+      events.push({
+        type:    'reply_received',
+        summary: `${r.contact_name || 'Unknown'} replied${r.intent && r.intent !== 'other' ? ` (${r.intent})` : ''}: "${(r.body || '').slice(0, 120)}"`,
+        when:    r.sent_at,
+        source:  'messages',
+      });
+    }
+
+    // 3. Recent contact stage milestones (last 7 days)
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: recentContacts } = await sb.from('contacts')
+      .select('name, company_name, pipeline_stage, last_reply_at, last_email_sent_at, meeting_booked_at, invite_accepted_at, dm_sent_at, updated_at')
+      .eq('deal_id', deal_id)
+      .gte('updated_at', sevenDaysAgo)
+      .order('updated_at', { ascending: false })
+      .limit(30);
+
+    for (const c of recentContacts || []) {
+      const label = `${c.name}${c.company_name ? ` at ${c.company_name}` : ''}`;
+      if (c.meeting_booked_at && c.meeting_booked_at >= sevenDaysAgo) {
+        events.push({ type: 'meeting_booked', summary: `Meeting booked with ${label}`, when: c.meeting_booked_at, source: 'contacts' });
+      }
+      if (c.last_reply_at && c.last_reply_at >= sevenDaysAgo) {
+        events.push({ type: 'reply_received', summary: `${label} replied [stage: ${c.pipeline_stage || '?'}]`, when: c.last_reply_at, source: 'contacts' });
+      }
+      if (c.dm_sent_at && c.dm_sent_at >= sevenDaysAgo) {
+        events.push({ type: 'dm_sent', summary: `LinkedIn DM sent to ${label}`, when: c.dm_sent_at, source: 'contacts' });
+      }
+      if (c.invite_accepted_at && c.invite_accepted_at >= sevenDaysAgo) {
+        events.push({ type: 'invite_accepted', summary: `${label} accepted LinkedIn invite`, when: c.invite_accepted_at, source: 'contacts' });
+      }
+      if (c.last_email_sent_at && c.last_email_sent_at >= sevenDaysAgo) {
+        events.push({ type: 'email_sent', summary: `Email sent to ${label}`, when: c.last_email_sent_at, source: 'contacts' });
+      }
+    }
+
+    // Deduplicate and sort newest first
+    const seen = new Set();
+    const deduped = events
+      .filter(e => {
+        const key = `${e.type}:${e.summary.slice(0, 60)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => (b.when || '').localeCompare(a.when || ''))
+      .slice(0, cap);
+
+    // Summary counts
+    const repliesTotal = (replies || []).length;
+    const meetingsTotal = (recentContacts || []).filter(c => c.meeting_booked_at).length;
 
     return {
-      events: (data || []).map(e => ({
-        type:    e.event_type,
-        summary: e.summary,
-        when:    e.created_at,
-      })),
+      total_events:   deduped.length,
+      replies_7d:     repliesTotal,
+      meetings_7d:    meetingsTotal,
+      events: deduped.map(e => ({ type: e.type, summary: e.summary, when: e.when })),
     };
   } catch (err) {
     return { error: err.message };

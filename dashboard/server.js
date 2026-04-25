@@ -8283,6 +8283,37 @@ function registerRoutes(app) {
     }
   });
 
+  app.post('/api/jarvis/speak', requireAuth, async (req, res) => {
+    const { text } = req.body || {};
+    if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text required' });
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
+    try {
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'onwK4e9ZLuTAKqWW03F9'; // Daniel — clear British male
+      const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text: text.slice(0, 500),
+          model_id: 'eleven_turbo_v2_5',
+          voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.2 },
+        }),
+      });
+      if (!elevenRes.ok) {
+        const msg = await elevenRes.text().catch(() => '');
+        return res.status(502).json({ error: `ElevenLabs error ${elevenRes.status}: ${msg.slice(0, 120)}` });
+      }
+      res.set('Content-Type', 'audio/mpeg');
+      elevenRes.body.pipe(res);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 404 handler — JSON for API/webhook paths, index.html for everything else
   app.use((req, res) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/webhook')) {

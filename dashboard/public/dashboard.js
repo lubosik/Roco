@@ -10005,6 +10005,8 @@ const jarvisOrb = (() => {
   let isOpen = false;
   let recognition = null;
   let isListening = false;
+  let voiceEnabled = true;
+  let currentAudio = null;
 
   const orb = () => document.getElementById('jarvis-orb');
   const panel = () => document.getElementById('jarvis-panel');
@@ -10012,6 +10014,45 @@ const jarvisOrb = (() => {
   const input = () => document.getElementById('jarvis-input');
   const dot = () => document.getElementById('jarvis-status-dot');
   const mic = () => document.getElementById('jarvis-mic');
+
+  async function speakText(text) {
+    if (!voiceEnabled) return;
+    const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    if (!clean) return;
+    setOrbState('speaking');
+    // Try ElevenLabs first
+    try {
+      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      const res = await fetch('/api/jarvis/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ text: clean }),
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentAudio = audio;
+        audio.onended = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; };
+        audio.onerror = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; speakFallback(clean); };
+        audio.play().catch(() => speakFallback(clean));
+        return;
+      }
+    } catch {}
+    speakFallback(clean);
+  }
+
+  function speakFallback(text) {
+    if (!window.speechSynthesis) { setOrbState(null); return; }
+    window.speechSynthesis.cancel();
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.rate = 1.05;
+    utt.pitch = 0.95;
+    utt.onend = () => setOrbState(null);
+    utt.onerror = () => setOrbState(null);
+    window.speechSynthesis.speak(utt);
+  }
 
   function setOrbState(state) {
     const el = orb();
@@ -10079,14 +10120,27 @@ const jarvisOrb = (() => {
       });
       const data = await res.json();
       if (typing) typing.remove();
-      addMessage('bot', data.reply || data.error || 'No response');
+      const reply = data.reply || data.error || 'No response';
+      addMessage('bot', reply);
+      speakText(reply);
     } catch (err) {
       if (typing) typing.remove();
       addMessage('bot', `Error: ${err.message}`);
     } finally {
-      setOrbState(null);
       setDotState('active');
     }
+  }
+
+  function toggleVoice() {
+    voiceEnabled = !voiceEnabled;
+    if (!voiceEnabled) {
+      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      window.speechSynthesis?.cancel();
+      setOrbState(null);
+    }
+    const btn = document.getElementById('jarvis-voice-toggle');
+    if (btn) btn.title = voiceEnabled ? 'Mute voice' : 'Enable voice';
+    if (btn) btn.classList.toggle('muted', !voiceEnabled);
   }
 
   function setupSpeechRecognition() {
@@ -10159,5 +10213,5 @@ const jarvisOrb = (() => {
     if (isOpen) close(); else open();
   }
 
-  return { open, close, toggle, send, toggleMic };
+  return { open, close, toggle, send, toggleMic, toggleVoice };
 })();
