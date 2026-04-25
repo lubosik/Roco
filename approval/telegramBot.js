@@ -2207,7 +2207,7 @@ export async function reloadPendingInvestorApprovals() {
       const hasSubjects = !!(item.subject_a || item.subject);
       const bodyPreview = ((item.body || '').length > 800 ? `${item.body.slice(0, 800)}…` : (item.body || ''));
       const msg = [
-        `*ROCO — ${item.stage || 'EMAIL'} Ready for Approval* _(reloaded)_`,
+        `*ROCO — ${item.stage || 'EMAIL'} Ready for Approval*`,
         ``,
         `👤 *${item.contact_name || 'Unknown'}* · ${item.firm || 'Unknown Firm'}`,
         item.contact_email ? `📧 ${item.contact_email}` : null,
@@ -2294,7 +2294,7 @@ export async function reloadPendingSourcingApprovals() {
       const subjectBlock = !isLinkedIn && item.subject_a
         ? `*Subject A:* ${item.subject_a}\n*Subject B:* ${item.subject_b || 'N/A'}\n` : '';
       const msg = [
-        `*ROCO — ${item.stage} Draft Ready* _(reloaded)_`,
+        `*ROCO — ${item.stage} Draft Ready*`,
         `Mode: COMPANY SOURCING`,
         ``,
         `To: *${item.contact_name}* at *${item.firm}*`,

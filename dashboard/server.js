@@ -1484,7 +1484,7 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
     { data: repliesData },
   ] = await Promise.all([
     sb.from('contacts')
-      .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel')
+      .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel, dm_sent_at')
       .in('deal_id', safeIds),
     sb.from('emails')
       .select('id, deal_id, status')
@@ -1573,8 +1573,7 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
     if (!coverage.dm) {
       metrics.li_dms_sent = contacts.filter(contact =>
         contact.deal_id === dealId &&
-        ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(contact.pipeline_stage) &&
-        ['linkedin', 'linkedin_dm'].includes(contact.outreach_channel)
+        (contact.dm_sent_at || ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(contact.pipeline_stage))
       ).length;
     }
     metricsByDeal[dealId] = finalizeDealChannelMetrics(metrics);
@@ -1893,18 +1892,13 @@ async function collapseDuplicateLinkedInDmQueueRows(sb, contactId, canonicalRowI
 }
 
 export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
-  const payload = await buildLinkedInDmDraftPayload(contactId, { body });
-  if (!payload) return null;
-
-  const { contact, messageBody, researchSummary } = payload;
   const sb = getSupabase();
-  if (!sb) return null;
+  if (!sb || !contactId) return null;
 
-  // Only block re-queuing on active (not yet terminal) statuses.
-  // Terminal statuses (sent, skipped, failed, closed) allow re-queuing after a stage reset.
+  // Check 1: existing pending queue row
   const { data: existingRows } = await sb.from('approval_queue')
     .select('id, status, created_at')
-    .eq('contact_id', contact.id)
+    .eq('contact_id', contactId)
     .eq('stage', 'LinkedIn DM')
     .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
     .order('created_at', { ascending: false })
@@ -1913,6 +1907,25 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     await reloadPendingInvestorApprovals().catch(() => {});
     return existingRows[0];
   }
+
+  // Check 2: Optimistic lock — atomically claim the contact before building the draft.
+  // This prevents concurrent calls from both proceeding when the DB check finds no existing row.
+  const LOCKABLE_STAGES = ['invite_accepted', 'Enriched', 'enriched', 'Ranked', 'ranked'];
+  const { data: locked } = await sb.from('contacts')
+    .update({ pipeline_stage: 'pending_dm_approval' })
+    .eq('id', contactId)
+    .in('pipeline_stage', LOCKABLE_STAGES)
+    .select('id');
+
+  if (!locked?.length) {
+    // Another call already claimed or advanced this contact — abort
+    return null;
+  }
+
+  const payload = await buildLinkedInDmDraftPayload(contactId, { body });
+  if (!payload) return null;
+
+  const { contact, messageBody, researchSummary } = payload;
 
   const row = await addApprovalToQueue({
     contactId: contact.id,
@@ -3182,6 +3195,16 @@ export function initDashboard(state) {
 
   // Register Telegram webhook for inline button callbacks
   import('../core/telegram.js').then(m => m.registerTelegramWebhook()).catch(e => console.warn('[TELEGRAM] Webhook reg error:', e.message));
+
+  // Clear old cached welcome audio so it regenerates if the voice ID changed
+  const audioDir = path.join(__dirname, 'public', 'audio');
+  try {
+    if (fs.existsSync(audioDir)) {
+      fs.readdirSync(audioDir).filter(f => f.startsWith('welcome_')).forEach(f => {
+        try { fs.unlinkSync(path.join(audioDir, f)); } catch {}
+      });
+    }
+  } catch {}
 
   // Pre-generate ElevenLabs welcome audio for the configured display name
   generateWelcomeAudio(dashboardDisplayName).catch(console.error);
@@ -8289,7 +8312,7 @@ function registerRoutes(app) {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
     try {
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'onwK4e9ZLuTAKqWW03F9'; // Daniel — clear British male
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Rachel — female voice
       const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
         method: 'POST',
         headers: {
@@ -8299,7 +8322,7 @@ function registerRoutes(app) {
         },
         body: JSON.stringify({
           text: text.slice(0, 500),
-          model_id: 'eleven_turbo_v2_5',
+          model_id: 'eleven_multilingual_v2',
           voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.2 },
         }),
       });

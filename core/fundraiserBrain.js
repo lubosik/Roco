@@ -110,7 +110,7 @@ export async function gatherCurrentMetrics(dealId) {
     pendingApprovalsRes,
   ] = await Promise.all([
     sb.from('contacts')
-      .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, linkedin_connected, meeting_booked_at')
+      .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, meeting_booked_at')
       .eq('deal_id', dealId),
     sb.from('activity_log')
       .select('event_type, created_at')
@@ -186,6 +186,14 @@ export async function gatherCurrentMetrics(dealId) {
     pending_approvals: pendingApprovals,
     hours_since_last_li_invite: hoursSinceLastLiInvite,
     activity_events_today: activities.length,
+    emails_sent: contacts.filter(row => row.last_email_sent_at).length,
+    dms_sent: contacts.filter(row => row.dm_sent_at).length,
+    li_invites_sent: contacts.filter(row => row.invite_sent_at).length,
+    response_rate: (() => {
+      const replied = contacts.filter(row => row.last_reply_at || row.reply_channel).length;
+      const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;
+      return sent > 0 ? Math.round((replied / sent) * 100) : 0;
+    })(),
   };
 }
 
@@ -260,13 +268,6 @@ export async function runFundraiserReasoning(deal, context = {}, pushActivity = 
     `PATIENCE CHECK: ${normalizeNumber(metrics.firms_in_pipeline, 0)} firms active and ${normalizeNumber(metrics.li_pending, 0)} pending LinkedIn connections.`,
     `WHAT DOM SHOULD KNOW: ${normalizeNumber(metrics.meetings_booked, 0)}/${goalAnalysis.meetings_needed} meetings booked against the current working target. ${goalAnalysis.rationale}`,
   ].join('\n\n');
-
-  pushActivity({
-    type: 'analysis',
-    action: `Fundraiser reasoning: ${deal?.name || 'Deal'}`,
-    note: `${goalAnalysis.status} · day ${goalAnalysis.days_since_launch + 1} · ${normalizeNumber(metrics.firms_in_pipeline, 0)} firms active · ${normalizeNumber(metrics.meetings_booked, 0)} meetings booked`,
-    deal_id: deal?.id || null,
-  });
 
   return { directives, goalAnalysis, actionPlan };
 }

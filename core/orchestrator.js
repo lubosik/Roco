@@ -3552,8 +3552,9 @@ async function announceCycleDecision(deal, batch, mode, reason, extras = {}) {
     text = `🔍 *Research starting now* — ${deal.name}\n\nI’m filling Batch #${batch.batch_number} to keep the top of funnel full.\nCurrent batch: ${current}/${target} firms.\nWhy I’m doing it: ${cleanedReason}`;
   } else if (normalizedMode === 'research_wait') {
     text = `⏳ *Waiting before more research* — ${deal.name}\n\nI’m holding new firm research for Batch #${batch.batch_number} this cycle.\nWhy I’m waiting: ${cleanedReason}`;
-  } else if (normalizedMode === 'outreach_start') {
-    text = `📤 *Outreach running now* — ${deal.name}\n\nI’m moving Batch #${batch.batch_number} forward inside the current sending windows.\nWhy I’m doing it: ${cleanedReason}`;
+  } else if (normalizedMode === ‘outreach_start’) {
+    // Suppressed — fires on every batch and is noise; individual approval requests fire separately
+    text = null;
   } else if (normalizedMode === 'outreach_wait') {
     text = `⏳ *Waiting before outreach* — ${deal.name}\n\nI’m holding new outreach for Batch #${batch.batch_number} this cycle.\nWhy I’m waiting: ${cleanedReason}`;
   } else if (normalizedMode === 'followup_wait') {
