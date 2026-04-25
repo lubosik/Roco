@@ -502,6 +502,9 @@ export async function handleLinkedInAcceptance(contact, deal, pushActivity, queu
 
 // ── HANDLER: CONNECTION ACCEPTED ──────────────────────────────────────────────
 
+const relationDedup = new Map(); // contactId -> timestamp
+const RELATION_DEDUP_TTL = 60_000; // 60 seconds
+
 export async function handleLinkedInRelation(raw, pushActivity, queueForApproval) {
   const sb      = getSupabase();
   if (!sb) return { matchStatus: 'no_db' };
@@ -619,12 +622,19 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
     deal_name: getDealName(contact),
   });
 
-  try {
-    const { sendTelegram } = await import('../approval/telegramBot.js');
-    await sendTelegram(
-      `🟧 *New relation*\n\n${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}\nDeal: ${getDealName(contact)}${(payload.headline || contact.job_title) ? `\n${payload.headline || contact.job_title}` : ''}`
-    );
-  } catch {}
+  const dedupKey = `rel:${contact.id}`;
+  const lastSent = relationDedup.get(dedupKey);
+  if (lastSent && Date.now() - lastSent < RELATION_DEDUP_TTL) {
+    console.log(`[UNIPILE/REL] Dedup: ${contact.name} relation already processed ${Date.now() - lastSent}ms ago — skipping Telegram notification`);
+  } else {
+    relationDedup.set(dedupKey, Date.now());
+    try {
+      const { sendTelegram } = await import('../approval/telegramBot.js');
+      await sendTelegram(
+        `🟧 *New relation*\n\n${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}\nDeal: ${getDealName(contact)}${(payload.headline || contact.job_title) ? `\n${payload.headline || contact.job_title}` : ''}`
+      );
+    } catch {}
+  }
 
   console.log(`[UNIPILE/REL] ${contact.name} accepted LinkedIn invite — running acceptance flow`);
 

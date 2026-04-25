@@ -618,6 +618,7 @@ input, textarea, select { font-family: inherit; }
 .feed-badge.error      { background: rgba(239,68,68,0.15);   color: #f87171; }
 .feed-badge.excluded   { background: rgba(239,68,68,0.18);   color: #ef4444; }
 .feed-badge.analysis   { background: rgba(74,222,128,0.10);  color: #4ADE80; }
+.feed-badge.jarvis     { background: rgba(124,58,237,0.18);  color: #7C3AED; }  /* purple — JARVIS action */
 .feed-text {
   flex: 1;
   font-size: 12.5px;

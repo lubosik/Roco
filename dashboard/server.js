@@ -1959,6 +1959,21 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     deal_name: contact.deals?.name || null,
     dealId: contact.deal_id || null,
   });
+
+  // Fire Telegram notification in background (non-blocking)
+  const _contact = contact;
+  const _messageBody = messageBody;
+  const _rowId = row.id;
+  const _researchSummary = researchSummary;
+  import('../approval/telegramBot.js').then(({ sendLinkedInDMForApproval }) => {
+    sendLinkedInDMForApproval(
+      _contact,
+      _messageBody,
+      _contact.deal_id || null,
+      { stage: 'LinkedIn DM', researchSummary: _researchSummary, queueId: _rowId }
+    ).catch(() => {});
+  }).catch(() => {});
+
   notifyQueueUpdated();
   return row;
 }
@@ -3289,7 +3304,7 @@ async function generateWelcomeAudio(displayName) {
   info(`[VOICE] Generating welcome audio for ${displayName}...`);
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM', {
+    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB', {
       method: 'POST',
       headers: {
         'xi-api-key': apiKey,
@@ -3299,9 +3314,9 @@ async function generateWelcomeAudio(displayName) {
         text: `Welcome back, ${displayName}.`,
         model_id: 'eleven_flash_v2_5',
         voice_settings: {
-          stability: 0.45,
+          stability: 0.4,
           similarity_boost: 0.85,
-          style: 0.15,
+          style: 0.35,
           use_speaker_boost: true,
         },
       }),
@@ -8313,7 +8328,7 @@ function registerRoutes(app) {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'ElevenLabs not configured' });
     try {
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Rachel — female voice
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB'; // Adam — natural male voice
       // eleven_flash_v2_5 = ~75ms latency (vs 2000ms+ for multilingual_v2)
       // optimize_streaming_latency=3 removes audio normalizers for faster first byte
       const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3`, {
@@ -8324,9 +8339,9 @@ function registerRoutes(app) {
           'Accept': 'audio/mpeg',
         },
         body: JSON.stringify({
-          text: text.slice(0, 500),
+          text: text.slice(0, 2500),
           model_id: 'eleven_flash_v2_5',
-          voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.2 },
+          voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.35, use_speaker_boost: true },
         }),
       });
       if (!elevenRes.ok) {

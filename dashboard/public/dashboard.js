@@ -7723,6 +7723,7 @@ function typeToBadge(type) {
   if (t.includes('error') || t.includes('fail'))                                                 return 'error';
   if (t === 'excluded' || t.includes('excluded'))                                                return 'excluded';
   if (t === 'analysis' || t.includes('analysis'))                                                return 'analysis';
+  if (t === 'jarvis'  || t.includes('jarvis'))                                                  return 'jarvis';
   return 'system';
 }
 
@@ -7749,6 +7750,7 @@ function getActivityBadgeMeta(item) {
     excluded: 'No Match',
     analysis: 'Analysis',
     thinking: 'Thinking',
+    jarvis: 'JARVIS',
     system: 'System',
   };
   return { className, label: labels[className] || className };
@@ -10002,12 +10004,13 @@ async function uploadInvestorXLSX(file) {
 // ── JARVIS ORB ───────────────────────────────────────────────────────────────
 
 const jarvisOrb = (() => {
-  let isActive         = false;
-  let recognition      = null;
-  let isListening      = false;
-  let currentAudio     = null;
-  let audioCtx         = null;
+  let isActive          = false;
+  let recognition       = null;
+  let isListening       = false;
+  let currentAudio      = null;
+  let audioCtx          = null;
   let pendingTranscript = '';
+  let bargeInRecognition = null;
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
   // Must run synchronously inside a user gesture handler.
@@ -10113,11 +10116,55 @@ const jarvisOrb = (() => {
     });
   }
 
+  // ── barge-in: listen for user speech while JARVIS is speaking ────────────
+  function startBargeIn() {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return;
+    if (bargeInRecognition) { try { bargeInRecognition.stop(); } catch (e) {} }
+    var r = new SR();
+    r.continuous     = false;
+    r.interimResults = false;
+    r.lang           = 'en-US';
+    var bargeInText  = '';
+    r.onresult = function(e) {
+      bargeInText = (e.results[0] && e.results[0][0] && e.results[0][0].transcript) || '';
+    };
+    r.onend = function() {
+      bargeInRecognition = null;
+      if (bargeInText && isActive) {
+        // User interrupted — stop all audio and process their input immediately
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
+        dispatch(bargeInText);
+      }
+    };
+    r.onerror = function() { bargeInRecognition = null; };
+    try { r.start(); bargeInRecognition = r; } catch (e) {}
+  }
+
+  function stopBargeIn() {
+    if (bargeInRecognition) {
+      try { bargeInRecognition.stop(); } catch (e) {}
+      bargeInRecognition = null;
+    }
+  }
+
+  // ── sentence-boundary truncation — avoids cutting mid-sentence ───────────
+  function truncateAtSentence(text, maxLen) {
+    maxLen = maxLen || 580;
+    if (text.length <= maxLen) return text;
+    var chunk    = text.slice(0, maxLen);
+    var lastEnd  = Math.max(chunk.lastIndexOf('. '), chunk.lastIndexOf('! '), chunk.lastIndexOf('? '));
+    if (lastEnd > maxLen * 0.5) return chunk.slice(0, lastEnd + 1);
+    return chunk; // fallback to hard cut
+  }
+
   // ── ElevenLabs TTS ────────────────────────────────────────────────────────
   async function speakText(text) {
-    const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 600);
+    const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 2500);
     if (!clean) { afterSpeak(); return; }
     setOrbState('speaking', 'Speaking...');
+    startBargeIn();
     if (currentAudio) { currentAudio.pause(); currentAudio = null; }
     try {
       const res = await fetch('/api/jarvis/speak', {
@@ -10133,8 +10180,13 @@ const jarvisOrb = (() => {
   }
 
   function afterSpeak() {
-    isActive = false;
-    setOrbState(null, '');
+    stopBargeIn();
+    if (isActive) {
+      // Always-on: stay in conversation loop — restart mic after speaking
+      setTimeout(() => { if (isActive) startListening(); }, 400);
+    } else {
+      setOrbState(null, '');
+    }
   }
 
   // ── instant ack from pre-cached filler ────────────────────────────────────

@@ -3746,6 +3746,10 @@ async function researchNextFirms(deal, batch, needed, startingCount = 0) {
     .update({ ranked_firms: newCount, updated_at: new Date().toISOString() })
     .eq('id', batch.id);
 
+  if (added > 0) {
+    notifyJarvis('Research complete', `${added} new firm${added === 1 ? '' : 's'} queued for ${deal.name}`).catch(() => {});
+  }
+
   if (newCount >= BATCH_FIRM_TARGET) {
     await triggerCampaignReview(deal, batch);
   }
@@ -4040,6 +4044,7 @@ async function runApprovedEnrichment(deal, batch, state) {
     deal_name: deal.name,
     dealId: deal.id,
   });
+  notifyJarvis('Enrichment running', `${firmsToProcess.length} firm${firmsToProcess.length !== 1 ? 's' : ''} being enriched for ${deal.name} (${remaining} total pending)`).catch(() => {});
 
   for (let i = 0; i < firmsToProcess.length; i++) {
     await enrichSingleFirm(firmsToProcess[i], deal, batch, state);
@@ -4454,9 +4459,6 @@ async function runDealCycle(deal, state) {
     brainResult = await runFundraiserReasoning(deal, { metrics, agentConfig, orderedLists }, pushActivity);
     if (brainResult) brainResult._metrics = metrics;  // stash for patience check
     brainDirectives = brainResult?.directives || null;
-    if (brainDirectives) {
-      logBrainExecutionDecision(deal, brainDirectives);
-    }
 
     if (Number(metrics?.firms_in_pipeline || 0) < 25) {
       await triggerAutoFeedForDeal(deal, { reason: 'pipeline_depth', requestedCount: 24 }).catch(() => {});
@@ -6383,6 +6385,7 @@ async function phaseOutreach(deal, state) {
           deal_name: deal?.name,
           dealId: deal?.id,
         });
+        notifyJarvis('Email sent', `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}${subject ? ` · "${sanitizeOutreach(subject)}"` : ''}`).catch(() => {});
 
         await sbLogActivity({
           dealId: deal?.id,
@@ -6927,6 +6930,10 @@ async function executeOutreach(contact, contactPage, draft, decision, stage, fol
     note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}${channel === 'email' && decision?.subject ? ` · "${sanitizeOutreach(decision.subject)}"` : ''}`,
     deal_name: deal?.name, dealId: deal?.id,
   });
+  notifyJarvis(
+    channel === 'linkedin_dm' ? 'LinkedIn DM sent' : 'Email sent',
+    `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}${channel === 'email' && decision?.subject ? ` · "${sanitizeOutreach(decision.subject)}"` : ''}`
+  ).catch(() => {});
 
   // Telegram confirmation after successful send
   const channelLabel = channel === 'linkedin_dm' ? 'LinkedIn DM' : 'Email';
@@ -7535,4 +7542,64 @@ function logStep(action, note, type = 'General', deal = null) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JARVIS INTEGRATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Called by JARVIS to run firm research directly, bypassing batch state and cooldown.
+ * Finds up to `needed` new firms, queues them for enrichment, returns what was found.
+ */
+export async function runJarvisResearch(dealId, needed = 15) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'No database' };
+  try {
+    const deals = await getActiveDeals();
+    const deal = deals.find(d => String(d.id) === String(dealId));
+    if (!deal) return { error: 'Deal not found' };
+
+    // Need a batch to attach firms to — get or create
+    const batch = await ensureBatchExists(deal);
+    if (!batch) return { error: 'Could not get/create batch' };
+
+    const exclusions = await getDealExclusions(deal.id);
+    const existingNames = await getExcludedFirmNames(deal.id);
+
+    // Count current firms in batch
+    const { count: before } = await sb.from('firm_outreach_state')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_id', deal.id)
+      .eq('batch_id', batch.id);
+
+    await researchNextFirms(deal, batch, needed, before || 0);
+
+    const { count: after } = await sb.from('firm_outreach_state')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_id', deal.id)
+      .eq('batch_id', batch.id);
+
+    const added = (after || 0) - (before || 0);
+    return {
+      added,
+      total_in_batch: after || 0,
+      message: added > 0
+        ? `Found and queued ${added} new firms for enrichment.`
+        : 'No new firms found this pass — all candidates may already be in the pipeline or excluded.',
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+/**
+ * Push an event to JARVIS event feed without creating a top-level circular import.
+ * Uses dynamic import so jarvisTools.js can freely import orchestrator.js at the top level.
+ */
+async function notifyJarvis(action, note) {
+  try {
+    const { pushOrchestratorEvent } = await import('./jarvisTools.js');
+    pushOrchestratorEvent({ action, note });
+  } catch {}
 }

@@ -10,6 +10,24 @@ import { getSupabase } from './supabase.js';
 import { writeMemory } from './jarvisMemory.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ORCHESTRATOR EVENT FEED
+// Orchestrator pushes events here via notifyJarvis() (dynamic import in orchestrator.js).
+// JARVIS reads these in buildSystemPrompt to know what the orchestrator just did.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const orchestratorEvents = [];
+const MAX_EVENTS = 20;
+
+export function pushOrchestratorEvent(event) {
+  orchestratorEvents.unshift({ ...event, ts: new Date().toISOString() });
+  if (orchestratorEvents.length > MAX_EVENTS) orchestratorEvents.length = MAX_EVENTS;
+}
+
+export function getOrchestratorEvents(limit = 8) {
+  return orchestratorEvents.slice(0, limit);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TOOL SCHEMAS  (passed to Claude's `tools` array)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -296,6 +314,24 @@ export const JARVIS_TOOLS = [
     },
   },
   {
+    name: 'add_contact_to_pipeline',
+    description: 'Add a specific person to the pipeline database so the orchestrator enriches and reaches out to them. Use after finding someone via search or when Dom mentions a specific person/firm to target. The orchestrator will automatically enrich, find their LinkedIn, and draft outreach on the next cycle.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id:      { type: 'string', description: 'The deal UUID' },
+        name:         { type: 'string', description: 'Full name of the person' },
+        company_name: { type: 'string', description: 'Their firm or company name' },
+        job_title:    { type: 'string', description: 'Their job title (Partner, MD, Principal, etc.)' },
+        linkedin_url: { type: 'string', description: 'LinkedIn profile URL if known' },
+        email:        { type: 'string', description: 'Email address if known' },
+        notes:        { type: 'string', description: 'Why this person is a target, any intelligence about them' },
+        tier:         { type: 'string', description: 'Priority tier: hot, warm, possible (default: warm)' },
+      },
+      required: ['deal_id', 'name', 'company_name'],
+    },
+  },
+  {
     name: 'get_pipeline_contacts',
     description: 'Get contacts in a specific pipeline state or with specific properties. Use to find who has replied, who is warm, who needs follow-up.',
     input_schema: {
@@ -317,6 +353,13 @@ export const JARVIS_TOOLS = [
 // ─────────────────────────────────────────────────────────────────────────────
 // EXECUTORS
 // ─────────────────────────────────────────────────────────────────────────────
+
+async function emitJarvisActivity(action, note, dealId = null, deal_name = null) {
+  try {
+    const { pushActivity } = await import('../dashboard/server.js');
+    pushActivity({ type: 'jarvis', action, note, dealId, deal_name });
+  } catch {}
+}
 
 export async function executeTool(name, input) {
   switch (name) {
@@ -341,6 +384,7 @@ export async function executeTool(name, input) {
     case 'search_linkedin_people':  return toolSearchLinkedInPeople(input);
     case 'send_linkedin_dm':        return toolSendLinkedInDM(input);
     case 'send_email':              return toolSendEmail(input);
+    case 'add_contact_to_pipeline': return toolAddContactToPipeline(input);
     case 'get_pipeline_contacts':   return toolGetPipelineContacts(input);
     default:
       return { error: `Unknown tool: ${name}` };
@@ -445,6 +489,11 @@ async function toolApproveMessage({ deal_id, contact_name }) {
       tags:    [`contact:${(item.contact_name || '').toLowerCase().replace(/\s+/g, '_')}`, `firm:${(item.firm || '').toLowerCase().replace(/\s+/g, '_')}`],
     });
 
+    emitJarvisActivity(
+      `Approved message to ${item.contact_name}`,
+      `${item.firm || ''} · ${item.stage || item.channel || 'message'}`,
+      deal_id
+    ).catch(() => {});
     return { approved: true, contact: item.contact_name, firm: item.firm, channel: item.stage || item.channel };
   } catch (err) {
     return { error: err.message };
@@ -599,6 +648,12 @@ async function toolControlModule({ module, action, until }) {
 
     await saveSessionState(state);
 
+    emitJarvisActivity(
+      `${pausing ? 'Paused' : 'Resumed'} ${module}`,
+      `JARVIS ${pausing ? 'paused' : 'resumed'} ${module}${until ? ` until ${until}` : ''}`,
+      null
+    ).catch(() => {});
+
     return {
       module,
       action,
@@ -613,9 +668,22 @@ async function toolControlModule({ module, action, until }) {
 // ── trigger_research ──────────────────────────────────────────────────────────
 async function toolTriggerResearch({ deal_id }) {
   try {
-    const { triggerImmediateRun } = await import('./orchestrator.js');
+    const { runJarvisResearch, triggerImmediateRun } = await import('./orchestrator.js');
+
+    // Run direct firm discovery (bypasses batch cooldown)
+    const result = await runJarvisResearch(deal_id, 15);
+
+    // Also kick off a full cycle for enrichment/outreach
     triggerImmediateRun(deal_id).catch(() => {});
-    return { triggered: true, message: 'Immediate research and enrichment cycle started. New firms will be queued for outreach within minutes.' };
+
+    const msg = result.error
+      ? `Research cycle triggered (${result.error})`
+      : result.added > 0
+        ? `Found ${result.added} new firms, queued for enrichment and outreach.`
+        : 'Research ran — no new firms found this pass. Pipeline may already be full or all candidates are excluded.';
+
+    emitJarvisActivity('Research cycle triggered', msg, deal_id).catch(() => {});
+    return { triggered: true, firms_added: result.added || 0, message: msg };
   } catch (err) {
     return { error: err.message };
   }
@@ -1033,6 +1101,11 @@ async function toolSendLinkedInDM({ deal_id, contact_name, message }) {
       updated_at:     new Date().toISOString(),
     }).eq('id', contact.id);
 
+    emitJarvisActivity(
+      `Sent LinkedIn DM to ${contact.name}`,
+      `${contact.company_name || ''} · "${message.slice(0, 80)}"`,
+      deal_id
+    ).catch(() => {});
     return {
       sent: true,
       contact_name: contact.name,
@@ -1085,12 +1158,75 @@ async function toolSendEmail({ deal_id, contact_name, subject, body }) {
       updated_at:         new Date().toISOString(),
     }).eq('id', contact.id);
 
+    emitJarvisActivity(
+      `Sent email to ${contact.name}`,
+      `${contact.company_name || ''} · Subject: ${subject}`,
+      deal_id
+    ).catch(() => {});
     return {
       sent: true,
       to:      contact.email,
       contact: contact.name,
       firm:    contact.company_name,
       subject,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ── add_contact_to_pipeline ───────────────────────────────────────────────────
+async function toolAddContactToPipeline({ deal_id, name, company_name, job_title, linkedin_url, email, notes, tier = 'warm' }) {
+  const sb = getSupabase();
+  if (!sb) return { error: 'Database unavailable' };
+  try {
+    // Check if already exists (fuzzy match on first name + first word of company)
+    const { data: existing } = await sb.from('contacts')
+      .select('id, name, pipeline_stage')
+      .eq('deal_id', deal_id)
+      .ilike('name', `%${name.split(' ')[0]}%`)
+      .ilike('company_name', `%${company_name.split(' ')[0]}%`)
+      .limit(1);
+
+    if (existing?.length) {
+      return {
+        added: false,
+        message: `${name} at ${company_name} is already in the pipeline at stage: ${existing[0].pipeline_stage}`,
+      };
+    }
+
+    const { data: inserted, error: insertErr } = await sb.from('contacts').insert({
+      deal_id,
+      name,
+      company_name,
+      job_title:         job_title || null,
+      linkedin_url:      linkedin_url || null,
+      email:             email || null,
+      notes:             notes || null,
+      tier:              tier || 'warm',
+      pipeline_stage:    'Researched',
+      enrichment_status: linkedin_url ? 'linkedin_only' : 'pending',
+      source:            'jarvis',
+      created_at:        new Date().toISOString(),
+      updated_at:        new Date().toISOString(),
+    }).select('id').single();
+
+    if (insertErr) return { error: insertErr.message };
+
+    emitJarvisActivity(
+      `Added ${name} to pipeline`,
+      `${company_name}${job_title ? ` · ${job_title}` : ''} · tier: ${tier} · will be enriched next cycle`,
+      deal_id
+    ).catch(() => {});
+
+    // Kick off enrichment cycle
+    const { triggerImmediateRun } = await import('./orchestrator.js');
+    triggerImmediateRun(deal_id).catch(() => {});
+
+    return {
+      added: true,
+      contact_id: inserted?.id,
+      message: `Added ${name} at ${company_name} to the pipeline. Enrichment and LinkedIn outreach will start on the next orchestrator cycle.`,
     };
   } catch (err) {
     return { error: err.message };

@@ -28,12 +28,34 @@ async function recordDailyNewsScanFailure(deal, pushActivity, message) {
 }
 
 
+function repairJSON(str) {
+  return str
+    .replace(/,\s*([\]\}])/g, '$1')              // trailing commas before ] or }
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // control chars except \t \n \r
+    .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3'); // unquoted keys
+}
+
 function extractJSONArray(text) {
   const str = String(text || '');
   // Strip markdown code fences
   const cleaned = str.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
 
-  // Try all [ ... ] matches from largest to smallest to find a valid JSON array
+  // Step 1: Try direct JSON.parse first
+  const trimmed = cleaned.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {}
+    // Step 2: Try repaired version of the full string
+    try {
+      const repaired = repairJSON(trimmed);
+      const parsed = JSON.parse(repaired);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {}
+  }
+
+  // Step 3: Try all [ ... ] bracket matches from largest to smallest
   const allMatches = [];
   let depth = 0, start = -1;
   for (let i = 0; i < cleaned.length; i++) {
@@ -51,16 +73,22 @@ function extractJSONArray(text) {
   // Try each match from longest to shortest (the full array is usually the longest)
   allMatches.sort((a, b) => b.length - a.length);
   for (const candidate of allMatches) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-    } catch {}
+    // Try raw first, then repaired
+    for (const attempt of [candidate, repairJSON(candidate)]) {
+      try {
+        const parsed = JSON.parse(attempt);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch {}
+    }
   }
-  // Last resort: extract individual objects
+
+  // Step 4: Last resort — extract individual objects
   const objects = cleaned.match(/\{[^{}]*"firm_name"[^{}]*\}/g) || [];
   const results = [];
   for (const obj of objects) {
-    try { results.push(JSON.parse(obj)); } catch {}
+    for (const attempt of [obj, repairJSON(obj)]) {
+      try { results.push(JSON.parse(attempt)); break; } catch {}
+    }
   }
   return results;
 }

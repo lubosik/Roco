@@ -139,12 +139,18 @@ LIVE PIPELINE:
   Status: ${metrics.goal_status || 'UNKNOWN'}
 ` : '';
 
+  const { getOrchestratorEvents } = await import('./jarvisTools.js');
+  const recentEvents = getOrchestratorEvents(8);
+  const eventsSection = recentEvents.length
+    ? `\nORCHESTRATOR ACTIVITY (last ${recentEvents.length} events):\n${recentEvents.map(e => `  [${new Date(e.ts).toLocaleTimeString()}] ${e.action}${e.note ? ': ' + e.note : ''}`).join('\n')}\n`
+    : '';
+
   return `You are JARVIS — the AI agent running Roco, an autonomous PE/VC fundraising platform.
 
 You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
 
 ${dealSection}
-${metricsSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}
+${metricsSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 
@@ -172,7 +178,11 @@ IMPORTANT:
 - You control the orchestration cycle — you can pause, resume, or redirect it at any time.
 - When you use a tool and get a result, respond naturally based on the result.
 - One paragraph maximum per response. No lists, no headers, no structured summaries unless the user explicitly asks for a breakdown.
-- Never say "I'll need to" — either do it now with a tool or say why you can't.`;
+- Never say "I'll need to" — either do it now with a tool or say why you can't.
+- When asked to "do research" or "find more investors", use trigger_research — this runs firm discovery bypassing the batch cooldown and queues new firms for enrichment immediately.
+- When asked to "find someone" or "add [name] at [firm]" to the pipeline, use add_contact_to_pipeline to save them to the database. The orchestrator will enrich them automatically.
+- search_linkedin_people and find_decision_makers call Unipile directly — use them to find people, then add_contact_to_pipeline to save the best matches.
+- You have full read/write access to the pipeline database via tools. When you take an action, the orchestrator picks it up on the next cycle.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
