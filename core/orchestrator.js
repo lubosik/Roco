@@ -3551,14 +3551,17 @@ async function announceCycleDecision(deal, batch, mode, reason, extras = {}) {
     const target = Number(extras.target ?? BATCH_FIRM_TARGET);
     text = `🔍 *Research starting now* — ${deal.name}\n\nI'm filling Batch #${batch.batch_number} to keep the top of funnel full.\nCurrent batch: ${current}/${target} firms.\nWhy I'm doing it: ${cleanedReason}`;
   } else if (normalizedMode === 'research_wait') {
-    text = `⏳ *Waiting before more research* — ${deal.name}\n\nI'm holding new firm research for Batch #${batch.batch_number} this cycle.\nWhy I'm waiting: ${cleanedReason}`;
+    // Suppressed — normal orchestrator patience, not actionable
+    text = null;
   } else if (normalizedMode === 'outreach_start') {
-    // Suppressed — fires on every batch and is noise; individual approval requests fire separately
+    // Suppressed — individual approval requests fire separately
     text = null;
   } else if (normalizedMode === 'outreach_wait') {
-    text = `⏳ *Waiting before outreach* — ${deal.name}\n\nI'm holding new outreach for Batch #${batch.batch_number} this cycle.\nWhy I'm waiting: ${cleanedReason}`;
+    // Suppressed — normal patience behaviour, visible in activity log
+    text = null;
   } else if (normalizedMode === 'followup_wait') {
-    text = `⏳ *Waiting before follow-ups* — ${deal.name}\n\nI'm holding follow-ups for Batch #${batch.batch_number} this cycle.\nWhy I'm waiting: ${cleanedReason}`;
+    // Suppressed — normal patience behaviour, visible in activity log
+    text = null;
   } else if (normalizedMode === 'pending_approval') {
     text = `📋 *Awaiting approval* — ${deal.name}\n\nBatch #${batch.batch_number} is queued for your review.\nWhy I stopped here: ${cleanedReason}`;
   }
