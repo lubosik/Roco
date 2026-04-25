@@ -153,7 +153,9 @@ export async function gatherCurrentMetrics(dealId) {
     return ts.isValid && ts >= DateTime.fromISO(today.start).setZone(timezone) && ts <= DateTime.fromISO(today.end).setZone(timezone);
   }).length;
 
-  const liPending = contacts.filter(row => row.invite_sent_at && !row.invite_accepted_at).length;
+  // Use pipeline_stage as source of truth — invite_accepted_at was historically unreliable
+  const liPending = contacts.filter(row => String(row.pipeline_stage || '').toLowerCase() === 'invite_sent').length;
+  const liAccepted = contacts.filter(row => row.invite_accepted_at || ['dm sent','dm approved','pending_dm_approval','in conversation','invite_accepted'].includes(String(row.pipeline_stage || '').toLowerCase())).length;
   const firmsInPipeline = contacts.filter(row => {
     const stage = String(row.pipeline_stage || '').toLowerCase();
     return !['inactive', 'archived', 'declined', 'suppressed - opt out', 'suppressed', 'do_not_contact'].includes(stage);
@@ -180,6 +182,7 @@ export async function gatherCurrentMetrics(dealId) {
     emails_sent_today: emailsSentToday,
     dms_sent_today: dmsSentToday,
     li_pending: liPending,
+    li_accepted: liAccepted,
     firms_in_pipeline: firmsInPipeline,
     meetings_booked: meetingsBooked,
     total_replies: totalReplies,
@@ -188,7 +191,12 @@ export async function gatherCurrentMetrics(dealId) {
     activity_events_today: activities.length,
     emails_sent: contacts.filter(row => row.last_email_sent_at).length,
     dms_sent: contacts.filter(row => row.dm_sent_at).length,
-    li_invites_sent: contacts.filter(row => row.invite_sent_at).length,
+    // Stage-based count — invite_sent_at was historically unreliable
+    li_invites_sent: contacts.filter(row => {
+      if (row.invite_sent_at) return true;
+      const stage = String(row.pipeline_stage || '').toLowerCase();
+      return ['invite_sent', 'invite_accepted', 'pending_dm_approval', 'dm approved', 'dm sent', 'in conversation'].includes(stage);
+    }).length,
     response_rate: (() => {
       const replied = contacts.filter(row => row.last_reply_at || row.reply_channel).length;
       const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;

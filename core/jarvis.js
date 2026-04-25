@@ -76,17 +76,21 @@ async function buildPipelineHighlights(dealId) {
       sb.from('contacts').select('name, company_name, last_reply_at, pipeline_stage')
         .eq('deal_id', dealId).not('last_reply_at', 'is', null)
         .gte('last_reply_at', sevenDaysAgo).order('last_reply_at', { ascending: false }).limit(5),
-      sb.from('contacts').select('name, company_name, invite_accepted_at')
-        .eq('deal_id', dealId).not('invite_accepted_at', 'is', null).is('dm_sent_at', null)
-        .order('invite_accepted_at', { ascending: false }).limit(12),
+      // Use pipeline_stage — invite_accepted_at was historically unreliable
+      sb.from('contacts').select('name, company_name, pipeline_stage, invite_accepted_at')
+        .eq('deal_id', dealId)
+        .in('pipeline_stage', ['invite_accepted', 'pending_dm_approval'])
+        .limit(12),
       sb.from('contacts').select('name, company_name, meeting_booked_at')
         .eq('deal_id', dealId).not('meeting_booked_at', 'is', null).limit(10),
       sb.from('contacts').select('id', { count: 'exact', head: true })
         .eq('deal_id', dealId).not('last_email_sent_at', 'is', null),
       sb.from('contacts').select('id', { count: 'exact', head: true })
         .eq('deal_id', dealId).not('dm_sent_at', 'is', null),
+      // Count by stage — invite_sent_at was historically unreliable
       sb.from('contacts').select('id', { count: 'exact', head: true })
-        .eq('deal_id', dealId).not('invite_sent_at', 'is', null),
+        .eq('deal_id', dealId)
+        .in('pipeline_stage', ['invite_sent', 'invite_accepted', 'pending_dm_approval', 'DM Approved', 'DM Sent', 'In Conversation']),
     ]);
 
     const lines = [];
@@ -130,7 +134,7 @@ Target raise: ${deal.parsed_deal_info?.raise_amount || deal.target_raise || 'Not
   const metricsSection = metrics ? `
 LIVE PIPELINE:
   Emails sent: ${metrics.emails_sent || 0} (${metrics.emails_sent_today || 0} today)
-  LinkedIn invites: ${metrics.li_invites_sent || 0} sent · ${metrics.li_pending || 0} pending acceptance
+  LinkedIn invites: ${metrics.li_invites_sent || 0} sent · ${metrics.li_accepted || 0} accepted · ${metrics.li_pending || 0} still pending
   LinkedIn DMs: ${metrics.dms_sent || 0} sent
   Total replies: ${metrics.total_replies || 0}
   Response rate: ${metrics.response_rate || 0}%
