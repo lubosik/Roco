@@ -116,12 +116,120 @@ async function buildPipelineHighlights(dealId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DEAL TIMELINE & VELOCITY CONTEXT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildDealTimeline(deal) {
+  if (!deal) return '';
+  const sb = getSupabase();
+  const now = new Date();
+  const nowDay = now.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+  const sendingDays = Array.isArray(deal.sending_days) && deal.sending_days.length
+    ? deal.sending_days.map(d => d.toLowerCase())
+    : ['monday','tuesday','wednesday','thursday','friday'];
+  const isOutreachDay = sendingDays.includes(nowDay);
+  const isWeekend = ['saturday','sunday'].includes(nowDay);
+
+  // Days since launch
+  const launchDate = new Date(deal.created_at);
+  const daysSinceLaunch = Math.max(1, Math.floor((now - launchDate) / 86400000));
+
+  // Outreach days elapsed (rough: calendar days × active_days_ratio)
+  const outreachDaysElapsed = Math.max(1, Math.round(daysSinceLaunch * (sendingDays.length / 7)));
+
+  // Days until end of month (working deadline if no close date)
+  const closeDateStr = deal.target_close_date || null;
+  const deadline = closeDateStr ? new Date(closeDateStr) : new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  const daysUntilDeadline = Math.max(0, Math.ceil((deadline - now) / 86400000));
+  const deadlineLabel = closeDateStr
+    ? new Date(closeDateStr).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+    : `end of ${now.toLocaleDateString('en-US', { month: 'long' })} (no close date set)`;
+
+  // Working days remaining until deadline
+  let workingDaysLeft = 0;
+  const cursor = new Date(now);
+  cursor.setHours(0,0,0,0);
+  const deadlineMidnight = new Date(deadline);
+  deadlineMidnight.setHours(23,59,59,999);
+  while (cursor <= deadlineMidnight) {
+    const dName = cursor.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    if (sendingDays.includes(dName)) workingDaysLeft++;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  // Activity queries
+  const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const KEY_EVENTS = ['EMAIL_SENT','LINKEDIN_INVITE_SENT','LINKEDIN_DM_SENT','REPLY_RECEIVED','LINKEDIN_ACCEPTANCE'];
+
+  let last7 = {};
+  let lifetime = {};
+  if (sb) {
+    try {
+      const [r7, rAll] = await Promise.all([
+        sb.from('activity_log').select('event_type').eq('deal_id', deal.id)
+          .gte('created_at', since7d).in('event_type', KEY_EVENTS),
+        sb.from('activity_log').select('event_type').eq('deal_id', deal.id)
+          .gte('created_at', launchDate.toISOString()).in('event_type', KEY_EVENTS),
+      ]);
+      (r7.data || []).forEach(a => { last7[a.event_type] = (last7[a.event_type] || 0) + 1; });
+      (rAll.data || []).forEach(a => { lifetime[a.event_type] = (lifetime[a.event_type] || 0) + 1; });
+    } catch {}
+  }
+
+  const totalEmails   = lifetime['EMAIL_SENT'] || 0;
+  const totalInvites  = lifetime['LINKEDIN_INVITE_SENT'] || 0;
+  const totalDMs      = lifetime['LINKEDIN_DM_SENT'] || 0;
+  const totalReplies  = lifetime['REPLY_RECEIVED'] || 0;
+
+  const emailsPerDay  = (totalEmails  / outreachDaysElapsed).toFixed(1);
+  const invitesPerDay = (totalInvites / outreachDaysElapsed).toFixed(1);
+
+  const projEmails  = Math.round(parseFloat(emailsPerDay)  * workingDaysLeft);
+  const projInvites = Math.round(parseFloat(invitesPerDay) * workingDaysLeft);
+
+  const todayMode = isWeekend
+    ? `RESEARCH MODE — weekend, no outreach sending. Use today to find new firms, enrich pipeline, and review strategy.`
+    : isOutreachDay
+      ? `OUTREACH MODE — weekday, sending is active.`
+      : `MONITORING — today is not a configured sending day.`;
+
+  const targetAmount = deal.target_amount
+    ? `$${(deal.target_amount / 1_000_000).toFixed(1)}M`
+    : (deal.parsed_deal_info?.raise_amount || 'not set');
+
+  return `
+DEAL TIMELINE & PACE:
+  Launch date: ${launchDate.toLocaleDateString('en-GB', { day:'numeric', month:'long', year:'numeric' })} (${daysSinceLaunch} days ago, ~${outreachDaysElapsed} outreach days)
+  Target raise: ${targetAmount}
+  Working deadline: ${deadlineLabel} (${daysUntilDeadline} calendar days, ${workingDaysLeft} outreach days remaining)
+  Today (${now.toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}): ${todayMode}
+  Configured outreach days: ${sendingDays.map(d => d.slice(0,3)).join(', ')}
+
+LIFETIME ACTIVITY (since launch, from activity log):
+  Emails sent: ${totalEmails}
+  LinkedIn invites sent: ${totalInvites}
+  LinkedIn DMs sent: ${totalDMs}
+  Replies received: ${totalReplies}
+  Avg emails/outreach day: ${emailsPerDay}
+  Avg invites/outreach day: ${invitesPerDay}
+
+LAST 7 DAYS:
+  Emails: ${last7['EMAIL_SENT'] || 0}, LI invites: ${last7['LINKEDIN_INVITE_SENT'] || 0}, DMs: ${last7['LINKEDIN_DM_SENT'] || 0}, Replies: ${last7['REPLY_RECEIVED'] || 0}
+
+PACE PROJECTION (at current rate, ${workingDaysLeft} outreach days left):
+  Additional emails: ~${projEmails} -> total ~${totalEmails + projEmails}
+  Additional invites: ~${projInvites} -> total ~${totalInvites + projInvites}
+`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function buildSystemPrompt(deal, metrics) {
-  const memoryCtx  = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
-  const highlights = deal ? await buildPipelineHighlights(deal.id) : '';
+  const memoryCtx    = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
+  const highlights   = deal ? await buildPipelineHighlights(deal.id) : '';
+  const timelineSection = deal ? await buildDealTimeline(deal) : '';
 
   const dealSection = deal ? `
 ACTIVE DEAL: ${deal.name}
@@ -156,7 +264,7 @@ LIVE PIPELINE:
 You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
 
 ${dealSection}
-${metricsSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
+${metricsSection}${timelineSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 
@@ -188,7 +296,10 @@ IMPORTANT:
 - When asked to "do research" or "find more investors", use trigger_research — this runs firm discovery bypassing the batch cooldown and queues new firms for enrichment immediately.
 - When asked to "find someone" or "add [name] at [firm]" to the pipeline, use add_contact_to_pipeline to save them to the database. The orchestrator will enrich them automatically.
 - search_linkedin_people and find_decision_makers call Unipile directly — use them to find people, then add_contact_to_pipeline to save the best matches.
-- You have full read/write access to the pipeline database via tools. When you take an action, the orchestrator picks it up on the next cycle.`;
+- You have full read/write access to the pipeline database via tools. When you take an action, the orchestrator picks it up on the next cycle.
+- You understand the deal timeline: how many days since launch, working days remaining, and current velocity vs pace needed. When asked "are we on track?" or "what should we focus on?", synthesise the timeline and pipeline data to give a direct, specific answer with concrete numbers.
+- On weekends: recommend research activities (finding firms, enriching contacts, reviewing strategy). On weekdays: focus on outreach actions and approvals.
+- Always speak in terms of concrete numbers: "you've sent X emails in Y days, at this pace you'll hit Z by end of month."`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
