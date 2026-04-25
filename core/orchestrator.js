@@ -1336,14 +1336,16 @@ async function getExcludedFirmNames(dealId) {
   const sb = getSupabase();
   if (!sb) return new Set();
 
-  // Exclude from: current deal's batch_firms + ALL active deals' contacts + global exclusion list
-  // This prevents adding a firm to the pipeline if we're already reaching out to them on another deal
-  const [batchRes, allContactsRes, exclusionRes, otherDealsRes] = await Promise.all([
+  // Exclude from: batch_firms + contacts + firm_outreach_state + exclusion list + cross-deal contacts
+  // firm_outreach_state catches JARVIS-triggered research that may not yet be in batch_firms
+  const [batchRes, allContactsRes, exclusionRes, otherDealsRes, fosRes] = await Promise.all([
     sb.from('batch_firms').select('firm_name').eq('deal_id', dealId).then(r => r).catch(() => ({ data: [] })),
     sb.from('contacts').select('company_name').eq('deal_id', dealId).then(r => r).catch(() => ({ data: [] })),
     sb.from('firm_exclusion_list').select('company_name, deal_id, deal_status').then(r => r).catch(() => ({ data: [] })),
     // Also grab all firms from OTHER active deals' contacts (cross-deal dedup)
     sb.from('contacts').select('company_name').neq('deal_id', dealId).not('company_name', 'is', null).then(r => r).catch(() => ({ data: [] })),
+    // firm_outreach_state: firms already researched/contacted at any stage
+    sb.from('firm_outreach_state').select('firm_name').eq('deal_id', dealId).then(r => r).catch(() => ({ data: [] })),
   ]);
 
   const names = new Set();
@@ -1364,6 +1366,11 @@ async function getExcludedFirmNames(dealId) {
   // Cross-deal: exclude any firm already being contacted on another deal
   for (const row of otherDealsRes.data || []) {
     const name = normalizeFirmName(row?.company_name);
+    if (name) names.add(name);
+  }
+  // firm_outreach_state: safety net for JARVIS-initiated research
+  for (const row of fosRes.data || []) {
+    const name = normalizeFirmName(row?.firm_name);
     if (name) names.add(name);
   }
   return names;
