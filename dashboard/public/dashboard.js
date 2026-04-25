@@ -10011,6 +10011,7 @@ const jarvisOrb = (() => {
   let audioCtx          = null;
   let pendingTranscript = '';
   let bargeInRecognition = null;
+  let bargeInTriggered  = false;
   const INTERRUPT_WORDS = new Set(['ok', 'okay', 'yeah', 'yep', 'yup', 'wait', 'stop', 'sorry', 'actually', 'fine', 'no', 'nah', 'hold']);
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
@@ -10144,16 +10145,24 @@ const jarvisOrb = (() => {
     r.lang           = 'en-US';
     var bargeInText  = '';
     var bargeInConfidence = 0;
+    bargeInTriggered = false;
     r.onresult = function(e) {
       var result = e.results[e.results.length - 1];
       var alt = result && result[0];
       bargeInText = (alt && alt.transcript) || bargeInText || '';
       bargeInConfidence = Math.max(bargeInConfidence, Number(alt && alt.confidence) || 0);
+      if (!bargeInTriggered && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
+        bargeInTriggered = true;
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
+        try { r.stop(); } catch (e) {}
+        dispatch(bargeInText);
+      }
     };
     r.maxAlternatives = 1;
     r.onend = function() {
       bargeInRecognition = null;
-      if (bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
+      if (!bargeInTriggered && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
         if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
         dispatch(bargeInText);

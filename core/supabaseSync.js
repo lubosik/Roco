@@ -13,6 +13,9 @@ import { deriveOutreachEventStatus } from './hardeningHelpers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '../state.json');
+const LOCAL_STATE_DISABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.ROCO_DISABLE_LOCAL_STATE || '').trim().toLowerCase())
+  || !!process.env.RAILWAY_PUBLIC_DOMAIN
+  || !!process.env.RAILWAY_STATIC_URL;
 
 const DEFAULT_TEMPLATES = [
   {
@@ -153,7 +156,7 @@ async function mirrorOutreachEvent(sb, payload = {}) {
 export async function loadSessionState() {
   let localState = null;
   try {
-    if (fs.existsSync(STATE_FILE)) {
+    if (!LOCAL_STATE_DISABLED && fs.existsSync(STATE_FILE)) {
       localState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     }
   } catch {}
@@ -172,7 +175,9 @@ export async function loadSessionState() {
           ...(localState || {}),
           ...mapSessionFromSupabase(data),
         };
-        fs.writeFileSync(STATE_FILE, JSON.stringify(mapped, null, 2));
+        if (!LOCAL_STATE_DISABLED) {
+          fs.writeFileSync(STATE_FILE, JSON.stringify(mapped, null, 2));
+        }
         return mapped;
       }
     } catch (err) {
@@ -189,7 +194,9 @@ export async function loadSessionState() {
 export async function saveSessionState(state) {
   // Always write locally first
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    if (!LOCAL_STATE_DISABLED) {
+      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    }
   } catch {}
 
   const sb = getSupabase();

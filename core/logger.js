@@ -2,21 +2,29 @@ import winston from 'winston';
 import { notionLog } from '../crm/notionLogger.js';
 
 const { combine, timestamp, printf, colorize } = winston.format;
+const fileLoggingEnabled = !(['1', 'true', 'yes', 'on'].includes(String(process.env.ROCO_DISABLE_FILE_LOGGING || '').trim().toLowerCase())
+  || !!process.env.RAILWAY_PUBLIC_DOMAIN
+  || !!process.env.RAILWAY_STATIC_URL);
 
 const fmt = printf(({ level, message, timestamp, ...meta }) => {
   const extra = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
   return `${timestamp} [${level}] ${message}${extra}`;
 });
 
+const transports = [
+  new winston.transports.Console({
+    format: combine(colorize(), timestamp({ format: 'HH:mm:ss' }), fmt),
+  }),
+];
+
+if (fileLoggingEnabled) {
+  transports.push(new winston.transports.File({ filename: 'roco.log', maxsize: 10 * 1024 * 1024 }));
+}
+
 const logger = winston.createLogger({
   level: 'info',
   format: combine(timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), fmt),
-  transports: [
-    new winston.transports.Console({
-      format: combine(colorize(), timestamp({ format: 'HH:mm:ss' }), fmt),
-    }),
-    new winston.transports.File({ filename: 'roco.log', maxsize: 10 * 1024 * 1024 }),
-  ],
+  transports,
 });
 
 export async function log(level, message, meta = {}) {

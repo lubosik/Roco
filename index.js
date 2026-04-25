@@ -31,10 +31,12 @@ function getAppRole() {
 
 function getRuntimePlan() {
   const role = getAppRole();
+  const telegramTransport = String(process.env.TELEGRAM_TRANSPORT || 'polling').trim().toLowerCase();
+  const defaultTelegramEnabled = role === 'all' || role === 'worker' || (role === 'web' && telegramTransport === 'webhook');
   return {
     role,
     dashboard: envFlag('ROCO_ENABLE_DASHBOARD', role !== 'worker'),
-    telegram: envFlag('ROCO_ENABLE_TELEGRAM', role !== 'web'),
+    telegram: envFlag('ROCO_ENABLE_TELEGRAM', defaultTelegramEnabled),
     orchestrator: envFlag('ROCO_ENABLE_ORCHESTRATOR', role !== 'web'),
     fileWatcher: envFlag('ROCO_ENABLE_FILE_WATCHER', role !== 'web'),
     registerUnipileWebhooks: envFlag('ROCO_REGISTER_UNIPILE_WEBHOOKS', role !== 'worker'),
