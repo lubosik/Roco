@@ -10009,9 +10009,11 @@ const jarvisOrb = (() => {
   let isListening       = false;
   let currentAudio      = null;
   let audioCtx          = null;
+  let fallbackUtterance = null;
   let pendingTranscript = '';
   let bargeInRecognition = null;
   let bargeInTriggered  = false;
+  let playbackVersion   = 0;
   const INTERRUPT_WORDS = new Set(['ok', 'okay', 'yeah', 'yep', 'yup', 'wait', 'stop', 'sorry', 'actually', 'fine', 'no', 'nah', 'hold']);
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
@@ -10082,26 +10084,80 @@ const jarvisOrb = (() => {
     }
   }
 
+  function stopPlayback() {
+    if (currentAudio) {
+      try { currentAudio.pause(); } catch {}
+      currentAudio = null;
+    }
+    if (fallbackUtterance && window.speechSynthesis) {
+      try { window.speechSynthesis.cancel(); } catch {}
+      fallbackUtterance = null;
+    }
+  }
+
+  function invalidatePlayback() {
+    playbackVersion += 1;
+  }
+
+  function pickBrowserVoice() {
+    if (!window.speechSynthesis || typeof window.speechSynthesis.getVoices !== 'function') return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null;
+    return voices.find(v => /^en-GB/i.test(v.lang || ''))
+      || voices.find(v => /^en-US/i.test(v.lang || ''))
+      || voices.find(v => /^en/i.test(v.lang || ''))
+      || voices[0];
+  }
+
+  async function speakWithBrowser(text) {
+    if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') return false;
+    return new Promise((resolve) => {
+      try { window.speechSynthesis.cancel(); } catch {}
+      const utterance = new SpeechSynthesisUtterance(text);
+      const voice = pickBrowserVoice();
+      if (voice) utterance.voice = voice;
+      utterance.rate = 1.02;
+      utterance.pitch = 0.95;
+      utterance.volume = 1;
+      utterance.onend = () => {
+        fallbackUtterance = null;
+        resolve(true);
+      };
+      utterance.onerror = () => {
+        fallbackUtterance = null;
+        resolve(false);
+      };
+      fallbackUtterance = utterance;
+      try {
+        window.speechSynthesis.speak(utterance);
+      } catch {
+        fallbackUtterance = null;
+        resolve(false);
+      }
+    });
+  }
+
   // ── MediaSource streaming TTS — plays audio as chunks arrive ─────────────
   // Falls back to blob if MediaSource not supported (Safari quirks)
   async function playStream(fetchResponse) {
     return new Promise((resolve) => {
-      const done = () => { currentAudio = null; resolve(); };
+      const done = (played) => { currentAudio = null; resolve(!!played); };
 
       if (window.MediaSource && MediaSource.isTypeSupported('audio/mpeg')) {
         const ms    = new MediaSource();
         const audio = new Audio();
         audio.src   = URL.createObjectURL(ms);
         currentAudio = audio;
-        audio.onended = done;
-        audio.onerror = done;
+        audio.onended = () => done(true);
+        audio.onerror = () => done(false);
 
         ms.addEventListener('sourceopen', async () => {
           let sb;
-          try { sb = ms.addSourceBuffer('audio/mpeg'); } catch { done(); return; }
+          try { sb = ms.addSourceBuffer('audio/mpeg'); } catch { done(false); return; }
 
           const waitUpdate = () => new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-          const reader = fetchResponse.body.getReader();
+          const reader = fetchResponse.body?.getReader?.();
+          if (!reader) { done(false); return; }
           audio.play().catch(() => {});
 
           const pump = async () => {
@@ -10116,7 +10172,7 @@ const jarvisOrb = (() => {
               sb.appendBuffer(value);
               await waitUpdate();
               pump();
-            } catch { done(); }
+            } catch { done(false); }
           };
           pump();
         }, { once: true });
@@ -10126,10 +10182,10 @@ const jarvisOrb = (() => {
           const url   = URL.createObjectURL(blob);
           const audio = new Audio(url);
           currentAudio = audio;
-          audio.onended = () => { URL.revokeObjectURL(url); done(); };
-          audio.onerror = () => { URL.revokeObjectURL(url); done(); };
-          audio.play().catch(() => { URL.revokeObjectURL(url); done(); });
-        }).catch(done);
+          audio.onended = () => { URL.revokeObjectURL(url); done(true); };
+          audio.onerror = () => { URL.revokeObjectURL(url); done(false); };
+          audio.play().catch(() => { URL.revokeObjectURL(url); done(false); });
+        }).catch(() => done(false));
       }
     });
   }
@@ -10153,7 +10209,8 @@ const jarvisOrb = (() => {
       bargeInConfidence = Math.max(bargeInConfidence, Number(alt && alt.confidence) || 0);
       if (!bargeInTriggered && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
         bargeInTriggered = true;
-        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        invalidatePlayback();
+        stopPlayback();
         if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
         try { r.stop(); } catch (e) {}
         dispatch(bargeInText);
@@ -10163,7 +10220,8 @@ const jarvisOrb = (() => {
     r.onend = function() {
       bargeInRecognition = null;
       if (!bargeInTriggered && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence)) {
-        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        invalidatePlayback();
+        stopPlayback();
         if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
         dispatch(bargeInText);
       }
@@ -10195,18 +10253,38 @@ const jarvisOrb = (() => {
     if (!clean) { afterSpeak(); return; }
     setOrbState('speaking', 'Speaking...');
     startBargeIn();
-    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+    invalidatePlayback();
+    stopPlayback();
+    const speakVersion = playbackVersion;
+    const finishCurrentSpeak = () => {
+      if (speakVersion !== playbackVersion) return;
+      afterSpeak();
+    };
+    const fallbackToBrowser = async () => {
+      await speakWithBrowser(clean).catch(() => false);
+      finishCurrentSpeak();
+    };
     try {
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timeoutId = controller ? setTimeout(() => controller.abort(), 5000) : null;
       const res = await fetch('/api/jarvis/speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined,
         body: JSON.stringify({ text: clean }),
       });
-      if (!res.ok) { afterSpeak(); return; }
-      await playStream(res);
-      afterSpeak();
-    } catch { afterSpeak(); }
+      if (timeoutId) clearTimeout(timeoutId);
+      if (!res.ok) { await fallbackToBrowser(); return; }
+      const played = await playStream(res);
+      if (!played) {
+        await fallbackToBrowser();
+        return;
+      }
+      finishCurrentSpeak();
+    } catch {
+      await fallbackToBrowser();
+    }
   }
 
   function afterSpeak() {
@@ -10215,6 +10293,7 @@ const jarvisOrb = (() => {
       // Always-on: stay in conversation loop — restart mic after speaking
       setTimeout(() => { if (isActive) startListening(); }, 400);
     } else {
+      stopPlayback();
       setOrbState(null, '');
     }
   }
@@ -10324,8 +10403,9 @@ const jarvisOrb = (() => {
       isActive = false;
       syncActiveVisuals();
       stopListening();
+      invalidatePlayback();
       if (ackAudio)     { ackAudio.pause();     ackAudio = null; }
-      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      stopPlayback();
       setOrbState(null, '');
     } else {
       isActive = true;
