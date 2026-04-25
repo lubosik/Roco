@@ -140,32 +140,61 @@ export function getRecentlyResolvedQueueIds() {
   return recentlyResolvedQueueIds;
 }
 
+export function getTelegramTransport() {
+  const value = String(process.env.TELEGRAM_TRANSPORT || 'polling').trim().toLowerCase();
+  if (['off', 'disabled', 'none'].includes(value)) return 'off';
+  if (['webhook', 'hook'].includes(value)) return 'webhook';
+  return 'polling';
+}
+
 export function initTelegramBot(state) {
   rocoState = state;
+  const transport = getTelegramTransport();
 
-  bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-  info('Telegram bot started');
+  if (transport === 'off') {
+    info('Telegram bot disabled by TELEGRAM_TRANSPORT=off');
+    return null;
+  }
+
+  bot = new TelegramBot(
+    process.env.TELEGRAM_BOT_TOKEN,
+    transport === 'polling' ? { polling: true } : { polling: false },
+  );
+  info(`Telegram bot started (${transport})`);
 
   bot.on('message',        handleMessage);
   bot.on('callback_query', handleCallbackQuery);
 
-  // Suppress repeated 409 Conflict errors (two instances competing for same token)
-  // to once per 60 seconds — the bot still works for outgoing messages even when 409 fires.
-  let last409LogTime = 0;
-  bot.on('polling_error', (err) => {
-    if (String(err?.message || '').includes('409 Conflict')) {
-      const now = Date.now();
-      if (now - last409LogTime > 60000) {
-        error('Telegram polling conflict (409) — another bot instance may be running on Railway', { err: err.message });
-        last409LogTime = now;
+  if (transport === 'polling') {
+    // Suppress repeated 409 Conflict errors (two instances competing for same token)
+    // to once per 60 seconds — the bot still works for outgoing messages even when 409 fires.
+    let last409LogTime = 0;
+    bot.on('polling_error', (err) => {
+      if (String(err?.message || '').includes('409 Conflict')) {
+        const now = Date.now();
+        if (now - last409LogTime > 60000) {
+          error('Telegram polling conflict (409) — another bot instance may be running on Railway', { err: err.message });
+          last409LogTime = now;
+        }
+        return;
       }
-      return;
-    }
-    error('Telegram polling error', { err: err.message });
-  });
+      error('Telegram polling error', { err: err.message });
+    });
+  }
 
   registerCommands();
   return bot;
+}
+
+export async function processTelegramUpdate(update) {
+  if (!bot || typeof bot.processUpdate !== 'function' || !update) return false;
+  try {
+    bot.processUpdate(update);
+    return true;
+  } catch (err) {
+    error('Telegram webhook update handling failed', { err: err.message });
+    return false;
+  }
 }
 
 export async function sendTelegram(text) {

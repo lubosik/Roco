@@ -6998,6 +6998,12 @@ function registerRoutes(app) {
 
   app.post('/api/telegram/webhook', async (req, res) => {
     try {
+      const { processTelegramUpdate, getTelegramTransport } = await import('../approval/telegramBot.js');
+      if (getTelegramTransport() === 'webhook') {
+        await processTelegramUpdate(req.body);
+        return res.json({ ok: true });
+      }
+
       const cb = req.body?.callback_query;
       if (!cb) return res.json({ ok: true });
 

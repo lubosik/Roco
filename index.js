@@ -15,12 +15,32 @@ import { getDeal } from './core/dealContext.js';
 import { verifySupabase, seedDefaultTemplates, getActiveDeals, loadSessionState } from './core/supabaseSync.js';
 import { registerWebhooks } from './core/unipileSetup.js';
 
-const REQUIRED_VARS = [
-  'TELEGRAM_BOT_TOKEN',
-  'TELEGRAM_CHAT_ID',
-  'DASHBOARD_USER',
-  'DASHBOARD_PASS',
-];
+const BASE_REQUIRED_VARS = [];
+
+function envFlag(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  return ['1', 'true', 'yes', 'on'].includes(String(raw).trim().toLowerCase());
+}
+
+function getAppRole() {
+  const role = String(process.env.ROCO_APP_ROLE || 'all').trim().toLowerCase();
+  if (['web', 'worker', 'all'].includes(role)) return role;
+  return 'all';
+}
+
+function getRuntimePlan() {
+  const role = getAppRole();
+  return {
+    role,
+    dashboard: envFlag('ROCO_ENABLE_DASHBOARD', role !== 'worker'),
+    telegram: envFlag('ROCO_ENABLE_TELEGRAM', role !== 'web'),
+    orchestrator: envFlag('ROCO_ENABLE_ORCHESTRATOR', role !== 'web'),
+    fileWatcher: envFlag('ROCO_ENABLE_FILE_WATCHER', role !== 'web'),
+    registerUnipileWebhooks: envFlag('ROCO_REGISTER_UNIPILE_WEBHOOKS', role !== 'worker'),
+    startupTelegram: envFlag('ROCO_ENABLE_STARTUP_TELEGRAM', role !== 'web'),
+  };
+}
 
 function getServerBaseUrl(port) {
   const explicit = process.env.PUBLIC_URL || process.env.SERVER_BASE_URL;
@@ -39,8 +59,12 @@ function getServerBaseUrl(port) {
   return 'https://roco-production.up.railway.app';
 }
 
-async function validateEnv() {
-  const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+async function validateEnv(runtime) {
+  const requiredVars = [...BASE_REQUIRED_VARS];
+  if (runtime.telegram) requiredVars.push('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID');
+  if (runtime.dashboard) requiredVars.push('DASHBOARD_USER', 'DASHBOARD_PASS');
+
+  const missing = requiredVars.filter(v => !process.env[v]);
   if (missing.length) {
     console.error('\nMissing required environment variables:\n');
     missing.forEach(v => console.error(`  - ${v}`));
@@ -51,13 +75,16 @@ async function validateEnv() {
 }
 
 async function main() {
+  const runtime = getRuntimePlan();
   console.log('\n' + '='.repeat(50));
   console.log('  ROCO — Autonomous Fundraising Agent');
   console.log('='.repeat(50) + '\n');
   console.log(`  Start time: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`  Runtime role: ${runtime.role}`);
+  console.log(`  Components: dashboard=${runtime.dashboard} telegram=${runtime.telegram} orchestrator=${runtime.orchestrator} fileWatcher=${runtime.fileWatcher} registerUnipileWebhooks=${runtime.registerUnipileWebhooks}`);
 
   // 1. Validate env
-  await validateEnv();
+  await validateEnv(runtime);
 
   // 2. Connect to Supabase
   const supabaseOk = await verifySupabase();
@@ -78,40 +105,58 @@ async function main() {
   await seedDefaultTemplates();
 
   // 5. Start Telegram bot
-  const bot = initTelegramBot(rocoState);
-  startSupabaseApprovalPoller();
-  await reloadPendingInvestorApprovals().catch(() => {});
-  await reloadPendingSourcingApprovals().catch(() => {});
-  info('Telegram bot initialised');
+  if (runtime.telegram) {
+    initTelegramBot(rocoState);
+    startSupabaseApprovalPoller();
+    await reloadPendingInvestorApprovals().catch(() => {});
+    await reloadPendingSourcingApprovals().catch(() => {});
+    info('Telegram bot initialised');
+  } else {
+    info('Telegram bot skipped for this runtime role');
+  }
 
   // 6. Start dashboard + webhook server
-  initDashboard(rocoState);
+  if (runtime.dashboard) {
+    initDashboard(rocoState);
+  } else {
+    info('Dashboard server skipped for this runtime role');
+  }
 
   // Self-check: verify dashboard is reachable
-  await new Promise(r => setTimeout(r, 1500));
-  try {
-    const port = process.env.PORT || 3000;
-    const checkRes = await fetch(`http://127.0.0.1:${port}/health`);
-    if (checkRes.ok) {
-      info('Dashboard self-check passed');
-    } else {
-      warn(`Dashboard self-check returned HTTP ${checkRes.status}`);
+  if (runtime.dashboard) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const port = process.env.PORT || 3000;
+      const checkRes = await fetch(`http://127.0.0.1:${port}/health`);
+      if (checkRes.ok) {
+        info('Dashboard self-check passed');
+      } else {
+        warn(`Dashboard self-check returned HTTP ${checkRes.status}`);
+      }
+    } catch (selfCheckErr) {
+      warn(`Dashboard self-check failed: ${selfCheckErr.message}`);
     }
-  } catch (selfCheckErr) {
-    warn(`Dashboard self-check failed: ${selfCheckErr.message}`);
   }
 
   // 8. Register Unipile webhooks
-  try {
-    const port = process.env.PORT || 3000;
-    const baseUrl = getServerBaseUrl(port);
-    await registerWebhooks(baseUrl);
-  } catch (webhookErr) {
-    warn(`Unipile webhook registration failed: ${webhookErr.message}`);
+  if (runtime.registerUnipileWebhooks && runtime.dashboard) {
+    try {
+      const port = process.env.PORT || 3000;
+      const baseUrl = getServerBaseUrl(port);
+      await registerWebhooks(baseUrl);
+    } catch (webhookErr) {
+      warn(`Unipile webhook registration failed: ${webhookErr.message}`);
+    }
+  } else {
+    info('Unipile webhook registration skipped for this runtime role');
   }
 
   // 9. Start CSV file watcher
-  startFileWatcher();
+  if (runtime.fileWatcher) {
+    startFileWatcher();
+  } else {
+    info('CSV file watcher skipped for this runtime role');
+  }
 
   // 9. Load active deals and log them
   let activeDeals = [];
@@ -123,13 +168,17 @@ async function main() {
   }
 
   // 10. Start orchestrator
-  console.log('[STARTUP] Calling startOrchestrator...');
-  try {
-    await startOrchestrator();
-    console.log('[STARTUP] Orchestrator started successfully');
-  } catch (err) {
-    console.error('[STARTUP] startOrchestrator FAILED:', err.message);
-    console.error(err.stack);
+  if (runtime.orchestrator) {
+    console.log('[STARTUP] Calling startOrchestrator...');
+    try {
+      await startOrchestrator();
+      console.log('[STARTUP] Orchestrator started successfully');
+    } catch (err) {
+      console.error('[STARTUP] startOrchestrator FAILED:', err.message);
+      console.error(err.stack);
+    }
+  } else {
+    info('Orchestrator skipped for this runtime role');
   }
 
   console.log('\n' + '='.repeat(50));
@@ -149,9 +198,11 @@ async function main() {
   } catch {}
 
   const activeDealCount = activeDeals.length;
-  await sendTelegram(
-    `ROCO is online.\n\nActive deals: ${activeDealCount > 0 ? dealSummary : 'None — use Mission Control to launch a deal'}\nSupabase: ${supabaseOk ? '✓ Connected' : '⚠ Offline (local cache)'}\n\n/status — check status\n/pause — pause all\n/pipeline — top prospects`
-  );
+  if (runtime.telegram && runtime.startupTelegram) {
+    await sendTelegram(
+      `ROCO is online.\n\nActive deals: ${activeDealCount > 0 ? dealSummary : 'None — use Mission Control to launch a deal'}\nSupabase: ${supabaseOk ? '✓ Connected' : '⚠ Offline (local cache)'}\nRole: ${runtime.role}\n\n/status — check status\n/pause — pause all\n/pipeline — top prospects`
+    );
+  }
 
   info('Roco fully operational');
 }

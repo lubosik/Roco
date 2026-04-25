@@ -58,6 +58,11 @@ export async function answerCallbackQuery(callbackQueryId, text = 'Done') {
 export async function registerTelegramWebhook() {
   const token   = process.env.TELEGRAM_BOT_TOKEN;
   const baseUrl = process.env.SERVER_BASE_URL || process.env.PUBLIC_URL;
+  const transport = String(process.env.TELEGRAM_TRANSPORT || 'polling').trim().toLowerCase();
+  if (transport !== 'webhook') {
+    console.log(`[TELEGRAM] Webhook registration skipped — TELEGRAM_TRANSPORT=${transport || 'polling'}`);
+    return;
+  }
   if (!token || !baseUrl) {
     console.log('[TELEGRAM] Webhook registration skipped — no token or SERVER_BASE_URL');
     return;
