@@ -668,13 +668,24 @@ async function toolControlModule({ module, action, until }) {
 // ── trigger_research ──────────────────────────────────────────────────────────
 async function toolTriggerResearch({ deal_id }) {
   try {
+    // If no deal_id provided, find the first active deal from the database
+    let resolvedDealId = deal_id;
+    if (!resolvedDealId) {
+      const sb = getSupabase();
+      if (sb) {
+        const { data } = await sb.from('deals').select('id, name').eq('status', 'ACTIVE').limit(1);
+        resolvedDealId = data?.[0]?.id || null;
+      }
+    }
+    if (!resolvedDealId) return { error: 'No active deal found. Please specify a deal.' };
+
     const { runJarvisResearch, triggerImmediateRun } = await import('./orchestrator.js');
 
     // Run direct firm discovery (bypasses batch cooldown)
-    const result = await runJarvisResearch(deal_id, 15);
+    const result = await runJarvisResearch(resolvedDealId, 15);
 
     // Also kick off a full cycle for enrichment/outreach
-    triggerImmediateRun(deal_id).catch(() => {});
+    triggerImmediateRun(resolvedDealId).catch(() => {});
 
     const msg = result.error
       ? `Research cycle triggered (${result.error})`
@@ -682,7 +693,7 @@ async function toolTriggerResearch({ deal_id }) {
         ? `Found ${result.added} new firms, queued for enrichment and outreach.`
         : 'Research ran — no new firms found this pass. Pipeline may already be full or all candidates are excluded.';
 
-    emitJarvisActivity('Research cycle triggered', msg, deal_id).catch(() => {});
+    emitJarvisActivity('Research cycle triggered', msg, resolvedDealId).catch(() => {});
     return { triggered: true, firms_added: result.added || 0, message: msg };
   } catch (err) {
     return { error: err.message };

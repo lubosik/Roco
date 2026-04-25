@@ -121,6 +121,7 @@ async function buildSystemPrompt(deal, metrics) {
 
   const dealSection = deal ? `
 ACTIVE DEAL: ${deal.name}
+DEAL ID (use this exact UUID in all tool calls): ${deal.id}
 What's being raised: ${deal.description || deal.parsed_deal_info?.description || 'Not specified'}
 Target investors: ${deal.parsed_deal_info?.target_investor_profile || 'Not specified'}
 Target raise: ${deal.parsed_deal_info?.raise_amount || deal.target_raise || 'Not specified'}
@@ -253,7 +254,13 @@ export async function handleMessage(chatId, text, overrideDealId = null) {
     session.dealId = deals[0]?.id || null;
   }
 
-  const deal    = session.dealId ? await getDeal(session.dealId) : null;
+  let deal = session.dealId ? await getDeal(session.dealId) : null;
+  // If the stored dealId no longer resolves (deleted/closed), fall back to first active deal
+  if (!deal && !overrideDealId) {
+    const deals = await getActiveDeals().catch(() => []);
+    session.dealId = deals[0]?.id || null;
+    deal = session.dealId ? await getDeal(session.dealId) : null;
+  }
   const metrics = deal ? await gatherCurrentMetrics(deal.id).catch(() => null) : null;
 
   const systemPrompt = await buildSystemPrompt(deal, metrics);

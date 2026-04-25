@@ -7557,8 +7557,9 @@ export async function runJarvisResearch(dealId, needed = 15) {
   if (!sb) return { error: 'No database' };
   try {
     const deals = await getActiveDeals();
-    const deal = deals.find(d => String(d.id) === String(dealId));
-    if (!deal) return { error: 'Deal not found' };
+    let deal = dealId ? deals.find(d => String(d.id) === String(dealId)) : null;
+    if (!deal) deal = deals[0]; // fallback to first active deal
+    if (!deal) return { error: 'No active deals found' };
 
     // Need a batch to attach firms to — get or create
     const batch = await ensureBatchExists(deal);

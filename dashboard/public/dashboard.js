@@ -10129,13 +10129,18 @@ const jarvisOrb = (() => {
     r.onresult = function(e) {
       bargeInText = (e.results[0] && e.results[0][0] && e.results[0][0].transcript) || '';
     };
+    r.maxAlternatives = 1;
     r.onend = function() {
       bargeInRecognition = null;
       if (bargeInText && isActive) {
-        // User interrupted — stop all audio and process their input immediately
-        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-        if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
-        dispatch(bargeInText);
+        var words = bargeInText.trim().split(/\s+/).filter(function(w) { return w.length > 0; });
+        if (words.length >= 2) {
+          // User interrupted with at least 2 words — stop audio and dispatch
+          if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+          if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
+          dispatch(bargeInText);
+        }
+        // fewer than 2 words — likely background noise, ignore
       }
     };
     r.onerror = function() { bargeInRecognition = null; };
