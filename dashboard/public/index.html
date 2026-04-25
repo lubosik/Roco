@@ -1862,26 +1862,7 @@
     <div class="orb-shimmer"></div>
   </div>
 </div>
-
-<div id="jarvis-panel" class="jarvis-panel">
-  <div class="jarvis-panel-header">
-    <div class="jarvis-title">
-      <span class="jarvis-dot" id="jarvis-status-dot"></span>
-      JARVIS
-    </div>
-    <div class="jarvis-header-actions">
-      <button id="jarvis-voice-toggle" class="jarvis-icon-btn" title="Mute voice" onclick="jarvisOrb.toggleVoice()">&#128264;</button>
-      <button class="jarvis-close" onclick="jarvisOrb.close()">&#215;</button>
-    </div>
-  </div>
-  <div class="jarvis-messages" id="jarvis-messages"></div>
-  <div class="jarvis-input-row">
-    <button class="jarvis-mic" id="jarvis-mic" title="Voice input" onclick="jarvisOrb.toggleMic()">&#127908;</button>
-    <input type="text" id="jarvis-input" class="jarvis-input" placeholder="Ask JARVIS anything…"
-      onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); jarvisOrb.send(); }" />
-    <button class="jarvis-send" onclick="jarvisOrb.send()">&#10148;</button>
-  </div>
-</div>
+<div id="jarvis-status-label"></div>
 
 <script src="dashboard.js"></script>
 </body>

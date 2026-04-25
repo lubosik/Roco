@@ -276,7 +276,7 @@ async function toolGetStatus({ deal_id }) {
       safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('invite_sent_at', 'is', null)),
       safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('invite_accepted_at', 'is', null)),
       safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('last_reply_at', 'is', null)),
-      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('meeting_booked_at', 'is', null)),
+      safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('last_meeting_date', 'is', null)),
       safeCount(sb.from('approval_queue').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).eq('status', 'pending')),
       safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).eq('pipeline_stage', 'pending_dm_approval')),
       safeCount(sb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal_id).not('pipeline_stage', 'in', '("Archived","ARCHIVED","archived","Skipped","skipped_no_name","skipped_no_linkedin","skipped_duplicate_email","Inactive","Suppressed — Opt Out","Deleted — Do Not Contact")')),

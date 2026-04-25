@@ -110,7 +110,7 @@ export async function gatherCurrentMetrics(dealId) {
     pendingApprovalsRes,
   ] = await Promise.all([
     sb.from('contacts')
-      .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, meeting_booked_at')
+      .select('invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, last_meeting_date, meeting_count')
       .eq('deal_id', dealId),
     sb.from('activity_log')
       .select('event_type, created_at')
@@ -160,7 +160,7 @@ export async function gatherCurrentMetrics(dealId) {
   }).length;
   const meetingsBooked = contacts.filter(row => {
     const stage = String(row.pipeline_stage || '').toLowerCase();
-    return row.meeting_booked_at || stage.includes('meeting');
+    return row.last_meeting_date || Number(row.meeting_count) > 0 || stage.includes('meeting');
   }).length;
   const totalReplies = contacts.filter(row => row.last_reply_at || row.reply_channel).length + inboundMessages.length;
 

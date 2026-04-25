@@ -10002,13 +10002,14 @@ async function uploadInvestorXLSX(file) {
 // ── JARVIS ORB ───────────────────────────────────────────────────────────────
 
 const jarvisOrb = (() => {
-  let isOpen = false;
+  let isActive = false;     // orb is "on" — mic cycles until user presses again
   let recognition = null;
   let isListening = false;
-  let voiceEnabled = true;
   let currentAudio = null;
   let audioUnlocked = false;
+  let pendingTranscript = '';
 
+  // ── audio context unlock ──────────────────────────────────────────────────
   function unlockAudio() {
     if (audioUnlocked) return;
     audioUnlocked = true;
@@ -10017,114 +10018,64 @@ const jarvisOrb = (() => {
     silent.play().catch(() => {});
   }
 
-  const orb = () => document.getElementById('jarvis-orb');
-  const panel = () => document.getElementById('jarvis-panel');
-  const messages = () => document.getElementById('jarvis-messages');
-  const input = () => document.getElementById('jarvis-input');
-  const dot = () => document.getElementById('jarvis-status-dot');
-  const mic = () => document.getElementById('jarvis-mic');
+  // ── orb element helpers ───────────────────────────────────────────────────
+  const orb   = () => document.getElementById('jarvis-orb');
+  const label = () => document.getElementById('jarvis-status-label');
 
+  function setOrbState(state, text) {
+    const el = orb();
+    if (!el) return;
+    el.classList.remove('listening', 'thinking', 'speaking');
+    if (state) el.classList.add(state);
+    const lbl = label();
+    if (lbl) {
+      lbl.textContent = text || '';
+      lbl.className = 'jarvis-label' + (text ? ' visible' : '');
+    }
+  }
+
+  // ── ElevenLabs TTS ────────────────────────────────────────────────────────
   async function speakText(text) {
-    if (!voiceEnabled) return;
-    const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 500);
-    if (!clean) return;
-    setOrbState('speaking');
-    // Try ElevenLabs first
+    const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 600);
+    if (!clean) { afterSpeak(); return; }
+    setOrbState('speaking', 'Speaking...');
+    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
     try {
-      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
       const res = await fetch('/api/jarvis/speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
         body: JSON.stringify({ text: clean }),
       });
-      if (res.ok) {
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        currentAudio = audio;
-        audio.onended = () => {
-          setOrbState(null);
-          URL.revokeObjectURL(url);
-          currentAudio = null;
-          if (isOpen && voiceEnabled) setTimeout(() => { if (isOpen && !isListening) startListening(); }, 300);
-        };
-        audio.onerror = () => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; };
-        audio.play().catch(() => { setOrbState(null); URL.revokeObjectURL(url); currentAudio = null; });
-        return;
-      }
-    } catch { setOrbState(null); }
+      if (!res.ok) { afterSpeak(); return; }
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      currentAudio = audio;
+      audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); };
+      audio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); };
+      audio.play().catch(() => { URL.revokeObjectURL(url); currentAudio = null; afterSpeak(); });
+    } catch { afterSpeak(); }
   }
 
-  function speakFallback(text) {
-    if (!window.speechSynthesis) { setOrbState(null); return; }
-    window.speechSynthesis.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.rate = 1.05;
-    utt.pitch = 0.95;
-    utt.onend = () => setOrbState(null);
-    utt.onerror = () => setOrbState(null);
-    window.speechSynthesis.speak(utt);
+  function afterSpeak() {
+    if (isActive) {
+      setTimeout(() => { if (isActive && !isListening) startListening(); }, 400);
+    } else {
+      setOrbState(null, '');
+    }
   }
 
-  function setOrbState(state) {
-    const el = orb();
-    if (!el) return;
-    el.classList.remove('listening', 'thinking', 'speaking');
-    if (state) el.classList.add(state);
-  }
-
-  function setDotState(state) {
-    const el = dot();
-    if (!el) return;
-    el.classList.remove('active', 'busy', 'listening');
-    if (state) el.classList.add(state);
-  }
-
-  function addMessage(role, text) {
-    const container = messages();
-    if (!container) return;
-    const row = document.createElement('div');
-    row.className = `jarvis-msg ${role}`;
-    const bubble = document.createElement('div');
-    bubble.className = 'jarvis-bubble';
-    bubble.textContent = text;
-    row.appendChild(bubble);
-    container.appendChild(row);
-    container.scrollTop = container.scrollHeight;
-    return row;
-  }
-
-  function showTyping() {
-    const container = messages();
-    if (!container) return null;
-    const row = document.createElement('div');
-    row.className = 'jarvis-msg bot';
-    const bubble = document.createElement('div');
-    bubble.className = 'jarvis-bubble jarvis-typing';
-    bubble.innerHTML = '<span></span><span></span><span></span>';
-    row.appendChild(bubble);
-    container.appendChild(row);
-    container.scrollTop = container.scrollHeight;
-    return row;
-  }
-
+  // ── deal context ──────────────────────────────────────────────────────────
   function getActiveDealId() {
     const sel = document.querySelector('[data-active-deal-id]');
     return sel ? sel.dataset.activeDealId : null;
   }
 
-  async function send() {
-    unlockAudio();
-    const inp = input();
-    if (!inp) return;
-    const text = (inp.value || '').trim();
-    if (!text) return;
-    inp.value = '';
-    addMessage('user', text);
-    setOrbState('thinking');
-    setDotState('busy');
-    const typing = showTyping();
+  // ── send transcript to JARVIS ─────────────────────────────────────────────
+  async function dispatch(text) {
+    if (!text) { if (isActive) startListening(); return; }
+    setOrbState('thinking', 'Thinking...');
     try {
       const res = await fetch('/api/jarvis', {
         method: 'POST',
@@ -10133,102 +10084,73 @@ const jarvisOrb = (() => {
         body: JSON.stringify({ message: text, dealId: getActiveDealId() }),
       });
       const data = await res.json();
-      if (typing) typing.remove();
-      const reply = data.reply || data.error || 'No response';
-      addMessage('bot', reply);
-      speakText(reply);
-    } catch (err) {
-      if (typing) typing.remove();
-      addMessage('bot', `Error: ${err.message}`);
-    } finally {
-      setDotState('active');
-    }
+      const reply = data.reply || data.error || '';
+      await speakText(reply);
+    } catch { afterSpeak(); }
   }
 
-  function toggleVoice() {
-    voiceEnabled = !voiceEnabled;
-    if (!voiceEnabled) {
-      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-      window.speechSynthesis?.cancel();
-      setOrbState(null);
-    }
-    const btn = document.getElementById('jarvis-voice-toggle');
-    if (btn) btn.title = voiceEnabled ? 'Mute voice' : 'Enable voice';
-    if (btn) btn.classList.toggle('muted', !voiceEnabled);
-  }
-
-  function setupSpeechRecognition() {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) return null;
-    const r = new SpeechRecognition();
-    r.continuous = false;
-    r.interimResults = false;
-    r.lang = 'en-US';
+  // ── speech recognition ────────────────────────────────────────────────────
+  function buildRecognition() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return null;
+    const r = new SR();
+    r.continuous      = false;
+    r.interimResults  = false;
+    r.lang            = 'en-US';
     r.onresult = (e) => {
-      const transcript = e.results[0]?.[0]?.transcript || '';
-      const inp = input();
-      if (inp && transcript) inp.value = transcript;
-      stopListening();
-      send();
+      pendingTranscript = e.results[0]?.[0]?.transcript || '';
     };
-    r.onerror      = () => stopListening();
-    r.onend        = () => stopListening();
-    r.onspeechend  = () => { recognition?.stop(); };
+    r.onspeechend = () => { try { r.stop(); } catch {} };
+    r.onend = () => {
+      isListening = false;
+      const t = pendingTranscript;
+      pendingTranscript = '';
+      if (isActive) dispatch(t);
+    };
+    r.onerror = (e) => {
+      isListening = false;
+      pendingTranscript = '';
+      if (isActive && e.error !== 'aborted') setTimeout(() => { if (isActive) startListening(); }, 600);
+    };
     return r;
   }
 
   function startListening() {
-    if (!recognition) recognition = setupSpeechRecognition();
-    if (!recognition) { alert('Speech recognition not supported in this browser.'); return; }
+    if (!recognition) recognition = buildRecognition();
+    if (!recognition) return;
+    if (isListening) return;
     try {
       recognition.start();
       isListening = true;
-      setOrbState('listening');
-      setDotState('listening');
-      const m = mic();
-      if (m) m.classList.add('active');
+      setOrbState('listening', 'Listening...');
     } catch {}
   }
 
   function stopListening() {
     isListening = false;
-    setOrbState(null);
-    if (isOpen) setDotState('active');
-    const m = mic();
-    if (m) m.classList.remove('active');
     try { recognition?.stop(); } catch {}
   }
 
-  function toggleMic() {
+  // ── toggle: press orb to start / stop ────────────────────────────────────
+  function toggle() {
     unlockAudio();
-    if (isListening) stopListening();
-    else startListening();
-  }
-
-  function open() {
-    unlockAudio();
-    isOpen = true;
-    const p = panel();
-    if (p) p.classList.add('open');
-    setDotState('active');
-    const inp = input();
-    if (inp) setTimeout(() => inp.focus(), 150);
-    if (!messages()?.children.length) {
-      addMessage('bot', 'Hey — what\'s on your mind? Ask me about the pipeline, a specific deal, or tell me what you need.');
+    if (isActive) {
+      isActive = false;
+      stopListening();
+      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      setOrbState(null, '');
+    } else {
+      isActive = true;
+      startListening();
     }
   }
 
-  function close() {
-    isOpen = false;
-    const p = panel();
-    if (p) p.classList.remove('open');
-    setDotState(null);
-    stopListening();
-  }
-
-  function toggle() {
-    if (isOpen) close(); else open();
-  }
+  // legacy shim — kept so any existing callers don't break
+  function open()         { if (!isActive) toggle(); }
+  function close()        { if (isActive)  toggle(); }
+  function toggleMic()    { toggle(); }
+  function toggleVoice()  { toggle(); }
+  function send()         { /* voice only */ }
 
   return { open, close, toggle, send, toggleMic, toggleVoice };
 })();
