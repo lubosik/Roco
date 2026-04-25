@@ -430,7 +430,7 @@ Maximum 5 recommended investors.`;
 
 export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity) {
   if (dailyNewsScanFailureState.has(getNewsFailureKey(deal.id))) {
-    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: 'News scan skipped after today’s failure.', recommendedInvestors: [] };
+    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: "News scan skipped after today's failure.", recommendedInvestors: [] };
   }
   if (!deal?.id) {
     return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: [], grokRawResults: [], isRelevant: false, notes: '', recommendedInvestors: [] };
