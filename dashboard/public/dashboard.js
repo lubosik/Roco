@@ -10013,6 +10013,10 @@ const jarvisOrb = (() => {
   let bargeInRecognition = null;
   let bargeInTriggered  = false;
   let playbackVersion   = 0;
+  let turnVersion       = 0;
+  let activeDispatchController = null;
+  let activeSpeakController = null;
+  let activeSpeechText  = '';
   const INTERRUPT_WORDS = new Set(['ok', 'okay', 'yeah', 'yep', 'yup', 'wait', 'stop', 'sorry', 'actually', 'fine', 'no', 'nah', 'hold']);
 
   // ── AudioContext unlock (proper gesture registration) ─────────────────────
@@ -10059,9 +10063,31 @@ const jarvisOrb = (() => {
     document.body.classList.toggle('jarvis-engaged', !!isActive);
   }
 
+  function normalizeSpeechText(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function isLikelySelfSpeech(text) {
+    const heard = normalizeSpeechText(text);
+    if (!heard) return false;
+    if (FILLERS.some(f => normalizeSpeechText(f) === heard)) return true;
+    const spoken = normalizeSpeechText(activeSpeechText);
+    if (!spoken) return false;
+    if (spoken.includes(heard)) return true;
+    const heardWords = heard.split(' ').filter(Boolean);
+    if (heardWords.length < 2) return false;
+    const overlap = heardWords.filter(word => spoken.includes(word));
+    return overlap.length >= Math.min(heardWords.length, 3);
+  }
+
   function shouldTriggerBargeIn(text, confidence) {
     const clean = String(text || '').trim().toLowerCase();
     if (!clean) return false;
+    if (isLikelySelfSpeech(clean)) return false;
     const words = clean.split(/\s+/).filter(Boolean);
     if (words.length >= 2) return true;
     const first = words[0] || '';
@@ -10084,14 +10110,28 @@ const jarvisOrb = (() => {
   }
 
   function stopPlayback() {
+    activeSpeechText = '';
     if (currentAudio) {
       try { currentAudio.pause(); } catch {}
+      try { currentAudio.src = ''; } catch {}
       currentAudio = null;
     }
   }
 
   function invalidatePlayback() {
     playbackVersion += 1;
+  }
+
+  function invalidateTurn() {
+    turnVersion += 1;
+    if (activeDispatchController) {
+      try { activeDispatchController.abort(); } catch {}
+      activeDispatchController = null;
+    }
+    if (activeSpeakController) {
+      try { activeSpeakController.abort(); } catch {}
+      activeSpeakController = null;
+    }
   }
 
   // ── MediaSource streaming TTS — plays audio as chunks arrive ─────────────
@@ -10208,17 +10248,21 @@ const jarvisOrb = (() => {
   async function speakText(text) {
     const clean = text.replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim().slice(0, 2500);
     if (!clean) { afterSpeak(); return; }
+    if (!isActive) return;
     setOrbState('speaking', 'Speaking...');
     startBargeIn();
     invalidatePlayback();
     stopPlayback();
+    activeSpeechText = clean;
+    const currentTurn = turnVersion;
     const speakVersion = playbackVersion;
     const finishCurrentSpeak = () => {
-      if (speakVersion !== playbackVersion) return;
+      if (!isActive || currentTurn !== turnVersion || speakVersion !== playbackVersion) return;
       afterSpeak();
     };
     try {
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      activeSpeakController = controller;
       const timeoutId = controller ? setTimeout(() => controller.abort(), 5000) : null;
       const res = await fetch('/api/jarvis/speak', {
         method: 'POST',
@@ -10227,7 +10271,9 @@ const jarvisOrb = (() => {
         signal: controller ? controller.signal : undefined,
         body: JSON.stringify({ text: clean }),
       });
+      if (activeSpeakController === controller) activeSpeakController = null;
       if (timeoutId) clearTimeout(timeoutId);
+      if (!isActive || currentTurn !== turnVersion) return;
       if (!res.ok) {
         let detail = 'ElevenLabs voice unavailable';
         try {
@@ -10239,6 +10285,7 @@ const jarvisOrb = (() => {
         return;
       }
       const played = await playStream(res);
+      if (!isActive || currentTurn !== turnVersion) return;
       if (!played) {
         showToast('Jarvis voice playback failed', 'error', 5000);
         finishCurrentSpeak();
@@ -10246,6 +10293,8 @@ const jarvisOrb = (() => {
       }
       finishCurrentSpeak();
     } catch {
+      activeSpeakController = null;
+      if (!isActive || currentTurn !== turnVersion) return;
       showToast('Jarvis voice request failed', 'error', 5000);
       finishCurrentSpeak();
     }
@@ -10293,31 +10342,46 @@ const jarvisOrb = (() => {
 
   // ── classify whether text is an action request (no API call needed) ─────────
   function isActionRequest(text) {
-    const actionKeywords = ['find', 'search', 'check', 'look', 'get', 'show', 'pull', 'run', 'trigger',
-      'send', 'research', 'enrich', 'approve', 'skip', 'pause', 'resume', 'status', 'what is',
-      'how many', 'list', 'who', 'which', 'update', 'dm', 'email', 'contact'];
+    const actionKeywords = ['find', 'search', 'pull', 'run', 'trigger',
+      'send', 'research', 'enrich', 'approve', 'skip', 'pause', 'resume',
+      'update', 'draft', 'dm', 'email'];
     const lower = text.toLowerCase();
     return actionKeywords.some(k => lower.includes(k));
   }
 
   // ── dispatch transcript to JARVIS ─────────────────────────────────────────
   async function dispatch(text) {
-    if (!text) { afterSpeak(); return; }
+    const cleanText = String(text || '').trim();
+    if (!cleanText) { afterSpeak(); return; }
+    if (!isActive) return;
+    stopListening();
+    invalidateTurn();
+    const currentTurn = turnVersion;
     setOrbState('thinking', 'Thinking...');
-    const needsAck = isActionRequest(text);
+    const needsAck = isActionRequest(cleanText);
     if (needsAck) speakAck();  // plays cached filler immediately — zero added latency
     try {
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      activeDispatchController = controller;
       const res = await fetch('/api/jarvis', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ message: text, dealId: getActiveDealId() }),
+        signal: controller ? controller.signal : undefined,
+        body: JSON.stringify({ message: cleanText, dealId: getActiveDealId() }),
       });
+      if (activeDispatchController === controller) activeDispatchController = null;
+      if (!isActive || currentTurn !== turnVersion) return;
       const data  = await res.json();
       const reply = data.reply || data.error || '';
       if (needsAck) await waitForAck();  // let ack phrase finish before main response
+      if (!isActive || currentTurn !== turnVersion) return;
       await speakText(reply);
-    } catch { afterSpeak(); }
+    } catch {
+      activeDispatchController = null;
+      if (!isActive || currentTurn !== turnVersion) return;
+      afterSpeak();
+    }
   }
 
   // ── speech recognition ────────────────────────────────────────────────────
@@ -10367,6 +10431,8 @@ const jarvisOrb = (() => {
       isActive = false;
       syncActiveVisuals();
       stopListening();
+      stopBargeIn();
+      invalidateTurn();
       invalidatePlayback();
       if (ackAudio)     { ackAudio.pause();     ackAudio = null; }
       stopPlayback();
