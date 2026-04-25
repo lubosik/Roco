@@ -17,7 +17,7 @@ function getElevenLabsConfig() {
   return {
     apiKey: process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY || null,
     modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2',
-    defaultVoiceId: process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb',
+    defaultVoiceId: process.env.ELEVENLABS_VOICE_ID || '0pa5K4pOrbnP5VS5eH6k',
     voiceName: process.env.ELEVENLABS_VOICE_NAME || 'Configured voice',
   };
 }

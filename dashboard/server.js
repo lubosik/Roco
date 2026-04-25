@@ -3383,7 +3383,7 @@ async function generateWelcomeAudio(displayName) {
   info(`[VOICE] Generating welcome audio for ${displayName}...`);
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb', {
+    const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/0pa5K4pOrbnP5VS5eH6k', {
       method: 'POST',
       headers: {
         'xi-api-key': apiKey,
@@ -8415,7 +8415,7 @@ function registerRoutes(app) {
     const { text } = req.body || {};
     if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text required' });
     const apiKey = process.env.ELEVENLABS_API_KEY;
-    const configuredVoiceId = process.env.ELEVENLABS_VOICE_ID || 'CwhRBWXzGAHq8TQ4Fs17';
+    const configuredVoiceId = process.env.ELEVENLABS_VOICE_ID || '0pa5K4pOrbnP5VS5eH6k';
     const modelId = 'eleven_flash_v2_5';
     if (!apiKey) {
       updateJarvisVoiceStatus({
@@ -8487,7 +8487,7 @@ function registerRoutes(app) {
 
   app.get('/api/jarvis/voice-status', requireAuth, async (req, res) => {
     const configured = !!process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || 'CwhRBWXzGAHq8TQ4Fs17';
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || '0pa5K4pOrbnP5VS5eH6k';
     res.json({
       ...jarvisVoiceStatus,
       configured,
