@@ -503,6 +503,14 @@ export async function handleLinkedInAcceptance(contact, deal, pushActivity, queu
 
       if (workflowResult?.deferred) {
         await queueLinkedInDM(contact.id);
+        pushActivity({
+          type:   'linkedin',
+          action: `LinkedIn DM queued for retry: ${contact.name}`,
+          note:   workflowResult.reason || 'Acceptance recorded, DM approval will be retried by orchestrator',
+          deal_name: deal?.name || null,
+          dealId: deal?.id || contact.deal_id || null,
+        });
+        return;
       }
 
       console.warn(`[UNIPILE/REL] queueForApproval returned no approval row for ${contact.name} (${contact.id})`);

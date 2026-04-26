@@ -28,6 +28,7 @@ import { retrieveEmail } from '../integrations/unipileClient.js';
 import { getApiHealth, startHealthChecks } from '../core/apiFallback.js';
 import { info, error } from '../core/logger.js';
 import { aiComplete, haikuComplete, claudeWebSearch } from '../core/aiClient.js';
+import { normalizeComparableName } from '../core/hardeningHelpers.js';
 import {
   loadSessionState, saveSessionState,
   getAllDeals, getActiveDeals, getDeal, createDeal, updateDeal,
@@ -62,6 +63,8 @@ let jarvisVoiceStatus = {
 
 const activityFeed = [];
 const MAX_FEED = 200;
+const webhookReceiptDedupe = new Map();
+const WEBHOOK_RECEIPT_DEDUPE_MS = 10 * 60 * 1000;
 const campaignFirmLinkCache = new Map();
 const CAMPAIGN_FIRM_LINK_TTL_MS = 6 * 60 * 60 * 1000;
 const INVESTOR_DB_SUMMARY_TTL_MS = 5 * 60 * 1000;
@@ -295,6 +298,11 @@ function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
 }
 
 async function logWebhookReceipt(eventType, payload, source = 'unipile') {
+  const dedupeKey = buildWebhookReceiptDedupeKey(eventType, payload, source);
+  if (isDuplicateWebhookReceipt(dedupeKey)) {
+    return false;
+  }
+
   await insertWebhookLogRecord({
     event_type: eventType || 'unknown',
     payload: {
@@ -306,6 +314,53 @@ async function logWebhookReceipt(eventType, payload, source = 'unipile') {
     },
   });
   pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
+  return true;
+}
+
+function buildWebhookReceiptDedupeKey(eventType, payload, source = 'unipile') {
+  const event = payload || {};
+  const data = event?.data || event || {};
+  const sender = data?.sender || data?.from_attendee || data?.from || {};
+  const stableId = [
+    data.id,
+    data.message_id,
+    data.email_id,
+    data.event_id,
+    data.tracking_id,
+    data.thread_id,
+    data.conversation_id,
+    data.chat_id,
+    event.id,
+    event.message_id,
+  ].find(Boolean);
+  if (stableId) return `${source}:${eventType || 'unknown'}:${stableId}`;
+
+  const actor = [
+    data.from_email,
+    data.from,
+    sender.identifier,
+    sender.email,
+    sender.attendee_provider_id,
+    data.sender_id,
+    data.user_provider_id,
+    data.user_public_identifier,
+    data.user_full_name,
+  ].find(Boolean) || 'unknown';
+  const subject = data.subject || '';
+  const text = stripHtml(data.body_plain || data.body || data.text || data.message || '').slice(0, 160);
+  return `${source}:${eventType || 'unknown'}:${actor}:${subject}:${text}`;
+}
+
+function isDuplicateWebhookReceipt(key) {
+  const now = Date.now();
+  for (const [cachedKey, ts] of webhookReceiptDedupe) {
+    if (now - ts > WEBHOOK_RECEIPT_DEDUPE_MS) webhookReceiptDedupe.delete(cachedKey);
+  }
+  if (!key) return false;
+  const last = webhookReceiptDedupe.get(key);
+  if (last && now - last < WEBHOOK_RECEIPT_DEDUPE_MS) return true;
+  webhookReceiptDedupe.set(key, now);
+  return false;
 }
 
 function getTelegramBotId() {
@@ -1132,17 +1187,19 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
   }
 
   const threadIds = new Set();
-  try {
-    let query = sb.from('emails')
-      .select('gmail_thread_id')
-      .eq('contact_id', contact.id)
-      .not('gmail_thread_id', 'is', null);
-    if (dealId) query = query.eq('deal_id', dealId);
-    const { data } = await query;
-    for (const row of data || []) {
-      if (row?.gmail_thread_id) threadIds.add(String(row.gmail_thread_id));
-    }
-  } catch {}
+  for (const field of ['thread_id', 'gmail_thread_id']) {
+    try {
+      let query = sb.from('emails')
+        .select(field)
+        .eq('contact_id', contact.id)
+        .not(field, 'is', null);
+      if (dealId) query = query.eq('deal_id', dealId);
+      const { data } = await query;
+      for (const row of data || []) {
+        if (row?.[field]) threadIds.add(String(row[field]));
+      }
+    } catch {}
+  }
 
   try {
     let query = sb.from('replies')
@@ -1967,8 +2024,35 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     .select('id');
 
   if (!locked?.length) {
-    // Another call already claimed or advanced this contact — abort
-    return null;
+    // Another webhook/cycle may have claimed the row and be drafting right now.
+    // Do not arm the noisy fallback unless we know there is no active queue row
+    // and the contact is not already in the pending approval state.
+    const { data: current } = await sb.from('contacts')
+      .select('id, name, pipeline_stage, pending_linkedin_dm')
+      .eq('id', contactId)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    const currentStage = String(current?.pipeline_stage || '').trim().toLowerCase();
+    if (currentStage === 'pending_dm_approval') {
+      const { data: pendingRows } = await sb.from('approval_queue')
+        .select('id, status, created_at')
+        .eq('contact_id', contactId)
+        .eq('stage', 'LinkedIn DM')
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .catch(() => ({ data: null }));
+      if (pendingRows?.length) {
+        await reloadPendingInvestorApprovals().catch(() => {});
+        return pendingRows[0];
+      }
+      await sb.from('contacts').update({
+        pipeline_stage: 'invite_accepted',
+        pending_linkedin_dm: true,
+      }).eq('id', contactId).catch(() => {});
+      return { deferred: true, reason: 'draft_claim_in_progress_or_stale' };
+    }
+    return { deferred: true, reason: `stage_not_lockable:${current?.pipeline_stage || 'unknown'}` };
   }
 
   const payload = await buildLinkedInDmDraftPayload(contactId, { body });
@@ -2651,7 +2735,7 @@ export function initDashboard(state) {
       }
 
       await queueInboundWithDebounce({
-        fromEmail, fromName, bodyText, threadId, messageId, channel: 'email', raw: payload,
+        fromEmail, fromName, subject, bodyText, threadId, messageId, channel: 'email', raw: payload,
       });
     } catch (err) {
       console.error('[WEBHOOK/GMAIL] Error:', err.message);
@@ -2709,7 +2793,7 @@ export function initDashboard(state) {
 
       const outlookAccountId = payload?.account_id || process.env.UNIPILE_OUTLOOK_ACCOUNT_ID;
       await queueInboundWithDebounce({
-        fromEmail, fromName, bodyText, threadId, messageId,
+        fromEmail, fromName, subject, bodyText, threadId, messageId,
         channel: 'email', emailAccountId: outlookAccountId, raw: payload,
       });
     } catch (err) {
@@ -3148,7 +3232,7 @@ export function initDashboard(state) {
             });
 
             // Queue with debounce for contextual reply drafting
-            queueInboundWithDebounce({ fromEmail, fromName: contact.name, bodyText: body, threadId, channel: 'email' }).catch(() => {});
+            queueInboundWithDebounce({ fromEmail, fromName: contact.name, subject, bodyText: body, threadId, channel: 'email' }).catch(() => {});
 
             pushActivity({
               type: 'approval',
@@ -8787,7 +8871,86 @@ async function fetchSourcingContactById(contactId) {
   return data || null;
 }
 
-async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText, threadId, chatId, messageId, channel, emailAccountId, raw }) {
+async function findInvestorContactByEmail(sb, email, { requireActiveDeal = true } = {}) {
+  const normalized = normalizeInboundEmail(email);
+  if (!sb || !normalized) return null;
+  const { data } = await sb.from('contacts')
+    .select('*, deals(*)')
+    .ilike('email', normalized)
+    .limit(10);
+  return pickBestInvestorContact(data || [], { requireActiveDeal });
+}
+
+async function findInvestorContactByEmailThread(sb, threadId, { requireActiveDeal = true } = {}) {
+  if (!sb || !threadId) return null;
+  const fields = ['thread_id', 'gmail_thread_id'];
+  for (const field of fields) {
+    try {
+      const { data } = await sb.from('emails')
+        .select('contact_id')
+        .eq(field, threadId)
+        .not('contact_id', 'is', null)
+        .order('sent_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (data?.contact_id) {
+        const contact = await fetchInvestorContactById(data.contact_id);
+        if (contact && (!requireActiveDeal || String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE')) return contact;
+      }
+    } catch {}
+  }
+  try {
+    const { data } = await sb.from('replies')
+      .select('contact_id')
+      .eq('thread_id', threadId)
+      .not('contact_id', 'is', null)
+      .order('received_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (data?.contact_id) {
+      const contact = await fetchInvestorContactById(data.contact_id);
+      if (contact && (!requireActiveDeal || String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE')) return contact;
+    }
+  } catch {}
+  return null;
+}
+
+async function findInvestorContactByDisplayName(sb, fromName, { requireActiveDeal = true } = {}) {
+  const normalizedTarget = normalizeComparableName(fromName);
+  const first = normalizedTarget.split(/\s+/).filter(Boolean)[0];
+  if (!sb || !normalizedTarget || !first) return null;
+  try {
+    const { data } = await sb.from('contacts')
+      .select('*, deals(*)')
+      .ilike('name', `%${first}%`)
+      .limit(25);
+    const candidates = (data || []).filter(row => {
+      const rowName = normalizeComparableName(row?.name);
+      return rowName === normalizedTarget || (normalizedTarget.length >= 6 && rowName.includes(normalizedTarget));
+    });
+    return pickBestInvestorContact(candidates, { requireActiveDeal });
+  } catch {
+    return null;
+  }
+}
+
+async function findOriginalEmailByThread(sb, threadId) {
+  if (!sb || !threadId) return null;
+  for (const field of ['thread_id', 'gmail_thread_id']) {
+    try {
+      const { data } = await sb.from('emails')
+        .select('*, deals(name, description, sector, status)')
+        .eq(field, threadId)
+        .order('sent_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      if (data) return data;
+    } catch {}
+  }
+  return null;
+}
+
+async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject, bodyText, threadId, chatId, messageId, channel, emailAccountId, raw }) {
   if (!bodyText?.trim()) return;
 
   const normalizedEmail = normalizeInboundEmail(fromEmail);
@@ -8797,7 +8960,7 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText
   if (!contactKey) return;
 
   const batchKey  = `${channel}_${contactKey}`;
-  const msgEntry  = { content: bodyText.trim(), received_at: new Date(), channel, threadId: threadId || chatId || null, messageId, emailAccountId: emailAccountId || null, raw };
+  const msgEntry  = { content: bodyText.trim(), received_at: new Date(), channel, subject: subject || null, threadId: threadId || chatId || null, messageId, emailAccountId: emailAccountId || null, raw };
 
   if (replyDebounceMap.has(batchKey)) {
     const existing = replyDebounceMap.get(batchKey);
@@ -8823,7 +8986,7 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, bodyText
       console.log(`[REPLY] Contact not found for ${contactKey} — falling back to legacy handler`);
       await handleInboundReply({
         fromEmail: fromEmail || '', fromName: fromName || fromUrn || '', fromUrn: fromUrn || '',
-        subject: '', bodyText, threadId: threadId || chatId || '', messageId: messageId || '',
+        subject: subject || '', bodyText, threadId: threadId || chatId || '', messageId: messageId || '',
         channel, threadField: channel === 'email' ? 'gmail_thread_id' : null,
         emailAccountId: emailAccountId || null,
       });
@@ -8891,41 +9054,16 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
       }
     }
     if (channel === 'email' && fromEmail) {
-      const { data } = await sb.from('contacts').select('*, deals(*)').ilike('email', fromEmail).limit(10);
-      const contact = pickBestInvestorContact(data || [], { requireActiveDeal: true });
+      const contact = await findInvestorContactByEmail(sb, fromEmail, { requireActiveDeal: true });
       if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
     }
     if (channel === 'email' && threadId) {
-      const { data: emailThread } = await sb.from('emails')
-        .select('contact_id')
-        .eq('gmail_thread_id', threadId)
-        .not('contact_id', 'is', null)
-        .order('sent_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (emailThread?.contact_id) {
-        const contact = await fetchInvestorContactById(emailThread.contact_id);
-        if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
-      }
-      const { data: priorReply } = await sb.from('replies')
-        .select('contact_id')
-        .eq('thread_id', threadId)
-        .not('contact_id', 'is', null)
-        .order('received_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (priorReply?.contact_id) {
-        const contact = await fetchInvestorContactById(priorReply.contact_id);
-        if (contact && String(contact?.deals?.status || '').toUpperCase() === 'ACTIVE') return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
-      }
+      const contact = await findInvestorContactByEmailThread(sb, threadId, { requireActiveDeal: true });
+      if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
     }
     // Name-based fallback — catches replies from alternate email addresses (e.g. gcampbell@ vs bcampbell@)
     if (channel === 'email' && fromName && fromName.trim().split(/\s+/).length >= 2) {
-      const { data: nameMatches } = await sb.from('contacts')
-        .select('*, deals(*)')
-        .ilike('name', fromName.trim())
-        .limit(5);
-      const contact = pickBestInvestorContact(nameMatches || [], { requireActiveDeal: true });
+      const contact = await findInvestorContactByDisplayName(sb, fromName, { requireActiveDeal: true });
       if (contact) {
         console.log(`[RESOLVE] Matched by name "${fromName}" → ${contact.name} (email mismatch fallback)`);
         return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
@@ -8981,13 +9119,17 @@ async function processRocoBatchedReply(batch) {
     }).catch(() => {});
   }
 
-  // Update contact state
-  await sb?.from(contactTable).update({
+  // Update contact state immediately so the pipeline/campaign board reflects that
+  // this person is no longer in a cold outbound stage.
+  const statePatch = {
     response_received: true,
     last_reply_at:     new Date().toISOString(),
     response_summary:  combinedContent.slice(0, 200),
-    ...(contactTable === 'contacts' ? { follow_up_due_at: null } : {}),
-  }).eq('id', contact.id);
+    ...(contactTable === 'contacts'
+      ? { pipeline_stage: 'In Conversation', follow_up_due_at: null }
+      : { pipeline_stage: 'contacted' }),
+  };
+  await sb?.from(contactTable).update(statePatch).eq('id', contact.id);
 
   // Record which channel the reply came in on (for channel loyalty in responses)
   await sb?.from(contactTable).update({ reply_channel: channel })
@@ -9262,6 +9404,14 @@ async function processRocoBatchedReply(batch) {
         quote_preview: quotePreview,
       },
     }).catch(() => {});
+
+    pushActivity({
+      type: 'approval',
+      action: `Reply drafted for approval: ${contact.name}`,
+      note: `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent} · ${contextName}`,
+      dealId: deal?.id || null,
+      deal_name: deal?.name || null,
+    });
   }
 }
 
@@ -9739,16 +9889,17 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
   let contact = null;
   if (sb) {
     if (normalizedEmail) {
-      const { data } = await sb.from('contacts').select('*').ilike('email', normalizedEmail).limit(1).maybeSingle();
-      contact = data || null;
+      contact = await findInvestorContactByEmail(sb, normalizedEmail, { requireActiveDeal: true });
     }
     if (!contact && threadId) {
-      const { data } = await sb.from('contacts').select('*').eq('unipile_chat_id', threadId).limit(1).maybeSingle();
-      contact = data || null;
+      contact = await findInvestorContactByEmailThread(sb, threadId, { requireActiveDeal: true });
+    }
+    if (!contact && fromName && fromName.trim().split(/\s+/).length >= 2) {
+      contact = await findInvestorContactByDisplayName(sb, fromName, { requireActiveDeal: true });
     }
     if (!contact && fromUrn) {
       // Fall back to LinkedIn provider_id
-      const { data } = await sb.from('contacts').select('*').eq('linkedin_provider_id', fromUrn).limit(1).maybeSingle();
+      const { data } = await sb.from('contacts').select('*, deals(*)').eq('linkedin_provider_id', fromUrn).limit(1).maybeSingle();
       contact = data || null;
     }
   }
@@ -9756,13 +9907,7 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
   // Find original email by thread_id
   let originalEmail = null;
   if (sb && threadId) {
-    const query = sb.from('emails').select('*, deals(name, description, sector)')
-      .order('sent_at', { ascending: true })
-      .limit(1)
-      .single();
-    if (threadField) query.eq(threadField, threadId);
-    const { data } = await query;
-    originalEmail = data || null;
+    originalEmail = await findOriginalEmailByThread(sb, threadId);
   }
 
   // Log the inbound reply
@@ -9773,7 +9918,7 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
       thread_id:      threadId || null,
       message_id:     messageId || null,
       contact_id:     contact?.id || null,
-      deal_id:        originalEmail?.deal_id || null,
+      deal_id:        originalEmail?.deal_id || contact?.deal_id || null,
       channel,
       received_at:    new Date().toISOString(),
       classification: 'PENDING',
@@ -9791,7 +9936,13 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
     }).eq('id', contact.id);
   }
 
-  const deal = originalEmail?.deals;
+  let deal = originalEmail?.deals || contact?.deals || null;
+  if (!deal && (originalEmail?.deal_id || contact?.deal_id) && sb) {
+    try {
+      const { data } = await sb.from('deals').select('*').eq('id', originalEmail?.deal_id || contact?.deal_id).maybeSingle();
+      deal = data || null;
+    } catch {}
+  }
   const classification = await classifyWithGpt({
     body: bodyText, fromEmail, fromName,
     dealName: deal?.name || 'Unknown Deal',

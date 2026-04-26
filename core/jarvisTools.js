@@ -152,13 +152,14 @@ export const JARVIS_TOOLS = [
   },
   {
     name: 'suppress_firm',
-    description: 'Permanently suppress a firm from all future outreach on this deal. Use when they have declined, are not a fit, or should never be contacted again.',
+    description: 'Suppress a firm from future outreach for one deal or all deals. Use when Dom says to stop contacting a firm, blacklist a firm, or suppress a company. If scope is unclear, ask one confirmation question before using all_deals.',
     input_schema: {
       type: 'object',
       properties: {
         deal_id:   { type: 'string', description: 'The deal UUID' },
         firm_name: { type: 'string', description: 'Name of the firm to suppress' },
         reason:    { type: 'string', description: 'Why this firm is being suppressed' },
+        scope:     { type: 'string', enum: ['deal', 'all_deals'], description: 'deal suppresses only the active deal. all_deals suppresses this firm globally across current/future outreach.' },
       },
       required: ['deal_id', 'firm_name', 'reason'],
     },
@@ -188,7 +189,7 @@ export const JARVIS_TOOLS = [
   },
   {
     name: 'update_contact',
-    description: 'Update a contact\'s pipeline stage, tier, notes, email, or LinkedIn URL. Use this when Dom tells you someone replied, moved stages, gave new info, or should be re-classified. Fuzzy name match — partial names work.',
+    description: 'Update a contact\'s pipeline/campaign stage, tier, notes, email, or LinkedIn URL. Works on investor pipeline contacts first, then sourcing campaign contacts. Use this when Dom tells you someone replied, moved Kanban stages, became exhausted, gave new info, or should be re-classified. Fuzzy name match — partial names work.',
     input_schema: {
       type: 'object',
       properties: {
@@ -814,33 +815,92 @@ async function toolGetContactsBreakdown({ deal_id }) {
 }
 
 // ── suppress_firm ─────────────────────────────────────────────────────────────
-async function toolSuppressFirm({ deal_id, firm_name, reason }) {
+async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) {
   const sb = getSupabase();
   if (!sb) return { error: 'Database unavailable' };
   try {
-    await sb.from('firm_outreach_state').upsert({
-      deal_id,
-      firm_name,
-      status:     'suppressed',
-      notes:      reason,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'deal_id,firm_name' });
+    const now = new Date().toISOString();
+    const global = scope === 'all_deals';
+    const firmToken = firm_name.split(/\s+/).filter(Boolean)[0] || firm_name;
 
-    // Archive all contacts at this firm for this deal
-    await sb.from('contacts')
-      .update({ tier: 'archive', pipeline_stage: 'Archived' })
-      .eq('deal_id', deal_id)
-      .ilike('company_name', `%${firm_name.split(' ')[0]}%`);
+    if (!global) {
+      await sb.from('firm_outreach_state').upsert({
+        deal_id,
+        firm_name,
+        status:     'suppressed',
+        notes:      reason,
+        updated_at: now,
+      }, { onConflict: 'deal_id,firm_name' }).catch(() => {});
+    }
+
+    let contactsQuery = sb.from('contacts')
+      .update({
+        tier: 'archive',
+        pipeline_stage: 'Archived',
+        conversation_state: 'do_not_contact',
+        conversation_ended_reason: `Suppressed by JARVIS: ${reason}`,
+        updated_at: now,
+      })
+      .ilike('company_name', `%${firmToken}%`);
+    if (!global) contactsQuery = contactsQuery.eq('deal_id', deal_id);
+    const contactsResult = await contactsQuery.select('id').catch(() => ({ data: [] }));
+    const contactsSuppressed = contactsResult?.data?.length || 0;
+
+    let batchQuery = sb.from('batch_firms')
+      .update({ status: 'suppressed', notes: `Suppressed by JARVIS: ${reason}` })
+      .ilike('firm_name', `%${firmToken}%`);
+    if (!global) batchQuery = batchQuery.eq('deal_id', deal_id);
+    await batchQuery.catch(() => {});
+
+    if (!global) {
+      await sb.from('firm_suppressions').insert({
+        deal_id,
+        company_name: firm_name,
+        triggered_by_contact: 'JARVIS',
+        reason,
+        contacts_suppressed: contactsSuppressed,
+        suppression_type: 'JARVIS',
+        created_at: now,
+      }).catch(() => {});
+
+      await sb.from('deal_exclusions').insert({
+        deal_id,
+        firm_name: firm_name.toLowerCase().trim(),
+        added_by: 'JARVIS',
+      }).catch(() => {});
+    } else {
+      const { data: activeDeals } = await sb.from('deals').select('id').eq('status', 'ACTIVE').catch(() => ({ data: [] }));
+      for (const deal of activeDeals || []) {
+        await sb.from('firm_outreach_state').upsert({
+          deal_id: deal.id,
+          firm_name,
+          status: 'suppressed',
+          notes: `Global JARVIS suppression: ${reason}`,
+          updated_at: now,
+        }, { onConflict: 'deal_id,firm_name' }).catch(() => {});
+        await sb.from('deal_exclusions').insert({
+          deal_id: deal.id,
+          firm_name: firm_name.toLowerCase().trim(),
+          added_by: 'JARVIS',
+        }).catch(() => {});
+      }
+    }
 
     await writeMemory(deal_id, {
       type:    'DECISION',
       subject: `Suppressed ${firm_name}`,
-      content: `${firm_name} suppressed from all future outreach. Reason: ${reason}`,
+      content: `${firm_name} suppressed from ${global ? 'all deals' : 'this deal'}. Reason: ${reason}`,
       tags:    [`firm:${firm_name.toLowerCase().replace(/\s+/g, '_')}`],
-      metadata: { reason, suppressed_at: new Date().toISOString() },
+      metadata: { reason, scope: global ? 'all_deals' : 'deal', suppressed_at: now },
     });
 
-    return { suppressed: true, firm: firm_name };
+    emitJarvisActivity(
+      `Suppressed firm: ${firm_name}`,
+      `${global ? 'All deals' : 'Active deal'} · ${reason}`,
+      deal_id
+    ).catch(() => {});
+
+    return { suppressed: true, firm: firm_name, scope: global ? 'all_deals' : 'deal', contacts_suppressed: contactsSuppressed };
   } catch (err) {
     return { error: err.message };
   }
@@ -858,7 +918,46 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
       .ilike('name', `%${contact_name.split(' ')[0]}%`)
       .limit(5);
 
-    if (!matches?.length) return { error: `No contact found matching "${contact_name}"` };
+    if (!matches?.length) {
+      const { data: campaignMatches } = await sb.from('company_contacts')
+        .select('id, name, company_name, title, pipeline_stage, email, linkedin_url, notes, campaign_id, sourcing_campaigns(name)')
+        .ilike('name', `%${contact_name.split(' ')[0]}%`)
+        .limit(5)
+        .catch(() => ({ data: [] }));
+
+      if (!campaignMatches?.length) return { error: `No contact found matching "${contact_name}"` };
+
+      const campaignContact = campaignMatches.find(c =>
+        String(c.name || '').toLowerCase().startsWith(contact_name.toLowerCase().split(' ')[0])
+      ) || campaignMatches[0];
+
+      const campaignPatch = {};
+      if (pipeline_stage) campaignPatch.pipeline_stage = pipeline_stage;
+      if (email) campaignPatch.email = email;
+      if (linkedin_url) campaignPatch.linkedin_url = linkedin_url;
+      if (notes) {
+        const existing = campaignContact.notes ? `${campaignContact.notes}\n\n` : '';
+        campaignPatch.notes = `${existing}[JARVIS ${new Date().toISOString().slice(0, 10)}] ${notes}`;
+      }
+      campaignPatch.updated_at = new Date().toISOString();
+      if (Object.keys(campaignPatch).length <= 1) return { error: 'No fields provided to update' };
+
+      await sb.from('company_contacts').update(campaignPatch).eq('id', campaignContact.id);
+      emitJarvisActivity(
+        `Updated campaign contact: ${campaignContact.name}`,
+        `${campaignContact.company_name || ''} · ${Object.entries(campaignPatch).filter(([k]) => k !== 'updated_at').map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(', ')}`,
+        null,
+        campaignContact.sourcing_campaigns?.name || null
+      ).catch(() => {});
+      return {
+        updated: true,
+        mode: 'campaign',
+        contact: campaignContact.name,
+        firm: campaignContact.company_name,
+        campaign: campaignContact.sourcing_campaigns?.name || null,
+        changes: Object.keys(campaignPatch).filter(k => k !== 'updated_at'),
+      };
+    }
 
     // Pick best match (prefer exact name start)
     const contact = matches.find(c =>
@@ -879,6 +978,11 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
     if (!Object.keys(patch).length) return { error: 'No fields provided to update' };
 
     await sb.from('contacts').update(patch).eq('id', contact.id);
+    emitJarvisActivity(
+      `Updated pipeline contact: ${contact.name}`,
+      `${contact.company_name || ''} · ${Object.entries(patch).filter(([k]) => k !== 'updated_at').map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(', ')}`,
+      deal_id
+    ).catch(() => {});
 
     await writeMemory(deal_id, {
       type:    'UPDATE',
@@ -935,6 +1039,8 @@ async function toolRecordReply({ deal_id, contact_name, message, intent, action_
       pipeline_stage: newStage,
       notes: noteParts.join('\n'),
       last_reply_at: new Date().toISOString(),
+      response_received: true,
+      reply_channel: 'manual',
       updated_at: new Date().toISOString(),
     }).eq('id', contact.id);
 
@@ -944,6 +1050,11 @@ async function toolRecordReply({ deal_id, contact_name, message, intent, action_
       content: `${contact.name} (${contact.company_name}) replied. Intent: ${intent || 'unknown'}. Message: "${message.slice(0, 400)}".${action_note ? ` Planned action: ${action_note}` : ''}`,
       tags:    [`contact:${(contact.name || '').toLowerCase().replace(/\s+/g, '_')}`, `intent:${intent || 'other'}`],
     });
+    emitJarvisActivity(
+      `Recorded reply: ${contact.name}`,
+      `${contact.company_name || ''} · ${intent || 'other'}${action_note ? ` · ${action_note}` : ''}`,
+      deal_id
+    ).catch(() => {});
 
     return {
       recorded: true,
