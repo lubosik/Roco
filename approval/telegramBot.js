@@ -393,7 +393,7 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       info(`Email draft sent to Telegram for approval: ${name}`);
 
       // Attach action buttons (done after send so we have the message_id)
-      bot.editMessageReplyMarkup(buildKeyboard(sent.message_id), {
+      bot.editMessageReplyMarkup(buildKeyboard(sent.message_id, queueRow?.id || null), {
         chat_id: chatId,
         message_id: sent.message_id,
       }).catch(() => {});
@@ -483,7 +483,7 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
         queuedAt: new Date().toISOString(),
         queueId,
       });
-      bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(sent.message_id), {
+      bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(sent.message_id, queueId), {
         chat_id: chatId,
         message_id: sent.message_id,
       }).catch(() => {});
@@ -550,49 +550,53 @@ export async function sendPriorChatForApproval({ contactName, firm, dealName, su
   }
 }
 
-function buildKeyboard(msgId) {
+function callbackPayload(action, msgId, queueId = null) {
+  return queueId ? `${action}:${msgId}:${queueId}` : `${action}:${msgId}`;
+}
+
+function buildKeyboard(msgId, queueId = null) {
   return {
     inline_keyboard: [
       [
-        { text: '✓ Send A', callback_data: `aa:${msgId}` },
-        { text: '✓ Send B', callback_data: `ab:${msgId}` },
+        { text: '✓ Send A', callback_data: callbackPayload('aa', msgId, queueId) },
+        { text: '✓ Send B', callback_data: callbackPayload('ab', msgId, queueId) },
       ],
       [
-        { text: '✏ Edit',   callback_data: `ed:${msgId}` },
-        { text: '🗑 Delete', callback_data: `sk:${msgId}` },
+        { text: '✏ Edit',   callback_data: callbackPayload('ed', msgId, queueId) },
+        { text: '🗑 Delete', callback_data: callbackPayload('sk', msgId, queueId) },
       ],
     ],
   };
 }
 
-function buildLinkedInDMKeyboard(msgId) {
+function buildLinkedInDMKeyboard(msgId, queueId = null) {
   return {
     inline_keyboard: [
-      [{ text: '✓ Approve', callback_data: `sa:${msgId}` }],
+      [{ text: '✓ Approve', callback_data: callbackPayload('sa', msgId, queueId) }],
       [
-        { text: '✏ Edit', callback_data: `ed:${msgId}` },
-        { text: 'Manual', callback_data: `lm:${msgId}` },
-        { text: 'Close',  callback_data: `lc:${msgId}` },
+        { text: '✏ Edit', callback_data: callbackPayload('ed', msgId, queueId) },
+        { text: 'Manual', callback_data: callbackPayload('lm', msgId, queueId) },
+        { text: 'Close',  callback_data: callbackPayload('lc', msgId, queueId) },
       ],
     ],
   };
 }
 
-function buildReloadedApprovalKeyboard(msgId, hasSubjects = false) {
+function buildReloadedApprovalKeyboard(msgId, hasSubjects = false, queueId = null) {
   return {
     inline_keyboard: hasSubjects
       ? [
           [
-            { text: '✓ Send A', callback_data: `aa:${msgId}` },
-            { text: '✓ Send B', callback_data: `ab:${msgId}` },
+            { text: '✓ Send A', callback_data: callbackPayload('aa', msgId, queueId) },
+            { text: '✓ Send B', callback_data: callbackPayload('ab', msgId, queueId) },
           ],
-          [{ text: '✗ Skip', callback_data: `sk:${msgId}` }],
+          [{ text: '✗ Skip', callback_data: callbackPayload('sk', msgId, queueId) }],
         ]
       : [
-          [{ text: '✓ Approve', callback_data: `sa:${msgId}` }],
+          [{ text: '✓ Approve', callback_data: callbackPayload('sa', msgId, queueId) }],
           [
-            { text: 'Manual', callback_data: `lm:${msgId}` },
-            { text: 'Close',  callback_data: `lc:${msgId}` },
+            { text: 'Manual', callback_data: callbackPayload('lm', msgId, queueId) },
+            { text: 'Close',  callback_data: callbackPayload('lc', msgId, queueId) },
           ],
         ],
   };
@@ -760,7 +764,7 @@ async function handleLinkedInDMEdit(chatId, oldMsgId, approval, instructions) {
     ].join('\n');
     const newSent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
     pendingApprovals.set(newSent.message_id, { ...approval });
-    await bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(newSent.message_id), {
+    await bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(newSent.message_id, approval.queueId || null), {
       chat_id: chatId, message_id: newSent.message_id,
     }).catch(() => {});
     await bot.sendMessage(chatId, `✅ Revised — approve or edit using the buttons above.`);
@@ -799,8 +803,8 @@ async function resendUpdatedApproval(chatId, oldMsgId, approval) {
   const newSent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
   pendingApprovals.set(newSent.message_id, { ...approval });
   const keyboard = isLinkedIn
-    ? buildLinkedInDMKeyboard(newSent.message_id)
-    : buildKeyboard(newSent.message_id);
+    ? buildLinkedInDMKeyboard(newSent.message_id, approval.queueId || null)
+    : buildKeyboard(newSent.message_id, approval.queueId || null);
   await bot.editMessageReplyMarkup(keyboard, {
     chat_id: chatId, message_id: newSent.message_id,
   }).catch(() => {});
@@ -886,16 +890,22 @@ async function handleCallbackQuery(query) {
 
   const colon  = data.indexOf(':');
   if (colon === -1) return;
-  const action = data.slice(0, colon);
-  const msgId  = Number(data.slice(colon + 1));
+  const parts = data.split(':');
+  const action = parts[0];
+  const msgId  = Number(parts[1]);
+  const queueId = parts[2] || null;
+  if (!Number.isFinite(msgId)) {
+    await bot.sendMessage(chatId, '⚠ This approval button is malformed. Open the queue from the dashboard or ask Roco to resend it.');
+    return;
+  }
 
   // Dedup guard — ignore duplicate button presses while one is in flight
   if (processingApprovals.has(msgId)) return;
   processingApprovals.add(msgId);
 
-  let approval = pendingApprovals.get(msgId);
+  let approval = pendingApprovals.get(msgId) || pendingApprovals.get(String(msgId));
   if (!approval) {
-    approval = await reloadApprovalForTelegramMessage(msgId);
+    approval = await reloadApprovalForTelegramMessage(msgId, queueId);
   }
   if (!approval) {
     processingApprovals.delete(msgId);
@@ -1791,7 +1801,7 @@ async function handleQueue(chatId, args = '') {
 
     await bot.sendMessage(chatId, text, {
       parse_mode: 'Markdown',
-      reply_markup: buildKeyboard(msgId),
+      reply_markup: buildKeyboard(msgId, a.queueId || null),
     });
   }
 }
@@ -2252,26 +2262,45 @@ function buildReloadedApprovalEntry(item) {
   };
 }
 
-async function reloadApprovalForTelegramMessage(msgId) {
+async function reloadApprovalForTelegramMessage(msgId, queueId = null) {
   const sb = getSupabase();
-  if (!sb || !msgId) return null;
+  if (!sb || (!msgId && !queueId)) return null;
   try {
-    const { data: item } = await sb.from('approval_queue')
-      .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
-      .eq('telegram_msg_id', msgId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    let item = null;
+    if (queueId) {
+      const byQueue = await sb.from('approval_queue')
+        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
+        .eq('id', queueId)
+        .maybeSingle();
+      if (byQueue.error) throw byQueue.error;
+      item = byQueue.data || null;
+    }
+    if (!item && msgId) {
+      const byTelegram = await sb.from('approval_queue')
+        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
+        .eq('telegram_msg_id', msgId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (byTelegram.error) throw byTelegram.error;
+      item = byTelegram.data || null;
+    }
     if (!item || item.outreach_mode === 'company_sourcing') return null;
     // Already handled by another instance (Railway/VPS both running) or window-queued
-    if (['approved', 'approved_waiting_for_window', 'sending', 'sent', 'telegram_skipped'].includes(item.status)) {
+    if (['approved', 'approved_waiting_for_window', 'sending', 'sent', 'telegram_skipped', 'skipped', 'manual', 'failed'].includes(item.status)) {
       return { __alreadyHandled: true, status: item.status, contactName: item.contact_name, firm: item.firm };
     }
     if (item.status !== 'pending') return null;
+    if (msgId && !item.telegram_msg_id) {
+      await sb.from('approval_queue').update({ telegram_msg_id: msgId }).eq('id', item.id).catch(() => {});
+      item.telegram_msg_id = msgId;
+    }
     const entry = buildReloadedApprovalEntry(item);
     pendingApprovals.set(msgId, entry);
+    pendingApprovals.set(String(msgId), entry);
     return entry;
-  } catch {
+  } catch (err) {
+    error('Failed to reload Telegram approval', { err: err.message, msgId, queueId });
     return null;
   }
 }
@@ -2337,7 +2366,7 @@ export async function reloadPendingInvestorApprovals() {
       await sb.from('approval_queue').update({
         telegram_msg_id: sent.message_id,
       }).eq('id', item.id).then(() => {}, () => {});
-      await bot.editMessageReplyMarkup(buildReloadedApprovalKeyboard(sent.message_id, hasSubjects), {
+      await bot.editMessageReplyMarkup(buildReloadedApprovalKeyboard(sent.message_id, hasSubjects, item.id), {
         chat_id: chatId,
         message_id: sent.message_id,
       }).catch(() => {});
