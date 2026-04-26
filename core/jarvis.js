@@ -35,7 +35,9 @@ function getClient() {
   if (process.env.OPENROUTER_API_KEY) {
     return new Anthropic({
       apiKey:  process.env.OPENROUTER_API_KEY,
-      baseURL: 'https://openrouter.ai/api/v1',
+      // Anthropic SDK appends /v1/messages itself. OpenRouter's Anthropic-
+      // compatible root is /api, otherwise requests become /api/v1/v1/messages.
+      baseURL: 'https://openrouter.ai/api',
     });
   }
   return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
