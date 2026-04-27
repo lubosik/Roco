@@ -296,15 +296,27 @@ export async function getActiveDeals() {
   const sb = getSupabase();
   if (!sb) return [];
   try {
-    const { data } = await sb
+    const { data, error } = await sb
       .from('deals')
       .select('*')
-      .eq('status', 'ACTIVE')
+      .ilike('status', 'active')
       .neq('paused', true)
       .order('created_at', { ascending: false });
+    if (error) throw error;
     return data || [];
-  } catch {
-    return [];
+  } catch (err) {
+    try {
+      const { data, error } = await sb
+        .from('deals')
+        .select('*')
+        .ilike('status', 'active')
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+      return (data || []).filter(deal => deal.paused !== true);
+    } catch (fallbackErr) {
+      console.warn('[supabaseSync] Could not load active deals:', fallbackErr.message || err.message);
+      return [];
+    }
   }
 }
 
@@ -866,7 +878,14 @@ export async function verifySupabase() {
     if (error) throw error;
     return true;
   } catch (err) {
-    console.warn('[supabaseSync] Supabase verification failed:', err.message);
-    return false;
+    try {
+      const { error } = await sb.from('deals').select('id').limit(1);
+      if (error) throw error;
+      console.warn(`[supabaseSync] sessions verification failed (${err.message}); deals table is reachable`);
+      return true;
+    } catch (fallbackErr) {
+      console.warn('[supabaseSync] Supabase verification failed:', fallbackErr.message || err.message);
+      return false;
+    }
   }
 }

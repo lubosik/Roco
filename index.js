@@ -162,10 +162,19 @@ async function main() {
 
   // 9. Load active deals and log them
   let activeDeals = [];
+  let activeDealsLoaded = false;
+  let activeDealsError = '';
   try {
-    activeDeals = await getActiveDeals();
-    console.log(`✓ Active deals: ${activeDeals.length > 0 ? activeDeals.map(d => d.name).join(', ') : 'none — launch a deal from Mission Control'}`);
+    if (!supabaseOk) {
+      activeDealsError = 'Supabase unavailable';
+      console.log('  Active deals: not checked (Supabase unavailable)');
+    } else {
+      activeDeals = await getActiveDeals();
+      activeDealsLoaded = true;
+      console.log(`✓ Active deals: ${activeDeals.length > 0 ? activeDeals.map(d => d.name).join(', ') : 'none — launch a deal from Mission Control'}`);
+    }
   } catch (err) {
+    activeDealsError = err.message || 'unknown error';
     console.log(`  Active deals: could not load (${err.message})`);
   }
 
@@ -200,9 +209,14 @@ async function main() {
   } catch {}
 
   const activeDealCount = activeDeals.length;
+  const activeDealLine = activeDealCount > 0
+    ? dealSummary
+    : activeDealsLoaded
+      ? 'None — use Mission Control to launch a deal'
+      : `Unknown — ${activeDealsError || 'Supabase check did not complete'}`;
   if (runtime.telegram && runtime.startupTelegram) {
     await sendTelegram(
-      `ROCO is online.\n\nActive deals: ${activeDealCount > 0 ? dealSummary : 'None — use Mission Control to launch a deal'}\nSupabase: ${supabaseOk ? '✓ Connected' : '⚠ Offline (local cache)'}\nRole: ${runtime.role}\n\n/status — check status\n/pause — pause all\n/pipeline — top prospects`
+      `ROCO is online.\n\nActive deals: ${activeDealLine}\nSupabase: ${supabaseOk ? '✓ Connected' : '⚠ Offline or not configured on this service'}\nRole: ${runtime.role}\n\n/status — check status\n/pause — pause all\n/pipeline — top prospects`
     );
   }
 

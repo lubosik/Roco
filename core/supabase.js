@@ -11,11 +11,16 @@ let _client = null;
 
 export function getSupabase() {
   if (!_client) {
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_KEY;
+    const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY
+      || process.env.SUPABASE_SERVICE_ROLE_KEY
+      || process.env.SUPABASE_SERVICE_ROLE;
     if (!url || !key) {
-      console.warn('[supabase] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — Supabase disabled');
+      console.warn('[supabase] SUPABASE_URL or service key not set — Supabase disabled');
       return null;
+    }
+    if (!process.env.SUPABASE_SERVICE_KEY && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE)) {
+      console.warn('[supabase] Using SUPABASE_SERVICE_ROLE_KEY fallback; prefer setting SUPABASE_SERVICE_KEY on every Railway service');
     }
     _client = createClient(url, key, {
       auth: { persistSession: false },
