@@ -685,20 +685,23 @@ async function toolTriggerResearch({ deal_id }) {
 
     const { runJarvisResearch, triggerImmediateRun } = await import('./orchestrator.js');
 
-    // Run direct firm discovery (bypasses batch cooldown)
-    const result = await runJarvisResearch(resolvedDealId, 15);
+    // Fire research asynchronously — don't block Jarvis waiting for results
+    const confirmMsg = 'Research triggered. Finding new firms now and queuing them for enrichment. You can watch it run in the live activity log.';
+    emitJarvisActivity('Research cycle triggered', 'Firm discovery started by Jarvis voice command', resolvedDealId).catch(() => {});
+
+    runJarvisResearch(resolvedDealId, 15).then(result => {
+      const followUp = result.error
+        ? `Research completed with warning: ${result.error}`
+        : result.added > 0
+          ? `Research done: found ${result.added} new firms, queued for enrichment and outreach.`
+          : 'Research complete. No new firms this pass — pipeline may already be full or all candidates excluded.';
+      emitJarvisActivity('Research complete', followUp, resolvedDealId).catch(() => {});
+    }).catch(() => {});
 
     // Also kick off a full cycle for enrichment/outreach
     triggerImmediateRun(resolvedDealId).catch(() => {});
 
-    const msg = result.error
-      ? `Research cycle triggered (${result.error})`
-      : result.added > 0
-        ? `Found ${result.added} new firms, queued for enrichment and outreach.`
-        : 'Research ran — no new firms found this pass. Pipeline may already be full or all candidates are excluded.';
-
-    emitJarvisActivity('Research cycle triggered', msg, resolvedDealId).catch(() => {});
-    return { triggered: true, firms_added: result.added || 0, message: msg };
+    return { triggered: true, message: confirmMsg };
   } catch (err) {
     return { error: err.message };
   }
