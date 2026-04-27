@@ -87,6 +87,8 @@ function getActivityTimestamp(entry) {
 }
 
 function buildActivityFingerprint(entry) {
+  const explicitKey = entry?.activity_key || entry?.activityKey || entry?.detail?.activity_key || entry?.meta?.activity_key;
+  if (explicitKey) return `activity_key:${explicitKey}`;
   if (entry?.id) return `id:${entry.id}`;
   const ts = entry?.created_at || entry?.timestamp || entry?.createdAt || '';
   return [
@@ -319,7 +321,7 @@ function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
   };
 }
 
-async function logWebhookReceipt(eventType, payload, source = 'unipile') {
+async function logWebhookReceipt(eventType, payload, source = 'unipile', options = {}) {
   const dedupeKey = buildWebhookReceiptDedupeKey(eventType, payload, source);
   if (isDuplicateWebhookReceipt(dedupeKey)) {
     return false;
@@ -335,7 +337,9 @@ async function logWebhookReceipt(eventType, payload, source = 'unipile') {
       },
     },
   });
-  pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
+  if (options.emitActivity !== false) {
+    pushActivity(buildWebhookReceiptActivity(eventType, payload, source));
+  }
   return true;
 }
 
@@ -744,7 +748,7 @@ async function processUnipileMessageEvent(event) {
       return 'suppressed';
     }
 
-    await logWebhookReceipt(eventType || 'message_received', event, 'unipile_messages').catch(() => {});
+    await logWebhookReceipt(eventType || 'message_received', event, 'unipile_messages', { emitActivity: false }).catch(() => {});
 
     await queueInboundWithDebounce({
       fromUrn: fromProvId,
@@ -785,7 +789,7 @@ async function processUnipileMessageEvent(event) {
   }
 
   if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
-    await logWebhookReceipt(eventType, event, 'unipile_messages').catch(() => {});
+    await logWebhookReceipt(eventType, event, 'unipile_messages', { emitActivity: false }).catch(() => {});
     return 'email';
   }
 
@@ -1299,7 +1303,21 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
 // REPLY DEBOUNCE BATCHER
 // ─────────────────────────────────────────────
 const replyDebounceMap = new Map();
+const inboundReplyDedupe = new Map();
 const REPLY_DEBOUNCE_MS = 90 * 1000;
+const INBOUND_REPLY_DEDUPE_MS = 10 * 60 * 1000;
+
+function isDuplicateInboundReply(key) {
+  if (!key) return false;
+  const now = Date.now();
+  for (const [cachedKey, ts] of inboundReplyDedupe) {
+    if (now - ts > INBOUND_REPLY_DEDUPE_MS) inboundReplyDedupe.delete(cachedKey);
+  }
+  const last = inboundReplyDedupe.get(key);
+  if (last && now - last < INBOUND_REPLY_DEDUPE_MS) return true;
+  inboundReplyDedupe.set(key, now);
+  return false;
+}
 
 function clearDebounceForDeal(dealId) {
   let cleared = 0;
@@ -2044,7 +2062,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
 
   // Check 2: Optimistic lock — atomically claim the contact before building the draft.
   // This prevents concurrent calls from both proceeding when the DB check finds no existing row.
-  const LOCKABLE_STAGES = ['invite_accepted', 'Enriched', 'enriched', 'Ranked', 'ranked'];
+  const LOCKABLE_STAGES = ['invite_accepted', 'Invite Accepted', 'Enriched', 'enriched', 'Ranked', 'ranked', 'pending_linkedin_dm'];
   const { data: locked } = await sb.from('contacts')
     .update({ pipeline_stage: 'pending_dm_approval' })
     .eq('id', contactId)
@@ -2163,7 +2181,7 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
     .select('*, deals!contacts_deal_id_fkey(*)')
     .eq('id', contactId)
     .single();
-  if (!contact || !contact.linkedin_provider_id) return null;
+  if (!contact || (!contact.linkedin_provider_id && !contact.unipile_chat_id)) return null;
 
   let firmResearch = null;
   if (contact.firm_id) {
@@ -2730,7 +2748,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
-      await logWebhookReceipt(event?.type || 'mail_received', event, 'gmail');
+      await logWebhookReceipt(event?.type || 'mail_received', event, 'gmail', { emitActivity: false });
       console.log('[WEBHOOK/GMAIL] Received event:', event?.type || 'unknown');
 
       // Unipile sends a wrapper with type + payload
@@ -2775,7 +2793,7 @@ export function initDashboard(state) {
     res.json({ ok: true }); // Acknowledge immediately
     try {
       const event = req.body;
-      await logWebhookReceipt(event?.event || event?.type || 'mail_received', event, 'outlook');
+      await logWebhookReceipt(event?.event || event?.type || 'mail_received', event, 'outlook', { emitActivity: false });
       console.log('[WEBHOOK/OUTLOOK] Received event:', event?.event || event?.type || 'unknown');
 
       const payload   = event?.data || event;
@@ -3223,78 +3241,27 @@ export function initDashboard(state) {
       }
       const mode = await processUnipileMessageEvent(event);
       if (mode === 'email') {
-        const sb = getSupabase();
         const payload = event?.data || event || {};
-        // Inbound email reply from investor — mark contact as replied + notify
         const fromEmail = payload?.from_attendee?.identifier || payload?.from?.email || payload?.from_email || payload?.from || '';
         const fromName  = payload?.from_attendee?.display_name || payload?.from_name || '';
         const subject   = payload?.subject || '';
-        // Prefer plain-text; fall back to HTML and strip tags so Telegram/activity feed is readable.
         const rawBody   = payload?.body_plain || payload?.body_text || payload?.text || payload?.message || payload?.snippet || payload?.body || payload?.html || '';
         const body      = stripHtml(rawBody);
         const threadId  = payload?.thread_id || payload?.threadId || payload?.conversation_id || payload?.in_reply_to?.id || '';
         const messageId = payload?.id || payload?.message_id || payload?.email_id || '';
         console.log(`[WEBHOOKS/UNIPILE] mail_received from: ${fromEmail} subject: ${subject}`);
 
-        if (sb && fromEmail) {
-          // Find contact by email
-          const { data: contact } = await sb.from('contacts')
-            .select('id, name, company_name, deal_id, deals!contacts_deal_id_fkey(name, status)')
-            .ilike('email', fromEmail)
-            .limit(1)
-            .single();
-
-          if (contact && String(contact.deals?.status || 'ACTIVE').toUpperCase() === 'ACTIVE') {
-            // Mark as replied
-            await sb.from('contacts').update({
-              response_received: true,
-              pipeline_stage: 'In Conversation',
-              follow_up_due_at: null,
-            }).eq('id', contact.id);
-
-            const dealName = contact.deals?.name || 'Unknown deal';
-            pushActivity({
-              type: 'reply',
-              activity_badge: 'replied',
-              action: `Email replied: ${contact.name}`,
-              note: `${truncateInline(body, 120)} · ${dealName}${contact.company_name ? ` · ${contact.company_name}` : ''}${subject ? ` · "${truncateInline(subject, 80)}"` : ''}`,
-              full_content: body || null,
-              dealId: contact.deal_id,
-              deal_name: dealName,
-            });
-
-            // Queue with debounce for contextual reply drafting
-            queueInboundWithDebounce({
-              fromEmail,
-              fromName: contact.name || fromName,
-              subject,
-              bodyText: body,
-              threadId,
-              messageId,
-              channel: 'email',
-              raw: payload,
-            }).catch(() => {});
-
-            pushActivity({
-              type: 'approval',
-              action: `Next action: draft email reply for ${contact.name}`,
-              note: `Matched to deal ${dealName} · contextual reply workflow queued`,
-              full_content: body || null,
-              dealId: contact.deal_id,
-              deal_name: dealName,
-            });
-          } else {
-            console.log(`[WEBHOOKS/UNIPILE] mail_received — no contact found for ${fromEmail}`);
-            pushActivity({
-              type: 'email',
-              activity_badge: 'email',
-              action: `Inbound email received: ${fromName || fromEmail}`,
-              note: contact
-                ? `${contact.name} matched a non-active deal, so no active deal workflow was triggered${subject ? ` · "${truncateInline(subject, 80)}"` : ''}`
-                : `No active deal match${subject ? ` · "${truncateInline(subject, 80)}"` : ''}${body ? ` · ${truncateInline(body, 120)}` : ''}`,
-              full_content: body || null,
-            });
-          }
+        if (fromEmail) {
+          await queueInboundWithDebounce({
+            fromEmail,
+            fromName,
+            subject,
+            bodyText: body,
+            threadId,
+            messageId,
+            channel: 'email',
+            raw: payload,
+          });
         }
       }
     } catch (err) {
@@ -4282,6 +4249,10 @@ function registerRoutes(app) {
 
             // Log to activity_log so email sent metrics increment
             let contactForLog = null;
+            const emailSentActivityAt = new Date().toISOString();
+            const emailSentActivityKey = sendResult?.emailId
+              ? `email_sent:${sendResult.emailId}`
+              : `email_sent:${queueItem.contact_id || queueItem.contact_email || queueItem.contact_name || 'unknown'}:${emailSentActivityAt}`;
             try {
               const result = await sb.from('contacts').select('deal_id').eq('id', queueItem.contact_id).single();
               contactForLog = result?.data || null;
@@ -4299,7 +4270,7 @@ function registerRoutes(app) {
                 const followUpMatch = stageLabel.match(/follow[- ]up\s*(\d+)/i);
                 const followUpNumber = followUpMatch ? Number(followUpMatch[1] || 1) : 0;
                 const nextFollowUpPlan = getNextFollowUpPlanForChannel(sequence, dealRow || null, 'email', followUpNumber);
-                const sentAt = new Date().toISOString();
+                const sentAt = emailSentActivityAt;
                 const nextFollowUpDueAt = nextFollowUpPlan?.delayDays
                   ? new Date(Date.now() + nextFollowUpPlan.delayDays * 24 * 60 * 60 * 1000).toISOString()
                   : null;
@@ -4316,8 +4287,10 @@ function registerRoutes(app) {
                 await sb.from('activity_log').insert({
                   deal_id:    contactForLog.deal_id,
                   event_type: 'EMAIL_SENT',
-                  summary:    `Email sent to ${queueItem.contact_name || ''} at ${queueItem.firm || ''}`,
+                  summary:    `Email sent: ${queueItem.contact_name || 'contact'}`,
                   detail:     {
+                    activity_key: emailSentActivityKey,
+                    message: [queueItem.firm || '', finalSubject || ''].filter(Boolean).join(' · '),
                     channel: 'email',
                     account_id: sendResult?.accountId || null,
                     provider_id: sendResult?.providerId || null,
@@ -4332,8 +4305,10 @@ function registerRoutes(app) {
 
             pushActivity({
               type:   'email',
+              activity_key: emailSentActivityKey,
               action: `Email sent: ${queueItem.contact_name || ''}`,
               note:   `${queueItem.firm || ''} · ${finalSubject}`,
+              persist: false,
             });
             await sendTelegram(
               `✅ *Email sent* → *${queueItem.contact_name || 'contact'}* (${queueItem.firm || contactRow?.company_name || 'unknown firm'})${finalSubject ? `\nSubject: _${sanitizeApprovalText(finalSubject)}_` : ''}`
@@ -8529,7 +8504,8 @@ function registerRoutes(app) {
       const { handleMessage } = await import('../core/jarvis.js');
       const effectiveChatId = chatId || 'dashboard-orb';
       const reply = await handleMessage(effectiveChatId, message.trim(), dealId || null);
-      res.json({ reply: reply || '' });
+      const action = await resolveJarvisDashboardAction(message, dealId || null).catch(() => null);
+      res.json({ reply: reply || '', action });
     } catch (err) {
       console.error('[JARVIS ORB]', err.message);
       res.status(500).json({ error: err.message });
@@ -8654,6 +8630,16 @@ export function pushActivity(entry, legacyType) {
     || 'System event';
   const deal_id = entry.deal_id || entry.dealId || null;
   const enriched = { ...entry, type, action, note, message, deal_id, timestamp: new Date().toISOString() };
+
+  const fingerprint = buildActivityFingerprint(enriched);
+  const now = Date.now();
+  const isRecentDuplicate = activityFeed.some(existing => {
+    if (buildActivityFingerprint(existing) !== fingerprint) return false;
+    const ts = getActivityTimestamp(existing);
+    return ts && now - ts < 10 * 60 * 1000;
+  });
+  if (isRecentDuplicate) return;
+
   activityFeed.push(enriched);
   if (activityFeed.length > MAX_FEED) activityFeed.shift();
 
@@ -8665,7 +8651,7 @@ export function pushActivity(entry, legacyType) {
 
   // Persist to Supabase activity_log — try new schema, fall back to old
   const sb = getSupabase();
-  if (sb) {
+  if (sb && entry.persist !== false) {
     sb.from('activity_log').insert({
       deal_id,
       type,
@@ -8686,6 +8672,108 @@ export function pushActivity(entry, legacyType) {
 
 export function notifyQueueUpdated(count = null) {
   if (wss) broadcastToAll({ type: 'QUEUE_UPDATED', count });
+}
+
+async function resolveJarvisDashboardAction(message, dealId = null) {
+  const text = String(message || '').trim();
+  const lower = text.toLowerCase();
+  if (!text) return null;
+
+  if (/\b(approval|approve|queue|drafts?)\b/.test(lower)) return { type: 'open_view', view: 'queue' };
+  if (/\b(analytics|weekly report|daily report|reports?)\b/.test(lower)) return { type: 'open_view', view: 'analytics' };
+  if (/\b(transcript|meeting notes?|meetings?)\b/.test(lower)) return { type: 'open_view', view: 'transcripts' };
+  if (/\b(activity|live log|activity log)\b/.test(lower)) return { type: 'open_view', view: 'activity' };
+
+  const sb = getSupabase();
+  if (!sb) {
+    if (/\b(database|investor database)\b/.test(lower)) return { type: 'open_view', view: 'database' };
+    if (/\b(pipeline|record|responder|responded|replied)\b/.test(lower)) return { type: 'open_view', view: 'pipeline' };
+    return null;
+  }
+
+  if (/\b(last|latest|most recent)\b/.test(lower) && /\b(responder|responded|replied|reply|response)\b/.test(lower)) {
+    let latest = null;
+    try {
+      let query = sb.from('conversation_messages')
+        .select('contact_id, deal_id, contact_name, received_at, sent_at, created_at')
+        .eq('direction', 'inbound')
+        .not('contact_id', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      if (dealId) query = query.eq('deal_id', dealId);
+      const { data } = await query;
+      latest = (data || [])
+        .sort((a, b) => new Date(b.received_at || b.sent_at || b.created_at || 0) - new Date(a.received_at || a.sent_at || a.created_at || 0))[0] || null;
+    } catch {}
+
+    if (!latest) {
+      try {
+        let query = sb.from('contacts')
+          .select('id, deal_id, name, last_reply_at')
+          .not('last_reply_at', 'is', null)
+          .order('last_reply_at', { ascending: false })
+          .limit(1);
+        if (dealId) query = query.eq('deal_id', dealId);
+        const { data } = await query;
+        const contact = data?.[0] || null;
+        if (contact) latest = { contact_id: contact.id, deal_id: contact.deal_id, contact_name: contact.name };
+      } catch {}
+    }
+
+    if (latest?.contact_id) {
+      return { type: 'open_contact', view: 'pipeline', contactId: latest.contact_id, dealId: latest.deal_id || dealId || null, label: latest.contact_name || 'Last responder' };
+    }
+    return { type: 'open_view', view: 'pipeline' };
+  }
+
+  const wantsRecord = /\b(open|show|pull up|go to|find|view)\b/.test(lower)
+    && /\b(record|profile|pipeline|database|investor|contact|thing)\b/.test(lower);
+  if (wantsRecord) {
+    const cleaned = lower
+      .replace(/\b(open|show|pull|up|go|to|find|view|please|can|you|me|the|inside|in|dashboard|record|profile|pipeline|database|investor|contact|thing|section|for|of)\b/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const terms = cleaned.split(/\s+/).filter(term => term.length > 1).slice(0, 4);
+
+    if (terms.length) {
+      const nameProbe = terms.join(' ');
+      try {
+        let query = sb.from('contacts')
+          .select('id, deal_id, name, company_name, updated_at')
+          .ilike('name', `%${terms[0]}%`)
+          .order('updated_at', { ascending: false })
+          .limit(20);
+        if (dealId) query = query.eq('deal_id', dealId);
+        const { data } = await query;
+        const matches = (data || []).filter(row => {
+          const haystack = `${row.name || ''} ${row.company_name || ''}`.toLowerCase();
+          return terms.every(term => haystack.includes(term)) || haystack.includes(nameProbe);
+        });
+        const contact = matches[0] || data?.[0] || null;
+        if (contact) return { type: 'open_contact', view: 'pipeline', contactId: contact.id, dealId: contact.deal_id || dealId || null, label: contact.name || 'Contact' };
+      } catch {}
+
+      if (/\b(database|investor database|investor)\b/.test(lower)) {
+        try {
+          const { data } = await sb.from('investors_db')
+            .select('id, name, company_name, updated_at')
+            .or(`name.ilike.%${terms[0]}%,company_name.ilike.%${terms[0]}%`)
+            .order('updated_at', { ascending: false })
+            .limit(10);
+          const match = (data || []).find(row => {
+            const haystack = `${row.name || ''} ${row.company_name || ''}`.toLowerCase();
+            return terms.every(term => haystack.includes(term));
+          }) || data?.[0] || null;
+          if (match) return { type: 'open_investor_db', view: 'database', investorId: match.id, label: match.name || match.company_name || 'Investor' };
+        } catch {}
+      }
+    }
+  }
+
+  if (/\b(database|investor database)\b/.test(lower)) return { type: 'open_view', view: 'database' };
+  if (/\b(pipeline)\b/.test(lower)) return { type: 'open_view', view: 'pipeline' };
+  return null;
 }
 
 // ─────────────────────────────────────────────
@@ -9028,10 +9116,34 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject,
   if (!contactKey) return;
 
   const batchKey  = `${channel}_${contactKey}`;
-  const msgEntry  = { content: bodyText.trim(), received_at: new Date(), channel, subject: subject || null, threadId: threadId || chatId || null, messageId, emailAccountId: emailAccountId || null, raw };
+  const msgEntry  = {
+    content: bodyText.trim(),
+    received_at: new Date(),
+    channel,
+    subject: subject || null,
+    threadId: threadId || chatId || null,
+    messageId,
+    emailAccountId: emailAccountId || null,
+    fromEmail: normalizedEmail || null,
+    fromUrn: fromUrn || null,
+    fromName: fromName || null,
+    chatId: chatId || null,
+    raw,
+  };
+  const messageDedupeKey = messageId
+    ? `${channel}:message:${messageId}`
+    : `${channel}:${contactKey}:${subject || ''}:${bodyText.trim().slice(0, 240)}`;
+  if (isDuplicateInboundReply(messageDedupeKey)) {
+    console.log(`[REPLY] Duplicate inbound ${channel} message suppressed for ${contactKey}`);
+    return;
+  }
 
   if (replyDebounceMap.has(batchKey)) {
     const existing = replyDebounceMap.get(batchKey);
+    if (messageId && existing.messages.some(message => String(message.messageId || '') === String(messageId))) {
+      console.log(`[REPLY] Duplicate batched message suppressed for ${contactKey}`);
+      return;
+    }
     clearTimeout(existing.timer);
     existing.messages.push(msgEntry);
     existing.timer = setTimeout(() => flushReplyBatch(batchKey), REPLY_DEBOUNCE_MS);
@@ -9051,6 +9163,23 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject,
 
     if (!ctx.contact) {
       console.log(`[REPLY] No active deal/contact context for ${contactKey} — logged receipt only`);
+      pushActivity({
+        type: channel === 'linkedin' ? 'linkedin' : 'email',
+        activity_badge: channel === 'linkedin' ? 'linkedin' : 'email',
+        activity_key: messageId ? `unmatched_inbound:${channel}:${messageId}` : null,
+        action: `${channel === 'linkedin' ? 'Inbound LinkedIn DM received' : 'Inbound email received'}: ${fromName || normalizedEmail || fromUrn || contactKey}`,
+        note: buildInboundMessageNote([
+          subject ? `Subject: "${subject}"` : null,
+          bodyText || null,
+        ]),
+        full_content: bodyText || null,
+        meta: {
+          matched_active_deal: false,
+          from_email: normalizedEmail || null,
+          provider_id: fromUrn || null,
+          subject: subject || null,
+        },
+      });
       return;
     }
 
@@ -9115,6 +9244,13 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
         if (linkedinContact) return { contact: linkedinContact, deal: linkedinContact.deals || null, campaign: null, mode: 'investor_outreach' };
       }
     }
+    if (channel === 'linkedin' && fromName && fromName.trim().split(/\s+/).length >= 2) {
+      const contact = await findInvestorContactByDisplayName(sb, fromName, { requireActiveDeal: true });
+      if (contact) {
+        console.log(`[RESOLVE] Matched LinkedIn sender by name "${fromName}" → ${contact.name}`);
+        return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
+      }
+    }
     if (channel === 'email' && fromEmail) {
       const contact = await findInvestorContactByEmail(sb, fromEmail, { requireActiveDeal: true });
       if (contact) return { contact, deal: contact.deals || null, campaign: null, mode: 'investor_outreach' };
@@ -9159,6 +9295,37 @@ async function resolveContactAndContext({ contactKey, channel, fromEmail, fromUr
   } catch {}
 
   return { contact: null, deal: null, campaign: null, mode: null };
+}
+
+function validateMatchedReplyContext({ contact, deal, campaign, mode, channel, messages = [] }) {
+  const reasons = [];
+  const hasPerson = !!(contact?.id && String(contact?.name || '').trim());
+  const activeDealVerified = mode === 'investor_outreach'
+    ? !!(deal?.id && String(deal?.status || '').toUpperCase() === 'ACTIVE')
+    : !!(campaign?.id && !['closed', 'archived', 'paused'].includes(String(campaign?.status || '').toLowerCase()));
+  const firmVerified = !!(
+    contact?.firm_id ||
+    String(contact?.company_name || '').trim() ||
+    String(campaign?.firm_name || '').trim() ||
+    String(contact?.target_companies?.company_name || '').trim()
+  );
+  const validContactDetails = channel === 'email'
+    ? !!(
+        normalizeInboundEmail(contact?.email) ||
+        messages.some(msg => normalizeInboundEmail(msg?.fromEmail || msg?.raw?.from_email || msg?.raw?.from_attendee?.identifier))
+      )
+    : !!(
+        contact?.linkedin_provider_id ||
+        contact?.unipile_chat_id ||
+        messages.some(msg => msg?.chatId || msg?.fromUrn || msg?.raw?.chat_id || msg?.raw?.sender?.attendee_provider_id)
+      );
+
+  if (!hasPerson) reasons.push('missing_person_match');
+  if (!activeDealVerified) reasons.push('not_verified_active_deal');
+  if (!firmVerified) reasons.push('missing_verified_firm');
+  if (!validContactDetails) reasons.push('missing_valid_contact_details');
+
+  return { ok: reasons.length === 0, reasons };
 }
 
 async function processRocoBatchedReply(batch) {
@@ -9210,6 +9377,31 @@ async function processRocoBatchedReply(batch) {
         unipileMessageId: msg?.messageId || null,
       }).catch(() => {});
     }
+  }
+
+  const replyContextValidation = validateMatchedReplyContext({ contact, deal, campaign, mode, channel, messages });
+  if (!replyContextValidation.ok) {
+    const reasonText = replyContextValidation.reasons.join(', ');
+    await sb?.from('activity_log').insert({
+      deal_id:    deal?.id || null,
+      contact_id: contact?.id || null,
+      event_type: 'REPLY_REVIEW_SKIPPED',
+      summary:    `[${contextName}]: Reply automation skipped for ${contact?.name || 'unknown contact'}`,
+      detail:     {
+        reasons: replyContextValidation.reasons,
+        channel,
+        content_preview: combinedContent.slice(0, 240),
+      },
+    }).catch(() => {});
+    pushActivity({
+      type: 'system',
+      action: `Reply automation skipped: ${contact?.name || 'unknown contact'}`,
+      note: `${contextName} · ${reasonText}`,
+      dealId: deal?.id || null,
+      deal_name: deal?.name || null,
+      persist: false,
+    });
+    return;
   }
 
   // Load conversation history — prefer conversation_messages table, fall back to activity_log
@@ -9281,6 +9473,16 @@ async function processRocoBatchedReply(batch) {
     }).catch(() => {});
     return;
   }
+
+  await notifyInboundReplyClassified({
+    contact,
+    deal,
+    campaign,
+    contextName,
+    channel,
+    message: combinedContent,
+    classification,
+  });
 
   // ── CONVERSATION STATE MACHINE (investor_outreach only) ─────────────────────
   if (mode === 'investor_outreach' && contact?.id) {
@@ -9522,6 +9724,7 @@ Instructions:
 5. Use first name: "${firstName}"
 6. No em-dashes, no bullet points, no corporate language, 4-6 sentences max per reply
 7. Sound like a knowledgeable human counterpart, not an AI agent
+8. If the latest message is only an acknowledgement, sign-off, "okay", "thank you", "see you later", or otherwise does not require a useful response, set intent to conversation_end, next_action to continue or archive, and return messages_to_send as an empty array
 
 Return ONLY valid JSON (no markdown):
 {
@@ -9548,6 +9751,27 @@ Return ONLY valid JSON (no markdown):
     console.error(`[REPLY] classifyAndDraftRocoReply failed for ${contact.name}:`, err.message);
     return null;
   }
+}
+
+async function notifyInboundReplyClassified({ contact, deal, campaign, contextName, channel, message, classification }) {
+  const sentiment = String(classification?.sentiment || 'neutral').toLowerCase();
+  const intent = String(classification?.intent || 'unknown').toLowerCase();
+  const isPositive = sentiment === 'positive' || ['interested', 'asking_question', 'providing_info', 'considering'].includes(intent);
+  const isNegative = sentiment === 'negative' || ['not_interested', 'conversation_end'].includes(intent);
+  const marker = isPositive ? '🟩 Positive response' : isNegative ? '🟥 Negative response' : '⬜ Neutral response';
+  const quote = sanitizeApprovalText(message).slice(0, 900);
+  const firm = contact?.company_name || campaign?.firm_name || 'unknown firm';
+  const dealName = deal?.name || contextName || campaign?.name || 'Unknown deal';
+  await sendTelegram([
+    `*${marker}*`,
+    `Deal: *${sanitizeApprovalText(dealName)}*`,
+    `Person: *${sanitizeApprovalText(contact?.name || 'Unknown')}*`,
+    `Firm: *${sanitizeApprovalText(firm)}*`,
+    `Channel: ${channel === 'linkedin' ? 'LinkedIn' : 'Email'}`,
+    `Sentiment: ${sentiment} | Intent: ${intent}`,
+    '',
+    `They said: _${quote || 'No message body captured'}_`,
+  ].join('\n')).catch(() => {});
 }
 
 function detectResearchNeeded(content) {

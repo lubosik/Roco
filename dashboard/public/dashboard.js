@@ -5954,6 +5954,8 @@ let _activityLivePending = [];
 
 function activityEventKey(event) {
   if (!event) return '';
+  const semanticKey = event.activity_key || event.activityKey || event.detail?.activity_key || event.meta?.activity_key;
+  if (semanticKey) return `activity_key:${semanticKey}`;
   return String(
     event.id
     || [
@@ -10390,6 +10392,23 @@ const jarvisOrb = (() => {
     return actionKeywords.some(k => lower.includes(k));
   }
 
+  function applyDashboardAction(action) {
+    if (!action || typeof action !== 'object') return;
+    if (action.type === 'open_view' && action.view) {
+      navigate(`#${action.view}`);
+      return;
+    }
+    if (action.type === 'open_contact' && action.contactId) {
+      navigate(`#${action.view || 'pipeline'}`);
+      setTimeout(() => openContactSidePanel(action.contactId, action.dealId || null), 250);
+      return;
+    }
+    if (action.type === 'open_investor_db' && action.investorId) {
+      navigate(`#${action.view || 'database'}`);
+      setTimeout(() => openInvestorDatabaseSidePanel(action.investorId), 250);
+    }
+  }
+
   // ── dispatch transcript to JARVIS ─────────────────────────────────────────
   async function dispatch(text) {
     const cleanText = String(text || '').trim();
@@ -10415,6 +10434,7 @@ const jarvisOrb = (() => {
       if (!isActive || currentTurn !== turnVersion) return;
       const data  = await res.json();
       const reply = data.reply || data.error || '';
+      applyDashboardAction(data.action);
       if (needsAck) await waitForAck();  // let ack phrase finish before main response
       if (!isActive || currentTurn !== turnVersion) return;
       await speakText(reply);

@@ -117,6 +117,55 @@ async function buildPipelineHighlights(dealId) {
   }
 }
 
+async function buildTodaysReplyContext(dealId) {
+  const sb = getSupabase();
+  if (!sb || !dealId) return '';
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const since = start.toISOString();
+  try {
+    const events = [];
+
+    const { data: messages } = await sb.from('conversation_messages')
+      .select('contact_id, contact_name, channel, body, intent, received_at, sent_at, created_at, contacts(name, company_name, last_intent, last_intent_label)')
+      .eq('deal_id', dealId)
+      .eq('direction', 'inbound')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(12);
+
+    for (const row of messages || []) {
+      const contactName = row.contact_name || row.contacts?.name || 'Unknown';
+      const firm = row.contacts?.company_name || '';
+      const sentiment = row.contacts?.last_intent_label || row.intent || 'unknown';
+      events.push({
+        when: row.received_at || row.sent_at || row.created_at,
+        line: `${contactName}${firm ? ` at ${firm}` : ''} via ${row.channel || 'unknown'} (${sentiment}): "${String(row.body || '').replace(/\s+/g, ' ').slice(0, 160)}"`,
+      });
+    }
+
+    const { data: contacts } = await sb.from('contacts')
+      .select('name, company_name, last_reply_at, reply_channel, last_intent, last_intent_label, response_summary')
+      .eq('deal_id', dealId)
+      .gte('last_reply_at', since)
+      .order('last_reply_at', { ascending: false })
+      .limit(12);
+
+    const seen = new Set(events.map(event => event.line.toLowerCase().slice(0, 80)));
+    for (const row of contacts || []) {
+      const line = `${row.name}${row.company_name ? ` at ${row.company_name}` : ''} via ${row.reply_channel || 'unknown'} (${row.last_intent_label || row.last_intent || 'unknown'}): "${String(row.response_summary || '').replace(/\s+/g, ' ').slice(0, 160)}"`;
+      const key = line.toLowerCase().slice(0, 80);
+      if (!seen.has(key)) events.push({ when: row.last_reply_at, line });
+    }
+
+    if (!events.length) return 'TODAY\'S ACTIVE-DEAL RESPONSES: none recorded yet.';
+    events.sort((a, b) => new Date(b.when || 0) - new Date(a.when || 0));
+    return `TODAY'S ACTIVE-DEAL RESPONSES (${events.length}):\n${events.slice(0, 10).map(event => `  ${event.line}`).join('\n')}`;
+  } catch {
+    return '';
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DEAL TIMELINE & VELOCITY CONTEXT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +280,7 @@ PACE PROJECTION (at current rate, ${workingDaysLeft} outreach days left):
 async function buildSystemPrompt(deal, metrics) {
   const memoryCtx    = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
   const highlights   = deal ? await buildPipelineHighlights(deal.id) : '';
+  const todaysReplies = deal ? await buildTodaysReplyContext(deal.id) : '';
   const timelineSection = deal ? await buildDealTimeline(deal) : '';
 
   const dealSection = deal ? `
@@ -266,7 +316,7 @@ LIVE PIPELINE:
 You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
 
 ${dealSection}
-${metricsSection}${timelineSection}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
+${metricsSection}${timelineSection}${todaysReplies ? `${todaysReplies}\n` : ''}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 

@@ -674,6 +674,10 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
   try {
     const chatId = process.env.TELEGRAM_CHAT_ID;
     const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    if (queueItemId) {
+      const sb = getSupabase();
+      await sb?.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueItemId).catch(() => {});
+    }
 
     pendingApprovals.set(sent.message_id, {
       name,
@@ -2227,13 +2231,19 @@ async function executeReloadedApproval(item, decision) {
     } catch {}
   }
 
+  const emailSentAt = new Date().toISOString();
+  const emailSentActivityKey = sendResult?.emailId
+    ? `email_sent:${sendResult.emailId}`
+    : `email_sent:${item.contact_id || item.contact_email || item.contact_name || 'unknown'}:${emailSentAt}`;
   if (dealId) {
     try {
       await sb.from('activity_log').insert({
         deal_id: dealId,
         event_type: 'EMAIL_SENT',
-        summary: `Email sent to ${item.contact_name || ''} at ${item.firm || ''}`,
+        summary: `Email sent: ${item.contact_name || 'contact'}`,
         detail: {
+          activity_key: emailSentActivityKey,
+          message: [item.firm || '', approvedSubject || ''].filter(Boolean).join(' · '),
           channel: 'email',
           account_id: sendResult?.accountId || null,
           provider_id: sendResult?.providerId || null,
@@ -2241,12 +2251,18 @@ async function executeReloadedApproval(item, decision) {
           thread_id: sendResult?.threadId || null,
           to: toEmail,
         },
-        created_at: new Date().toISOString(),
+        created_at: emailSentAt,
       });
     } catch {}
   }
 
-  pushActivity({ type: 'email', action: `Email sent: ${item.contact_name || ''}`, note: `${item.firm || ''} · ${approvedSubject}` });
+  pushActivity({
+    type: 'email',
+    activity_key: emailSentActivityKey,
+    action: `Email sent: ${item.contact_name || ''}`,
+    note: `${item.firm || ''} · ${approvedSubject}`,
+    persist: false,
+  });
   await sendTelegram(
     `✅ *Email sent* → *${item.contact_name || 'contact'}* (${item.firm || 'unknown firm'})${approvedSubject ? `\nSubject: _${sanitizeApprovalText(approvedSubject)}_` : ''}`
   ).catch(() => {});
@@ -2254,6 +2270,27 @@ async function executeReloadedApproval(item, decision) {
 }
 
 function buildReloadedApprovalEntry(item) {
+  const messageType = String(item.message_type || '').toLowerCase();
+  const channel = String(item.channel || (messageType.includes('linkedin') ? 'linkedin' : 'email')).toLowerCase();
+  if (messageType === 'email_reply' || messageType === 'linkedin_reply' || /reply/i.test(item.stage || '')) {
+    const body = item.edited_body || item.message_text || item.body || '';
+    return {
+      name: item.contact_name || 'Unknown',
+      firm: item.firm || '',
+      isReply: true,
+      queueId: item.id,
+      replyApproval: {
+        queueItemId: item.id,
+        channel,
+        replyToId: item.reply_to_id || null,
+        contactId: item.contact_id || null,
+        contactEmail: item.contact_email || null,
+        replyBody: body,
+        subject: item.subject_a || item.subject || null,
+      },
+      replayed: true,
+    };
+  }
   return {
     name: item.contact_name || 'Unknown',
     firm: item.firm || '',
@@ -2279,7 +2316,7 @@ async function reloadApprovalForTelegramMessage(msgId, queueId = null) {
     let item = null;
     if (queueId) {
       const byQueue = await sb.from('approval_queue')
-        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
+        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, message_text, message_type, channel, reply_to_id, outreach_mode, telegram_msg_id, status')
         .eq('id', queueId)
         .maybeSingle();
       if (byQueue.error) throw byQueue.error;
@@ -2287,7 +2324,7 @@ async function reloadApprovalForTelegramMessage(msgId, queueId = null) {
     }
     if (!item && msgId) {
       const byTelegram = await sb.from('approval_queue')
-        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, outreach_mode, telegram_msg_id, status')
+        .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, message_text, message_type, channel, reply_to_id, outreach_mode, telegram_msg_id, status')
         .eq('telegram_msg_id', msgId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -2325,7 +2362,7 @@ export async function reloadPendingInvestorApprovals() {
   );
 
   const { data: pending } = await sb.from('approval_queue')
-    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, outreach_mode, telegram_msg_id')
+    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, message_text, message_type, channel, reply_to_id, outreach_mode, telegram_msg_id')
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(30);

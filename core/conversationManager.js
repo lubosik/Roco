@@ -16,10 +16,14 @@ export async function getConversationHistory(contactId, dealId = null) {
     .from('conversation_messages')
     .select('*')
     .eq('contact_id', contactId)
-    .order('sent_at', { ascending: true });
+    .order('created_at', { ascending: true });
   if (dealId) query = query.eq('deal_id', dealId);
   const { data } = await query;
-  return data || [];
+  return (data || []).sort((a, b) => {
+    const aTime = new Date(a.sent_at || a.received_at || a.created_at || 0).getTime();
+    const bTime = new Date(b.sent_at || b.received_at || b.created_at || 0).getTime();
+    return aTime - bTime;
+  });
 }
 
 export async function logConversationMessage({ contactId, dealId, direction, channel, subject, body, unipileMessageId, templateName }) {

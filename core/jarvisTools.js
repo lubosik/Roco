@@ -606,12 +606,23 @@ async function toolGetRecentActivity({ deal_id, limit = 15 }) {
       .sort((a, b) => (b.when || '').localeCompare(a.when || ''))
       .slice(0, cap);
 
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayIso = todayStart.toISOString();
+    const repliesToday = deduped.filter(e =>
+      e.type === 'reply_received' &&
+      e.when &&
+      new Date(e.when).getTime() >= new Date(todayIso).getTime()
+    );
+
     // Summary counts
     const repliesTotal = (replies || []).length;
     const meetingsTotal = (recentContacts || []).filter(c => c.meeting_booked_at).length;
 
     return {
       total_events:   deduped.length,
+      replies_today:  repliesToday.length,
+      reply_events_today: repliesToday.map(e => ({ summary: e.summary, when: e.when })),
       replies_7d:     repliesTotal,
       meetings_7d:    meetingsTotal,
       events: deduped.map(e => ({ type: e.type, summary: e.summary, when: e.when })),
@@ -1412,6 +1423,8 @@ async function toolGetPipelineContacts({ deal_id, filter, limit = 20 }) {
       filter,
       count: (data || []).length,
       contacts: (data || []).map(c => ({
+        id:                 c.id,
+        deal_id,
         name:               c.name,
         firm:               c.company_name,
         stage:              c.pipeline_stage,
