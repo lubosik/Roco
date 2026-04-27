@@ -6079,6 +6079,8 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
       ? event.full_content
       : stringifyActivityField(event.action || event.summary || '');
     const note  = stringifyActivityField(event.note || event.detail || '');
+    const fullContent = stringifyActivityField(event.full_content || '');
+    const showFullMessage = fullContent && !isExpandedType && fullContent !== mainText && fullContent !== note;
 
     return `<div style="padding:10px 14px;background:rgba(${color === '#A78BFA' ? '167,139,250' : '138,134,128'},0.06);
                         border-left:3px solid ${color};border-radius:0 4px 4px 0;margin-bottom:5px">
@@ -6096,6 +6098,10 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
         ${esc(mainText)}
       </div>
       ${note ? `<div style="margin-top:3px;font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">${esc(note)}</div>` : ''}
+      ${showFullMessage ? `<details style="margin-top:8px">
+        <summary style="cursor:pointer;color:#C9A84C;font-size:10px;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">View full message</summary>
+        <div style="margin-top:6px;padding:8px;background:rgba(0,0,0,0.22);border:1px solid #242424;border-radius:6px;color:#D8D2C8;font-size:11px;line-height:1.55;white-space:pre-wrap;max-height:320px;overflow:auto">${esc(fullContent)}</div>
+      </details>` : ''}
     </div>`;
   }).join('') || '<div style="color:#3A3835;font-size:12px;padding:16px 0">No activity yet.</div>';
 

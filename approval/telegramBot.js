@@ -648,15 +648,21 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
   const company     = contact?.company_name || '';
   const channelLbl  = channel === 'linkedin' ? 'LinkedIn' : 'Email';
   const replyLabel  = String(options.replyLabel || '').trim();
-  const quotePreview = String(options.quotePreview || '').trim();
+  const inboundSubject = String(options.inboundSubject || '').trim();
+  const inboundBody = String(options.inboundBody || '').trim();
+  const quotePreview = String(options.quotePreview || inboundBody.slice(0, 220)).trim();
+  const intent = String(options.intent || '').trim();
+  const sentiment = String(options.sentiment || '').trim();
 
   const msg = [
     `💬 *Reply Queued — ${channelLbl}*`,
     ``,
     `To: *${name}*${company ? ` (${company})` : ''}`,
     `[${contextName}]`,
+    inboundSubject ? `Subject: _${inboundSubject.substring(0, 140)}_` : null,
+    intent || sentiment ? `Intent: ${intent || 'unknown'}${sentiment ? ` | Sentiment: ${sentiment}` : ''}` : null,
     replyLabel ? `Replying to: ${replyLabel}` : null,
-    quotePreview ? `Quoted message: _${quotePreview}_` : null,
+    quotePreview ? `They said: _${quotePreview.substring(0, 360)}_` : null,
     ``,
     '```',
     String(replyBody || '').substring(0, 600),
@@ -680,6 +686,10 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
         replyToId,
         replyLabel,
         quotePreview,
+        inboundSubject,
+        inboundBody,
+        intent,
+        sentiment,
         contactId:       contact?.id,
         contactEmail:    contact?.email,
         replyBody:       replyBody,

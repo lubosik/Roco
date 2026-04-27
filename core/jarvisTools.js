@@ -189,7 +189,7 @@ export const JARVIS_TOOLS = [
   },
   {
     name: 'update_contact',
-    description: 'Update a contact\'s pipeline/campaign stage, tier, notes, email, or LinkedIn URL. Works on investor pipeline contacts first, then sourcing campaign contacts. Use this when Dom tells you someone replied, moved Kanban stages, became exhausted, gave new info, or should be re-classified. Fuzzy name match — partial names work.',
+    description: 'Update a contact\'s pipeline/campaign stage, tier, notes, sentiment, intent, email, or LinkedIn URL. Works on investor pipeline contacts first, then sourcing campaign contacts. Use this when Dom tells you someone replied, moved Kanban stages, became exhausted, gave new info, or should be re-classified. Fuzzy name match — partial names work.',
     input_schema: {
       type: 'object',
       properties: {
@@ -198,6 +198,8 @@ export const JARVIS_TOOLS = [
         pipeline_stage: { type: 'string', description: 'New pipeline stage: Researched, invite_sent, invite_accepted, Email Sent, Replied, Meeting Booked, Archived' },
         tier:           { type: 'string', description: 'Contact tier: hot, warm, possible, archive' },
         notes:          { type: 'string', description: 'Notes to append (added to existing notes, not overwritten)' },
+        intent:         { type: 'string', description: 'Latest reply intent, e.g. interested, not_interested, asking_question, meeting_request, neutral' },
+        sentiment:      { type: 'string', enum: ['positive', 'neutral', 'negative'], description: 'Latest contact sentiment shown in the pipeline' },
         email:          { type: 'string', description: 'Update or set email address' },
         linkedin_url:   { type: 'string', description: 'Update or set LinkedIn profile URL' },
       },
@@ -214,6 +216,7 @@ export const JARVIS_TOOLS = [
         contact_name: { type: 'string', description: 'Name or partial name of the contact who replied' },
         message:      { type: 'string', description: 'The reply content or summary of what they said' },
         intent:       { type: 'string', description: 'Intent classification: interested, not_interested, more_info, meeting_request, follow_up_later, unsubscribe, other' },
+        sentiment:    { type: 'string', enum: ['positive', 'neutral', 'negative'], description: 'Sentiment classification for the reply' },
         action_note:  { type: 'string', description: 'Optional: what Dom wants to do next (e.g. "follow up in 2 weeks", "book a call")' },
       },
       required: ['deal_id', 'contact_name', 'message'],
@@ -907,7 +910,7 @@ async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) 
 }
 
 // ── update_contact ────────────────────────────────────────────────────────────
-async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, notes, email, linkedin_url }) {
+async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, notes, intent, sentiment, email, linkedin_url }) {
   const sb = getSupabase();
   if (!sb) return { error: 'Database unavailable' };
   try {
@@ -935,9 +938,14 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
       if (pipeline_stage) campaignPatch.pipeline_stage = pipeline_stage;
       if (email) campaignPatch.email = email;
       if (linkedin_url) campaignPatch.linkedin_url = linkedin_url;
-      if (notes) {
+      const campaignNoteParts = [
+        notes || null,
+        intent ? `Intent: ${intent}` : null,
+        sentiment ? `Sentiment: ${sentiment}` : null,
+      ].filter(Boolean);
+      if (campaignNoteParts.length) {
         const existing = campaignContact.notes ? `${campaignContact.notes}\n\n` : '';
-        campaignPatch.notes = `${existing}[JARVIS ${new Date().toISOString().slice(0, 10)}] ${notes}`;
+        campaignPatch.notes = `${existing}[JARVIS ${new Date().toISOString().slice(0, 10)}] ${campaignNoteParts.join(' · ')}`;
       }
       campaignPatch.updated_at = new Date().toISOString();
       if (Object.keys(campaignPatch).length <= 1) return { error: 'No fields provided to update' };
@@ -967,6 +975,8 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
     const patch = {};
     if (pipeline_stage) patch.pipeline_stage = pipeline_stage;
     if (tier) patch.tier = tier;
+    if (intent) patch.last_intent = intent;
+    if (sentiment) patch.last_intent_label = sentiment;
     if (email) patch.email = email;
     if (linkedin_url) patch.linkedin_url = linkedin_url;
     if (notes) {
@@ -1003,7 +1013,7 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
 }
 
 // ── record_reply ──────────────────────────────────────────────────────────────
-async function toolRecordReply({ deal_id, contact_name, message, intent, action_note }) {
+async function toolRecordReply({ deal_id, contact_name, message, intent, sentiment, action_note }) {
   const sb = getSupabase();
   if (!sb) return { error: 'Database unavailable' };
   try {
@@ -1041,18 +1051,20 @@ async function toolRecordReply({ deal_id, contact_name, message, intent, action_
       last_reply_at: new Date().toISOString(),
       response_received: true,
       reply_channel: 'manual',
+      last_intent: intent || 'other',
+      last_intent_label: sentiment || 'neutral',
       updated_at: new Date().toISOString(),
     }).eq('id', contact.id);
 
     await writeMemory(deal_id, {
       type:    'REPLY',
       subject: `Reply from ${contact.name} at ${contact.company_name}`,
-      content: `${contact.name} (${contact.company_name}) replied. Intent: ${intent || 'unknown'}. Message: "${message.slice(0, 400)}".${action_note ? ` Planned action: ${action_note}` : ''}`,
-      tags:    [`contact:${(contact.name || '').toLowerCase().replace(/\s+/g, '_')}`, `intent:${intent || 'other'}`],
+      content: `${contact.name} (${contact.company_name}) replied. Intent: ${intent || 'unknown'}. Sentiment: ${sentiment || 'neutral'}. Message: "${message.slice(0, 400)}".${action_note ? ` Planned action: ${action_note}` : ''}`,
+      tags:    [`contact:${(contact.name || '').toLowerCase().replace(/\s+/g, '_')}`, `intent:${intent || 'other'}`, `sentiment:${sentiment || 'neutral'}`],
     });
     emitJarvisActivity(
       `Recorded reply: ${contact.name}`,
-      `${contact.company_name || ''} · ${intent || 'other'}${action_note ? ` · ${action_note}` : ''}`,
+      `${contact.company_name || ''} · ${intent || 'other'} · ${sentiment || 'neutral'}${action_note ? ` · ${action_note}` : ''}`,
       deal_id
     ).catch(() => {});
 
@@ -1062,6 +1074,7 @@ async function toolRecordReply({ deal_id, contact_name, message, intent, action_
       firm: contact.company_name,
       stage_now: newStage,
       intent: intent || 'other',
+      sentiment: sentiment || 'neutral',
     };
   } catch (err) {
     return { error: err.message };

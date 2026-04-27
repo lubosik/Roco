@@ -219,6 +219,13 @@ function sanitizeApprovalText(text) {
     .trim();
 }
 
+function buildInboundMessageNote(parts = []) {
+  return parts
+    .map(part => truncateInline(part, 120))
+    .filter(Boolean)
+    .join(' · ');
+}
+
 function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
   const normalizedType = String(
     eventType || payload?.type || payload?.event_type || payload?.event || 'unknown'
@@ -230,31 +237,46 @@ function buildWebhookReceiptActivity(eventType, payload, source = 'unipile') {
     const fromEmail = event?.from_attendee?.identifier || event?.from_email || event?.from?.email || event?.from || '';
     const fromName = event?.from_attendee?.display_name || event?.from_name || '';
     const subject = event?.subject || '';
-    const preview = truncateInline(extractUnipileEmailBody(event), 120);
+    const body = extractUnipileEmailBody(event);
+    const sender = fromName || fromEmail || 'unknown sender';
     return {
-      type: 'webhook',
-      action: `Webhook received: ${sourceLabel} email`,
-      note: [
-        fromName || fromEmail || 'unknown sender',
-        subject ? `"${truncateInline(subject, 90)}"` : null,
-        preview || null,
-      ].filter(Boolean).join(' · '),
-      meta: { event_type: normalizedType, source: sourceLabel },
+      type: 'email',
+      activity_badge: 'email',
+      action: `Inbound ${sourceLabel} email received: ${sender}`,
+      note: buildInboundMessageNote([
+        subject ? `Subject: "${subject}"` : null,
+        body || null,
+      ]),
+      full_content: body || null,
+      meta: {
+        event_type: normalizedType,
+        source: sourceLabel,
+        sender,
+        from_email: fromEmail || null,
+        subject: subject || null,
+        matched_active_deal: false,
+      },
     };
   }
 
   if (['message_received', 'message.created'].includes(normalizedType)) {
     const fromName = event?.sender?.attendee_name || event?.sender_name || event?.attendee_name || '';
     const fromProviderId = event?.sender?.attendee_provider_id || event?.sender_id || event?.attendee_id || '';
-    const preview = truncateInline(extractUnipileMessageText(event), 120);
+    const body = extractUnipileMessageText(event);
+    const sender = fromName || fromProviderId || 'unknown sender';
     return {
-      type: 'webhook',
-      action: `Webhook received: LinkedIn message`,
-      note: [
-        fromName || fromProviderId || 'unknown sender',
-        preview || null,
-      ].filter(Boolean).join(' · '),
-      meta: { event_type: normalizedType, source: sourceLabel },
+      type: 'linkedin',
+      activity_badge: 'linkedin',
+      action: `Inbound LinkedIn DM received: ${sender}`,
+      note: buildInboundMessageNote([body || null]),
+      full_content: body || null,
+      meta: {
+        event_type: normalizedType,
+        source: sourceLabel,
+        sender,
+        provider_id: fromProviderId || null,
+        matched_active_deal: false,
+      },
     };
   }
 
@@ -764,8 +786,7 @@ async function processUnipileMessageEvent(event) {
 
   if (['mail_received', 'email.received', 'email_received'].includes(eventType)) {
     await logWebhookReceipt(eventType, event, 'unipile_messages').catch(() => {});
-    console.warn('[WEBHOOKS/UNIPILE] Email event reached LinkedIn webhook endpoint; ignoring until webhook config is corrected');
-    return 'ignored_email';
+    return 'email';
   }
 
   await insertWebhookLogRecord({
@@ -1048,18 +1069,25 @@ function normalizeSheetRows(rows) {
 }
 
 function extractUnipileMessageText(message) {
-  return String(message?.text || message?.message || message?.body || '').trim();
+  return [
+    message?.text,
+    message?.message,
+    message?.body_plain,
+    message?.body,
+    message?.content,
+  ].map(stripHtml).find(Boolean) || '';
 }
 
 function extractUnipileEmailBody(message) {
-  return String(
-    message?.body_text
-    || message?.text
-    || message?.message
-    || message?.body
-    || message?.snippet
-    || ''
-  ).trim();
+  return [
+    message?.body_plain,
+    message?.body_text,
+    message?.text,
+    message?.message,
+    message?.snippet,
+    message?.body,
+    message?.html,
+  ].map(stripHtml).find(Boolean) || '';
 }
 
 function getUnipileMessageTimestamp(message) {
@@ -1932,7 +1960,7 @@ async function loadLinkedInConversationContext(contact) {
 }
 
 function truncateInline(value, max = 140) {
-  const text = String(value || '').trim();
+  const text = stripHtml(value).replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
@@ -2715,7 +2743,7 @@ export function initDashboard(state) {
       const fromEmail   = payload?.from_attendee?.identifier || payload?.from_email || '';
       const fromName    = payload?.from_attendee?.display_name || payload?.from_name || '';
       const subject     = payload?.subject || '';
-      const bodyText    = payload?.body || payload?.body_plain || payload?.text || '';
+      const bodyText    = payload?.body_plain || payload?.body_text || payload?.text || payload?.message || payload?.snippet || payload?.body || payload?.html || '';
       const threadId    = payload?.thread_id || payload?.in_reply_to?.id || payload?.conversation_id || '';
       const messageId   = payload?.id || payload?.message_id || '';
 
@@ -2772,7 +2800,7 @@ export function initDashboard(state) {
       const fromEmail = payload?.from_attendee?.identifier || payload?.from_email || '';
       const fromName  = payload?.from_attendee?.display_name || payload?.from_name || '';
       const subject   = payload?.subject || '';
-      const bodyText  = payload?.body_plain || payload?.body || payload?.text || '';
+      const bodyText  = payload?.body_plain || payload?.body_text || payload?.text || payload?.message || payload?.snippet || payload?.body || payload?.html || '';
       const threadId  = payload?.thread_id || payload?.in_reply_to?.id || payload?.conversation_id || '';
       const messageId = payload?.id || payload?.message_id || payload?.email_id || '';
 
@@ -2895,7 +2923,7 @@ export function initDashboard(state) {
       const payload   = event?.data || event;
       const fromUrn   = payload?.sender?.attendee_provider_id || payload?.sender_id || payload?.attendee_id || '';
       const fromName  = payload?.sender?.attendee_name || payload?.sender_name || payload?.attendee_name || '';
-      const bodyText  = payload?.message || payload?.text || payload?.body || '';
+      const bodyText  = payload?.message || payload?.text || payload?.body_plain || payload?.body || payload?.content || '';
       const chatId    = payload?.chat_id || payload?.conversation_id || '';
       const messageId = payload?.id || payload?.message_id || '';
 
@@ -2921,7 +2949,7 @@ export function initDashboard(state) {
       const fromProvId   = payload?.sender?.attendee_provider_id || payload?.sender_id || payload?.attendee_id || '';
       const fromName     = payload?.sender?.attendee_name || payload?.sender_name || payload?.attendee_name || '';
       const fromLinkedin = fromProvId ? `https://linkedin.com/in/${fromProvId}` : null;
-      const messageText  = payload?.message || payload?.text || payload?.body || '';
+      const messageText  = payload?.message || payload?.text || payload?.body_plain || payload?.body || payload?.content || '';
       const chatId       = payload?.chat_id || payload?.conversation_id || '';
       const messageId    = payload?.id || payload?.message_id || '';
 
@@ -3196,13 +3224,16 @@ export function initDashboard(state) {
       const mode = await processUnipileMessageEvent(event);
       if (mode === 'email') {
         const sb = getSupabase();
+        const payload = event?.data || event || {};
         // Inbound email reply from investor — mark contact as replied + notify
-        const fromEmail = event?.from?.email || event?.from_email || event?.from || '';
-        const subject   = event?.subject || '';
+        const fromEmail = payload?.from_attendee?.identifier || payload?.from?.email || payload?.from_email || payload?.from || '';
+        const fromName  = payload?.from_attendee?.display_name || payload?.from_name || '';
+        const subject   = payload?.subject || '';
         // Prefer plain-text; fall back to HTML and strip tags so Telegram/activity feed is readable.
-        const rawBody   = event?.text || event?.html || event?.body || '';
+        const rawBody   = payload?.body_plain || payload?.body_text || payload?.text || payload?.message || payload?.snippet || payload?.body || payload?.html || '';
         const body      = stripHtml(rawBody);
-        const threadId  = event?.thread_id || event?.threadId || '';
+        const threadId  = payload?.thread_id || payload?.threadId || payload?.conversation_id || payload?.in_reply_to?.id || '';
+        const messageId = payload?.id || payload?.message_id || payload?.email_id || '';
         console.log(`[WEBHOOKS/UNIPILE] mail_received from: ${fromEmail} subject: ${subject}`);
 
         if (sb && fromEmail) {
@@ -3226,32 +3257,42 @@ export function initDashboard(state) {
               type: 'reply',
               activity_badge: 'replied',
               action: `Email replied: ${contact.name}`,
-              note: `Matched to deal ${dealName}${contact.company_name ? ` · ${contact.company_name}` : ''}${subject ? ` · "${subject}"` : ''}`,
+              note: `${truncateInline(body, 120)} · ${dealName}${contact.company_name ? ` · ${contact.company_name}` : ''}${subject ? ` · "${truncateInline(subject, 80)}"` : ''}`,
+              full_content: body || null,
               dealId: contact.deal_id,
               deal_name: dealName,
             });
 
             // Queue with debounce for contextual reply drafting
-            queueInboundWithDebounce({ fromEmail, fromName: contact.name, subject, bodyText: body, threadId, channel: 'email' }).catch(() => {});
+            queueInboundWithDebounce({
+              fromEmail,
+              fromName: contact.name || fromName,
+              subject,
+              bodyText: body,
+              threadId,
+              messageId,
+              channel: 'email',
+              raw: payload,
+            }).catch(() => {});
 
             pushActivity({
               type: 'approval',
               action: `Next action: draft email reply for ${contact.name}`,
               note: `Matched to deal ${dealName} · contextual reply workflow queued`,
+              full_content: body || null,
               dealId: contact.deal_id,
               deal_name: dealName,
             });
-
-            const { sendTelegram } = await import('../approval/telegramBot.js');
-            await sendTelegram(`📧 *Email reply* from *${contact.name}* (${contact.company_name || 'unknown'})\nSubject: _${subject}_`).catch(() => {});
           } else {
             console.log(`[WEBHOOKS/UNIPILE] mail_received — no contact found for ${fromEmail}`);
             pushActivity({
-              type: contact ? 'system' : 'excluded',
-              action: `Email reply received: ${fromEmail}`,
+              type: 'email',
+              activity_badge: 'email',
+              action: `Inbound email received: ${fromName || fromEmail}`,
               note: contact
-                ? `${contact.name} matched a non-active deal, so no active deal workflow was triggered`
-                : 'Email address did not match any active deals',
+                ? `${contact.name} matched a non-active deal, so no active deal workflow was triggered${subject ? ` · "${truncateInline(subject, 80)}"` : ''}`
+                : `No active deal match${subject ? ` · "${truncateInline(subject, 80)}"` : ''}${body ? ` · ${truncateInline(body, 120)}` : ''}`,
+              full_content: body || null,
             });
           }
         }
@@ -8828,25 +8869,51 @@ function broadcastToAll(data) {
 // DEBOUNCE BATCHER — 90-second multi-reply handler
 // ─────────────────────────────────────────────
 
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : '';
+    })
+    .replace(/&#(\d+);/g, (_, num) => {
+      const code = parseInt(num, 10);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : '';
+    })
+    .replace(/&nbsp;|&ensp;|&emsp;|&thinsp;/gi, ' ')
+    .replace(/&zwnj;|&zwj;|&lrm;|&rlm;/gi, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;|&#39;/g, "'");
+}
+
 function stripHtml(html) {
   if (!html) return '';
-  return html
+  let text = String(html)
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n')
     .replace(/<\/div>/gi, '\n')
     .replace(/<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '');
+  text = decodeHtmlEntities(text);
+  text = text
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>|<\/div>|<\/li>/gi, '\n')
     .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
     .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+  return text;
 }
 
 function normalizeInboundEmail(value) {
@@ -8951,6 +9018,7 @@ async function findOriginalEmailByThread(sb, threadId) {
 }
 
 async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject, bodyText, threadId, chatId, messageId, channel, emailAccountId, raw }) {
+  bodyText = stripHtml(bodyText);
   if (!bodyText?.trim()) return;
 
   const normalizedEmail = normalizeInboundEmail(fromEmail);
@@ -8982,14 +9050,7 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject,
     });
 
     if (!ctx.contact) {
-      // Unknown contact — fall back to legacy handler
-      console.log(`[REPLY] Contact not found for ${contactKey} — falling back to legacy handler`);
-      await handleInboundReply({
-        fromEmail: fromEmail || '', fromName: fromName || fromUrn || '', fromUrn: fromUrn || '',
-        subject: subject || '', bodyText, threadId: threadId || chatId || '', messageId: messageId || '',
-        channel, threadField: channel === 'email' ? 'gmail_thread_id' : null,
-        emailAccountId: emailAccountId || null,
-      });
+      console.log(`[REPLY] No active deal/contact context for ${contactKey} — logged receipt only`);
       return;
     }
 
@@ -8999,7 +9060,8 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject,
       type: 'reply',
       activity_badge: getReplyActivityBadge(channel),
       action: `${channel === 'linkedin' ? 'LinkedIn reply received' : 'Email reply received'}: ${ctx.contact.name}`,
-      note: `${truncateInline(bodyText, 100)}${contextLabel ? ` · ${contextLabel}` : ''}`,
+      note: `${truncateInline(bodyText, 120)}${contextLabel ? ` · ${contextLabel}` : ''}${subject ? ` · "${truncateInline(subject, 80)}"` : ''}`,
+      full_content: bodyText,
       dealId: ctx.deal?.id || null,
       deal_name: ctx.deal?.name || null,
     });
@@ -9357,6 +9419,7 @@ async function processRocoBatchedReply(batch) {
       ? `LinkedIn message ${i + 1}/${messages.length}`
       : `Email message ${i + 1}/${messages.length}`;
     const quotePreview = truncateInline(inbound.content, 160);
+    const inboundSubject = inbound.subject || null;
 
     const { data: queued } = await sb?.from('approval_queue').insert({
       deal_id:            deal?.id || null,
@@ -9389,7 +9452,14 @@ async function processRocoBatchedReply(batch) {
       channel,
       replyTargetId,
       emailAccountId,
-      { replyLabel, quotePreview }
+      {
+        replyLabel,
+        quotePreview,
+        inboundSubject,
+        inboundBody: inbound.content,
+        intent: classification.intent,
+        sentiment: classification.sentiment,
+      }
     ).catch(() => {});
 
     await sb?.from('activity_log').insert({
@@ -9409,6 +9479,7 @@ async function processRocoBatchedReply(batch) {
       type: 'approval',
       action: `Reply drafted for approval: ${contact.name}`,
       note: `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent} · ${contextName}`,
+      full_content: inbound.content,
       dealId: deal?.id || null,
       deal_name: deal?.name || null,
     });
@@ -9959,6 +10030,11 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
 
   console.log(`[INBOUND/${channel.toUpperCase()}] Classified as: ${classification.intent}`);
 
+  if (!contact?.id) {
+    console.log(`[INBOUND/${channel.toUpperCase()}] Inbound ignored because no active contact context was resolved`);
+    return;
+  }
+
   if (classification.intent === 'AUTO_REPLY') {
     return;
   }
@@ -9973,19 +10049,7 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
       const replySubject = `Re: ${subject || originalEmail?.subject_used || originalEmail?.subject_a || 'our conversation'}`;
       const activeDealId = originalEmail?.deal_id || deal?.id || contact?.deal_id || null;
       if (!contact?.id || !activeDealId) {
-        await sendTelegram(
-          `⚠ *Inbound reply matched no active deal for approval*\n\n` +
-          `From: ${fromName || fromEmail || 'Unknown contact'}\n` +
-          `Channel: ${channel}\n` +
-          `Intent: ${classification.intent}\n\n` +
-          `${truncateInline(bodyText, 280)}`
-        ).catch(() => {});
-        pushActivity({
-          type: 'warning',
-          action: `Inbound reply needs manual review: ${replyContact.name || fromName || fromEmail || 'Unknown'}`,
-          note: `No active deal/contact context resolved for ${channel} reply`,
-          dealId: activeDealId,
-        });
+        console.log(`[INBOUND/${channel.toUpperCase()}] Positive-looking inbound ignored because no active deal/contact context was resolved`);
         return;
       }
 
@@ -10027,22 +10091,22 @@ async function handleInboundReply({ fromEmail, fromName, fromUrn, subject, bodyT
           activeDeal?.name || deal?.name || 'Unknown',
           channel,
           threadId,
-          emailAccountId
+          emailAccountId,
+          {
+            inboundSubject: subject || originalEmail?.subject_used || originalEmail?.subject_a || null,
+            inboundBody: bodyText,
+            quotePreview: truncateInline(bodyText, 160),
+            intent: classification.intent,
+            sentiment: classification.sentiment,
+          }
         ).catch(() => {});
       }
-
-      await sendTelegram(
-        `💬 *Reply drafted for approval*\n\n` +
-        `From: ${fromName || fromEmail || 'LinkedIn contact'}\n` +
-        `Intent: ${classification.intent} | Channel: ${channel}\n\n` +
-        `---\n${draftBody.substring(0, 600)}\n---` +
-        (domNote ? `\n\n${domNote}` : '')
-      ).catch(() => {});
 
       pushActivity({
         type: 'approval',
         action: `Reply drafted for approval: ${replyContact.name || fromName}`,
         note: `${channel === 'linkedin' ? 'LinkedIn' : 'Email'} · ${classification.intent}`,
+        full_content: bodyText,
         dealId: activeDealId,
       });
 

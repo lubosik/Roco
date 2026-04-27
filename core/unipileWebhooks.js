@@ -19,13 +19,41 @@ const messageBatches = new Map();
 
 // ── NORMALISATION ─────────────────────────────────────────────────────────────
 
+function cleanText(value) {
+  const decodeCodePoint = raw => {
+    const code = Number(raw);
+    return Number.isFinite(code) && code > 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : ' ';
+  };
+  return String(value || '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>|<\/div>|<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => decodeCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, num) => decodeCodePoint(parseInt(num, 10)))
+    .replace(/&nbsp;|&ensp;|&emsp;|&thinsp;/gi, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;|&#39;/g, "'")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function normalizeMessage(raw) {
   const data = raw?.data || raw;
   return {
     event_type:         raw.type || raw.event_type || 'unknown',
     message_id:         data.id || data.message_id || raw.id || raw.message_id,
     chat_id:            data.chat_id || data.thread_id || data.conversation_id || raw.chat_id,
-    text:               data.message || data.text || data.body || data.content || raw.message || raw.text || '',
+    text:               cleanText(data.message || data.text || data.body || data.content || raw.message || raw.text || ''),
     sender_provider_id:
       data.sender?.attendee_provider_id ||
       data.sender?.provider_id ||
@@ -241,9 +269,11 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
   if (!contact) {
     console.log('[UNIPILE/MSG] No matching contact — ignoring');
     pushActivity({
-      type: 'excluded',
-      action: `LinkedIn reply received: ${payload.sender_provider_id || payload.chat_id || 'unknown sender'}`,
-      note: 'Sender did not match any active deals',
+      type: 'linkedin',
+      activity_badge: 'linkedin',
+      action: `Inbound LinkedIn DM received: ${payload.sender_name || payload.sender_provider_id || payload.chat_id || 'unknown sender'}`,
+      note: `No active deal match${payload.text ? ` · ${payload.text.slice(0, 120)}` : ''}`,
+      full_content: payload.text || null,
     });
     return;
   }
@@ -267,6 +297,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
     activity_badge: 'linkedin_reply',
     action: `LinkedIn reply received: ${contact.name}`,
     note: `${String(payload.text || '').trim().slice(0, 100)}${getDealName(contact) ? ` · ${getDealName(contact)}` : ''}`,
+    full_content: payload.text || null,
     dealId: contact.deal_id,
     deal_name: getDealName(contact),
   });
