@@ -274,6 +274,40 @@ PACE PROJECTION (at current rate, ${workingDaysLeft} outreach days left):
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LIVE ACTIVITY LOG CONTEXT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildRecentActivityContext(dealId) {
+  try {
+    const sb = getSupabase();
+    if (!sb) return '';
+
+    let query = sb.from('activity_log')
+      .select('event_type, summary, detail, created_at')
+      .order('created_at', { ascending: false })
+      .limit(25);
+
+    if (dealId) {
+      query = query.or(`deal_id.eq.${dealId},deal_id.is.null`);
+    }
+
+    const { data: events } = await query;
+    if (!events?.length) return '';
+
+    const lines = events.map(e => {
+      const time = new Date(e.created_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+      const type = String(e.event_type || '').replace(/_/g, ' ').toUpperCase();
+      const summary = String(e.summary || '').slice(0, 120);
+      return `  [${time}] ${type}: ${summary}`;
+    });
+
+    return `\nLIVE ACTIVITY LOG (last 25 events, newest first):\n${lines.join('\n')}\n`;
+  } catch {
+    return '';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -298,6 +332,7 @@ LIVE PIPELINE:
   LinkedIn DMs: ${metrics.dms_sent || 0} sent
   Total unique replies (email + LinkedIn combined): ${metrics.total_replies || 0}
   Total replies: ${metrics.total_replies || 0}
+  Positive replies: ${metrics.positive_replies || 0} (${metrics.positive_reply_rate || 0}% positive reply rate)
   Response rate: ${metrics.response_rate || 0}%
   Meetings booked: ${metrics.meetings_booked || 0}
   Active firms: ${metrics.firms_in_pipeline || 0}
@@ -306,17 +341,19 @@ LIVE PIPELINE:
 ` : '';
 
   const { getOrchestratorEvents } = await import('./jarvisTools.js');
-  const recentEvents = getOrchestratorEvents(8);
+  const recentEvents = getOrchestratorEvents(15);
   const eventsSection = recentEvents.length
     ? `\nORCHESTRATOR ACTIVITY (last ${recentEvents.length} events):\n${recentEvents.map(e => `  [${new Date(e.ts).toLocaleTimeString()}] ${e.action}${e.note ? ': ' + e.note : ''}`).join('\n')}\n`
     : '';
+
+  const recentActivity = deal ? await buildRecentActivityContext(deal.id) : await buildRecentActivityContext(null);
 
   return `You are JARVIS — the AI agent running Roco, an autonomous PE/VC fundraising platform.
 
 You are not a chatbot. You are an intelligent co-worker who controls the entire fundraising operation. You have full visibility into the pipeline, memory of everything done previously, and tools to act on anything.
 
 ${dealSection}
-${metricsSection}${timelineSection}${todaysReplies ? `${todaysReplies}\n` : ''}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}
+${metricsSection}${timelineSection}${todaysReplies ? `${todaysReplies}\n` : ''}${highlights ? `PIPELINE HIGHLIGHTS (live from database):\n${highlights}\n` : ''}${eventsSection}${recentActivity}
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 

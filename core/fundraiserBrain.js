@@ -110,7 +110,7 @@ export async function gatherCurrentMetrics(dealId) {
     pendingApprovalsRes,
   ] = await Promise.all([
     sb.from('contacts')
-      .select('id, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, last_reply_at, reply_channel, last_meeting_date, meeting_count')
+      .select('id, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, conversation_state, last_reply_at, reply_channel, last_meeting_date, meeting_count')
       .eq('deal_id', dealId),
     sb.from('activity_log')
       .select('event_type, created_at')
@@ -169,6 +169,16 @@ export async function gatherCurrentMetrics(dealId) {
   inboundMessages.forEach(msg => { if (msg.contact_id) repliedContactIds.add(msg.contact_id); });
   const totalReplies = repliedContactIds.size;
 
+  // Positive replies = contacts who have replied and are NOT in a terminal negative state
+  const positiveReplies = contacts.filter(row => {
+    if (!row.last_reply_at && !row.reply_channel) return false;
+    const stage = String(row.pipeline_stage || '').toLowerCase();
+    const convState = String(row.conversation_state || '').toLowerCase();
+    if (['inactive', 'declined', 'do_not_contact', 'archived', 'suppressed'].includes(stage)) return false;
+    if (['conversation_ended_negative', 'do_not_contact'].includes(convState)) return false;
+    return true;
+  }).length;
+
   const lastInviteAt = contacts
     .map(row => row.invite_sent_at)
     .filter(Boolean)
@@ -204,6 +214,11 @@ export async function gatherCurrentMetrics(dealId) {
       const replied = contacts.filter(row => row.last_reply_at || row.reply_channel).length;
       const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;
       return sent > 0 ? Math.round((replied / sent) * 100) : 0;
+    })(),
+    positive_replies: positiveReplies,
+    positive_reply_rate: (() => {
+      const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;
+      return sent > 0 ? Math.round((positiveReplies / sent) * 100) : 0;
     })(),
   };
 }

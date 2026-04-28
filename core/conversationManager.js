@@ -217,7 +217,31 @@ export async function setConversationState(contactId, state, extras = {}) {
     updates.follow_up_due_at    = null;
   }
 
-  if (['awaiting_response', 'needs_reply'].includes(state)) {
+  // When a contact is actively replying (needs_reply or awaiting_response),
+  // promote pipeline_stage to 'In Conversation' unless already at a more
+  // advanced positive stage. Only apply if the caller hasn't already provided
+  // a pipeline_stage override via extras.
+  if (['awaiting_response', 'needs_reply'].includes(state) && !extras.pipeline_stage) {
+    try {
+      const { data: contact } = await sb.from('contacts')
+        .select('pipeline_stage')
+        .eq('id', contactId)
+        .single();
+
+      const MEETING_STAGES = [
+        'meeting scheduled', 'meeting booked',
+        'meeting_scheduled', 'meeting_booked',
+      ];
+      const currentStage = (contact?.pipeline_stage || '').toLowerCase();
+      const alreadyAdvanced = MEETING_STAGES.some(s => s === currentStage);
+
+      if (!alreadyAdvanced) {
+        updates.pipeline_stage = 'In Conversation';
+        console.log(`[CONV] pipeline_stage promoted to 'In Conversation' for contact ${contactId} (was: ${contact?.pipeline_stage || 'unknown'})`);
+      }
+    } catch (stageErr) {
+      console.warn(`[CONV] Could not fetch contact stage for pipeline promotion:`, stageErr.message);
+    }
     updates.follow_up_due_at = null;
   }
 

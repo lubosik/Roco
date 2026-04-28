@@ -2112,7 +2112,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       action: 'LinkedIn DM queue stalled',
       note: `No draft payload could be built for contact ${contactId}, flagged for retry`,
     });
-    return null;
+    return { deferred: true, reason: 'draft_payload_empty' };
   }
 
   const { contact, messageBody, researchSummary } = payload;
@@ -2181,7 +2181,12 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
     .select('*, deals!contacts_deal_id_fkey(*)')
     .eq('id', contactId)
     .single();
-  if (!contact || (!contact.linkedin_provider_id && !contact.unipile_chat_id)) return null;
+  if (!contact) return null;
+  // If contact lacks LinkedIn identifiers, we can still draft — sending will be retried if it fails
+  const canSendLinkedIn = contact.linkedin_provider_id || contact.unipile_chat_id;
+  if (!canSendLinkedIn) {
+    console.warn(`[buildLinkedInDmDraftPayload] contact ${contact.id} has no linkedin_provider_id or unipile_chat_id — will draft but DM send may require retry`);
+  }
 
   let firmResearch = null;
   if (contact.firm_id) {
