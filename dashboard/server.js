@@ -2072,15 +2072,23 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
 
   // Check 1: do not re-draft a DM that Dom already skipped/closed.
   const { data: blockedRows } = await sb.from('approval_queue')
-    .select('id, status, created_at')
+    .select('id, status, created_at, edit_instructions')
     .eq('contact_id', contactId)
     .eq('stage', 'LinkedIn DM')
     .in('status', ['skipped', 'telegram_skipped', 'closed', 'manual'])
     .order('created_at', { ascending: false })
-    .limit(1);
-  if (blockedRows?.length) {
-    await suppressSkippedLinkedInDmContact(sb, contactId, `Prior LinkedIn DM approval was ${blockedRows[0].status}`);
-    return { deferred: true, reason: `previous_dm_${blockedRows[0].status}` };
+    .limit(5);
+  const manuallyBlockedRow = (blockedRows || []).find(row => {
+    if (row.status !== 'skipped') return true;
+    const instructions = String(row.edit_instructions || '').toLowerCase();
+    return !instructions.includes('auto-requeued')
+      && !instructions.includes('missing score')
+      && !instructions.includes('missing research')
+      && !instructions.includes('stale processing');
+  });
+  if (manuallyBlockedRow) {
+    await suppressSkippedLinkedInDmContact(sb, contactId, `Prior LinkedIn DM approval was ${manuallyBlockedRow.status}`);
+    return { deferred: true, reason: `previous_dm_${manuallyBlockedRow.status}` };
   }
 
   // Check 2: do not open a LinkedIn DM lane for a contact already in an email sequence.
