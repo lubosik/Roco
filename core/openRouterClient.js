@@ -136,7 +136,9 @@ export async function orComplete(prompt, {
             messages,
             max_tokens: maxTokens,
             temperature: tier === 'draft' || tier === 'conversation' ? 0.7 : 0.1,
-            ...(tier === 'web' ? { web_search_options: { search_context_size: 'medium' } } : {}),
+            // web_search_options is only for OpenRouter's own search layer (e.g. openai/gpt-4o-search-preview).
+            // Perplexity sonar models have built-in search and reject this parameter.
+            ...(tier === 'web' && !resolvedModel.startsWith('perplexity/') ? { web_search_options: { search_context_size: 'medium' } } : {}),
           }),
         });
         if (!res.ok) {

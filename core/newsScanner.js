@@ -180,27 +180,41 @@ function simplifyGrokQuery(query) {
 async function executeGrokNewsQueries(deal, queries = [], pushActivity) {
   const rawResults = [];
   for (const query of queries) {
-    let result = await grokWebSearch(
-      query,
-      'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
-      1100
-    );
+    let result = null;
+    let errorMsg = null;
     let retryQuery = null;
+
+    try {
+      result = await grokWebSearch(
+        query,
+        'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
+        1100
+      );
+    } catch (err) {
+      errorMsg = err.message;
+    }
+
     if (!result) {
       retryQuery = simplifyGrokQuery(query);
       if (retryQuery && retryQuery !== query) {
-        result = await grokWebSearch(
-          retryQuery,
-          'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
-          900
-        );
+        try {
+          result = await grokWebSearch(
+            retryQuery,
+            'You are an investor intelligence analyst. Search the live web and return concrete findings with source detail.',
+            900
+          );
+          if (result) errorMsg = null;
+        } catch (err) {
+          errorMsg = errorMsg || err.message;
+        }
       }
     }
+
     rawResults.push({
       query,
       retry_query: retryQuery,
       success: !!result,
-      raw_result: result || `Query failed for: ${query}`,
+      raw_result: result || (errorMsg ? `Search error: ${errorMsg}` : `Query returned no results: ${query}`),
     });
   }
   return rawResults;
@@ -214,8 +228,9 @@ export async function grokWebSearch(query, systemContext = '', maxTokens = 1000)
       systemPrompt: systemContext || null,
     });
   } catch (err) {
-    console.warn('[WEB SEARCH]', err.message);
-    return null;
+    console.warn('[WEB SEARCH] Error:', err.message);
+    // Re-throw so executeGrokNewsQueries can surface the real error in the failure notification
+    throw err;
   }
 }
 
