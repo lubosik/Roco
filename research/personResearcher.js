@@ -4,7 +4,7 @@
  * - Reuse/canonicalize existing structured data first (zero-cost path)
  * - Gemini grounded search is the default live-research provider
  * - Grok is optional fallback
- * Tracks completion via a [PERSON_RESEARCHED] marker in the notes field.
+ * Tracks completion via research markers in the notes field.
  */
 
 import { getResearchContext } from '../core/agentContext.js';
@@ -48,6 +48,75 @@ export function hasCoreResearchFields(record) {
   return !!(record?.past_investments && record?.investment_thesis && record?.sector_focus);
 }
 
+const RESEARCH_MARKERS = [
+  '[PERSON_RESEARCH_VERIFIED',
+  '[PERSON_RESEARCH_PARTIAL',
+  '[PERSON_RESEARCHED',
+  '[PERSON_RESEARCHED_FOR_RANKING',
+  '[LINKEDIN_PROFILE_RESEARCHED',
+];
+
+function hasText(value, minLength = 2) {
+  return typeof value === 'string' && value.trim().length >= minLength;
+}
+
+function notesInclude(notes, pattern) {
+  return typeof notes === 'string' && notes.toLowerCase().includes(pattern);
+}
+
+export function classifyPersonResearch(record = {}) {
+  const notes = typeof record.notes === 'string' ? record.notes : '';
+  if (notes.includes('[PERSON_RESEARCH_VERIFIED')) return 'verified';
+
+  const past = record.past_investments;
+  const thesis = record.investment_thesis || record.thesis;
+  const sectors = record.sector_focus || record.preferred_industries;
+  const geography = record.geography || record.preferred_geographies || record.hq_country || record.hq_location;
+  const cheque = record.typical_cheque || record.typical_cheque_size;
+  const aum = record.firm_aum || record.aum_fund_size;
+  const profile = record.firm_description || record.description || record.research_notes || record.recent_news;
+
+  if (hasCoreResearchFields(record)) return 'verified';
+
+  const evidence = [
+    past,
+    thesis,
+    sectors,
+    geography,
+    cheque,
+    aum,
+    profile,
+  ].filter(v => hasText(String(v || ''), 4)).length;
+
+  const hasInvestmentSpecifics = hasText(String(past || ''), 4)
+    || hasText(String(thesis || ''), 20)
+    || hasText(String(sectors || ''), 4);
+
+  if (hasInvestmentSpecifics && evidence >= 3) return 'verified';
+
+  if (
+    notes.includes('[PERSON_RESEARCH_PARTIAL') ||
+    RESEARCH_MARKERS.some(marker => notes.includes(marker)) ||
+    notesInclude(notes, 'linkedin headline:') ||
+    notesInclude(notes, 'linkedin summary:') ||
+    notesInclude(notes, 'profile:') ||
+    evidence > 0 ||
+    hasText(record.company_name || record.job_title || record.linkedin_url || '', 3)
+  ) {
+    return 'partial';
+  }
+
+  return 'missing';
+}
+
+export function hasVerifiedPersonResearch(record = {}) {
+  return classifyPersonResearch(record) === 'verified';
+}
+
+export function hasPartialPersonResearch(record = {}) {
+  return classifyPersonResearch(record) === 'partial';
+}
+
 export function hasFreshResearch(record, ttlDays = getResearchConfig().cacheTtlDays) {
   if (!record?.last_researched_at) return false;
   const last = Date.parse(record.last_researched_at);
@@ -73,7 +142,7 @@ export function normalizePersonResearch(record = {}) {
     linkedin_url: record.linkedin_url || record.decision_maker_linkedin || null,
     recent_news: record.recent_news || null,
     contact_type_confirmed: type,
-    confidence: hasCoreResearchFields(record) ? 'high' : 'medium',
+    confidence: hasVerifiedPersonResearch(record) ? 'high' : 'medium',
   };
 }
 
@@ -214,5 +283,5 @@ export async function researchPerson({ contact, deal }) {
 
 /** Returns true if a contact's notes contain the research marker */
 export function isResearched(notes) {
-  return typeof notes === 'string' && notes.includes('[PERSON_RESEARCHED]');
+  return typeof notes === 'string' && RESEARCH_MARKERS.some(marker => notes.includes(marker));
 }

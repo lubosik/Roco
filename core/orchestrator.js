@@ -39,6 +39,8 @@ import {
   isResearched,
   hasCoreResearchFields,
   hasFreshResearch,
+  classifyPersonResearch,
+  hasVerifiedPersonResearch,
 } from '../research/personResearcher.js';
 import { researchFirmOnly, findDecisionMakers } from '../research/firmResearcher.js';
 import { runDealResearch } from '../research/dealResearcher.js'; // legacy fallback
@@ -1212,8 +1214,8 @@ async function backfillContactsFromInvestorsDb() {
   for (const contact of contacts) {
     const updates = {};
 
-    // Backfill person_researched if notes contain the marker but column is false
-    if (!contact.person_researched && contact.notes?.includes('[PERSON_RESEARCHED]')) {
+    // Backfill person_researched only for verified research, not partial profile scraps.
+    if (!contact.person_researched && hasVerifiedPersonResearch(contact)) {
       updates.person_researched = true;
       personResearchedFilled++;
     }
@@ -2209,6 +2211,32 @@ function hasUsableResearchBasis(contact) {
     contact.investment_thesis ||
     contact.sector_focus
   );
+}
+
+function isVerifiedResearchReady(contact) {
+  return hasVerifiedPersonResearch(contact);
+}
+
+function researchStatusLabel(contact) {
+  return classifyPersonResearch(contact);
+}
+
+function stripPersonResearchMarkers(notes) {
+  return String(notes || '')
+    .replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCHED_FOR_RANKING[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCH_PARTIAL[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCH_VERIFIED[^\n]*\]/g, '')
+    .trim();
+}
+
+function hasRecentResearchVerificationFailure(contact, hours = 6) {
+  const notes = String(contact?.notes || '');
+  const matches = [...notes.matchAll(/\[PERSON_RESEARCH_VERIFICATION_FAILED ([^\]]+)\]/g)];
+  if (!matches.length) return false;
+  const latest = Date.parse(matches[matches.length - 1][1]);
+  if (Number.isNaN(latest)) return false;
+  return Date.now() - latest < hours * 60 * 60 * 1000;
 }
 
 function buildContactResearchContext(contact = {}) {
@@ -5281,38 +5309,18 @@ async function phasePersonResearch(deal, batch) {
       const research = await researchPerson({ contact, deal });
       if (!research) continue;
 
-      const notesBase = String(contact.notes || '').replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '').trim();
-      const summaryLines = [
-        research.firm_description ? `Profile: ${research.firm_description}` : null,
-        research.investment_thesis ? `Thesis: ${research.investment_thesis}` : null,
-        research.past_investments ? `Past: ${research.past_investments}` : null,
-        research.recent_news ? `Recent: ${research.recent_news}` : null,
-      ].filter(Boolean);
-      const marker = `[PERSON_RESEARCHED ${new Date().toISOString()}]`;
-      const nextNotes = [notesBase, marker, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000);
-
-      const updates = {
-        person_researched: true,
-        notes: nextNotes,
-      };
-      if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
-      if (research.company_name && !contact.company_name) updates.company_name = research.company_name;
-      if (research.linkedin_url && !contact.linkedin_url) updates.linkedin_url = research.linkedin_url;
-      if (research.sector_focus) updates.sector_focus = research.sector_focus;
-      if (research.geography) updates.geography = research.geography;
-      if (research.typical_cheque) updates.typical_cheque_size = research.typical_cheque;
-      if (research.firm_aum) updates.aum_fund_size = research.firm_aum;
-      if (research.past_investments) updates.past_investments = research.past_investments;
-      if (research.investment_thesis) updates.investment_thesis = research.investment_thesis;
-      if (research.contact_type_confirmed) updates.contact_type = research.contact_type_confirmed;
-
+      const updates = buildPersonResearchUpdates(contact, research);
+      const status = researchStatusLabel({ ...contact, ...updates });
       await sb.from('contacts').update(updates).eq('id', contact.id);
       await sbLogActivity({
         dealId: deal.id,
         contactId: contact.id,
-        eventType: 'PERSON_RESEARCHED',
-        summary: `${contact.name} researched before outreach`,
+        eventType: status === 'verified' ? 'PERSON_RESEARCH_VERIFIED' : 'PERSON_RESEARCH_PARTIAL',
+        summary: status === 'verified'
+          ? `${contact.name} verified researched before outreach`
+          : `${contact.name} partially researched before outreach`,
         detail: {
+          research_status: status,
           company_name: research.company_name || contact.company_name || null,
           past_investments: research.past_investments || null,
           investment_thesis: research.investment_thesis || null,
@@ -5385,8 +5393,11 @@ async function buildDraftLinkedInProfileContext(contactPage) {
   ].filter(Boolean).join('\n');
 }
 
-function buildPersonResearchUpdates(contact, research, marker = 'PERSON_RESEARCHED') {
-  const notesBase = String(contact.notes || '').replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '').trim();
+function buildPersonResearchUpdates(contact, research, marker = null) {
+  const mergedForStatus = { ...contact, ...research };
+  const status = classifyPersonResearch(mergedForStatus);
+  const effectiveMarker = marker || (status === 'verified' ? 'PERSON_RESEARCH_VERIFIED' : 'PERSON_RESEARCH_PARTIAL');
+  const notesBase = stripPersonResearchMarkers(contact.notes);
   const summaryLines = [
     research.firm_description ? `Profile: ${research.firm_description}` : null,
     research.investment_thesis ? `Thesis: ${research.investment_thesis}` : null,
@@ -5394,8 +5405,8 @@ function buildPersonResearchUpdates(contact, research, marker = 'PERSON_RESEARCH
     research.recent_news ? `Recent: ${research.recent_news}` : null,
   ].filter(Boolean);
   const updates = {
-    person_researched: true,
-    notes: [notesBase, `[${marker} ${new Date().toISOString()}]`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
+    person_researched: status === 'verified',
+    notes: [notesBase, `[${effectiveMarker} ${new Date().toISOString()}]`, `Research status: ${status}`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
   };
   if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
   if (research.company_name && !contact.company_name) updates.company_name = research.company_name;
@@ -5426,14 +5437,16 @@ async function enrichSparseContactBeforeRanking(contact, deal, sb) {
         : '';
       const linkedInLines = [
         `[LINKEDIN_PROFILE_RESEARCHED ${new Date().toISOString()}]`,
+        `[PERSON_RESEARCH_PARTIAL ${new Date().toISOString()}]`,
+        'Research status: partial',
         profile.headline ? `LinkedIn headline: ${profile.headline}` : null,
         profile.summary ? `LinkedIn summary: ${String(profile.summary).slice(0, 320)}` : null,
         experience ? `LinkedIn experience: ${experience}` : null,
       ].filter(Boolean);
       const patch = {
         notes: [String(current.notes || '').trim(), ...linkedInLines].filter(Boolean).join('\n').slice(0, 4000),
+        person_researched: false,
       };
-      if (linkedInLines.length > 1) patch.person_researched = true;
       if (profile.current_title && !current.job_title) patch.job_title = profile.current_title;
       if (profile.current_company && !current.company_name) patch.company_name = profile.current_company;
       if (profile.location && !current.geography) patch.geography = profile.location;
@@ -5451,15 +5464,19 @@ async function enrichSparseContactBeforeRanking(contact, deal, sb) {
       throw err;
     }
     if (research) {
-      const patch = buildPersonResearchUpdates(current, research, 'PERSON_RESEARCHED_FOR_RANKING');
+      const patch = buildPersonResearchUpdates(current, research);
+      const status = researchStatusLabel({ ...current, ...patch });
       await sb.from('contacts').update(patch).eq('id', current.id);
       current = { ...current, ...patch };
       await sbLogActivity({
         dealId: deal.id,
         contactId: current.id,
-        eventType: 'PERSON_RESEARCHED_FOR_RANKING',
-        summary: `${current.name} researched before scoring`,
+        eventType: status === 'verified' ? 'PERSON_RESEARCH_VERIFIED_FOR_RANKING' : 'PERSON_RESEARCH_PARTIAL_FOR_RANKING',
+        summary: status === 'verified'
+          ? `${current.name} verified researched before scoring`
+          : `${current.name} partially researched before scoring`,
         detail: {
+          research_status: status,
           company_name: research.company_name || current.company_name || null,
           past_investments: research.past_investments || null,
           investment_thesis: research.investment_thesis || null,
@@ -5469,6 +5486,77 @@ async function enrichSparseContactBeforeRanking(contact, deal, sb) {
   }
 
   return current;
+}
+
+async function ensureVerifiedResearchBeforeDraft(contact, deal, reason = 'outreach') {
+  if (isVerifiedResearchReady(contact)) return contact;
+
+  const sb = getSupabase();
+  if (!sb || !contact?.id || !deal?.id) return null;
+
+  if (hasRecentResearchVerificationFailure(contact)) {
+    info(`[${deal.name}] ${contact.name} has recent failed verification research — deferring draft`);
+    return null;
+  }
+
+  pushActivity({
+    type: 'research',
+    action: `Verifying research before drafting: ${contact.name}`,
+    note: `${contact.company_name || 'unknown firm'} · ${reason}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  try {
+    const research = await researchPerson({ contact, deal });
+    if (!research) return null;
+
+    const patch = buildPersonResearchUpdates(contact, research);
+    const updated = { ...contact, ...patch };
+    const status = researchStatusLabel(updated);
+    await sb.from('contacts').update(patch).eq('id', contact.id);
+
+    await sbLogActivity({
+      dealId: deal.id,
+      contactId: contact.id,
+      eventType: status === 'verified' ? 'PERSON_RESEARCH_VERIFIED_BEFORE_DRAFT' : 'PERSON_RESEARCH_PARTIAL_BEFORE_DRAFT',
+      summary: status === 'verified'
+        ? `${contact.name} verified researched before drafting`
+        : `${contact.name} still only partially researched before drafting`,
+      detail: {
+        research_status: status,
+        reason,
+        company_name: research.company_name || contact.company_name || null,
+        past_investments: research.past_investments || null,
+        investment_thesis: research.investment_thesis || null,
+      },
+    }).catch(() => {});
+
+    if (status === 'verified') return updated;
+
+    info(`[${deal.name}] ${contact.name} research is still partial after verification — deferring draft`);
+    return null;
+  } catch (err) {
+    const marker = `[PERSON_RESEARCH_VERIFICATION_FAILED ${new Date().toISOString()}] ${String(err.message || err).slice(0, 180)}`;
+    const notes = `${String(contact.notes || '').trim()}\n${marker}`.trim().slice(0, 4000);
+    await sb.from('contacts').update({
+      notes,
+      person_researched: false,
+      pipeline_stage: 'Researched',
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id).then(null, () => {});
+
+    await sbLogActivity({
+      dealId: deal.id,
+      contactId: contact.id,
+      eventType: 'PERSON_RESEARCH_VERIFICATION_FAILED',
+      summary: `${contact.name} could not be verified before drafting`,
+      detail: { reason, error: String(err.message || err).slice(0, 500) },
+    }).catch(() => {});
+
+    warn(`[${deal.name}] ${contact.name} verification research failed before draft: ${err.message}`);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6471,11 +6559,9 @@ async function phaseOutreach(deal, state) {
     return selected;
   };
 
-  // Research gate: only outreach contacts whose research is complete.
-  // A contact is research-ready if:
-  //   (a) person_researched is true, OR
-  //   (b) enrichment_status is not pending (research ran but may have come back empty — Sonnet fills gaps)
-  // Contacts still awaiting research are skipped this cycle and picked up once phasePersonResearch completes.
+  // Research gate: only contacts with at least partial research can be selected.
+  // The final draft gate requires verified research and runs one verification pass
+  // immediately before generating outreach copy.
   // Contacts that are permanently unreachable — no email AND no LinkedIn at all
   // Note: email_invalid_linkedin_only is NOT dead — they have a LinkedIn URL and can receive DMs
   const DEAD_STATUSES = new Set(['skipped_no_linkedin', 'skipped_no_name']);
@@ -6490,7 +6576,12 @@ async function phaseOutreach(deal, state) {
       return false;
     }
     if (DEAD_STATUSES.has(c.enrichment_status)) return false; // no contact method
-    if (hasUsableResearchBasis(c)) return true;
+    if (hasUsableResearchBasis(c)) {
+      if (!isVerifiedResearchReady(c)) {
+        info(`[${deal.name}] phaseOutreach: ${c.name} — partial research found; will verify before drafting`);
+      }
+      return true;
+    }
     if (RESEARCH_PENDING_STATUSES.includes(c.enrichment_status)) {
       info(`[${deal.name}] phaseOutreach: ${c.name} — research not yet complete, deferring`);
       return false;
@@ -7015,6 +7106,8 @@ async function phaseFollowUps(deal, state) {
 
 async function handleOutreachApproval(contact, stage, followUpNumber, deal, options = {}) {
   if (contactsInFlight.has(contact.id)) return;
+  const sb = getSupabase();
+  if (!sb) return;
   const forceChannel = options.forceChannel || 'email';
 
   // DB-level dedup: if there's already an active approval for this contact+deal,
@@ -7053,6 +7146,13 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
     info(`[OUTREACH] ${contact.name} has no LinkedIn provider ID — skipping LinkedIn DM approval`);
     return;
   }
+
+  const verifiedContact = await ensureVerifiedResearchBeforeDraft(contact, deal, forceChannel);
+  if (!verifiedContact) {
+    info(`[OUTREACH] ${contact.name} not verified enough to draft yet — deferring`);
+    return;
+  }
+  contact = verifiedContact;
 
   // Build a contact-page-like object for the drafting helpers
   const contactPage = buildContactPage(contact);

@@ -43,6 +43,11 @@ import { handleLinkedInMessage as handleLiMsg, handleLinkedInRelation as handleL
 import { startInboxMonitor } from '../core/inboxMonitor.js';
 import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
 import { listDailyActivityReports } from '../core/analyticsEngine.js';
+import {
+  researchPerson,
+  classifyPersonResearch,
+  hasVerifiedPersonResearch,
+} from '../research/personResearcher.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '../state.json');
@@ -2066,6 +2071,106 @@ function hasActiveEmailConversation(contact = {}) {
     || ['intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'].includes(contact.conversation_state);
 }
 
+function stripPersonResearchMarkers(notes) {
+  return String(notes || '')
+    .replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCHED_FOR_RANKING[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCH_PARTIAL[^\n]*\]/g, '')
+    .replace(/\n?\[PERSON_RESEARCH_VERIFIED[^\n]*\]/g, '')
+    .trim();
+}
+
+function buildPersonResearchPatch(contact, research) {
+  const status = classifyPersonResearch({ ...contact, ...research });
+  const marker = status === 'verified' ? 'PERSON_RESEARCH_VERIFIED' : 'PERSON_RESEARCH_PARTIAL';
+  const notesBase = stripPersonResearchMarkers(contact.notes);
+  const summaryLines = [
+    research.firm_description ? `Profile: ${research.firm_description}` : null,
+    research.investment_thesis ? `Thesis: ${research.investment_thesis}` : null,
+    research.past_investments ? `Past: ${research.past_investments}` : null,
+    research.recent_news ? `Recent: ${research.recent_news}` : null,
+  ].filter(Boolean);
+
+  const patch = {
+    person_researched: status === 'verified',
+    notes: [notesBase, `[${marker} ${new Date().toISOString()}]`, `Research status: ${status}`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
+  };
+  if (research.job_title && !contact.job_title) patch.job_title = research.job_title;
+  if (research.company_name && !contact.company_name) patch.company_name = research.company_name;
+  if (research.linkedin_url && !contact.linkedin_url) patch.linkedin_url = research.linkedin_url;
+  if (research.sector_focus) patch.sector_focus = research.sector_focus;
+  if (research.geography) patch.geography = research.geography;
+  if (research.typical_cheque) patch.typical_cheque_size = research.typical_cheque;
+  if (research.firm_aum) patch.aum_fund_size = research.firm_aum;
+  if (research.past_investments) patch.past_investments = research.past_investments;
+  if (research.investment_thesis) patch.investment_thesis = research.investment_thesis;
+  if (research.contact_type_confirmed) patch.contact_type = research.contact_type_confirmed;
+  return patch;
+}
+
+function hasRecentResearchVerificationFailure(contact, hours = 6) {
+  const matches = [...String(contact?.notes || '').matchAll(/\[PERSON_RESEARCH_VERIFICATION_FAILED ([^\]]+)\]/g)];
+  if (!matches.length) return false;
+  const latest = Date.parse(matches[matches.length - 1][1]);
+  return Number.isFinite(latest) && Date.now() - latest < hours * 60 * 60 * 1000;
+}
+
+async function ensureVerifiedResearchForLinkedInDraft(contact, sb) {
+  if (hasVerifiedPersonResearch(contact)) return contact;
+  if (!sb || !contact?.id || !contact?.deals?.id) return null;
+  if (hasRecentResearchVerificationFailure(contact)) return null;
+
+  pushActivity({
+    type: 'research',
+    action: `Verifying research before LinkedIn DM: ${contact.name}`,
+    note: contact.company_name || 'unknown firm',
+    deal_name: contact.deals?.name || null,
+    dealId: contact.deals?.id || contact.deal_id || null,
+  });
+
+  try {
+    const research = await researchPerson({ contact, deal: contact.deals });
+    if (!research) return null;
+    const patch = buildPersonResearchPatch(contact, research);
+    const updated = { ...contact, ...patch };
+    const status = classifyPersonResearch(updated);
+    await sb.from('contacts').update(patch).eq('id', contact.id);
+    await sbLogActivity({
+      dealId: contact.deals?.id || contact.deal_id || null,
+      contactId: contact.id,
+      eventType: status === 'verified' ? 'PERSON_RESEARCH_VERIFIED_BEFORE_DM_DRAFT' : 'PERSON_RESEARCH_PARTIAL_BEFORE_DM_DRAFT',
+      summary: status === 'verified'
+        ? `${contact.name} verified researched before LinkedIn DM draft`
+        : `${contact.name} still only partially researched before LinkedIn DM draft`,
+      detail: {
+        research_status: status,
+        company_name: research.company_name || contact.company_name || null,
+        past_investments: research.past_investments || null,
+        investment_thesis: research.investment_thesis || null,
+      },
+    }).catch(() => {});
+    return status === 'verified' ? updated : null;
+  } catch (err) {
+    const marker = `[PERSON_RESEARCH_VERIFICATION_FAILED ${new Date().toISOString()}] ${String(err.message || err).slice(0, 180)}`;
+    const notes = `${String(contact.notes || '').trim()}\n${marker}`.trim().slice(0, 4000);
+    await sb.from('contacts').update({
+      notes,
+      person_researched: false,
+      pipeline_stage: 'invite_accepted',
+      pending_linkedin_dm: true,
+      updated_at: new Date().toISOString(),
+    }).eq('id', contact.id).then(null, () => {});
+    await sbLogActivity({
+      dealId: contact.deals?.id || contact.deal_id || null,
+      contactId: contact.id,
+      eventType: 'PERSON_RESEARCH_VERIFICATION_FAILED',
+      summary: `${contact.name} could not be verified before LinkedIn DM draft`,
+      detail: { error: String(err.message || err).slice(0, 500) },
+    }).catch(() => {});
+    return null;
+  }
+}
+
 export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
   const sb = getSupabase();
   if (!sb || !contactId) return null;
@@ -2241,10 +2346,11 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
   const sb = getSupabase();
   if (!sb || !contactId) return null;
 
-  const { data: contact } = await sb.from('contacts')
+  const { data: fetchedContact } = await sb.from('contacts')
     .select('*, deals!contacts_deal_id_fkey(*)')
     .eq('id', contactId)
     .single();
+  let contact = fetchedContact;
   if (!contact) return null;
 
   // If contact lacks LinkedIn identifiers, try to find them via Unipile search before drafting
@@ -2300,7 +2406,7 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
     firmResearch = data || null;
   }
 
-  const enrichedContact = {
+  let enrichedContact = {
     ...contact,
     past_investments: contact.past_investments || firmResearch?.past_investments || '',
     investment_thesis: contact.investment_thesis || firmResearch?.investment_thesis || firmResearch?.thesis || '',
@@ -2309,6 +2415,14 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
     match_rationale: firmResearch?.match_rationale || '',
     justification: firmResearch?.justification || '',
   };
+
+  const verifiedContact = await ensureVerifiedResearchForLinkedInDraft(enrichedContact, sb);
+  if (!verifiedContact) {
+    console.warn(`[buildLinkedInDmDraftPayload] contact ${contact.id} has only partial/missing research — deferring LinkedIn DM draft`);
+    return null;
+  }
+  contact = verifiedContact;
+  enrichedContact = verifiedContact;
 
   const conversationHistory = await loadLinkedInConversationContext(contact);
 
