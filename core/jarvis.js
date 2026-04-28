@@ -283,7 +283,7 @@ async function buildRecentActivityContext(dealId) {
     if (!sb) return '';
 
     let query = sb.from('activity_log')
-      .select('event_type, summary, detail, created_at')
+      .select('event_type, summary, detail, type, action, note, full_content, created_at')
       .order('created_at', { ascending: false })
       .limit(25);
 
@@ -296,8 +296,8 @@ async function buildRecentActivityContext(dealId) {
 
     const lines = events.map(e => {
       const time = new Date(e.created_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-      const type = String(e.event_type || '').replace(/_/g, ' ').toUpperCase();
-      const summary = String(e.summary || '').slice(0, 120);
+      const type = String(e.event_type || e.type || '').replace(/_/g, ' ').toUpperCase();
+      const summary = String(e.summary || e.action || e.note || e.full_content || '').replace(/\s+/g, ' ').slice(0, 160);
       return `  [${time}] ${type}: ${summary}`;
     });
 

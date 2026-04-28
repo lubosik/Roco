@@ -11,7 +11,7 @@ import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from '../core/run
 let bot;
 let rocoState; // injected from orchestrator
 
-async function clearTelegramApprovalControls(messageId) {
+export async function clearTelegramApprovalControls(messageId) {
   if (!bot || !messageId) return;
   try {
     await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
@@ -2454,7 +2454,7 @@ export async function reloadPendingInvestorApprovals() {
   );
 
   const { data: pending } = await sb.from('approval_queue')
-    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, message_text, message_type, channel, reply_to_id, outreach_mode, telegram_msg_id')
+    .select('id, contact_id, contact_name, contact_email, firm, stage, subject_a, subject_b, subject, body, edited_body, message_text, message_type, channel, reply_to_id, outreach_mode, telegram_msg_id, score, research_summary')
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(30);
@@ -2492,6 +2492,8 @@ export async function reloadPendingInvestorApprovals() {
         `*ROCO — ${item.stage || 'EMAIL'} Ready for Approval*`,
         ``,
         `👤 *${item.contact_name || 'Unknown'}* · ${item.firm || 'Unknown Firm'}`,
+        `📊 Score: ${item.score || '—'}/100`,
+        item.research_summary ? `🔍 _${String(item.research_summary).slice(0, 220)}_` : null,
         item.contact_email ? `📧 ${item.contact_email}` : null,
         ``,
         hasSubjects ? `📧 *Subject A:* _${item.subject_a || item.subject || ''}_` : null,

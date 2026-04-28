@@ -2196,6 +2196,62 @@ function contactNeedsCoreResearch(contact) {
   return !contact?.past_investments || !contact?.investment_thesis || !contact?.sector_focus;
 }
 
+function hasUsableResearchBasis(contact) {
+  if (!contact) return false;
+  return !!(
+    contact.person_researched ||
+    hasCoreResearchFields(contact) ||
+    isResearched(contact.notes) ||
+    contact.why_this_firm ||
+    contact.match_rationale ||
+    contact.justification ||
+    contact.past_investments ||
+    contact.investment_thesis ||
+    contact.sector_focus
+  );
+}
+
+function buildContactResearchContext(contact = {}) {
+  const pastInvestments = Array.isArray(contact.past_investments)
+    ? contact.past_investments.join(', ')
+    : String(contact.past_investments || '').trim();
+  const whyThisFirm = contact.why_this_firm
+    || contact.match_rationale
+    || contact.justification
+    || contact.firms?.match_rationale
+    || contact.firms?.justification
+    || '';
+  const thesis = contact.investment_thesis || contact.thesis || '';
+  const criteria = [
+    contact.typical_cheque_size ? `Cheque: ${contact.typical_cheque_size}` : null,
+    contact.sector_focus ? `Sector: ${contact.sector_focus}` : null,
+    contact.geography ? `Geography: ${contact.geography}` : null,
+    contact.aum_fund_size ? `AUM: ${contact.aum_fund_size}` : null,
+  ].filter(Boolean).join('; ');
+
+  return {
+    whyThisFirm,
+    pastInvestments,
+    investmentThesis: thesis,
+    comparableDeals: pastInvestments ? pastInvestments.split(',').map(v => v.trim()).filter(Boolean).slice(0, 5) : [],
+    approachAngle: whyThisFirm || thesis || contact.notes || '',
+    investmentCriteria: criteria || contact.notes || '',
+    aum: contact.aum_fund_size || '',
+  };
+}
+
+function buildResearchSummary(contact = {}) {
+  const ctx = buildContactResearchContext(contact);
+  return [
+    ctx.whyThisFirm ? `Why fit: ${ctx.whyThisFirm}` : null,
+    ctx.pastInvestments ? `Past investments: ${ctx.pastInvestments}` : null,
+    ctx.investmentThesis ? `Thesis: ${ctx.investmentThesis}` : null,
+    contact.sector_focus ? `Focus: ${contact.sector_focus}` : null,
+    contact.typical_cheque_size ? `Cheque: ${contact.typical_cheque_size}` : null,
+    contact.notes && !isResearched(contact.notes) ? contact.notes : null,
+  ].filter(Boolean).join(' · ').slice(0, 900);
+}
+
 function hasResearchFailureMarker(notes) {
   if (typeof notes !== 'string') return false;
   return notes.includes('[PERSON_RESEARCH_FAILED]') || notes.includes('Research failed');
@@ -4229,6 +4285,12 @@ async function enrichSingleFirm(firm, deal, batch, state) {
 async function runApprovedOutreach(deal, batch, state, directives = null) {
   const sb = getSupabase();
   if (!sb) return;
+
+  await repairUnqualifiedOutreachQueue(deal);
+  await phaseRank(deal, state);
+  await phaseArchive(deal, state);
+  await phasePersonResearch(deal, batch);
+
   const { data: approvedContacts } = await sb.from('contacts')
     .select('id, email')
     .eq('deal_id', deal.id)
@@ -5069,6 +5131,67 @@ async function phaseArchive(deal, state) {
   logStep(`Archived ${contacts.length} low-score contacts`, deal.name, 'system', deal);
 }
 
+async function repairUnqualifiedOutreachQueue(deal) {
+  const sb = getSupabase();
+  if (!sb || !deal?.id) return;
+
+  const { data: rows } = await sb.from('approval_queue')
+    .select('id, contact_id, contact_name, stage, message_type, status')
+    .eq('deal_id', deal.id)
+    .in('status', ['pending', 'approved', 'approved_waiting_for_window'])
+    .limit(100);
+
+  const outreachRows = (rows || []).filter(row => {
+    const messageType = String(row.message_type || '').toLowerCase();
+    const stage = String(row.stage || '').toLowerCase();
+    return row.contact_id && !messageType.includes('reply') && !stage.includes('reply');
+  });
+  if (!outreachRows.length) return;
+
+  const contactIds = [...new Set(outreachRows.map(row => row.contact_id).filter(Boolean))];
+  const { data: contacts } = await sb.from('contacts')
+    .select('id, name, pipeline_stage, investor_score, notes, person_researched, past_investments, investment_thesis, sector_focus')
+    .in('id', contactIds);
+  const contactsById = new Map((contacts || []).map(contact => [String(contact.id), contact]));
+
+  const badRows = outreachRows.filter(row => {
+    const contact = contactsById.get(String(row.contact_id));
+    if (!contact) return true;
+    const score = Number(contact.investor_score);
+    return !Number.isFinite(score) || score <= 0 || !hasUsableResearchBasis(contact);
+  });
+  if (!badRows.length) return;
+
+  const badQueueIds = badRows.map(row => row.id);
+  const badContactIds = [...new Set(badRows.map(row => row.contact_id).filter(Boolean))];
+
+  await sb.from('approval_queue').update({
+    status: 'skipped',
+    resolved_at: new Date().toISOString(),
+    edit_instructions: 'Auto-requeued: missing score or research basis; must pass rank/research before outreach.',
+  }).in('id', badQueueIds);
+
+  await sb.from('contacts').update({
+    pipeline_stage: 'Researched',
+    updated_at: new Date().toISOString(),
+  }).in('id', badContactIds);
+
+  pushActivity({
+    type: 'system',
+    action: `Requeued ${badContactIds.length} unqualified outreach contact${badContactIds.length !== 1 ? 's' : ''}`,
+    note: `${deal.name} · missing score or research basis; ranking/research will run before outreach`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  await sbLogActivity({
+    dealId: deal.id,
+    eventType: 'OUTREACH_REQUEUED_FOR_RESEARCH',
+    summary: `${badContactIds.length} queued outreach contact(s) requeued for scoring/research`,
+    detail: { queue_ids: badQueueIds, contact_ids: badContactIds },
+  }).catch(() => {});
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 2b — PERSON RESEARCH
 // Deep-research each shortlisted contact using Gemini grounded web search.
@@ -5077,7 +5200,89 @@ async function phaseArchive(deal, state) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function phasePersonResearch(deal, batch) {
-  info(`[${deal.name}] phasePersonResearch: skipped by policy — use firm research + LinkedIn profile retrieval instead`);
+  const sb = getSupabase();
+  if (!sb || !deal?.id) return;
+
+  const threshold = Number(deal.min_investor_score || 60);
+  const { data: contacts, error: err } = await sb.from('contacts')
+    .select('*')
+    .eq('deal_id', deal.id)
+    .in('pipeline_stage', ['Ranked', 'ranked', 'Enriched', 'enriched', 'Approved for Outreach', 'invite_sent'])
+    .gte('investor_score', threshold)
+    .order('investor_score', { ascending: false })
+    .order('created_at', { ascending: true })
+    .limit(25);
+  if (err) {
+    warn(`[${deal.name}] phasePersonResearch query failed: ${err.message}`);
+    return;
+  }
+
+  const candidates = (contacts || [])
+    .filter(contact => shouldResearchContact(contact, deal, batch))
+    .slice(0, 5);
+
+  if (!candidates.length) {
+    info(`[${deal.name}] phasePersonResearch: no shortlisted contacts need research`);
+    return;
+  }
+
+  pushActivity({
+    type: 'research',
+    action: `Deep-researching ${candidates.length} contact${candidates.length !== 1 ? 's' : ''} before outreach`,
+    note: `${deal.name} · scoring/research gate`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+
+  for (const contact of candidates) {
+    try {
+      const research = await researchPerson({ contact, deal });
+      if (!research) continue;
+
+      const notesBase = String(contact.notes || '').replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '').trim();
+      const summaryLines = [
+        research.firm_description ? `Profile: ${research.firm_description}` : null,
+        research.investment_thesis ? `Thesis: ${research.investment_thesis}` : null,
+        research.past_investments ? `Past: ${research.past_investments}` : null,
+        research.recent_news ? `Recent: ${research.recent_news}` : null,
+      ].filter(Boolean);
+      const marker = `[PERSON_RESEARCHED ${new Date().toISOString()}]`;
+      const nextNotes = [notesBase, marker, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000);
+
+      const updates = {
+        person_researched: true,
+        notes: nextNotes,
+      };
+      if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
+      if (research.company_name && !contact.company_name) updates.company_name = research.company_name;
+      if (research.linkedin_url && !contact.linkedin_url) updates.linkedin_url = research.linkedin_url;
+      if (research.sector_focus) updates.sector_focus = research.sector_focus;
+      if (research.geography) updates.geography = research.geography;
+      if (research.typical_cheque) updates.typical_cheque_size = research.typical_cheque;
+      if (research.firm_aum) updates.aum_fund_size = research.firm_aum;
+      if (research.past_investments) updates.past_investments = research.past_investments;
+      if (research.investment_thesis) updates.investment_thesis = research.investment_thesis;
+      if (research.contact_type_confirmed) updates.contact_type = research.contact_type_confirmed;
+
+      await sb.from('contacts').update(updates).eq('id', contact.id);
+      await sbLogActivity({
+        dealId: deal.id,
+        contactId: contact.id,
+        eventType: 'PERSON_RESEARCHED',
+        summary: `${contact.name} researched before outreach`,
+        detail: {
+          company_name: research.company_name || contact.company_name || null,
+          past_investments: research.past_investments || null,
+          investment_thesis: research.investment_thesis || null,
+        },
+      }).catch(() => {});
+      await sleep(1000);
+    } catch (e) {
+      warn(`[${deal.name}] phasePersonResearch failed for ${contact.name}: ${e.message}`);
+      const failureNote = `${String(contact.notes || '').trim()}\n[PERSON_RESEARCH_FAILED ${new Date().toISOString()}] ${String(e.message || '').slice(0, 180)}`.trim().slice(0, 4000);
+      await sb.from('contacts').update({ notes: failureNote }).eq('id', contact.id).catch(() => {});
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6148,13 +6353,22 @@ async function phaseOutreach(deal, state) {
   const DEAD_STATUSES = new Set(['skipped_no_linkedin', 'skipped_no_name']);
   const RESEARCH_PENDING_STATUSES = ['pending', 'Pending'];
   const isResearchReady = (c) => {
+    const score = Number(c?.investor_score);
+    if (!Number.isFinite(score) || score <= 0) {
+      info(`[${deal.name}] phaseOutreach: ${c.name} — not scored yet, deferring`);
+      return false;
+    }
+    if (score < Number(deal.min_investor_score || 60)) {
+      return false;
+    }
     if (DEAD_STATUSES.has(c.enrichment_status)) return false; // no contact method
-    if (c.person_researched) return true;
+    if (hasUsableResearchBasis(c)) return true;
     if (RESEARCH_PENDING_STATUSES.includes(c.enrichment_status)) {
       info(`[${deal.name}] phaseOutreach: ${c.name} — research not yet complete, deferring`);
       return false;
     }
-    return true; // enrichment done but research data may be sparse — Sonnet fills from own knowledge
+    info(`[${deal.name}] phaseOutreach: ${c.name} — missing research basis, deferring`);
+    return false;
   };
 
   const cleanupPendingFirmQueueConflicts = async () => {
@@ -6732,14 +6946,16 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
     : [];
   const sequenceStepLabel = await getSequenceStepLabelForChannel(deal, forceChannel, followUpNumber);
   const linkedInApprovalStage = followUpNumber > 0 ? `LinkedIn Follow-Up ${followUpNumber}` : 'LinkedIn DM';
+  const researchContext = buildContactResearchContext(contact);
+  const researchSummary = buildResearchSummary(contact);
 
   let draft = forceChannel === 'linkedin_dm'
-    ? await draftLinkedInDM(contactPage, null, stage === 'INTRO' ? 'intro' : 'followup', {
+    ? await draftLinkedInDM(contactPage, researchContext, stage === 'INTRO' ? 'intro' : 'followup', {
         deal,
         conversationHistory: linkedinConversationHistory,
         sequenceStepLabel,
       })
-    : await draftEmailWithTemplate(contactPage, null, stage, deal, effectiveInstructions);
+    : await draftEmailWithTemplate(contactPage, researchContext, stage, deal, effectiveInstructions);
   if (!draft) {
     error(`[OUTREACH] Draft generation failed for ${contact.name}`);
     return;
@@ -6771,27 +6987,27 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
     let decision = forceChannel === 'linkedin_dm'
       ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
           stage: linkedInApprovalStage,
-          researchSummary: contact.notes || null,
+          researchSummary: researchSummary || null,
         })
-      : await sendEmailForApproval(contactPage, draft, contact.notes || '', contact.investor_score || 0, stage, deal.id);
+      : await sendEmailForApproval(contactPage, draft, researchSummary || '', contact.investor_score || 0, stage, deal.id);
 
     let editCount = 0;
     while (decision.action === 'edit' && editCount < 3) {
       editCount++;
       draft = forceChannel === 'linkedin_dm'
-        ? await draftLinkedInDM(contactPage, null, stage === 'INTRO' ? 'intro' : 'followup', {
+        ? await draftLinkedInDM(contactPage, researchContext, stage === 'INTRO' ? 'intro' : 'followup', {
             deal,
             conversationHistory: linkedinConversationHistory,
             sequenceStepLabel,
           })
-        : await draftEmail(contactPage, null, stage, decision.instructions);
+        : await draftEmail(contactPage, researchContext, stage, decision.instructions);
       if (!draft) return;
       decision = forceChannel === 'linkedin_dm'
-        ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
+          ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
             stage: linkedInApprovalStage,
-            researchSummary: contact.notes || null,
+            researchSummary: researchSummary || null,
           })
-        : await sendEmailForApproval(contactPage, draft, contact.notes || '', contact.investor_score || 0, stage, deal.id);
+        : await sendEmailForApproval(contactPage, draft, researchSummary || '', contact.investor_score || 0, stage, deal.id);
     }
 
     if (decision.action === 'approve') {
@@ -7572,6 +7788,14 @@ function buildContactPage(contact) {
     linkedin_url: contact.linkedin_url,
     website: contact.website || contact.firms?.website || null,
     investor_score: contact.investor_score,
+    job_title: contact.job_title,
+    notes: contact.notes,
+    sector_focus: contact.sector_focus,
+    geography: contact.geography,
+    typical_cheque_size: contact.typical_cheque_size,
+    past_investments: Array.isArray(contact.past_investments) ? contact.past_investments.join(', ') : contact.past_investments,
+    aum_fund_size: contact.aum_fund_size,
+    investment_thesis: contact.investment_thesis,
     why_this_firm: whyThisFirm,
   };
 }

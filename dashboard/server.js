@@ -9,7 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DateTime } from 'luxon';
-import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals, dismissPendingApproval, getRecentlyResolvedQueueIds } from '../approval/telegramBot.js';
+import { getPendingApprovals, resolveApprovalFromDashboard, updateApprovalDraftFromDashboard, clearApprovalsForDeal, clearTelegramApprovalControls, sendTelegram, sendSourcingDraftToTelegram, sendReplyForApproval, reloadPendingInvestorApprovals, dismissPendingApproval, getRecentlyResolvedQueueIds } from '../approval/telegramBot.js';
 import { getInvestorGuidance, getSourcingGuidance, saveInvestorGuidance, saveSourcingGuidance, buildGuidanceBlock } from '../services/guidanceService.js';
 import { invalidateCache as invalidateAgentContext } from '../core/agentContext.js';
 import { getSupabase } from '../core/supabase.js';
@@ -1304,7 +1304,7 @@ async function hydrateEmailConversationHistory(sb, contact, dealId = null) {
 // ─────────────────────────────────────────────
 const replyDebounceMap = new Map();
 const inboundReplyDedupe = new Map();
-const REPLY_DEBOUNCE_MS = 90 * 1000;
+const REPLY_DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_MS || 15_000);
 const INBOUND_REPLY_DEDUPE_MS = 10 * 60 * 1000;
 
 function isDuplicateInboundReply(key) {
@@ -1959,6 +1959,14 @@ function buildLinkedInDraftContactPage(contact) {
     company_name: contact.company_name,
     linkedin_url: contact.linkedin_url,
     investor_score: contact.investor_score,
+    job_title: contact.job_title,
+    notes: contact.notes,
+    sector_focus: contact.sector_focus,
+    geography: contact.geography,
+    typical_cheque_size: contact.typical_cheque_size,
+    past_investments: Array.isArray(contact.past_investments) ? contact.past_investments.join(', ') : contact.past_investments,
+    aum_fund_size: contact.aum_fund_size,
+    investment_thesis: contact.investment_thesis,
     why_this_firm: whyThisFirm,
   };
 }
@@ -4088,7 +4096,7 @@ function registerRoutes(app) {
     if (sb) {
       try {
         const { data } = await sb.from('approval_queue')
-          .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
+          .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id, telegram_msg_id')
           .eq('id', id)
           .in('status', ['pending', 'approved_waiting_for_window'])
           .maybeSingle();
@@ -4099,6 +4107,7 @@ function registerRoutes(app) {
     if (sbItem && isReplyMessageType(sbItem.message_type)) {
       try {
         await dismissPendingApproval(id).catch(() => {});
+        if (sbItem.telegram_msg_id) await clearTelegramApprovalControls(sbItem.telegram_msg_id).catch(() => {});
         const result = await sendApprovedReply({
           queueId: sbItem.id,
           queueItem: sbItem,
@@ -4138,7 +4147,7 @@ function registerRoutes(app) {
         try {
           if (!queueItem) {
             const { data } = await sb.from('approval_queue')
-              .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id')
+              .select('id, deal_id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, stage, subject_a, subject_b, subject, approved_subject, message_type, channel, reply_to_id, telegram_msg_id')
               .eq('id', id)
               .eq('status', 'pending')
               .single();
@@ -4148,6 +4157,7 @@ function registerRoutes(app) {
 
         if (queueItem?.contact_id && queueItem?.stage === 'LinkedIn DM') {
           try {
+            if (queueItem.telegram_msg_id) await clearTelegramApprovalControls(queueItem.telegram_msg_id).catch(() => {});
             const text = sanitizeApprovalText(editedBody || queueItem.edited_body || queueItem.body || '');
             await sb.from('contacts').update({
               pipeline_stage: 'DM Approved',
@@ -4183,6 +4193,7 @@ function registerRoutes(app) {
         // Email approval (INTRO or other email stages) — send via Unipile Gmail
         if (queueItem?.contact_id) {
           try {
+            if (queueItem.telegram_msg_id) await clearTelegramApprovalControls(queueItem.telegram_msg_id).catch(() => {});
             // Look up contact email if not stored directly on the queue item
             let toEmail = queueItem.contact_email;
             let contactRow = null;
@@ -4396,7 +4407,12 @@ function registerRoutes(app) {
     const sb = getSupabase();
     if (sb) {
       try {
-        await sb.from('approval_queue').update({ status: 'skipped' }).eq('id', id);
+        const { data: skippedRow } = await sb.from('approval_queue')
+          .update({ status: 'skipped', resolved_at: new Date().toISOString() })
+          .eq('id', id)
+          .select('telegram_msg_id')
+          .maybeSingle();
+        if (skippedRow?.telegram_msg_id) await clearTelegramApprovalControls(skippedRow.telegram_msg_id).catch(() => {});
       } catch {
         // best effort
       }
