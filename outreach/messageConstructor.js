@@ -54,7 +54,7 @@ export async function constructOutreachMessage(contact, firm, dealId, messageTyp
     await sb.from('contacts').update({
       pipeline_stage: 'skipped_no_name',
       notes: (contact.notes || '') + '\n[SKIPPED: no valid name]',
-    }).eq('id', contact.id).catch(() => {});
+    }).eq('id', contact.id).then(null, () => {});
     return null;
   }
 
@@ -208,7 +208,7 @@ ${editNote}`;
     await sb.from('contacts').update({
       pipeline_stage: 'skipped_insufficient_data',
       notes: (contact.notes || '') + `\n[SKIPPED: ${parsed.reason}]`,
-    }).eq('id', contact.id).catch(() => {});
+    }).eq('id', contact.id).then(null, () => {});
     return null;
   }
 
@@ -228,7 +228,7 @@ ${editNote}`;
       await sb.from('contacts').update({
         pipeline_stage: 'skipped_wrong_deal_context',
         notes: (contact.notes || '') + `\n[SKIPPED: LLM referenced wrong deal "${other.name}"]`,
-      }).eq('id', contact.id).catch(() => {});
+      }).eq('id', contact.id).then(null, () => {});
       return null;
     }
   }

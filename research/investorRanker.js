@@ -121,6 +121,12 @@ Return ONLY this JSON (no markdown):
     };
   } catch (err) {
     console.error('[RANKER] Failed for', investor.company_name || investor.name, ':', err.message);
-    return { score: 0, grade: 'Archive', rationale: 'Scoring failed', key_reason: '' };
+    return {
+      score: null,
+      grade: 'Retry',
+      rationale: `Scoring failed: ${String(err.message || 'unknown error').slice(0, 160)}`,
+      key_reason: '',
+      retryable: true,
+    };
   }
 }

@@ -119,7 +119,7 @@ async function getNextBatchContacts(deal, batchNumber) {
         stage: 'Prospecting',
         investor_score: contact.investor_score,
         company_name: contact.company_name,
-      }, { onConflict: 'deal_id,contact_id' }).catch(() => {});
+      }, { onConflict: 'deal_id,contact_id' }).then(null, () => {});
 
       // Write Deal Name to Notion so the pipeline table shows it
       if (contact.notion_page_id) {

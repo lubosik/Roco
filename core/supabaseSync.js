@@ -761,7 +761,7 @@ export async function addApprovalToQueue(data) {
         subject_a: data.subjectA || null,
         subject_b: data.subjectB || null,
         body: data.body || null,
-        score: data.score || null,
+        score: data.score ?? null,
         research_summary: data.researchSummary || null,
         outreach_mode: data.outreachMode || null,
         status: 'pending',

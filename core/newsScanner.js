@@ -803,7 +803,7 @@ export async function saveDealNewsLeads(dealId, leads, deal = null, pushActivity
 
   for (const lead of topLeads) {
     try {
-      const { data: existing } = await sb.from('firms').select('id').ilike('name', lead.firm_name).limit(1).catch(() => ({ data: [] }));
+      const { data: existing } = await sb.from('firms').select('id').ilike('name', lead.firm_name).limit(1).then(result => result, () => ({ data: [] }));
       if (!existing?.length) {
         await sb.from('firms').insert({
           name: lead.firm_name,

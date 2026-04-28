@@ -108,7 +108,7 @@ export async function runDealResearch(deal) {
       activity_type: 'research',
       deal_id: deal.id,
       created_at: new Date().toISOString(),
-    }).catch(() => {});
+    }).then(null, () => {});
   }
 
   return saved;

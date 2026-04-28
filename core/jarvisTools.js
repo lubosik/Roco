@@ -847,7 +847,7 @@ async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) 
         status:     'suppressed',
         notes:      reason,
         updated_at: now,
-      }, { onConflict: 'deal_id,firm_name' }).catch(() => {});
+      }, { onConflict: 'deal_id,firm_name' }).then(null, () => {});
     }
 
     let contactsQuery = sb.from('contacts')
@@ -867,7 +867,7 @@ async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) 
       .update({ status: 'suppressed', notes: `Suppressed by JARVIS: ${reason}` })
       .ilike('firm_name', `%${firmToken}%`);
     if (!global) batchQuery = batchQuery.eq('deal_id', deal_id);
-    await batchQuery.catch(() => {});
+    await batchQuery.then(null, () => {});
 
     if (!global) {
       await sb.from('firm_suppressions').insert({
@@ -878,15 +878,15 @@ async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) 
         contacts_suppressed: contactsSuppressed,
         suppression_type: 'JARVIS',
         created_at: now,
-      }).catch(() => {});
+      }).then(null, () => {});
 
       await sb.from('deal_exclusions').insert({
         deal_id,
         firm_name: firm_name.toLowerCase().trim(),
         added_by: 'JARVIS',
-      }).catch(() => {});
+      }).then(null, () => {});
     } else {
-      const { data: activeDeals } = await sb.from('deals').select('id').eq('status', 'ACTIVE').catch(() => ({ data: [] }));
+      const { data: activeDeals } = await sb.from('deals').select('id').eq('status', 'ACTIVE').then(result => result, () => ({ data: [] }));
       for (const deal of activeDeals || []) {
         await sb.from('firm_outreach_state').upsert({
           deal_id: deal.id,
@@ -894,12 +894,12 @@ async function toolSuppressFirm({ deal_id, firm_name, reason, scope = 'deal' }) 
           status: 'suppressed',
           notes: `Global JARVIS suppression: ${reason}`,
           updated_at: now,
-        }, { onConflict: 'deal_id,firm_name' }).catch(() => {});
+        }, { onConflict: 'deal_id,firm_name' }).then(null, () => {});
         await sb.from('deal_exclusions').insert({
           deal_id: deal.id,
           firm_name: firm_name.toLowerCase().trim(),
           added_by: 'JARVIS',
-        }).catch(() => {});
+        }).then(null, () => {});
       }
     }
 
@@ -940,7 +940,7 @@ async function toolUpdateContact({ deal_id, contact_name, pipeline_stage, tier, 
         .select('id, name, company_name, title, pipeline_stage, email, linkedin_url, notes, campaign_id, sourcing_campaigns(name)')
         .ilike('name', `%${contact_name.split(' ')[0]}%`)
         .limit(5)
-        .catch(() => ({ data: [] }));
+        .then(result => result, () => ({ data: [] }));
 
       if (!campaignMatches?.length) return { error: `No contact found matching "${contact_name}"` };
 

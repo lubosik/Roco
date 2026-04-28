@@ -1769,7 +1769,7 @@ async function triggerAutoFeedForDeal(deal, { reason = 'pipeline_depth', request
     event_type: 'PIPELINE_AUTO_FEED',
     summary: `Auto-feed triggered for ${deal.name}: researched ${researched} new firms, ${added} added after deduplication, ${skipped} skipped (already in pipeline).`,
     created_at: new Date().toISOString(),
-  }).catch(() => {});
+  }).then(null, () => {});
   pushActivity({
     type: 'pipeline',
     action: `Auto-feed triggered for ${deal.name}: researched ${researched} new firms, ${added} added after deduplication, ${skipped} skipped (already in pipeline).`,
@@ -4434,7 +4434,7 @@ async function archiveFirm(firmId, dealId, reason, note = '') {
         .eq('response_received', true)
         .limit(1)
         .maybeSingle()
-        .catch(() => ({ data: null }));
+        .then(result => result, () => ({ data: null }));
       await updateListStats({ name: firm.source_list }, dealId, !!positiveReply).catch(() => {});
     }
 
@@ -5020,19 +5020,61 @@ async function phaseRank(deal, state) {
 
   for (const contact of contacts) {
     try {
-      const result = await rankInvestor({ investor: contact, deal });
+      let scoringContact = contact;
+      if (contactNeedsCoreResearch(scoringContact)) {
+        try {
+          scoringContact = await enrichSparseContactBeforeRanking(scoringContact, deal, sb);
+        } catch (researchErr) {
+          warn(`[${deal.name}] Pre-score research failed for ${contact.name}: ${researchErr.message}`);
+          if (!hasUsableResearchBasis(scoringContact)) {
+            const retryNote = `${String(contact.notes || '').replace(/\n?\[SCORE_RETRY:[^\n]*\]/g, '').trim()}\n[SCORE_RETRY: ${new Date().toISOString()}] Pre-score research failed: ${String(researchErr.message || '').slice(0, 180)}`.trim().slice(0, 4000);
+            await sb.from('contacts').update({
+              notes: retryNote,
+              pipeline_stage: 'Researched',
+              investor_score: null,
+            }).eq('id', contact.id);
+            await sbLogActivity({
+              dealId: deal.id,
+              contactId: contact.id,
+              eventType: 'RANK_RETRY',
+              summary: `${contact.name} left unscored — research failed before ranking`,
+              detail: { error: researchErr.message },
+            }).catch(() => {});
+            continue;
+          }
+        }
+      }
+
+      const result = await rankInvestor({ investor: scoringContact, deal });
+      if (result?.retryable || !Number.isFinite(Number(result?.score))) {
+        const retryNote = `${String(scoringContact.notes || '').replace(/\n?\[SCORE_RETRY:[^\n]*\]/g, '').trim()}\n[SCORE_RETRY: ${new Date().toISOString()}] ${result?.rationale || 'Scoring failed; will retry'}`.trim().slice(0, 4000);
+        await sb.from('contacts').update({
+          notes: retryNote,
+          pipeline_stage: 'Researched',
+          investor_score: null,
+        }).eq('id', scoringContact.id);
+        await sbLogActivity({
+          dealId: deal.id,
+          contactId: scoringContact.id,
+          eventType: 'RANK_RETRY',
+          summary: `${scoringContact.name} left unscored — scoring failed and will retry`,
+          detail: { rationale: result?.rationale || null },
+        }).catch(() => {});
+        continue;
+      }
+
       // Map grade to tier
       const tierMap = { 'Hot': 'hot', 'Warm': 'warm', 'Possible': 'possible', 'Archive': 'archive' };
       const tier = tierMap[result.grade] || (result.score >= 75 ? 'hot' : result.score >= 50 ? 'warm' : result.score >= 30 ? 'possible' : 'archive');
       const isArchived = result.grade === 'Archive' || tier === 'archive';
       // If enrichment already ran (any non-pending status), skip straight to Enriched
       const ENRICHMENT_DONE = ['enriched','enriched_apify','linkedin_only','email_invalid_linkedin_only','skipped_no_linkedin','email_only'];
-      const enrichmentAlreadyDone = ENRICHMENT_DONE.includes(contact.enrichment_status);
-      const newStage = isArchived ? 'Archived' : (enrichmentAlreadyDone || contact.pipeline_stage === 'Enriched') ? 'Enriched' : 'Ranked';
+      const enrichmentAlreadyDone = ENRICHMENT_DONE.includes(scoringContact.enrichment_status);
+      const newStage = isArchived ? 'Archived' : (enrichmentAlreadyDone || scoringContact.pipeline_stage === 'Enriched') ? 'Enriched' : 'Ranked';
       // Build the update object with score, stage, and tier
       // Classify as individual or institutional based on company_name
-      const companyLower = (contact.company_name || '').toLowerCase().trim();
-      const isIndividual = !contact.company_name || GENERIC_FIRM_NAMES.has(companyLower) || contact.is_angel;
+      const companyLower = (scoringContact.company_name || '').toLowerCase().trim();
+      const isIndividual = !scoringContact.company_name || GENERIC_FIRM_NAMES.has(companyLower) || scoringContact.is_angel;
 
       const rankUpdate = {
         investor_score: result.score,
@@ -5041,11 +5083,11 @@ async function phaseRank(deal, state) {
         contact_type: isIndividual ? 'individual' : 'institutional',
       };
       // If fresh contact (never enriched), mark pending so phaseEnrich picks it up
-      if (!isArchived && !enrichmentAlreadyDone && !contact.enrichment_status) {
+      if (!isArchived && !enrichmentAlreadyDone && !scoringContact.enrichment_status) {
         rankUpdate.enrichment_status = 'pending';
       }
       // Apply intelligence boost from comparable deal analysis
-      const boost = await getIntelligenceBoost(contact, deal, sb);
+      const boost = await getIntelligenceBoost(scoringContact, deal, sb);
       if (boost.delta > 0) {
         rankUpdate.investor_score = Math.min((result.score || 0) + boost.delta, 100);
       }
@@ -5053,30 +5095,30 @@ async function phaseRank(deal, state) {
       await sb.from('contacts').update({
         ...rankUpdate,
         notes: (() => {
-          const clean = (contact.notes || '').replace(/\n?\[SCORE:[^\n]*\]/g, '').trim();
+          const clean = (scoringContact.notes || '').replace(/\n?\[SCORE:[^\n]*\]/g, '').replace(/\n?\[SCORE_RETRY:[^\n]*\]/g, '').trim();
           const baseEntry = `[SCORE: ${result.score} — ${result.grade}] ${result.rationale}`;
           const boostEntry = boost.delta > 0
             ? `\n[INTELLIGENCE BOOST +${boost.delta}] Backed ${boost.times} comparable deal(s): ${boost.companies}`
             : '';
           return clean ? `${clean}\n${baseEntry}${boostEntry}` : `${baseEntry}${boostEntry}`;
         })(),
-      }).eq('id', contact.id);
+      }).eq('id', scoringContact.id);
 
-      logStep(`Ranked: ${contact.name}`, `${result.grade} (${result.score})`, 'research', deal);
+      logStep(`Ranked: ${scoringContact.name}`, `${result.grade} (${result.score})`, 'research', deal);
       await sbLogActivity({
         dealId: deal.id,
-        contactId: contact.id,
+        contactId: scoringContact.id,
         eventType: 'RANKED',
-        summary: `${contact.name} scored ${result.score} — ${result.grade}`,
+        summary: `${scoringContact.name} scored ${result.score} — ${result.grade}`,
         detail: { score: result.score, grade: result.grade, rationale: result.rationale },
       });
 
       // If enrichment was already done in a prior pass, log it so the feed shows the full flow
       if (!isArchived && enrichmentAlreadyDone) {
-        const enrichLabel = contact.enrichment_status === 'enriched' || contact.enrichment_status === 'enriched_apify'
-          ? `Email on file (${contact.enrichment_status})`
-          : `No email found (${contact.enrichment_status})`;
-        pushActivity({ type: 'enrichment', action: `Enriched`, note: `${contact.name} — ${enrichLabel}`, deal_name: deal.name, dealId: deal.id });
+        const enrichLabel = scoringContact.enrichment_status === 'enriched' || scoringContact.enrichment_status === 'enriched_apify'
+          ? `Email on file (${scoringContact.enrichment_status})`
+          : `No email found (${scoringContact.enrichment_status})`;
+        pushActivity({ type: 'enrichment', action: `Enriched`, note: `${scoringContact.name} — ${enrichLabel}`, deal_name: deal.name, dealId: deal.id });
       }
     } catch (e) {
       console.warn(`[RANK] Failed for ${contact.name}:`, e.message);
@@ -5280,7 +5322,7 @@ async function phasePersonResearch(deal, batch) {
     } catch (e) {
       warn(`[${deal.name}] phasePersonResearch failed for ${contact.name}: ${e.message}`);
       const failureNote = `${String(contact.notes || '').trim()}\n[PERSON_RESEARCH_FAILED ${new Date().toISOString()}] ${String(e.message || '').slice(0, 180)}`.trim().slice(0, 4000);
-      await sb.from('contacts').update({ notes: failureNote }).eq('id', contact.id).catch(() => {});
+      await sb.from('contacts').update({ notes: failureNote }).eq('id', contact.id).then(null, () => {});
     }
   }
 }
@@ -5341,6 +5383,85 @@ async function buildDraftLinkedInProfileContext(contactPage) {
     experience ? `Recent experience: ${experience}` : null,
     skills ? `Skills: ${skills}` : null,
   ].filter(Boolean).join('\n');
+}
+
+function buildPersonResearchUpdates(contact, research, marker = 'PERSON_RESEARCHED') {
+  const notesBase = String(contact.notes || '').replace(/\n?\[PERSON_RESEARCHED[^\n]*\]/g, '').trim();
+  const summaryLines = [
+    research.firm_description ? `Profile: ${research.firm_description}` : null,
+    research.investment_thesis ? `Thesis: ${research.investment_thesis}` : null,
+    research.past_investments ? `Past: ${research.past_investments}` : null,
+    research.recent_news ? `Recent: ${research.recent_news}` : null,
+  ].filter(Boolean);
+  const updates = {
+    person_researched: true,
+    notes: [notesBase, `[${marker} ${new Date().toISOString()}]`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
+  };
+  if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
+  if (research.company_name && !contact.company_name) updates.company_name = research.company_name;
+  if (research.linkedin_url && !contact.linkedin_url) updates.linkedin_url = research.linkedin_url;
+  if (research.sector_focus) updates.sector_focus = research.sector_focus;
+  if (research.geography) updates.geography = research.geography;
+  if (research.typical_cheque) updates.typical_cheque_size = research.typical_cheque;
+  if (research.firm_aum) updates.aum_fund_size = research.firm_aum;
+  if (research.past_investments) updates.past_investments = research.past_investments;
+  if (research.investment_thesis) updates.investment_thesis = research.investment_thesis;
+  if (research.contact_type_confirmed) updates.contact_type = research.contact_type_confirmed;
+  return updates;
+}
+
+async function enrichSparseContactBeforeRanking(contact, deal, sb) {
+  let current = { ...contact };
+
+  const identifier = current.linkedin_provider_id || current.linkedin_url || null;
+  if (identifier && contactNeedsCoreResearch(current)) {
+    const profile = await retrieveLinkedInProfile(identifier).catch(() => null);
+    if (profile) {
+      const experience = Array.isArray(profile.experience)
+        ? profile.experience
+          .map(role => [role?.title, role?.company_name || role?.company].filter(Boolean).join(' at '))
+          .filter(Boolean)
+          .slice(0, 2)
+          .join('; ')
+        : '';
+      const linkedInLines = [
+        `[LINKEDIN_PROFILE_RESEARCHED ${new Date().toISOString()}]`,
+        profile.headline ? `LinkedIn headline: ${profile.headline}` : null,
+        profile.summary ? `LinkedIn summary: ${String(profile.summary).slice(0, 320)}` : null,
+        experience ? `LinkedIn experience: ${experience}` : null,
+      ].filter(Boolean);
+      const patch = {
+        notes: [String(current.notes || '').trim(), ...linkedInLines].filter(Boolean).join('\n').slice(0, 4000),
+      };
+      if (profile.current_title && !current.job_title) patch.job_title = profile.current_title;
+      if (profile.current_company && !current.company_name) patch.company_name = profile.current_company;
+      if (profile.location && !current.geography) patch.geography = profile.location;
+      await sb.from('contacts').update(patch).eq('id', current.id);
+      current = { ...current, ...patch };
+    }
+  }
+
+  if (contactNeedsCoreResearch(current)) {
+    const research = await researchPerson({ contact: current, deal });
+    if (research) {
+      const patch = buildPersonResearchUpdates(current, research, 'PERSON_RESEARCHED_FOR_RANKING');
+      await sb.from('contacts').update(patch).eq('id', current.id);
+      current = { ...current, ...patch };
+      await sbLogActivity({
+        dealId: deal.id,
+        contactId: current.id,
+        eventType: 'PERSON_RESEARCHED_FOR_RANKING',
+        summary: `${current.name} researched before scoring`,
+        detail: {
+          company_name: research.company_name || current.company_name || null,
+          past_investments: research.past_investments || null,
+          investment_thesis: research.investment_thesis || null,
+        },
+      }).catch(() => {});
+    }
+  }
+
+  return current;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6251,7 +6372,7 @@ async function phaseLinkedInInvites(deal, state) {
         // Defer this contact for 4 hours so it doesn't re-enter the queue every cycle
         await sb.from('contacts').update({
           follow_up_due_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
-        }).eq('id', contact.id).catch(() => {});
+        }).eq('id', contact.id).then(null, () => {});
       }
     } catch (e) {
       warn(`[${deal.name}] Unexpected LinkedIn invite processing error for ${contact.name}: ${e.message}`);
@@ -6858,7 +6979,7 @@ async function phaseFollowUps(deal, state) {
         dealId: deal.id,
       });
       // Clear the LinkedIn patience timer before drafting the email
-      await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id).catch(() => {});
+      await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id).then(null, () => {});
       await handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' }).catch(() => {});
     } else {
       // Patience window expired → mark inactive and advance waterfall to next person at the firm.

@@ -73,7 +73,7 @@ export async function writeGlobalRuntimeSetting(key, value) {
       if (duplicates.length) {
         const duplicateIds = duplicates.map(row => row.id).filter(Boolean);
         if (duplicateIds.length) {
-          await sb.from('deal_settings').delete().in('id', duplicateIds).catch(() => {});
+          await sb.from('deal_settings').delete().in('id', duplicateIds).then(null, () => {});
         }
       }
     } else {

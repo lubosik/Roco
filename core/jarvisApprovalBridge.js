@@ -45,7 +45,7 @@ export async function executeApprovalById(item) {
 
   if (item.contact_id) {
     const { data: contact } = await sb.from('contacts')
-      .select('email, deal_id').eq('id', item.contact_id).single().catch(() => ({ data: null }));
+      .select('email, deal_id').eq('id', item.contact_id).single().then(result => result, () => ({ data: null }));
     toEmail = toEmail || contact?.email || null;
     dealId  = dealId  || contact?.deal_id || null;
   }

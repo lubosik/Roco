@@ -563,7 +563,7 @@ async function findActiveTrackedDealContext(sb, trackedEmail) {
     .select('id, name, email, company_name, job_title, deal_id, deals!contacts_deal_id_fkey(id, name, status)')
     .eq('id', trackedEmail.contact_id)
     .maybeSingle()
-    .catch(() => ({ data: null }));
+    .then(result => result, () => ({ data: null }));
 
   const deal = contact?.deals || null;
   if (!contact?.id || String(deal?.status || '').toUpperCase() !== 'ACTIVE') return null;
@@ -744,7 +744,7 @@ async function processUnipileMessageEvent(event) {
       await insertWebhookLogRecord({
         event_type: eventType || 'message_received',
         payload: event || {},
-      }).catch(() => {});
+      }).then(null, () => {});
       return 'suppressed';
     }
 
@@ -783,7 +783,7 @@ async function processUnipileMessageEvent(event) {
               : 'acceptance webhook did not match an active contact',
           },
         },
-      }).catch(() => {});
+      }).then(null, () => {});
     }
     return;
   }
@@ -977,7 +977,7 @@ async function upsertTranscriptInvestorDatabaseRecord(sb, { analysis, contact, i
       .or(`email.eq.${lookupEmail},primary_contact_email.eq.${lookupEmail}`)
       .limit(1)
       .maybeSingle()
-      .catch(() => ({ data: null }));
+      .then(result => result, () => ({ data: null }));
     existing = data || null;
   }
   if (!existing && lookupName) {
@@ -986,7 +986,7 @@ async function upsertTranscriptInvestorDatabaseRecord(sb, { analysis, contact, i
       .ilike('name', lookupName)
       .limit(1)
       .maybeSingle()
-      .catch(() => ({ data: null }));
+      .then(result => result, () => ({ data: null }));
     existing = data || null;
   }
 
@@ -2085,7 +2085,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       .select('id, name, pipeline_stage, pending_linkedin_dm')
       .eq('id', contactId)
       .maybeSingle()
-      .catch(() => ({ data: null }));
+      .then(result => result, () => ({ data: null }));
     const currentStage = String(current?.pipeline_stage || '').trim().toLowerCase();
     if (currentStage === 'pending_dm_approval') {
       const { data: pendingRows } = await sb.from('approval_queue')
@@ -2095,7 +2095,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
         .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending'])
         .order('created_at', { ascending: false })
         .limit(1)
-        .catch(() => ({ data: null }));
+        .then(result => result, () => ({ data: null }));
       if (pendingRows?.length) {
         await reloadPendingInvestorApprovals().catch(() => {});
         return pendingRows[0];
@@ -2103,7 +2103,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       await sb.from('contacts').update({
         pipeline_stage: 'invite_accepted',
         pending_linkedin_dm: true,
-      }).eq('id', contactId).catch(() => {});
+      }).eq('id', contactId).then(null, () => {});
       return { deferred: true, reason: 'draft_claim_in_progress_or_stale' };
     }
     return { deferred: true, reason: `stage_not_lockable:${current?.pipeline_stage || 'unknown'}` };
@@ -2114,7 +2114,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     await sb.from('contacts').update({
       pipeline_stage: 'invite_accepted',
       pending_linkedin_dm: true,
-    }).eq('id', contactId).catch(() => {});
+    }).eq('id', contactId).then(null, () => {});
     pushActivity({
       type: 'warning',
       action: 'LinkedIn DM queue stalled',
@@ -2142,7 +2142,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     await sb.from('contacts').update({
       pipeline_stage: 'invite_accepted',
       pending_linkedin_dm: true,
-    }).eq('id', contact.id).catch(() => {});
+    }).eq('id', contact.id).then(null, () => {});
     throw new Error(`Failed to create LinkedIn approval queue row for ${contact.name || contact.id}`);
   }
 
@@ -2215,7 +2215,7 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
           await sb.from('contacts').update({
             linkedin_provider_id: providerId || contact.linkedin_provider_id,
             linkedin_url: profileUrl || contact.linkedin_url,
-          }).eq('id', contact.id).catch(() => {});
+          }).eq('id', contact.id).then(null, () => {});
           contact = {
             ...contact,
             linkedin_provider_id: providerId || contact.linkedin_provider_id,
@@ -2240,7 +2240,7 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
       .select('aum, past_investments, investment_thesis, thesis, match_rationale, justification')
       .eq('id', contact.firm_id)
       .maybeSingle()
-      .catch(() => ({ data: null }));
+      .then(result => result, () => ({ data: null }));
     firmResearch = data || null;
   }
 
@@ -2420,7 +2420,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
         summary: `LinkedIn DM failed for ${contact.name || 'contact'}`,
         detail: { error: String(err.message || 'Unknown send failure').slice(0, 500) },
         created_at: new Date().toISOString(),
-      }).catch(() => {});
+      }).then(null, () => {});
     }
     sendTelegram(`❌ *LinkedIn DM failed* → *${contact.name || 'contact'}* (${contact.company_name || 'unknown firm'})${deal?.name ? ` · *${deal.name}*` : ''}\n_${String(err.message || 'Unknown failure').slice(0, 160)}_`).catch(() => {});
     notifyQueueUpdated();
@@ -2454,7 +2454,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
     channel:    'linkedin_dm',
     body:       bodyToSend,
     sent_at:    sentAt,
-  }).catch(err => console.warn('[LI DM] log error:', err.message));
+  }).then(null, err => console.warn('[LI DM] log error:', err.message));
 
   if (contact.deal_id) {
     await sb.from('activity_log').insert({
@@ -2485,7 +2485,7 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
       status: 'sent',
       sent_at: sentAt,
       edited_body: bodyToSend !== queueItem?.body ? bodyToSend : (queueItem?.edited_body || null),
-    }).eq('id', queueId).catch(err => console.warn('[LI DM] approval_queue update error:', err.message));
+    }).eq('id', queueId).then(null, err => console.warn('[LI DM] approval_queue update error:', err.message));
   }
 
   notifyQueueUpdated();
@@ -2600,7 +2600,7 @@ export async function sendApprovedReply({ queueId = null, queueItem = null, forc
         channel: 'linkedin_dm',
         body: bodyToSend,
         sent_at: sentAt,
-      }).catch(() => {});
+      }).then(null, () => {});
     }
 
     pushActivity({
@@ -2673,7 +2673,7 @@ export async function sendApprovedReply({ queueId = null, queueItem = null, forc
       body: bodyToSend,
       subject,
       sent_at: sentAt,
-    }).catch(() => {});
+    }).then(null, () => {});
   }
 
   pushActivity({
@@ -3034,7 +3034,7 @@ export function initDashboard(state) {
           from_linkedin_url:   fromLinkedin || null,
           from_provider_id:    fromProvId || null,
           created_at:          new Date().toISOString(),
-        }).catch(e => console.warn('[WEBHOOK/LINKEDIN/MSG] DB insert failed:', e.message));
+        }).then(null, e => console.warn('[WEBHOOK/LINKEDIN/MSG] DB insert failed:', e.message));
       }
 
       // Route through debounce batcher to draft response
@@ -3994,7 +3994,7 @@ function registerRoutes(app) {
             status: 'skipped',
             resolved_at: new Date().toISOString(),
             edit_instructions: 'Auto-skipped: missing usable email address',
-          }).in('id', missingEmailIds).catch(() => {});
+          }).in('id', missingEmailIds).then(null, () => {});
         }
         const merged = [];
         const seenQueueIds = new Set();
@@ -9418,7 +9418,7 @@ async function processRocoBatchedReply(batch) {
       event_type: 'REPLY_RECEIVED',
       summary:    `[${contextName}]: ${contact.name} sent a message via ${channel}`,
       detail:     { content: msg.content, channel },
-    }).catch(() => {});
+    }).then(null, () => {});
   }
 
   // Update contact state immediately so the pipeline/campaign board reflects that
@@ -9543,7 +9543,7 @@ async function processRocoBatchedReply(batch) {
       contact_id: contact.id,
       event_type: 'REPLY_CLASSIFICATION_ERROR',
       summary:    `[${contextName}]: Failed to classify reply from ${contact.name}`,
-    }).catch(() => {});
+    }).then(null, () => {});
     return;
   }
 
@@ -9592,7 +9592,7 @@ async function processRocoBatchedReply(batch) {
             .eq('direction', 'inbound')
             .order('created_at', { ascending: false })
             .limit(1)
-            .catch(() => {});
+            .then(null, () => {});
         }
 
         // Apply conversation state
@@ -9657,7 +9657,7 @@ async function processRocoBatchedReply(batch) {
       contact_id: contact.id,
       event_type: 'CONVERSATION_ENDED',
       summary:    `[${contextName}]: Conversation with ${contact.name} ended naturally`,
-    }).catch(() => {});
+    }).then(null, () => {});
     await sendTelegram(
       `🔚 *Conversation ended* — ${contact.name} (${contact.company_name || 'unknown'})\n[${contextName}] — archived.`
     ).catch(() => {});
@@ -9887,7 +9887,7 @@ async function conductMidConversationResearch(content, contact, deal, campaign, 
       event_type: 'MID_CONVERSATION_RESEARCH',
       summary:    `[${contextName}]: Mid-conversation research for ${contact.name}`,
       detail:     { question_preview: content.slice(0, 100) },
-    }).catch(() => {});
+    }).then(null, () => {});
 
     return text;
   } catch (err) {
@@ -9921,14 +9921,14 @@ async function handleNegativeReplyResponse(contact, deal, campaign, mode, contex
       response_received:     true,
       responding_contact_id: contact.id,
       status:                'declined',
-    }).catch(() => {});
+    }).then(null, () => {});
 
     await sb?.from('firm_suppressions').upsert({
       firm_id:    contact.firm_id,
       deal_id:    deal.id,
       reason:     'declined',
       suppressed_at: now,
-    }, { onConflict: 'firm_id,deal_id' }).catch(() => {});
+    }, { onConflict: 'firm_id,deal_id' }).then(null, () => {});
   } else if (mode === 'investor_outreach' && isAngel) {
     // Angel — they represent only themselves, no firm suppression
     console.log(`[SUPPRESSION] ${contact.name} is angel — individual suppression only, no firm-wide suppression`);

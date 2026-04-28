@@ -572,6 +572,20 @@ Archive if: pure VC/angel/accelerator; deal size clearly out of range; status in
 - Activity/pacing (10pts): Recently active? Recent fund close or dry powder?`;
   }
 
+  const deterministicFallback = (inv) => {
+    const det = Number.isFinite(Number(inv._det_score))
+      ? Number(inv._det_score)
+      : scoreDeterministic(inv, dealInfo).deterministicScore;
+    const score = Math.max(0, Math.min(100, Math.round(det)));
+    return {
+      ...inv,
+      _det_score: det,
+      score,
+      grade: score >= 65 ? 'Warm' : score >= 45 ? 'Possible' : 'Archive',
+      score_reason: 'AI scoring unavailable - using deterministic score',
+    };
+  };
+
   for (let i = 0; i < investors.length; i += BATCH) {
     const rawBatch = investors.slice(i, i + BATCH);
     const batch = [];
@@ -663,27 +677,28 @@ Grades: Hot=85+, Warm=65-84, Possible=45-64, Archive=0-44`;
     try {
       const text = await haikuComplete(prompt, { maxTokens: 500 });
       const match = text.replace(/```json|```/g, '').trim().match(/\[[\s\S]*\]/);
-      if (match) {
-        const scores = JSON.parse(match[0]);
-        scores.forEach(s => {
-          const inv = batch[s.idx];
-          if (inv) results.push({
-            ...inv,
+      if (!match) throw new Error('AI scoring returned no JSON array');
+      const scores = JSON.parse(match[0]);
+      const scoredIndexes = new Set();
+      scores.forEach(s => {
+        const inv = batch[s.idx];
+        if (inv) {
+          scoredIndexes.add(Number(s.idx));
+          results.push({
+            ...deterministicFallback(inv),
             score: Math.min(100, Math.max(0, Number(s.score) || 0)),
             grade: s.grade || 'Possible',
             score_reason: s.reason || '',
           });
-        });
-      }
+        }
+      });
+      batch.forEach((inv, idx) => {
+        if (!scoredIndexes.has(idx)) results.push(deterministicFallback(inv));
+      });
     } catch (err) {
       console.warn('[BATCH SCORE] Error:', err.message);
       // Fall back to deterministic score on AI failure
-      batch.forEach(inv => results.push({
-        ...inv,
-        score: inv._det_score || 0,
-        grade: inv._det_score >= 65 ? 'Warm' : inv._det_score >= 45 ? 'Possible' : 'Archive',
-        score_reason: 'AI scoring failed — using deterministic score',
-      }));
+      batch.forEach(inv => results.push(deterministicFallback(inv)));
     }
   }
 

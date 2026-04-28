@@ -491,7 +491,7 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
       // can be found in the in-memory map (via reloadPendingInvestorApprovals) and
       // reloadApprovalForTelegramMessage can match button presses on old messages.
       if (sb && queueId) {
-        sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).catch(() => {});
+        sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).then(null, () => {});
       }
       info(`LinkedIn DM draft sent to Telegram for approval: ${name}`);
     } catch (err) {
@@ -676,7 +676,7 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
     const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
     if (queueItemId) {
       const sb = getSupabase();
-      await sb?.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueItemId).catch(() => {});
+      await sb?.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueItemId).then(null, () => {});
     }
 
     pendingApprovals.set(sent.message_id, {
@@ -2131,7 +2131,7 @@ async function executeReloadedApproval(item, decision) {
     // Direct SUBJECT: override — no AI redraft needed
     if (instructions.toUpperCase().startsWith('SUBJECT:') && !isLinkedInStageLabel(item.stage)) {
       const newSubject = instructions.slice(8).trim();
-      await sb.from('approval_queue').update({ approved_subject: newSubject }).eq('id', item.id).catch(() => {});
+      await sb.from('approval_queue').update({ approved_subject: newSubject }).eq('id', item.id).then(null, () => {});
       await bot.sendMessage(
         process.env.TELEGRAM_CHAT_ID,
         `✅ Subject updated to: "${newSubject}"`,
@@ -2169,7 +2169,7 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
     await sb.from('approval_queue').update({
       edited_body: newBody,
       edit_instructions: instructions,
-    }).eq('id', item.id).catch(() => {});
+    }).eq('id', item.id).then(null, () => {});
 
     // Send a new Telegram message with the redrafted email and re-approval buttons
     const subject = item.approved_subject || item.subject_a || item.subject || '';
@@ -2205,7 +2205,7 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
         pendingApprovals.set(sent.message_id, entry);
         pendingApprovals.set(String(sent.message_id), entry);
         // Update DB with new telegram_msg_id
-        await sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', item.id).catch(() => {});
+        await sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', item.id).then(null, () => {});
       }
     } catch (err) {
       console.warn('[TELEGRAM EDIT] Failed to send redrafted message:', err.message);
@@ -2431,7 +2431,7 @@ async function reloadApprovalForTelegramMessage(msgId, queueId = null) {
     }
     if (item.status !== 'pending') return null;
     if (msgId && !item.telegram_msg_id) {
-      await sb.from('approval_queue').update({ telegram_msg_id: msgId }).eq('id', item.id).catch(() => {});
+      await sb.from('approval_queue').update({ telegram_msg_id: msgId }).eq('id', item.id).then(null, () => {});
       item.telegram_msg_id = msgId;
     }
     const entry = buildReloadedApprovalEntry(item);

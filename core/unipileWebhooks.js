@@ -392,7 +392,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
         sentiment: intent?.category || null,
         last_reply_at: new Date().toISOString(),
         ...stageUpdates,
-      }).eq('id', contact.id).catch(() => {});
+      }).eq('id', contact.id).then(null, () => {});
 
       // Skip draft if conversation ended negatively
       if (!isNegative && typeof draftContextualReply === 'function') {
@@ -427,7 +427,7 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
             await sb.from('approval_queue')
               .update({ message_type: 'linkedin_reply' })
               .eq('id', queueRow.id)
-              .catch(() => {});
+              .then(null, () => {});
 
             // Notify via Telegram
             try {
