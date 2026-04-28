@@ -485,9 +485,33 @@ export async function buildDealNewsScan(deal, portfolioDeals = [], pushActivity)
   const successfulResults = grokRawResults.filter(item => item.success && item.raw_result).map(item => item.raw_result);
 
   if (!successfulResults.length) {
-    const failureReason = grokRawResults.map(item => item.raw_result).filter(Boolean).slice(0, 2).join(' | ') || 'Web search returned no successful results';
-    await recordDailyNewsScanFailure(deal, pushActivity, failureReason);
-    return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
+    // Try fallback with research-tier model (Kimi K2, which has live web access)
+    try {
+      const { orComplete } = await import('./openRouterClient.js');
+      const fallbackQuery = `Search the web for recent news (last 30 days) about PE/VC firm activity, healthcare investment deals, and investor signals relevant to: ${deal.sector || 'healthcare and medical devices'}. Find at least 3 investor firms with specific recent events showing active investment appetite. Name the firms, describe the signal, and explain relevance. Be specific with facts.`;
+      const fallbackResult = await orComplete(fallbackQuery, {
+        tier: 'research',
+        maxTokens: 1200,
+        systemPrompt: 'You are an investor intelligence analyst with web access. Return detailed, specific findings with firm names and recent events.',
+      });
+      if (fallbackResult && fallbackResult.length > 150) {
+        successfulResults.push(fallbackResult);
+        pushActivity?.({
+          type: 'research',
+          action: 'News scan: fallback research model succeeded',
+          note: `${deal.name} · primary web search failed, used research tier`,
+          deal_id: deal.id,
+        });
+      }
+    } catch (fbErr) {
+      console.warn('[NEWS SCAN] Fallback research also failed:', fbErr.message);
+    }
+
+    if (!successfulResults.length) {
+      const failureReason = grokRawResults.map(item => item.raw_result).filter(Boolean).slice(0, 2).join(' | ') || 'Web search returned no successful results';
+      await recordDailyNewsScanFailure(deal, pushActivity, failureReason);
+      return { leads: [], summary: '', rawSummary: '', rejectedFindings: [], grokQueries: queryPlan, grokRawResults, isRelevant: false, notes: 'News scan failed for today.', recommendedInvestors: [] };
+    }
   }
 
   let searchPayload = null;
@@ -753,10 +777,11 @@ export async function scanInvestorNewsForDeal(deal, optionsOrPushActivity, maybe
   }
 }
 
-export async function saveDealNewsLeads(dealId, leads) {
+export async function saveDealNewsLeads(dealId, leads, deal = null, pushActivity = null) {
   const sb = getSupabase();
   if (!sb || !dealId || !Array.isArray(leads) || !leads.length) return 0;
   let saved = 0;
+  const storedLeads = [];
   for (const lead of leads) {
     const { error } = await sb.from('news_investor_leads').insert({
       deal_id: dealId,
@@ -765,8 +790,41 @@ export async function saveDealNewsLeads(dealId, leads) {
       confidence: lead.urgency === 'high' ? 9 : 7,
       source_url: lead.source_url || lead.source_hint || null,
     });
-    if (!error) saved += 1;
+    if (!error) {
+      saved += 1;
+      storedLeads.push(lead);
+    }
   }
+
+  // Queue top high-confidence leads as firms for the research pipeline
+  const topLeads = storedLeads
+    .filter(l => l.firm_name && Number(l.confidence || (l.urgency === 'high' ? 9 : 7)) >= 7)
+    .slice(0, 2);
+
+  for (const lead of topLeads) {
+    try {
+      const { data: existing } = await sb.from('firms').select('id').ilike('name', lead.firm_name).limit(1).catch(() => ({ data: [] }));
+      if (!existing?.length) {
+        await sb.from('firms').insert({
+          name: lead.firm_name,
+          deal_id: deal?.id || dealId || null,
+          source: 'news_scan',
+          status: 'pending_research',
+          investment_thesis: `${lead.why_relevant || ''}`.slice(0, 500),
+          notes: `Recent signal: ${lead.signal || lead.news_event || ''}`.slice(0, 500),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).catch(() => {});
+        pushActivity?.({
+          type: 'research',
+          action: `News lead queued for research: ${lead.firm_name}`,
+          note: `Confidence ${lead.confidence || (lead.urgency === 'high' ? 9 : 7)} · ${(lead.why_relevant || '').slice(0, 80)}`,
+          deal_id: deal?.id || dealId || null,
+        });
+      }
+    } catch {}
+  }
+
   return saved;
 }
 

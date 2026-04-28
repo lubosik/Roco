@@ -1354,7 +1354,7 @@ async function toolAddContactToPipeline({ deal_id, name, company_name, job_title
       notes:             notes || null,
       tier:              tier || 'warm',
       pipeline_stage:    'Researched',
-      enrichment_status: linkedin_url ? 'linkedin_only' : 'pending',
+      enrichment_status: 'pending',
       source:            'jarvis',
       created_at:        new Date().toISOString(),
       updated_at:        new Date().toISOString(),

@@ -2124,6 +2124,98 @@ async function executeReloadedApproval(item, decision) {
     return;
   }
 
+  if (decision.action === 'edit') {
+    const instructions = decision.instructions || '';
+    const originalBody = item.edited_body || item.body || '';
+
+    // Direct SUBJECT: override — no AI redraft needed
+    if (instructions.toUpperCase().startsWith('SUBJECT:') && !isLinkedInStageLabel(item.stage)) {
+      const newSubject = instructions.slice(8).trim();
+      await sb.from('approval_queue').update({ approved_subject: newSubject }).eq('id', item.id).catch(() => {});
+      await bot.sendMessage(
+        process.env.TELEGRAM_CHAT_ID,
+        `✅ Subject updated to: "${newSubject}"`,
+      ).catch(() => {});
+      const { notifyQueueUpdated } = await import('../dashboard/server.js');
+      notifyQueueUpdated();
+      return;
+    }
+
+    // Direct BODY: override — skip AI redraft
+    let newBody = originalBody;
+    if (instructions.toUpperCase().startsWith('BODY:')) {
+      newBody = instructions.slice(5).trim();
+    } else {
+      // AI redraft
+      try {
+        const { orComplete } = await import('../core/openRouterClient.js');
+        const prompt = `You are editing a fundraising outreach email on behalf of Dom.
+
+ORIGINAL EMAIL:
+${originalBody}
+
+EDIT INSTRUCTIONS:
+${instructions}
+
+Return ONLY the revised email body. No subject line. No labels. No explanation. Sign off as: Dom`;
+        const draft = await orComplete(prompt, { tier: 'conversation', maxTokens: 600 });
+        if (draft?.trim()) newBody = draft.trim();
+      } catch (err) {
+        console.warn('[TELEGRAM EDIT] AI redraft failed:', err.message);
+      }
+    }
+
+    // Save updated body to DB
+    await sb.from('approval_queue').update({
+      edited_body: newBody,
+      edit_instructions: instructions,
+    }).eq('id', item.id).catch(() => {});
+
+    // Send a new Telegram message with the redrafted email and re-approval buttons
+    const subject = item.approved_subject || item.subject_a || item.subject || '';
+    const altSubject = item.subject_b || null;
+    const contactName = item.contact_name || 'contact';
+    const preview = [
+      `✏ *Redrafted for ${contactName}*`,
+      subject ? `Subject: _${subject}_` : null,
+      '',
+      newBody.length > 800 ? `${newBody.slice(0, 800)}…` : newBody,
+    ].filter(s => s !== null).join('\n');
+
+    const inlineKeyboard = [[
+      { text: altSubject ? '✅ Approve A' : '✅ Approve', callback_data: `aa:${item.telegram_msg_id || 0}:${item.id}` },
+      ...(altSubject ? [{ text: '✅ Approve B', callback_data: `ab:${item.telegram_msg_id || 0}:${item.id}` }] : []),
+      { text: '✏ Edit again', callback_data: `ed:${item.telegram_msg_id || 0}:${item.id}` },
+      { text: '✗ Skip', callback_data: `sk:${item.telegram_msg_id || 0}:${item.id}` },
+    ]];
+
+    try {
+      const sent = await bot.sendMessage(
+        process.env.TELEGRAM_CHAT_ID,
+        preview,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: inlineKeyboard },
+        },
+      );
+      // Register the new message in pendingApprovals so buttons work
+      if (sent?.message_id) {
+        const updatedItem = { ...item, edited_body: newBody, telegram_msg_id: sent.message_id };
+        const entry = buildReloadedApprovalEntry(updatedItem);
+        pendingApprovals.set(sent.message_id, entry);
+        pendingApprovals.set(String(sent.message_id), entry);
+        // Update DB with new telegram_msg_id
+        await sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', item.id).catch(() => {});
+      }
+    } catch (err) {
+      console.warn('[TELEGRAM EDIT] Failed to send redrafted message:', err.message);
+    }
+
+    const { notifyQueueUpdated } = await import('../dashboard/server.js');
+    notifyQueueUpdated();
+    return;
+  }
+
   if (isLinkedInStageLabel(item.stage) && item.contact_id) {
     const { sendApprovedLinkedInDM } = await import('../dashboard/server.js');
     const { notifyQueueUpdated } = await import('../dashboard/server.js');

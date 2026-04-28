@@ -4431,7 +4431,7 @@ function registerRoutes(app) {
         if (Object.keys(patch).length) {
           const { data } = await sb.from('approval_queue').update(patch)
             .eq('id', id)
-            .in('status', ['pending', 'approved_waiting_for_window'])
+            .in('status', ['pending', 'approved', 'approved_waiting_for_window'])
             .select('id')
             .maybeSingle();
           updatedDb = !!data?.id;
@@ -4572,6 +4572,20 @@ function registerRoutes(app) {
           stats.active_prospects = count || 0;
           stats.activeProspects  = count || 0;
         } catch (e) { console.warn('/api/stats prospects:', e.message); }
+
+        // Positive replies — contacts that replied and are not in a negative/dead state
+        try {
+          const { count: positiveReplies } = await sb.from('contacts')
+            .select('id', { count: 'exact', head: true })
+            .in('deal_id', safeAllActiveIds)
+            .not('last_reply_at', 'is', null)
+            .not('pipeline_stage', 'in', '("Inactive","Archived","ARCHIVED","archived","Suppressed — Opt Out","Deleted — Do Not Contact")')
+            .not('conversation_state', 'in', '("conversation_ended_negative","do_not_contact")');
+          stats.positive_replies = positiveReplies || 0;
+          stats.positive_reply_rate = stats.overall_outreach_sent > 0
+            ? Math.round(((positiveReplies || 0) / stats.overall_outreach_sent) * 100)
+            : 0;
+        } catch (e) { console.warn('/api/stats positive_replies:', e.message); }
 
         // Deal counts + capital
         try {

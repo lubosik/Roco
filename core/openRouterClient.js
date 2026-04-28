@@ -41,9 +41,13 @@ function recordSuccess(tier) { const b = getBreaker(tier); b.failures = 0; b.ope
 function recordFailure(tier) {
   const b = getBreaker(tier);
   b.failures++;
-  if (b.failures >= 3) {
-    b.openUntil = Date.now() + 60_000;
-    console.warn(`[OR] Circuit breaker open: ${tier} — 60s cooldown`);
+  // Web tier is used for news scans — use a more lenient threshold so occasional
+  // Perplexity hiccups don't lock out the entire scan cycle.
+  const threshold = tier === 'web' ? 5 : 3;
+  const cooldown  = tier === 'web' ? 30_000 : 60_000;
+  if (b.failures >= threshold) {
+    b.openUntil = Date.now() + cooldown;
+    console.warn(`[OR] Circuit breaker open: ${tier} — ${cooldown / 1000}s cooldown`);
   }
 }
 
@@ -167,10 +171,14 @@ export async function orComplete(prompt, {
     }
   }
 
-  // Anthropic direct fallback
-  const fallbackModel = tier === 'draft' || tier === 'conversation' || tier === 'brain'
-    ? 'claude-haiku-4-5-20251001'
-    : 'claude-haiku-4-5-20251001';
+  // Web tier has no meaningful Anthropic fallback — Anthropic cannot search the live web,
+  // and ANTHROPIC_API_KEY is not guaranteed to be set on Railway.
+  if (tier === 'web') {
+    throw new Error(`Web search unavailable: OpenRouter circuit breaker open for web tier. Will retry after cooldown.`);
+  }
+
+  // Anthropic direct fallback (non-web tiers only)
+  const fallbackModel = 'claude-haiku-4-5-20251001';
   return anthropicDirect(messages, { maxTokens, model: fallbackModel, systemPrompt });
 }
 

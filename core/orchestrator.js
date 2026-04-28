@@ -1799,7 +1799,7 @@ async function runDailyNewsScanCycle(deals) {
         const scanResult = await buildDealNewsScan(deal, deals, pushActivity).catch(() => ({ leads: [], summary: '' }));
         portfolioScanRows.push({ deal, scanResult });
         const leads = Array.isArray(scanResult?.leads) ? scanResult.leads : [];
-        await saveDealNewsLeads(deal.id, leads).catch(() => {});
+        await saveDealNewsLeads(deal.id, leads, deal, pushActivity).catch(() => {});
         const pipelineResult = await addNewsLeadsToBatch(deal, leads).catch(() => ({ added: 0, skipped: leads.length, batch: null }));
         const actionsTaken = [];
         if (pipelineResult.added > 0) {

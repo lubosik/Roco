@@ -513,6 +513,7 @@ function applyStats(s) {
   setText('stat-emails-sent',    fmt(s.emailsSent || s.emails_sent));
   setText('stat-emails-replied', fmt(s.emails_replied || 0));
   setText('stat-response-rate',  s.response_rate != null ? pct(s.response_rate) : (s.responseRate != null ? pct(s.responseRate) : '—'));
+  setText('stat-positive-reply-rate', s.positive_reply_rate != null ? pct(s.positive_reply_rate) : '—');
   if (s.emails_replied != null) setText('stat-response-sub', `${fmt(s.emails_replied)} email repl${s.emails_replied === 1 ? 'y' : 'ies'}`);
   setText('stat-prospects',      fmt(s.activeProspects || s.active_prospects));
   setText('stat-queue',          fmt(s.queueCount || s.approval_queue));
