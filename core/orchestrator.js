@@ -5495,8 +5495,8 @@ async function ensureVerifiedResearchBeforeDraft(contact, deal, reason = 'outrea
   if (!sb || !contact?.id || !deal?.id) return null;
 
   if (hasRecentResearchVerificationFailure(contact)) {
-    info(`[${deal.name}] ${contact.name} has recent failed verification research — deferring draft`);
-    return null;
+    info(`[${deal.name}] ${contact.name} has recent failed verification — proceeding with best available copy`);
+    return contact;
   }
 
   pushActivity({
@@ -5534,8 +5534,8 @@ async function ensureVerifiedResearchBeforeDraft(contact, deal, reason = 'outrea
 
     if (status === 'verified') return updated;
 
-    info(`[${deal.name}] ${contact.name} research is still partial after verification — deferring draft`);
-    return null;
+    info(`[${deal.name}] ${contact.name} research is still partial after verification — proceeding with best available copy`);
+    return updated;
   } catch (err) {
     const marker = `[PERSON_RESEARCH_VERIFICATION_FAILED ${new Date().toISOString()}] ${String(err.message || err).slice(0, 180)}`;
     const notes = `${String(contact.notes || '').trim()}\n${marker}`.trim().slice(0, 4000);
@@ -5554,8 +5554,8 @@ async function ensureVerifiedResearchBeforeDraft(contact, deal, reason = 'outrea
       detail: { reason, error: String(err.message || err).slice(0, 500) },
     }).catch(() => {});
 
-    warn(`[${deal.name}] ${contact.name} verification research failed before draft: ${err.message}`);
-    return null;
+    warn(`[${deal.name}] ${contact.name} verification research failed before draft — proceeding with best available copy: ${err.message}`);
+    return contact;
   }
 }
 

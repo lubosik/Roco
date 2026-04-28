@@ -116,7 +116,7 @@ export const JARVIS_TOOLS = [
   },
   {
     name: 'trigger_research',
-    description: 'Kick off an immediate research and enrichment cycle for the deal. Finds new firms, enriches contacts, and loads them into the pipeline. The orchestrator then handles outreach on the next cycle.',
+    description: 'Kick off the full research pipeline for the deal: checks existing database contacts, searches the web for matching investors, fetches Unipile company profiles, searches LinkedIn for decision makers, scores firms, adds them to the campaign, and queues contacts for outreach. Use this when asked to find more investors or add more people to any deal.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1361,6 +1361,24 @@ async function toolAddContactToPipeline({ deal_id, name, company_name, job_title
     }).select('id').single();
 
     if (insertErr) return { error: insertErr.message };
+
+    // Immediately fetch Unipile personal profile if linkedin_url is available
+    if (linkedin_url) {
+      try {
+        const { retrieveLinkedInProfile } = await import('../integrations/unipileClient.js');
+        const profile = await retrieveLinkedInProfile(linkedin_url);
+        if (profile?.provider_id) {
+          const profileUpdates = {
+            linkedin_provider_id: profile.provider_id,
+            updated_at: new Date().toISOString(),
+          };
+          if (profile.headline && !job_title) profileUpdates.job_title = profile.headline.slice(0, 200);
+          if (profile.current_company && !company_name) profileUpdates.company_name = profile.current_company;
+          if (profile.emails?.[0]) profileUpdates.email = profile.emails[0];
+          await sb.from('contacts').update(profileUpdates).eq('id', inserted.id);
+        }
+      } catch {}
+    }
 
     emitJarvisActivity(
       `Added ${name} to pipeline`,
