@@ -71,6 +71,87 @@ Archive if: pure pension/sovereign wealth with zero VC activity, or clear geogra
   return { financialLines, scoringBlock, dealType };
 }
 
+function toText(value) {
+  if (Array.isArray(value)) return value.join(', ');
+  return String(value || '');
+}
+
+function gradeFromScore(score) {
+  if (score >= 85) return 'Hot';
+  if (score >= 65) return 'Warm';
+  if (score >= 45) return 'Possible';
+  return 'Archive';
+}
+
+function fallbackScoreInvestor(investor, deal) {
+  const combined = [
+    investor.investor_type,
+    investor.contact_type,
+    investor.job_title,
+    investor.company_name,
+    investor.firm_description,
+    investor.description,
+    investor.sector_focus,
+    investor.preferred_industries,
+    investor.investment_thesis,
+    investor.past_investments,
+    investor.notes,
+  ].map(toText).join(' ').toLowerCase();
+  const dealText = [
+    deal.type,
+    deal.raise_type,
+    deal.sector,
+    deal.description,
+    deal.investor_profile,
+  ].map(toText).join(' ').toLowerCase();
+  const dealSector = String(deal.sector || '').toLowerCase();
+  const isBuyoutDeal = /independent.sponsor|fundless|co.invest|buyout|private.equity|lbo/i.test(`${deal.type || ''} ${deal.raise_type || ''} ${deal.description || ''}`);
+  const isVentureOnly = /\b(vc|venture|seed|pre.seed|accelerator|incubator|angel)\b/.test(combined)
+    && !/private equity|buyout|family office|direct|co.?invest|independent sponsor|lmm|lower middle market/.test(combined);
+
+  let score = 35;
+  const reasons = [];
+
+  if (/family office|private equity|buyout|independent sponsor|fundless sponsor|direct investment|co.?invest|lower middle market|lmm|growth equity/.test(combined)) {
+    score += 25;
+    reasons.push('institutional/direct investment mandate signal');
+  } else if (/investor|advisor|founder|principal|partner|managing director|capital/.test(combined)) {
+    score += 12;
+    reasons.push('investor/operator seniority signal');
+  }
+
+  if (isBuyoutDeal && isVentureOnly) {
+    score -= 25;
+    reasons.push('venture-only profile appears weaker for this buyout-style deal');
+  }
+
+  if (dealSector && combined.includes(dealSector)) {
+    score += 18;
+    reasons.push(`explicit ${deal.sector} sector match`);
+  } else if (/health|medical|medtech|device|life science|healthcare|distribution/.test(combined + ' ' + dealText)) {
+    score += 14;
+    reasons.push('healthcare/medical adjacency');
+  }
+
+  if (investor.past_investments || /portfolio|backed|invested|acquisition|investment/.test(combined)) {
+    score += 10;
+    reasons.push('investment history available');
+  }
+  if (investor.email || investor.linkedin_provider_id || investor.linkedin_url) score += 5;
+  if (investor.geography || investor.hq_country || investor.hq_location) score += 4;
+  if (investor.typical_cheque_size || investor.preferred_deal_size_min || investor.preferred_investment_amount_min) score += 6;
+
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const grade = gradeFromScore(score);
+  return {
+    score,
+    grade,
+    rationale: `Fallback deterministic score used because AI scoring was unavailable; ${reasons.slice(0, 3).join(', ') || 'limited structured signals found'}.`,
+    key_reason: reasons[0] || 'deterministic fallback',
+    fallback: true,
+  };
+}
+
 export async function rankInvestor({ investor, deal }) {
   const agentCtx = await getScoringContext();
   const { financialLines, scoringBlock, dealType } = buildScoringCriteria(deal);
@@ -121,11 +202,13 @@ Return ONLY this JSON (no markdown):
     };
   } catch (err) {
     console.error('[RANKER] Failed for', investor.company_name || investor.name, ':', err.message);
+    const fallback = fallbackScoreInvestor(investor, deal);
+    if (fallback.score >= 45) return fallback;
     return {
+      ...fallback,
       score: null,
       grade: 'Retry',
-      rationale: `Scoring failed: ${String(err.message || 'unknown error').slice(0, 160)}`,
-      key_reason: '',
+      rationale: `Scoring failed and deterministic fallback had insufficient signal: ${String(err.message || 'unknown error').slice(0, 120)}`,
       retryable: true,
     };
   }
