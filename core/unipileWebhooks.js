@@ -358,25 +358,130 @@ export async function handleLinkedInMessage(raw, pushActivity, conversationManag
       } catch {}
     }
 
-    console.log(`[UNIPILE/MSG] Processing reply from ${contact.name} — drafting response`);
+    console.log(`[UNIPILE/MSG] Processing reply from ${contact.name} — classifying and drafting response`);
 
-    // Draft contextual reply via conversationManager
+    // Classify intent, update contact state, draft reply, and queue for approval
     try {
-      await conversationManager.draftContextualReply({
-        contact: { ...contact, unipile_chat_id: payload.chat_id || contact.unipile_chat_id },
-        deal:    contact.deals || { id: contact.deal_id },
-        channel: 'linkedin',
-        inboundMessage: combinedText,
-      });
-      pushActivity({
-        type: 'approval',
-        action: `Next action: draft LinkedIn reply for ${contact.name}`,
-        note: `Matched to deal ${getDealName(contact)} · contextual reply workflow queued`,
-        dealId: contact.deal_id,
-        deal_name: getDealName(contact),
-      });
+      const { getConversationHistory, addApprovalToQueue } = await import('./supabaseSync.js').catch(() => ({}));
+      const { classifyIntent, draftContextualReply } = await import('./conversationManager.js').catch(() => ({}));
+
+      // Load conversation history
+      let conversationHistory = [];
+      if (typeof getConversationHistory === 'function') {
+        conversationHistory = await getConversationHistory(contact.id, contact.deal_id).catch(() => []);
+      }
+
+      // Classify intent/sentiment
+      let intent = null;
+      if (typeof classifyIntent === 'function') {
+        try {
+          intent = await classifyIntent(combinedText, conversationHistory, contact, contact.deals || {});
+        } catch (err) {
+          console.warn('[UNIPILE/MSG] Intent classification failed:', err.message);
+        }
+      }
+
+      // Determine new conversation state
+      const newState = intent?.conversation_state || 'needs_reply';
+      const isNegative = ['conversation_ended_negative', 'do_not_contact'].includes(newState);
+      const stageUpdates = isNegative ? {} : { pipeline_stage: 'In Conversation' };
+
+      // Update contact with intent/sentiment results
+      await sb.from('contacts').update({
+        conversation_state: newState,
+        sentiment: intent?.category || null,
+        last_reply_at: new Date().toISOString(),
+        ...stageUpdates,
+      }).eq('id', contact.id).catch(() => {});
+
+      // Skip draft if conversation ended negatively
+      if (!isNegative && typeof draftContextualReply === 'function') {
+        const draftText = await draftContextualReply({
+          contact: { ...contact, unipile_chat_id: payload.chat_id || contact.unipile_chat_id },
+          deal: contact.deals || { id: contact.deal_id },
+          channel: 'linkedin',
+          inboundMessage: combinedText,
+          intent,
+          conversationHistory,
+        });
+
+        if (draftText && typeof addApprovalToQueue === 'function') {
+          const deal = contact.deals || { id: contact.deal_id };
+
+          // Queue for approval
+          const queueRow = await addApprovalToQueue({
+            contactId: contact.id,
+            contactName: contact.name || '',
+            contactEmail: contact.email || null,
+            firm: contact.company_name || '',
+            dealId: contact.deal_id || null,
+            dealName: deal?.name || null,
+            stage: 'LinkedIn DM',
+            body: draftText,
+            score: contact.investor_score || null,
+            outreachMode: 'linkedin_reply',
+          });
+
+          // Stamp message_type so the orchestrator picks it up as a linkedin_reply
+          if (queueRow?.id) {
+            await sb.from('approval_queue')
+              .update({ message_type: 'linkedin_reply' })
+              .eq('id', queueRow.id)
+              .catch(() => {});
+
+            // Notify via Telegram
+            try {
+              const { sendLinkedInDMForApproval } = await import('../approval/telegramBot.js');
+              await sendLinkedInDMForApproval(
+                {
+                  id: contact.id,
+                  name: contact.name || '',
+                  email: contact.email || null,
+                  company_name: contact.company_name || '',
+                  investor_score: contact.investor_score || null,
+                  linkedin_url: contact.linkedin_url || null,
+                  contact_type: contact.contact_type || null,
+                },
+                draftText,
+                contact.deal_id || null,
+                {
+                  stage: 'LinkedIn Reply',
+                  queueId: queueRow.id,
+                  researchSummary: `Reply to: ${combinedText.slice(0, 120)}${intent?.category ? ` · ${intent.category}` : ''}`,
+                }
+              );
+            } catch (tgErr) {
+              console.warn('[UNIPILE/MSG] Telegram notify failed:', tgErr.message);
+            }
+
+            // Notify dashboard
+            try {
+              const { notifyQueueUpdated } = await import('../dashboard/server.js');
+              notifyQueueUpdated();
+            } catch {}
+
+            pushActivity({
+              type: 'approval',
+              activity_badge: 'linkedin_reply',
+              action: `LinkedIn reply queued for approval: ${contact.name}`,
+              note: `${intent?.category || 'reply'} · ${combinedText.slice(0, 80)}${getDealName(contact) ? ` · ${getDealName(contact)}` : ''}`,
+              dealId: contact.deal_id,
+              deal_name: getDealName(contact),
+            });
+          }
+        }
+      } else if (isNegative) {
+        console.log(`[UNIPILE/MSG] Negative/ended conversation for ${contact.name} — no reply drafted (state: ${newState})`);
+        pushActivity({
+          type: 'system',
+          action: `LinkedIn reply — no draft (${newState}): ${contact.name}`,
+          note: `${combinedText.slice(0, 80)}`,
+          dealId: contact.deal_id,
+          deal_name: getDealName(contact),
+        });
+      }
     } catch (err) {
-      console.error('[UNIPILE/MSG] Draft reply error:', err.message);
+      console.error('[UNIPILE/MSG] Reply workflow error:', err.message);
     }
   }, 90_000);
 }

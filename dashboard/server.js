@@ -2182,9 +2182,47 @@ async function buildLinkedInDmDraftPayload(contactId, { body = null } = {}) {
     .eq('id', contactId)
     .single();
   if (!contact) return null;
-  // If contact lacks LinkedIn identifiers, we can still draft — sending will be retried if it fails
-  const canSendLinkedIn = contact.linkedin_provider_id || contact.unipile_chat_id;
-  if (!canSendLinkedIn) {
+
+  // If contact lacks LinkedIn identifiers, try to find them via Unipile search before drafting
+  if (!contact.linkedin_provider_id && !contact.unipile_chat_id && contact.name) {
+    try {
+      const { searchLinkedInPeople } = await import('../integrations/unipileClient.js');
+      const nameParts = contact.name.trim().split(/\s+/);
+      const firstName = nameParts[0] || '';
+      const lastName = nameParts.slice(1).join(' ') || '';
+      const searchResults = await searchLinkedInPeople({
+        keywords: `${firstName} ${lastName} ${contact.company_name || ''}`.trim(),
+        limit: 5,
+      });
+      const match = (searchResults || []).find(r => {
+        const rName = String(r.name || r.full_name || '').toLowerCase();
+        const contactName = contact.name.toLowerCase();
+        return rName.includes(firstName.toLowerCase()) ||
+          contactName.includes((r.name || '').split(' ')[0]?.toLowerCase() || '');
+      });
+      if (match) {
+        const providerId = match.provider_id || match.providerId || null;
+        const profileUrl = match.profile_url || match.linkedinUrl || match.linkedin_url || null;
+        if (providerId || profileUrl) {
+          await sb.from('contacts').update({
+            linkedin_provider_id: providerId || contact.linkedin_provider_id,
+            linkedin_url: profileUrl || contact.linkedin_url,
+          }).eq('id', contact.id).catch(() => {});
+          contact = {
+            ...contact,
+            linkedin_provider_id: providerId || contact.linkedin_provider_id,
+            linkedin_url: profileUrl || contact.linkedin_url,
+          };
+          console.log(`[DM DRAFT] Found LinkedIn profile for ${contact.name} via search: ${profileUrl || providerId}`);
+        }
+      }
+    } catch (searchErr) {
+      console.warn(`[DM DRAFT] LinkedIn profile search failed for ${contact.name}:`, searchErr.message);
+    }
+  }
+
+  // Log if still no LinkedIn identifiers after search
+  if (!contact.linkedin_provider_id && !contact.unipile_chat_id) {
     console.warn(`[buildLinkedInDmDraftPayload] contact ${contact.id} has no linkedin_provider_id or unipile_chat_id — will draft but DM send may require retry`);
   }
 
