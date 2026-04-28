@@ -418,7 +418,8 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
   if (!bot) return { action: 'error' };
   const name = contact.name || 'Contact';
   const firm = contact.company_name || 'Unknown Firm';
-  const score = contact.investor_score || 0;
+  const score = contact.investor_score ?? null;
+  const scoreLabel = score == null ? 'unscored' : `${score}/100`;
   const stage = options.stage || 'LinkedIn DM';
   const researchSummary = options.researchSummary || null;
   let queueId = options.queueId || null;
@@ -437,7 +438,7 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
     `*ROCO — LinkedIn DM Ready for Approval*`,
     ``,
     `👤 ${dmNameDisplay} · ${firm}`,
-    `📊 Score: ${score}/100  |  ${contactType}  |  LinkedIn DM`,
+    `📊 Score: ${scoreLabel}  |  ${contactType}  |  LinkedIn DM`,
     researchSummary ? `🔍 _${String(researchSummary).substring(0, 220)}_` : null,
     ``,
     '```',
@@ -1169,6 +1170,17 @@ function resolveApproval(msgId, approval, action, extra = {}) {
     recentlyResolvedQueueIds.add(String(approval.queueId));
     setTimeout(() => recentlyResolvedQueueIds.delete(String(approval.queueId)), 12_000);
     updateApprovalStatus(approval.queueId, status, subject).catch(() => {});
+  }
+  if (action !== 'approve' && approval.isLinkedInDM && approval.contactId) {
+    const sb = getSupabase();
+    if (sb) {
+      sb.from('contacts').update({
+        pipeline_stage: 'Skipped',
+        pending_linkedin_dm: false,
+        follow_up_due_at: null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', approval.contactId).then(null, () => {});
+    }
   }
   import('../dashboard/server.js').then(({ pushActivity, notifyQueueUpdated }) => {
     pushActivity({

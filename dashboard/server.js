@@ -559,7 +559,7 @@ async function findTrackedEmailRecord(sb, payload) {
 async function findActiveTrackedDealContext(sb, trackedEmail) {
   if (!sb || !trackedEmail?.deal_id) return null;
 
-  const { data: contact } = await sb.from('contacts')
+  let { data: contact } = await sb.from('contacts')
     .select('id, name, email, company_name, job_title, deal_id, deals!contacts_deal_id_fkey(id, name, status)')
     .eq('id', trackedEmail.contact_id)
     .maybeSingle()
@@ -2051,11 +2051,59 @@ async function collapseDuplicateLinkedInDmQueueRows(sb, contactId, canonicalRowI
   } catch {}
 }
 
+async function suppressSkippedLinkedInDmContact(sb, contactId, reason = 'LinkedIn DM skipped') {
+  if (!sb || !contactId) return;
+  await sb.from('contacts').update({
+    pipeline_stage: 'Skipped',
+    pending_linkedin_dm: false,
+    follow_up_due_at: null,
+    updated_at: new Date().toISOString(),
+  }).eq('id', contactId).then(null, () => {});
+}
+
+function hasActiveEmailConversation(contact = {}) {
+  return !!contact.last_email_sent_at
+    || ['intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'].includes(contact.conversation_state);
+}
+
 export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance', body = null } = {}) {
   const sb = getSupabase();
   if (!sb || !contactId) return null;
 
-  // Check 1: existing pending queue row
+  // Check 1: do not re-draft a DM that Dom already skipped/closed.
+  const { data: blockedRows } = await sb.from('approval_queue')
+    .select('id, status, created_at')
+    .eq('contact_id', contactId)
+    .eq('stage', 'LinkedIn DM')
+    .in('status', ['skipped', 'telegram_skipped', 'closed', 'manual'])
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (blockedRows?.length) {
+    await suppressSkippedLinkedInDmContact(sb, contactId, `Prior LinkedIn DM approval was ${blockedRows[0].status}`);
+    return { deferred: true, reason: `previous_dm_${blockedRows[0].status}` };
+  }
+
+  // Check 2: do not open a LinkedIn DM lane for a contact already in an email sequence.
+  const { data: currentContact } = await sb.from('contacts')
+    .select('id, name, pipeline_stage, investor_score, last_email_sent_at, conversation_state, pending_linkedin_dm')
+    .eq('id', contactId)
+    .maybeSingle()
+    .then(result => result, () => ({ data: null }));
+  if (hasActiveEmailConversation(currentContact)) {
+    await suppressSkippedLinkedInDmContact(sb, contactId, 'Already contacted by email; LinkedIn DM lane suppressed');
+    return { deferred: true, reason: 'already_contacted_by_email' };
+  }
+  const score = Number(currentContact?.investor_score);
+  if (!Number.isFinite(score) || score <= 0) {
+    await sb.from('contacts').update({
+      pipeline_stage: 'Researched',
+      pending_linkedin_dm: false,
+      updated_at: new Date().toISOString(),
+    }).eq('id', contactId).then(null, () => {});
+    return { deferred: true, reason: 'missing_score' };
+  }
+
+  // Check 3: existing pending queue row
   const { data: existingRows } = await sb.from('approval_queue')
     .select('id, status, created_at')
     .eq('contact_id', contactId)
@@ -2134,7 +2182,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     dealName: contact.deals?.name || null,
     stage: 'LinkedIn DM',
     body: messageBody,
-    score: contact.investor_score || null,
+    score: contact.investor_score ?? null,
     researchSummary,
     outreachMode: 'investor_outreach',
   });
@@ -4410,9 +4458,12 @@ function registerRoutes(app) {
         const { data: skippedRow } = await sb.from('approval_queue')
           .update({ status: 'skipped', resolved_at: new Date().toISOString() })
           .eq('id', id)
-          .select('telegram_msg_id')
+          .select('telegram_msg_id, contact_id, stage')
           .maybeSingle();
         if (skippedRow?.telegram_msg_id) await clearTelegramApprovalControls(skippedRow.telegram_msg_id).catch(() => {});
+        if (skippedRow?.contact_id && String(skippedRow.stage || '').toLowerCase().includes('linkedin')) {
+          await suppressSkippedLinkedInDmContact(sb, skippedRow.contact_id, 'LinkedIn DM approval skipped from dashboard');
+        }
       } catch {
         // best effort
       }

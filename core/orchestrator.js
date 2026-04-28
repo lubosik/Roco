@@ -5180,7 +5180,7 @@ async function repairUnqualifiedOutreachQueue(deal) {
   const { data: rows } = await sb.from('approval_queue')
     .select('id, contact_id, contact_name, stage, message_type, status')
     .eq('deal_id', deal.id)
-    .in('status', ['pending', 'approved', 'approved_waiting_for_window'])
+    .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'processing'])
     .limit(100);
 
   const outreachRows = (rows || []).filter(row => {
@@ -5433,6 +5433,7 @@ async function enrichSparseContactBeforeRanking(contact, deal, sb) {
       const patch = {
         notes: [String(current.notes || '').trim(), ...linkedInLines].filter(Boolean).join('\n').slice(0, 4000),
       };
+      if (linkedInLines.length > 1) patch.person_researched = true;
       if (profile.current_title && !current.job_title) patch.job_title = profile.current_title;
       if (profile.current_company && !current.company_name) patch.company_name = profile.current_company;
       if (profile.location && !current.geography) patch.geography = profile.location;
@@ -5442,7 +5443,13 @@ async function enrichSparseContactBeforeRanking(contact, deal, sb) {
   }
 
   if (contactNeedsCoreResearch(current)) {
-    const research = await researchPerson({ contact: current, deal });
+    let research = null;
+    try {
+      research = await researchPerson({ contact: current, deal });
+    } catch (err) {
+      if (hasUsableResearchBasis(current)) return current;
+      throw err;
+    }
     if (research) {
       const patch = buildPersonResearchUpdates(current, research, 'PERSON_RESEARCHED_FOR_RANKING');
       await sb.from('contacts').update(patch).eq('id', current.id);
