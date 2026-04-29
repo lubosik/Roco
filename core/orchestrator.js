@@ -5296,7 +5296,17 @@ async function phasePersonResearch(deal, batch) {
     return;
   }
 
-  const candidates = (contacts || [])
+  // Prioritise contacts with email so email outreach starts without waiting for LinkedIn
+  const sortedForResearch = [...(contacts || [])].sort((a, b) => {
+    const aHasEmail = hasUsableEmail(a.email) ? 0 : 1;
+    const bHasEmail = hasUsableEmail(b.email) ? 0 : 1;
+    if (aHasEmail !== bHasEmail) return aHasEmail - bHasEmail;
+    const scoreDiff = Number(b.investor_score || 0) - Number(a.investor_score || 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
+  });
+
+  const candidates = sortedForResearch
     .filter(contact => shouldResearchContact(contact, deal, batch))
     .slice(0, 5);
 
@@ -6604,6 +6614,11 @@ async function phaseOutreach(deal, state) {
     if (RESEARCH_PENDING_STATUSES.includes(c.enrichment_status)) {
       info(`[${deal.name}] phaseOutreach: ${c.name} — research not yet complete, deferring`);
       return false;
+    }
+    // Research failed too many times — proceed with best-copy outreach (firm notes still available)
+    if (countResearchFailures(c) >= RESEARCH_FAILURE_CAP) {
+      info(`[${deal.name}] phaseOutreach: ${c.name} — research cap hit, proceeding with best-copy outreach`);
+      return true;
     }
     info(`[${deal.name}] phaseOutreach: ${c.name} — missing research basis, deferring`);
     return false;
