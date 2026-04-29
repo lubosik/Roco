@@ -2,8 +2,7 @@
  * research/personResearcher.js
  * Investor research router:
  * - Reuse/canonicalize existing structured data first (zero-cost path)
- * - Gemini grounded search is the default live-research provider
- * - Grok is optional fallback
+ * - Try configured grounded-search providers before falling back to synthesis
  * Tracks completion via research markers in the notes field.
  */
 
@@ -35,6 +34,13 @@ function getResearchConfig() {
       .filter((model, index, all) => all.indexOf(model) === index),
     grokModel: process.env.RESEARCH_GROK_MODEL || DEFAULT_GROK_MODEL,
   };
+}
+
+function normalizeOpenRouterModel(model) {
+  if (!model) return null;
+  if (model.includes('/')) return model;
+  if (model.startsWith('gemini-')) return `google/${model}`;
+  return model;
 }
 
 function inferContactType(contact) {
@@ -212,28 +218,94 @@ Return ONLY this JSON (no markdown, no other text):
 }
 
 function parseJsonFromText(text) {
-  const match = text.replace(/```json\n?|```/g, '').trim().match(/\{[\s\S]*\}/);
+  const match = String(text || '').replace(/```json\n?|```/g, '').trim().match(/\{[\s\S]*\}/);
   if (!match) throw new Error('No JSON in response');
   return JSON.parse(match[0]);
 }
 
-async function tryWebSearch(prompt, contactName, errors) {
+function summarizeResearchErrors(errors) {
+  return errors
+    .map(e => `${e.api}/${e.model}: ${e.status || 'no-status'} ${String(e.message || '').replace(/\s+/g, ' ').slice(0, 140)}`)
+    .join('; ');
+}
+
+function resultHasResearchSignal(result) {
+  if (!result || typeof result !== 'object') return false;
+  return [
+    result.firm_description,
+    result.sector_focus,
+    result.past_investments,
+    result.investment_thesis,
+    result.recent_news,
+    result.job_title,
+    result.company_name,
+  ].some(value => hasText(String(value || ''), 4));
+}
+
+async function tryOpenRouterResearch(prompt, contactName, errors, {
+  api,
+  tier = 'web',
+  model = null,
+  label = null,
+  maxTokens = 1536,
+}) {
+  const resolvedModel = normalizeOpenRouterModel(model);
   try {
-    const { orComplete } = await import('../core/openRouterClient.js');
-    const text = await orComplete(prompt, { tier: 'web', maxTokens: 1024 });
+    const { orComplete, getModelForTier } = await import('../core/openRouterClient.js');
+    const modelName = resolvedModel || getModelForTier(tier);
+    const text = await orComplete(prompt, { tier, model: resolvedModel, maxTokens });
     const result = parseJsonFromText(text);
-    console.log(`[PERSON RESEARCH] ${contactName}: Perplexity success (${result.confidence || '?'} confidence)`);
+    if (!resultHasResearchSignal(result)) throw new Error('Research response contained no usable fields');
+    console.log(`[PERSON RESEARCH] ${contactName}: ${label || modelName} success (${result.confidence || '?'} confidence)`);
     return result;
   } catch (err) {
-    errors.push({ api: 'perplexity', model: 'sonar-pro', status: err.status, message: err.message });
-    console.warn(`[PERSON RESEARCH] Perplexity failed for ${contactName}: ${err.message}`);
+    errors.push({
+      api,
+      model: resolvedModel || tier,
+      status: err.status || err.code || null,
+      message: err.message,
+    });
+    console.warn(`[PERSON RESEARCH] ${api} failed for ${contactName}: ${err.message}`);
     return null;
   }
 }
 
+function buildResearchAttempts(config) {
+  const geminiAttempts = config.geminiModels.map(model => ({
+    api: 'gemini',
+    tier: 'web',
+    model,
+    label: normalizeOpenRouterModel(model),
+  }));
+
+  const perplexityAttempt = {
+    api: 'perplexity',
+    tier: 'web',
+    model: process.env.OR_WEB_MODEL || null,
+    label: process.env.OR_WEB_MODEL || 'perplexity/sonar-pro',
+  };
+
+  return config.primaryProvider === 'gemini'
+    ? [...geminiAttempts, perplexityAttempt]
+    : [perplexityAttempt, ...geminiAttempts];
+}
+
+async function tryResearchSynthesis(prompt, contactName, errors) {
+  const synthesisPrompt = `${prompt}
+
+Live web search failed or returned no usable fields. Make one final best-effort pass using only reliable knowledge in the supplied context and the model's existing knowledge. Do not invent portfolio companies, cheque size, AUM, recent news, or LinkedIn URLs. Use null for anything uncertain and set confidence to "low" unless the supplied context clearly supports the answer.`;
+
+  return tryOpenRouterResearch(synthesisPrompt, contactName, errors, {
+    api: 'openrouter_research',
+    tier: 'research',
+    label: process.env.OR_RESEARCH_MODEL || 'research tier',
+    maxTokens: 1536,
+  });
+}
+
 /**
  * Research one investor using web-grounded AI search.
- * Tries Gemini first (all models, both keys), then Grok as final fallback.
+ * Tries configured grounded providers first, then best-effort research synthesis.
  *
  * @param {{ contact: object, deal: object }} params
  * @returns {Promise<object|null>}
@@ -258,8 +330,13 @@ export async function researchPerson({ contact, deal }) {
   const prompt = agentCtx ? `${agentCtx}${basePrompt}` : basePrompt;
   const errors = [];
 
+  for (const attempt of buildResearchAttempts(config)) {
+    const result = await tryOpenRouterResearch(prompt, contact.name, errors, attempt);
+    if (result) return result;
+  }
+
   {
-    const result = await tryWebSearch(prompt, contact.name, errors);
+    const result = await tryResearchSynthesis(prompt, contact.name, errors);
     if (result) return result;
   }
 
@@ -270,13 +347,16 @@ export async function researchPerson({ contact, deal }) {
 
   // All APIs failed — classify the error type so orchestrator can surface it
   const quotaStatuses = [429, 503];
-  const isQuota = errors.some(e => quotaStatuses.includes(e.status) || e.message.includes('429') || e.message.toLowerCase().includes('quota') || e.message.toLowerCase().includes('rate limit'));
-  const isGrokQuota = errors.filter(e => e.api === 'grok').some(e => quotaStatuses.includes(e.status) || e.message.includes('429'));
+  const isQuota = errors.some(e => {
+    const msg = String(e.message || '').toLowerCase();
+    return quotaStatuses.includes(e.status) || msg.includes('429') || msg.includes('quota') || msg.includes('rate limit');
+  });
 
   const apisSummary = [...new Set(errors.map(e => e.api))].join(' + ');
-  const err = new Error(`All research APIs failed for ${contact.name} (tried: ${apisSummary})`);
+  const detail = summarizeResearchErrors(errors);
+  const err = new Error(`All research APIs failed for ${contact.name} (tried: ${apisSummary}; ${detail})`);
   err.isQuota = isQuota;
-  err.isGrokFailed = errors.some(e => e.api === 'grok');
+  err.isGrokFailed = false;
   err.allErrors = errors;
   throw err;
 }
