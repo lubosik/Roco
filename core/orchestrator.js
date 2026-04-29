@@ -728,8 +728,8 @@ async function runCycle(state) {
 }
 
 async function checkMondayIntelligence() {
-  const now = new Date();
-  const estNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const estClock = DateTime.now().setZone('America/New_York');
+  const estNow = estClock.toJSDate();
   const sb = getSupabase();
   if (!sb) return;
 
@@ -737,7 +737,7 @@ async function checkMondayIntelligence() {
   // These accumulate when: (a) a Monday run failed, or (b) pre-created placeholders
   // that were never generated because the server was down during the window.
   // Run on every cycle (not just Monday) so missed reports always self-heal.
-  const todayISO = estNow.toISOString().split('T')[0];
+  const todayISO = estClock.toISODate();
 
   // Reset any 'generating' records for past weeks — these are zombie runs where
   // the process crashed mid-generation. Current week can legitimately be 'generating'
@@ -769,9 +769,11 @@ async function checkMondayIntelligence() {
     }
   }
 
+  await generateMissingCompletedWeeklyReports(sb, estClock);
+
   // ── SCHEDULED: Monday 9am EST — generate last week's report ──────────────
-  const isMonday = estNow.getDay() === 1;
-  const isNineAm = estNow.getHours() === 9 && estNow.getMinutes() < 10;
+  const isMonday = estClock.weekday === 1;
+  const isNineAm = estClock.hour === 9 && estClock.minute < 10;
 
   if (!isMonday || !isNineAm) return;
 
@@ -828,6 +830,59 @@ async function checkMondayIntelligence() {
   }
 }
 
+async function generateMissingCompletedWeeklyReports(sb, estClock) {
+  const lastCompletedStart = estClock.startOf('week').minus({ weeks: 1 });
+  const lastCompletedEnd = lastCompletedStart.plus({ days: 6 });
+  const lastCompletedStartISO = lastCompletedStart.toISODate();
+
+  const { data: existingRows } = await sb.from('weekly_intelligence')
+    .select('week_start, week_number, status')
+    .order('week_start', { ascending: true })
+    .then(result => result, () => ({ data: [] }));
+
+  const rows = existingRows || [];
+  const existingStarts = new Set(rows.map(row => row.week_start).filter(Boolean));
+  const completedRows = rows.filter(row => row.week_start && row.week_start <= lastCompletedStartISO);
+  const latest = completedRows[completedRows.length - 1] || null;
+  const maxWeekNumber = rows.reduce((max, row) => Math.max(max, Number(row.week_number || 0)), 0);
+
+  let cursor = latest?.week_start
+    ? DateTime.fromISO(latest.week_start, { zone: 'America/New_York' }).plus({ weeks: 1 })
+    : lastCompletedStart;
+  let weekNumber = latest?.week_number ? Number(latest.week_number) + 1 : Math.max(1, maxWeekNumber + 1);
+  let generated = 0;
+
+  while (cursor.isValid && cursor.toISODate() <= lastCompletedStartISO && generated < 6) {
+    const weekStart = cursor.toISODate();
+    const weekEnd = cursor.plus({ days: 6 }).toISODate();
+
+    if (!existingStarts.has(weekStart)) {
+      console.log(`[WEEKLY INTEL] Missing completed week detected: ${weekStart} — ${weekEnd}; generating Week ${weekNumber}`);
+      await sb.from('weekly_intelligence').upsert({
+        week_number: weekNumber,
+        week_start: weekStart,
+        week_end: weekEnd,
+        status: 'pending',
+      }, { onConflict: 'week_start' });
+      await runWeeklyIntelligence(weekStart, weekEnd, weekNumber, sb);
+      generated++;
+    }
+
+    cursor = cursor.plus({ weeks: 1 });
+    weekNumber++;
+  }
+
+  if (generated > 0) {
+    await sb.from('weekly_intelligence').upsert({
+      week_number: weekNumber,
+      week_start: estClock.startOf('week').toISODate(),
+      week_end: estClock.startOf('week').plus({ days: 6 }).toISODate(),
+      status: 'pending',
+    }, { onConflict: 'week_start', ignoreDuplicates: true }).then(null, () => {});
+    console.log(`[WEEKLY INTEL] Generated ${generated} missing completed weekly report(s); latest completed week was ${lastCompletedStartISO} — ${lastCompletedEnd.toISODate()}`);
+  }
+}
+
 async function gatherWeekMetrics(weekStart, weekEnd, sb) {
   const startISO = new Date(weekStart + 'T00:00:00Z').toISOString();
   const endISO   = new Date(weekEnd   + 'T23:59:59Z').toISOString();
@@ -848,6 +903,36 @@ async function gatherWeekMetrics(weekStart, weekEnd, sb) {
     positive_responses:    (acc.positive_responses    || 0) + (row.positive_responses    || 0),
     negative_responses:    (acc.negative_responses    || 0) + (row.negative_responses    || 0),
   }), {});
+
+  const { data: dailyLogRows } = await sb
+    .from('daily_logs')
+    .select('emails_sent_today, linkedin_sent_today, replies_received_today, positive_replies_today, meetings_booked_today, firms_added_today')
+    .gte('log_date', weekStart)
+    .lte('log_date', weekEnd)
+    .then(result => result, () => ({ data: [] }));
+
+  const fromDailyLogs = (dailyLogRows || []).reduce((acc, row) => ({
+    emails_sent:          (acc.emails_sent          || 0) + Number(row.emails_sent_today || 0),
+    linkedin_sent:        (acc.linkedin_sent        || 0) + Number(row.linkedin_sent_today || 0),
+    replies_received:     (acc.replies_received     || 0) + Number(row.replies_received_today || 0),
+    positive_responses:   (acc.positive_responses   || 0) + Number(row.positive_replies_today || 0),
+    meetings_booked:      (acc.meetings_booked      || 0) + Number(row.meetings_booked_today || 0),
+    firms_added:          (acc.firms_added          || 0) + Number(row.firms_added_today || 0),
+  }), {});
+
+  const { data: activityRows } = await sb
+    .from('activity_log')
+    .select('event_type')
+    .gte('created_at', startISO)
+    .lte('created_at', endISO)
+    .then(result => result, () => ({ data: [] }));
+
+  const activityCounts = (activityRows || []).reduce((acc, row) => {
+    const key = String(row.event_type || '').toUpperCase();
+    if (!key) return acc;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
 
   const { data: inboundMsgs } = await sb
     .from('conversation_messages')
@@ -875,7 +960,7 @@ async function gatherWeekMetrics(weekStart, weekEnd, sb) {
   const { count: contactsEnriched } = await sb
     .from('contacts')
     .select('id', { count: 'exact', head: true })
-    .eq('enrichment_status', 'complete')
+    .in('enrichment_status', ['complete', 'Complete', 'enriched', 'Enriched'])
     .gte('updated_at', startISO)
     .lte('updated_at', endISO);
 
@@ -898,13 +983,15 @@ async function gatherWeekMetrics(weekStart, weekEnd, sb) {
 
   const sentimentResult = await analyseSentimentBatch(allInbound);
 
-  const es  = fromDealAnalytics.emails_sent           || 0;
-  const er  = fromDealAnalytics.email_replies         || allInbound.filter(m => m.channel === 'email').length;
-  const li  = fromDealAnalytics.linkedin_invites_sent || 0;
+  const es  = activityCounts.EMAIL_SENT || fromDailyLogs.emails_sent || fromDealAnalytics.emails_sent || 0;
+  const er  = fromDealAnalytics.email_replies || allInbound.filter(m => m.channel === 'email').length || 0;
+  let li    = activityCounts.LINKEDIN_INVITE_SENT || fromDealAnalytics.linkedin_invites_sent || 0;
   const la  = liAccepted  || 0;
-  const lds = fromDealAnalytics.linkedin_dms_sent     || 0;
-  const ldr = fromDealAnalytics.linkedin_replies      || allInbound.filter(m => m.channel === 'linkedin').length;
-  const mtg = Math.max(fromDealAnalytics.meetings_booked || 0, meetingsFromIntent || 0);
+  let lds   = activityCounts.LINKEDIN_DM_SENT || fromDealAnalytics.linkedin_dms_sent || 0;
+  if (!li && !lds && fromDailyLogs.linkedin_sent) li = fromDailyLogs.linkedin_sent;
+  const ldr = fromDealAnalytics.linkedin_replies || allInbound.filter(m => m.channel === 'linkedin').length || 0;
+  const mtg = Math.max(fromDealAnalytics.meetings_booked || 0, meetingsFromIntent || 0, fromDailyLogs.meetings_booked || 0);
+  const totalReplies = Math.max(er + ldr, fromDailyLogs.replies_received || 0);
 
   return {
     emails_sent:              es,
@@ -916,10 +1003,10 @@ async function gatherWeekMetrics(weekStart, weekEnd, sb) {
     linkedin_dm_reply_rate:   lds > 0 ? +((ldr / lds) * 100).toFixed(1) : 0,
     meetings_booked:          mtg,
     active_deals_count:       activeDeals      || 0,
-    firms_researched:         firmsResearched  || 0,
+    firms_researched:         firmsResearched  || fromDailyLogs.firms_added || 0,
     contacts_enriched:        contactsEnriched || 0,
     ghosted_contacts:         ghosted          || 0,
-    total_replies:            er + ldr,
+    total_replies:            totalReplies,
     avg_sentiment:            sentimentResult.average,
     sentiment_breakdown:      sentimentResult.breakdown,
   };
@@ -993,6 +1080,40 @@ function extractJSON(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+function buildFallbackWeeklySageResult({ weekStart, weekEnd, metrics, dailyLogContext, parseError = null }) {
+  const outreachTotal = Number(metrics.emails_sent || 0)
+    + Number(metrics.linkedin_invites_sent || 0)
+    + Number(metrics.linkedin_dms_sent || 0);
+  const replyText = `${metrics.total_replies || 0} total repl${metrics.total_replies === 1 ? 'y' : 'ies'}`;
+  const meetingText = `${metrics.meetings_booked || 0} meeting${metrics.meetings_booked === 1 ? '' : 's'} booked`;
+  const dailySummary = String(dailyLogContext || '')
+    .replace(/\s+/g, ' ')
+    .slice(0, 700);
+
+  return {
+    headline: `Week ${weekStart} to ${weekEnd}: ${outreachTotal} outbound touchpoints, ${replyText}, ${meetingText}.`,
+    what_worked: [
+      `${metrics.emails_sent || 0} emails and ${Number(metrics.linkedin_invites_sent || 0) + Number(metrics.linkedin_dms_sent || 0)} LinkedIn actions kept outbound moving.`,
+      dailySummary ? `Daily logs show: ${dailySummary}` : null,
+    ].filter(Boolean).join(' '),
+    what_didnt_work: metrics.meetings_booked > 0
+      ? 'Meeting conversion still needs to be monitored against reply volume and follow-up speed.'
+      : 'Reply volume has not yet converted into booked meetings, so the next operating focus is faster qualification and sharper call conversion.',
+    best_investor_profile: 'Use the contacts that replied this week as the near-term signal. Review their firm size, mandate, geography, and sector focus before expanding the next batch.',
+    best_sending_time: 'Keep using the active deal sending windows until reply timestamps show a stronger pattern.',
+    template_recommendations: 'Keep the highest-performing deal templates active, but tighten each draft around one concrete reason the investor is relevant and one simple ask.',
+    investor_matching_insights: 'Prioritise investors with clear sector fit, evidence of recent activity, and a usable email or active LinkedIn path.',
+    template_generation_insights: 'Templates should stay short, human, and specific. Avoid generic fundraise language unless the investor research is too thin.',
+    trend_vs_last_week: 'Fallback report generated from live metrics and daily logs because the model response was incomplete.',
+    three_actions: [
+      'Review this week’s replies and tag the investor profile patterns that produced engagement.',
+      'Move any warm or interested replies to meeting conversion quickly.',
+      'Keep email-ready contacts ahead of LinkedIn-only contacts when LinkedIn is throttled or unauthenticated.',
+    ],
+    fallback_reason: parseError || null,
+  };
+}
+
 export async function runWeeklyIntelligence(weekStart, weekEnd, weekNum, sb) {
   const label = `Week ${weekNum} (${weekStart} — ${weekEnd})`;
   let currentStep = 'init';
@@ -1040,13 +1161,39 @@ export async function runWeeklyIntelligence(weekStart, weekEnd, weekNum, sb) {
 
     let dailyLogs = [];
     try {
-      const { data } = await sb
+      const { data: currentDailyRows } = await sb
+        .from('daily_logs')
+        .select('log_date, deal_name, emails_sent_today, linkedin_sent_today, replies_received_today, meetings_booked_today, pending_approvals, recommended_actions, telegram_voice_script')
+        .gte('log_date', weekStart)
+        .lte('log_date', weekEnd)
+        .order('log_date', { ascending: true });
+      dailyLogs = (currentDailyRows || []).map(row => ({
+        report_date: row.log_date,
+        headline: `Daily log · ${row.log_date}`,
+        executive_summary: row.telegram_voice_script || [
+          `${row.deal_name || 'Deal'}: ${row.emails_sent_today || 0} emails, ${row.linkedin_sent_today || 0} LinkedIn sends, ${row.replies_received_today || 0} replies, ${row.meetings_booked_today || 0} meetings.`,
+          `${row.pending_approvals || 0} pending approvals.`,
+        ].join(' '),
+        deal_sections: [{
+          deal_name: row.deal_name,
+          target_status: `${row.emails_sent_today || 0} emails · ${row.linkedin_sent_today || 0} LinkedIn · ${row.replies_received_today || 0} replies · ${row.meetings_booked_today || 0} meetings`,
+          progress_status: Array.isArray(row.recommended_actions) ? row.recommended_actions.join('; ') : 'No recommendations saved.',
+        }],
+      }));
+    } catch {}
+
+    try {
+      const { data: legacyDailyRows } = await sb
         .from('daily_activity_reports')
         .select('report_date, headline, executive_summary, deal_sections')
         .gte('report_date', weekStart)
         .lte('report_date', weekEnd)
         .order('report_date', { ascending: true });
-      dailyLogs = data || [];
+      const existingDates = new Set(dailyLogs.map(log => log.report_date));
+      dailyLogs = [
+        ...dailyLogs,
+        ...(legacyDailyRows || []).filter(log => !existingDates.has(log.report_date)),
+      ].sort((a, b) => new Date(a.report_date) - new Date(b.report_date));
     } catch {}
 
     const dailyLogContext = dailyLogs.length
@@ -1066,7 +1213,7 @@ export async function runWeeklyIntelligence(weekStart, weekEnd, weekNum, sb) {
 
     const response = await anthropic.messages.create({
       model:      'claude-haiku-4-5-20251001', // Haiku is faster + cheaper for structured output
-      max_tokens: 1500,  // bumped to avoid JSON truncation
+      max_tokens: 3000,
       messages: [{
         role: 'user',
         content: `You are SAGE, the intelligence engine for ROCO — an autonomous PE fundraising agent.
@@ -1103,7 +1250,19 @@ Return ONLY a raw JSON object — no markdown, no preamble, no explanation:
     // ── Step 4: Parse response ────────────────────────────────────────────────
     currentStep = 'parsing Claude response';
     const raw = response.content[0]?.text || '';
-    const sageResult = extractJSON(raw);  // robust extraction, handles any format
+    let sageResult = null;
+    try {
+      sageResult = extractJSON(raw);  // robust extraction, handles any format
+    } catch (parseErr) {
+      warn(`[WEEKLY INTEL] SAGE JSON parse failed for ${label}: ${parseErr.message}; saving fallback report`);
+      sageResult = buildFallbackWeeklySageResult({
+        weekStart,
+        weekEnd,
+        metrics,
+        dailyLogContext,
+        parseError: parseErr.message,
+      });
+    }
 
     // Validate required fields exist
     if (!sageResult.headline) throw new Error('SAGE response missing headline field');
@@ -7264,7 +7423,7 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
             conversationHistory: linkedinConversationHistory,
             sequenceStepLabel,
           })
-        : await draftEmail(contactPage, researchContext, stage, decision.instructions);
+        : await draftEmail(contactPage, researchContext, stage, decision.instructions, { deal });
       if (!draft) return;
       decision = forceChannel === 'linkedin_dm'
           ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
@@ -8008,7 +8167,7 @@ Return ONLY valid JSON (no markdown, no preamble):
   }
 
   // No template in DB — fall through to full AI drafting
-  return draftEmail(contactPage, research, stage, editInstructions);
+  return draftEmail(contactPage, research, stage, editInstructions, { deal });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

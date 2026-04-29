@@ -38,6 +38,20 @@ const TEMPLATE_NAME_PATTERNS = {
   followup: ['linkedin follow', 'follow up dm', 'follow-up dm', 'follow up', 'follow-up'],
 };
 
+const DEFAULT_LINKEDIN_TEMPLATES = {
+  intro: `{{firstName}}, thought {{dealName}} could be relevant given {{firm}}'s work around {{sectorFocus}}.
+
+{{dealBrief}}
+
+Happy to send the deck or a tighter summary if useful.`,
+  followup: `{{firstName}}, quick one on {{dealName}}.
+
+Given {{firm}}'s focus around {{sectorFocus}}, I thought the angle might be worth a look.
+
+Worth me sending the short version?`,
+  connection_request: `{{firstName}}, thought it would be useful to connect given your work around {{sectorFocus}} and what Dom is doing with {{dealName}}.`,
+};
+
 function clip(value, max = 400) {
   const text = String(value || '').trim();
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -209,9 +223,8 @@ export async function draftLinkedInDM(contactPage, researchData = null, type = '
     contactPage?.id || null,
     options.sequenceStepLabel || null,
   );
-  const templateBody = template?.body_a
-    ? fillTemplate(template.body_a, { contact, deal })
-    : '';
+  const fallbackTemplate = DEFAULT_LINKEDIN_TEMPLATES[type] || DEFAULT_LINKEDIN_TEMPLATES.intro;
+  const templateBody = fillTemplate(template?.body_a || fallbackTemplate, { contact, deal });
 
   const conversationHistory = Array.isArray(options.conversationHistory) ? options.conversationHistory : [];
   const priorChatSummary = clip(options.priorChatSummary || '', 500);
@@ -220,7 +233,7 @@ export async function draftLinkedInDM(contactPage, researchData = null, type = '
   const userPrompt = `${guidanceBlock}Draft a LinkedIn ${type === 'followup' ? 'follow-up DM' : 'DM'} from Dom to ${contact.name || firstName} at ${firm}.
 
 USE THIS TEMPLATE AS THE DEFAULT STRUCTURE FOR THIS STEP:
-${templateBody || '(No saved LinkedIn template found. Write from scratch.)'}
+${templateBody}
 
 CONTACT CONTEXT:
 Name: ${contact.name || 'Unknown'}
@@ -260,7 +273,7 @@ Return only the message text.`;
     const trimmed = text.trim();
     if (trimmed) {
       info(`LinkedIn DM drafted for ${firstName}`);
-      return { body: trimmed.slice(0, maxChars), type, templateName: template?.name || null };
+      return { body: trimmed.slice(0, maxChars), type, templateName: template?.name || 'Default LinkedIn DM' };
     }
     throw new Error('Empty model response');
   } catch (err) {
@@ -268,7 +281,7 @@ Return only the message text.`;
   }
 
   if (templateBody) {
-    return { body: templateBody.slice(0, maxChars), type, templateName: template?.name || null };
+    return { body: templateBody.slice(0, maxChars), type, templateName: template?.name || 'Default LinkedIn DM' };
   }
 
   return {

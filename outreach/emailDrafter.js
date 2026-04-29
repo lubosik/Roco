@@ -35,12 +35,12 @@ const EMAIL_LENGTH = {
 };
 
 
-export async function draftEmail(contactPage, researchData, stage = 'INTRO', editInstructions = null) {
+export async function draftEmail(contactPage, researchData, stage = 'INTRO', editInstructions = null, options = {}) {
   const name = getContactProp(contactPage, 'Name');
   const firstName = name?.split(' ')[0] || name;
   const firmRelation = contactPage.properties?.['Company Name']?.relation;
   const email = getContactProp(contactPage, 'Email');
-  const deal = getDeal();
+  const deal = options.deal || getDeal();
   const len = EMAIL_LENGTH[stage] || EMAIL_LENGTH.INTRO;
 
   info(`Drafting ${stage} email for ${firstName}`);
@@ -82,6 +82,10 @@ function buildUserPrompt(contactPage, firstName, fullName, research, deal, stage
     editNote = `\n\nDOM'S EDIT INSTRUCTIONS: ${editInstructions}\nApply these changes to the email. Keep everything else the same.`;
   }
 
+  const dealName = deal?.name || 'the deal';
+  const raiseAmount = deal?.raiseAmount || deal?.target_amount || deal?.targetAmount || '';
+  const keyMetrics = deal?.keyMetrics || deal?.key_metrics || 'Available on request';
+
   return `${guidanceBlock}Write an outreach email from Dom to ${fullName}.
 
 Investor research summary: ${approach}
@@ -92,12 +96,12 @@ Known AUM / fund size: ${aum}
 Their stated investment criteria: ${criteria}
 
 The deal Dom is fundraising for:
-- Deal name: ${deal.name}
-- Sector: ${deal.sector}
-- Raise amount: ${deal.raiseAmount}
-- Geography: ${deal.geography}
-- Key metrics: ${deal.keyMetrics || 'Available on request'}
-- Brief description: ${deal.description}
+- Deal name: ${dealName}
+- Sector: ${deal?.sector || 'Not specified'}
+- Raise amount: ${raiseAmount || 'Not specified'}
+- Geography: ${deal?.geography || deal?.target_geography || 'Not specified'}
+- Key metrics: ${keyMetrics}
+- Brief description: ${deal?.description || 'No brief description available'}
 
 Email stage: ${stage}
 Target word count: ${len.min}-${len.max} words for the body.
