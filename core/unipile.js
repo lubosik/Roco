@@ -224,9 +224,10 @@ export async function searchDecisionMakersByCompany(firmName, pushActivity = nul
       name: person.name || '',
       headline: person.headline || '',
       linkedin_url: person.profile_url || '',
+      linkedin_provider_id: person.provider_id || null,
       linkedin_urn: person.entity_urn || '',
       network_distance: person.network_distance || 3,
-      source: 'linkedin_search',
+      source: 'unipile_linkedin_search',
     }));
 
   if (people.length > 0) {
