@@ -5290,7 +5290,9 @@ async function phasePersonResearch(deal, batch) {
     .gte('investor_score', threshold)
     .order('investor_score', { ascending: false })
     .order('created_at', { ascending: true })
-    .limit(25);
+    // Fetch a wide enough window that lower-scored email-ready contacts are not
+    // starved behind LinkedIn-only rows before the local prioritisation pass.
+    .limit(250);
   if (err) {
     warn(`[${deal.name}] phasePersonResearch query failed: ${err.message}`);
     return;
