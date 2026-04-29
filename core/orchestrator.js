@@ -2285,6 +2285,13 @@ function hasResearchFailureMarker(notes) {
   return notes.includes('[PERSON_RESEARCH_FAILED]') || notes.includes('Research failed');
 }
 
+function countResearchFailures(contact) {
+  if (typeof contact?.notes !== 'string') return 0;
+  return (contact.notes.match(/\[PERSON_RESEARCH_FAILED/g) || []).length;
+}
+
+const RESEARCH_FAILURE_CAP = 3;
+
 function shouldResearchContact(contact, deal, batch) {
   const scoreThreshold = Number(deal.min_investor_score || 60);
   const score = Number(contact.investor_score || 0);
@@ -2296,6 +2303,8 @@ function shouldResearchContact(contact, deal, batch) {
     (isResearched(contact.notes) && !hasResearchFailureMarker(contact.notes));
 
   if (freshResearch && !missingCore) return false;
+  // Stop retrying after repeated failures — proceed with best-copy outreach
+  if (countResearchFailures(contact) >= RESEARCH_FAILURE_CAP) return false;
   if (!existingResearch) return true;
   if (missingCore) return true;
   if (inCurrentBatch) return true;
