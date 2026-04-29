@@ -21,7 +21,7 @@ import { isWithinSendingWindow, isGloballyPaused, getNextWindowOpen, isWithinCha
 import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } from './sendingWindow.js';
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
-import { findLinkedInUrl } from '../enrichment/linkedinFinder.js';
+import { findLinkedInUrl, findLinkedInProfile } from '../enrichment/linkedinFinder.js';
 import {
   sendLinkedInDM,
   sendEmail as unipileSendEmail,
@@ -5608,19 +5608,26 @@ async function enrichSingleContact(sb, contact, deal, state) {
       }
     } catch (_) {}
     try {
-      // Step 1: ensure LinkedIn URL exists
+      // Step 1: ensure LinkedIn URL + provider_id exist
       let linkedinUrl = contact.linkedin_url;
-      if (linkedinUrl && !contact.linkedin_provider_id && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
+      let linkedinProviderId = contact.linkedin_provider_id || null;
+      if (linkedinUrl && !linkedinProviderId && !isVerifiedLinkedInSource(contact.enrichment_source || contact.source)) {
         linkedinUrl = null;
       }
       if (!linkedinUrl && state.linkedin_enabled !== false && !hasRecentLinkedInNoMatchSuppression(contact.notes)) {
-        linkedinUrl = await findLinkedInUrl({
+        const found = await findLinkedInProfile({
           name: contact.name,
           company: contact.company_name,
           title: contact.job_title,
         });
-        if (linkedinUrl) {
-          await sb.from('contacts').update({ linkedin_url: linkedinUrl }).eq('id', contact.id);
+        if (found?.url) {
+          linkedinUrl = found.url;
+          const profilePatch = { linkedin_url: linkedinUrl };
+          if (found.providerId && !linkedinProviderId) {
+            linkedinProviderId = found.providerId;
+            profilePatch.linkedin_provider_id = found.providerId;
+          }
+          await sb.from('contacts').update(profilePatch).eq('id', contact.id);
         }
       }
 
@@ -5631,7 +5638,7 @@ async function enrichSingleContact(sb, contact, deal, state) {
         return;
       }
 
-      // If contact already has an email, skip KASPR/Apify and advance directly
+      // If contact already has an email, skip Apify and advance directly
       if (contact.email) {
         await sb.from('contacts').update({ enrichment_status: 'enriched', pipeline_stage: 'Enriched' }).eq('id', contact.id);
         logStep(`Already has email: ${contact.name}`, deal.name, 'enrichment', deal);
@@ -5639,11 +5646,12 @@ async function enrichSingleContact(sb, contact, deal, state) {
         return;
       }
 
-      // No LinkedIn URL and no email — completely unreachable, archive immediately
+      // No LinkedIn URL found yet — defer to linkedin_only + Enriched so phaseLinkedInInvites
+      // can attempt profile discovery via Unipile search when processing the invite
       if (!linkedinUrl) {
-        warn(`[ENRICH] No LinkedIn or email for ${contact.name} — archiving`);
-        await sb.from('contacts').update({ enrichment_status: 'skipped_no_linkedin', pipeline_stage: 'Archived' }).eq('id', contact.id);
-        pushActivity({ type: 'enrichment', action: `Archived (no contact info)`, note: `${contact.name} — no email or LinkedIn found`, deal_name: deal.name, dealId: deal.id });
+        warn(`[ENRICH] No LinkedIn URL found for ${contact.name} — deferring to invite-phase discovery`);
+        await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
+        pushActivity({ type: 'enrichment', action: `LinkedIn not found yet`, note: `${contact.name} — will attempt via Unipile invite phase`, deal_name: deal.name, dealId: deal.id });
         return;
       }
 
@@ -5839,10 +5847,12 @@ export async function phaseEnrich(deal, state) {
         if (hasRecentLinkedInNoMatchSuppression(contact.notes)) {
           continue;
         }
-        const url = await findLinkedInUrl({ name: contact.name, company: contact.company_name, title: contact.job_title });
-        if (url) {
-          await sb.from('contacts').update({ linkedin_url: url }).eq('id', contact.id);
-          logStep(`LinkedIn found: ${contact.name}`, deal.name, 'enrichment', deal);
+        const found = await findLinkedInProfile({ name: contact.name, company: contact.company_name, title: contact.job_title });
+        if (found?.url) {
+          const patch = { linkedin_url: found.url };
+          if (found.providerId && !contact.linkedin_provider_id) patch.linkedin_provider_id = found.providerId;
+          await sb.from('contacts').update(patch).eq('id', contact.id);
+          logStep(`LinkedIn found: ${contact.name}${found.providerId ? ' (provider_id captured)' : ''}`, deal.name, 'enrichment', deal);
         }
       } catch (e) {
         console.warn(`[ENRICH] LinkedIn find failed for ${contact.name}:`, e.message);

@@ -265,7 +265,9 @@ async function verifyCandidate(person, expected) {
 
     if (!isLikelyCompanyMatch(expected.company, resolvedCompanyValues)) return null;
 
-    return canonicalizeLinkedInProfileUrl(resolved?.linkedinUrl || candidateUrl);
+    const url = canonicalizeLinkedInProfileUrl(resolved?.linkedinUrl || candidateUrl);
+    const providerId = resolved?.providerId || null;
+    return { url, providerId };
   } catch (err) {
     console.warn(`[LINKEDIN FINDER] Candidate verification failed for "${expected.name}": ${err.message}`);
     return null;
@@ -294,17 +296,19 @@ async function verifyFallbackUrl(url, expected) {
     ];
 
     if (!isLikelyCompanyMatch(expected.company, resolvedCompanyValues)) return null;
-    return canonicalizeLinkedInProfileUrl(resolved?.linkedinUrl || candidateUrl);
+    const finalUrl = canonicalizeLinkedInProfileUrl(resolved?.linkedinUrl || candidateUrl);
+    const providerId = resolved?.providerId || null;
+    return { url: finalUrl, providerId };
   } catch (err) {
     console.warn(`[LINKEDIN FINDER] Fallback verification failed for "${expected.name}": ${err.message}`);
     return null;
   }
 }
 
-export async function findLinkedInUrl({ name, company, title }) {
+// Returns { url, providerId } — both Unipile (Sales Nav + Classic) and web fallback paths.
+// providerId is the LinkedIn member ID required for sending connection requests via Unipile.
+export async function findLinkedInProfile({ name, company, title }) {
   if (!name || !String(name).trim()) return null;
-
-  // Respect rate limit cooldown — don't hammer LinkedIn when we're already being throttled
   if (isLinkedInRateLimited()) return null;
 
   const expected = { name, company, title };
@@ -321,8 +325,8 @@ export async function findLinkedInUrl({ name, company, title }) {
   }
 
   for (const { person } of ranked.slice(0, 5)) {
-    const verifiedUrl = await verifyCandidate(person, expected);
-    if (verifiedUrl) return verifiedUrl;
+    const result = await verifyCandidate(person, expected);
+    if (result) return result;
   }
 
   const fallbackPrompt = buildFallbackPrompt(expected);
@@ -330,6 +334,12 @@ export async function findLinkedInUrl({ name, company, title }) {
   if (!fallbackUrl) return null;
 
   return verifyFallbackUrl(fallbackUrl, expected);
+}
+
+// Backwards-compatible: returns just the URL string.
+export async function findLinkedInUrl({ name, company, title }) {
+  const result = await findLinkedInProfile({ name, company, title });
+  return result?.url ?? null;
 }
 
 export function getLinkedInFallbackPrompt({ name, company, title }) {
