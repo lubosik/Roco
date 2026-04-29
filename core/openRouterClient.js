@@ -113,6 +113,7 @@ export async function orComplete(prompt, {
 } = {}) {
   const orKey = process.env.OPENROUTER_API_KEY;
   const resolvedModel = model || MODELS[tier] || MODELS.classify;
+  let openRouterErr = null;
 
   // Build messages array
   const messages = [];
@@ -165,6 +166,7 @@ export async function orComplete(prompt, {
       recordSuccess(tier);
       return text;
     } catch (err) {
+      openRouterErr = err;
       recordFailure(tier);
       console.warn(`[OR] ${resolvedModel} failed: ${err.message} — falling back to Anthropic direct`);
       pushActivity({ type: 'warning', action: 'OpenRouter fallback', note: `${resolvedModel}: ${err.message.substring(0, 100)}` });
@@ -174,6 +176,11 @@ export async function orComplete(prompt, {
   // Web tier has no meaningful Anthropic fallback — Anthropic cannot search the live web,
   // and ANTHROPIC_API_KEY is not guaranteed to be set on Railway.
   if (tier === 'web') {
+    if (openRouterErr) {
+      const e = new Error(`Web search unavailable for ${resolvedModel}: ${openRouterErr.message}`);
+      e.status = openRouterErr.status || openRouterErr.code || null;
+      throw e;
+    }
     throw new Error(`Web search unavailable: OpenRouter circuit breaker open for web tier. Will retry after cooldown.`);
   }
 
