@@ -1796,13 +1796,14 @@ select.form-input option { background: var(--bg-card-2); }
 .kanban-search-clear:hover { color: var(--text-bright); }
 .kanban-board {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 10px;
-  overflow-x: hidden;
+  grid-template-columns: repeat(7, minmax(160px, 1fr));
+  gap: 12px;
+  overflow-x: auto;
   min-height: 200px;
+  padding-bottom: 8px;
 }
 .kanban-col {
-  min-width: 0;
+  min-width: 160px;
   display: flex;
   flex-direction: column;
 }
@@ -1810,21 +1811,21 @@ select.form-input option { background: var(--bg-card-2); }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 2px 8px;
+  padding: 0 4px 10px;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   flex-shrink: 0;
   position: sticky;
   top: 0;
   background: var(--bg-raised);
   z-index: 1;
-  gap: 4px;
+  gap: 6px;
 }
 .kanban-col-title {
   font-family: 'DM Mono', monospace;
-  font-size: 8.5px;
+  font-size: 10px;
   font-weight: 500;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--gold);
   white-space: nowrap;
@@ -1835,13 +1836,13 @@ select.form-input option { background: var(--bg-card-2); }
 .kanban-col-title-dim { color: var(--text-dim); }
 .kanban-col-count {
   font-family: 'DM Mono', monospace;
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--text-dim);
   background: var(--bg-card-2);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 1px 6px;
-  min-width: 18px;
+  padding: 2px 7px;
+  min-width: 20px;
   text-align: center;
   flex-shrink: 0;
 }
@@ -1889,7 +1890,7 @@ select.form-input option { background: var(--bg-card-2); }
   border: 1px solid var(--border);
   border-left: 3px solid var(--gold-dim);
   border-radius: 6px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   cursor: pointer;
   transition: border-color var(--transition), background var(--transition);
 }
@@ -1908,32 +1909,32 @@ select.form-input option { background: var(--bg-card-2); }
   border-color: var(--border);
 }
 .kanban-firm-name {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-bright);
-  margin-bottom: 3px;
+  margin-bottom: 4px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .kanban-firm-contact {
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .kanban-firm-footer {
-  margin-top: 7px;
+  margin-top: 8px;
 }
 .kanban-score-badge {
   font-family: 'DM Mono', monospace;
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--gold);
   background: rgba(201,168,76,0.1);
   border: 1px solid rgba(201,168,76,0.2);
   border-radius: 3px;
-  padding: 1px 6px;
+  padding: 2px 7px;
 }
 .kanban-empty {
   text-align: center;
