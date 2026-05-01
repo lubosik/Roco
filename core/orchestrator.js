@@ -5447,7 +5447,7 @@ async function phasePersonResearch(deal, batch) {
   const { data: contacts, error: err } = await sb.from('contacts')
     .select('*')
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Ranked', 'ranked', 'Enriched', 'enriched', 'Approved for Outreach', 'invite_sent'])
+    .in('pipeline_stage', ['Ranked', 'ranked', 'Enriched', 'enriched', 'Researched', 'researched', 'Approved for Outreach', 'invite_sent'])
     .gte('investor_score', threshold)
     .order('investor_score', { ascending: false })
     .order('created_at', { ascending: true })
@@ -5489,7 +5489,13 @@ async function phasePersonResearch(deal, batch) {
   for (const contact of candidates) {
     try {
       const research = await researchPerson({ contact, deal });
-      if (!research) continue;
+      if (!research) {
+        // Record silent failure so countResearchFailures accumulates toward the cap
+        const failureNote = `${String(contact.notes || '').trim()}\n[PERSON_RESEARCH_FAILED ${new Date().toISOString()}] researchPerson returned null`.trim().slice(0, 4000);
+        await sb.from('contacts').update({ notes: failureNote }).eq('id', contact.id).then(null, () => {});
+        warn(`[${deal.name}] phasePersonResearch: researchPerson returned null for ${contact.name} — failure recorded`);
+        continue;
+      }
 
       const updates = buildPersonResearchUpdates(contact, research);
       const status = researchStatusLabel({ ...contact, ...updates });
@@ -6373,11 +6379,11 @@ async function phaseTopUpPipeline(deal, state) {
     .limit(1);
   const hasPriorityList = !!activePriorityLists?.length;
 
-  // Contacts ready for LinkedIn invites (Ranked/Enriched, has URL, not yet invited)
+  // Contacts ready for LinkedIn invites (Ranked/Enriched/Researched, has URL, not yet invited)
   const { count: pipelineReady } = await sb.from('contacts')
     .select('id', { count: 'exact', head: true })
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Ranked', 'Enriched'])
+    .in('pipeline_stage', ['Ranked', 'Enriched', 'Researched'])
     .not('linkedin_url', 'is', null)
     .is('invite_sent_at', null);
 
@@ -6630,7 +6636,7 @@ async function phaseLinkedInInvites(deal, state) {
   const { data: candidates } = await sb.from('contacts')
     .select('*')
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Enriched', 'ENRICHED', 'enriched'])  // both tracks get LinkedIn invites
+    .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Enriched', 'ENRICHED', 'enriched', 'Researched', 'RESEARCHED', 'researched'])  // both tracks get LinkedIn invites
     .not('linkedin_url', 'is', null)
     .is('invite_sent_at', null)
     .neq('pipeline_stage', 'invite_sent')  // extra guard: never re-send if stage already advanced
@@ -7210,7 +7216,7 @@ async function phaseOutreach(deal, state) {
   const { data: emailCandidates } = await sb.from('contacts')
     .select('*')
     .eq('deal_id', deal.id)
-    .in('pipeline_stage', ['Enriched', 'Ranked', 'invite_sent'])
+    .in('pipeline_stage', ['Enriched', 'Ranked', 'Researched', 'invite_sent'])
     .not('email', 'is', null)
     .is('last_email_sent_at', null)
     .order('investor_score', { ascending: false })
