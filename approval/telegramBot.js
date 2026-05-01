@@ -923,6 +923,25 @@ async function handleCallbackQuery(query) {
     approval = await reloadApprovalForTelegramMessage(msgId, queueId);
   }
   if (!approval) {
+    // Fallback: check if a recently-handled item exists (e.g. approved by the other running instance)
+    const sbFb = getSupabase();
+    if (sbFb) {
+      const since = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // last 30 min
+      const { data: recent } = await sbFb.from('approval_queue')
+        .select('id, contact_name, firm, status')
+        .not('status', 'in', '(pending)')
+        .gte('created_at', since)
+        .order('created_at', { ascending: false })
+        .limit(5);
+      const handled = recent?.find(r => ['approved', 'approved_waiting_for_window', 'sending', 'sent'].includes(r.status));
+      if (handled) {
+        processingApprovals.delete(msgId);
+        const who = [handled.contact_name, handled.firm].filter(Boolean).join(' @ ');
+        const statusMsg = handled.status === 'sent' ? '✅ Already sent' : '✅ Already approved — will send when window opens';
+        await bot.sendMessage(chatId, `${statusMsg}: *${who}*`, { parse_mode: 'Markdown' });
+        return;
+      }
+    }
     processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, '⚠ This draft is no longer in the queue — it may have already been handled.');
     return;

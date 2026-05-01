@@ -27,6 +27,15 @@ async function _rateLimit() {
   _lastCallAt = Date.now();
 }
 
+async function _fetchWithRetry(url, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
+    if (res.status !== 503 && res.status !== 504) return res;
+    if (attempt < retries) await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+  }
+  return await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
+}
+
 /**
  * Normalise raw API response into a consistent shape.
  * Returns null if the response does not contain useful data.
@@ -65,7 +74,7 @@ export async function enrichByEmail(email) {
 
   try {
     const url = `${BASE_URL}?apikey=${encodeURIComponent(apiKey)}&mail=${encodeURIComponent(email.trim())}`;
-    const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+    const res = await _fetchWithRetry(url);
 
     if (!res.ok) {
       console.warn(`[ReverseContact] enrichByEmail HTTP ${res.status} for ${email}`);
@@ -95,9 +104,14 @@ export async function enrichByLinkedIn(linkedInUrl) {
   await _rateLimit();
 
   try {
-    const url = `${BASE_URL}?apikey=${encodeURIComponent(apiKey)}&linkedInUrl=${encodeURIComponent(linkedInUrl.trim())}`;
-    const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+    // LinkedIn-by-URL requires paid PAYG plan — trial key returns 403
+    const url = `${BASE_URL}/profile?apikey=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(linkedInUrl.trim())}`;
+    const res = await _fetchWithRetry(url);
 
+    if (res.status === 403) {
+      console.info('[ReverseContact] enrichByLinkedIn: trial plan does not support LinkedIn URL lookup — upgrade to PAYG');
+      return null;
+    }
     if (!res.ok) {
       console.warn(`[ReverseContact] enrichByLinkedIn HTTP ${res.status} for ${linkedInUrl}`);
       return null;
