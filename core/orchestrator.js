@@ -6759,8 +6759,13 @@ async function phaseOutreach(deal, state) {
   const LI_INVITE_STALE_DAYS  = 2;
   const EMAIL_STALE_DAYS      = 3;
 
+  // Stages that are no longer "live" outreach — don't block the firm
+  const DEAD_PIPELINE_STAGES = new Set(['Inactive', 'inactive', 'Archived', 'archived', 'Skipped', 'skipped', 'Declined', 'declined']);
+
   const isOutreachStale = (c) => {
     if (c.response_received) return false;
+    // Inactive/Archived contacts were processed in a previous round — never block the firm
+    if (DEAD_PIPELINE_STAGES.has(c.pipeline_stage)) return true;
     if (c.pipeline_stage === 'invite_sent' && c.invite_sent_at) {
       return (Date.now() - new Date(c.invite_sent_at).getTime()) > LI_INVITE_STALE_DAYS * 86400000;
     }
