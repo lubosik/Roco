@@ -22,6 +22,8 @@ import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } fro
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
 import { findLinkedInUrl, findLinkedInProfile } from '../enrichment/linkedinFinder.js';
+import { enrichByEmail as rcEnrichByEmail } from '../enrichment/reverseContactEnricher.js';
+import { orComplete } from './openRouterClient.js';
 import {
   sendLinkedInDM,
   sendEmail as unipileSendEmail,
@@ -6065,6 +6067,71 @@ export async function phaseEnrich(deal, state) {
     const ids = noContact.map(c => c.id);
     await sb.from('contacts').update({ pipeline_stage: 'Archived', archive_reason: 'No email or LinkedIn found' }).in('id', ids);
     logStep(`Archived ${noContact.length} contact(s) — no email or LinkedIn found`, deal.name, 'system', deal);
+  }
+
+  // ── ReverseContact pass: contacts that have an email but no linkedin_url ──
+  // Uses ReverseContact reverse-email lookup to find their LinkedIn profile URL.
+  if (process.env.REVERSECONTACT_API_KEY) {
+    try {
+      const { data: emailNoLinkedIn } = await sb.from('contacts')
+        .select('id, name, email, company_name')
+        .eq('deal_id', deal.id)
+        .not('email', 'is', null)
+        .is('linkedin_url', null)
+        .in('pipeline_stage', ['Enriched', 'ENRICHED', 'enriched', 'Ranked', 'RANKED', 'ranked'])
+        .limit(5);
+
+      for (const contact of (emailNoLinkedIn || [])) {
+        try {
+          const rcResult = await rcEnrichByEmail(contact.email);
+          if (rcResult?.linkedInUrl) {
+            await sb.from('contacts').update({
+              linkedin_url: rcResult.linkedInUrl,
+              enrichment_status: 'enriched',
+            }).eq('id', contact.id);
+            logStep(`ReverseContact found LinkedIn for ${contact.name}`, deal.name, 'enrichment', deal);
+            pushActivity({ type: 'enrichment', action: `ReverseContact LinkedIn found`, note: `${contact.name} — ${rcResult.linkedInUrl}`, deal_name: deal.name, dealId: deal.id });
+          }
+        } catch (rcErr) {
+          console.warn(`[ENRICH] ReverseContact email lookup failed for ${contact.name}:`, rcErr.message);
+        }
+      }
+    } catch (rcPassErr) {
+      console.warn('[ENRICH] ReverseContact email pass error:', rcPassErr.message);
+    }
+  }
+
+  // ── Web-search fallback: contacts stuck with linkedin_only but no email, no linkedin_url ──
+  // Perplexity sonar-pro to find their LinkedIn URL. Capped at 3 per cycle.
+  try {
+    const { data: stuck } = await sb.from('contacts')
+      .select('id, name, company_name, job_title')
+      .eq('deal_id', deal.id)
+      .eq('enrichment_status', 'linkedin_only')
+      .is('email', null)
+      .is('linkedin_url', null)
+      .in('pipeline_stage', ['Enriched', 'ENRICHED', 'enriched'])
+      .limit(3);
+
+    for (const contact of (stuck || [])) {
+      try {
+        const searchPrompt = `Find the LinkedIn profile URL for ${contact.name}${contact.job_title ? `, ${contact.job_title}` : ''} at ${contact.company_name || 'their company'}. Return ONLY the LinkedIn URL in format https://www.linkedin.com/in/[identifier] or 'not found'.`;
+        const rawResponse = await orComplete(searchPrompt, { tier: 'web', maxTokens: 120 });
+        if (rawResponse) {
+          const match = rawResponse.match(/https:\/\/www\.linkedin\.com\/in\/[\w\-%.]+/i);
+          if (match) {
+            const foundUrl = match[0].replace(/[.,;)]+$/, '');
+            await sb.from('contacts').update({ linkedin_url: foundUrl }).eq('id', contact.id);
+            logStep(`Web search found LinkedIn for ${contact.name}`, deal.name, 'enrichment', deal);
+            pushActivity({ type: 'enrichment', action: `Web search LinkedIn found`, note: `${contact.name} — ${foundUrl}`, deal_name: deal.name, dealId: deal.id });
+          }
+        }
+      } catch (webErr) {
+        console.warn(`[ENRICH] Web search LinkedIn fallback failed for ${contact.name}:`, webErr.message);
+      }
+    }
+  } catch (webPassErr) {
+    console.warn('[ENRICH] Web search LinkedIn pass error:', webPassErr.message);
   }
 }
 

@@ -10004,11 +10004,11 @@ async function notifyInboundReplyClassified({ contact, deal, campaign, contextNa
   const intent = String(classification?.intent || 'unknown').toLowerCase();
   const isPositive = sentiment === 'positive' || ['interested', 'asking_question', 'providing_info', 'considering'].includes(intent);
   const isNegative = sentiment === 'negative' || ['not_interested', 'conversation_end'].includes(intent);
-  const marker = isPositive ? '🟩 Positive response' : isNegative ? '🟥 Negative response' : '⬜ Neutral response';
+  const marker = isPositive ? '🟩 Positive response' : isNegative ? '🟥 Negative response' : '🟪 Neutral response';
   const quote = sanitizeApprovalText(message).slice(0, 900);
   const firm = contact?.company_name || campaign?.firm_name || 'unknown firm';
   const dealName = deal?.name || contextName || campaign?.name || 'Unknown deal';
-  await sendTelegram([
+  const lines = [
     `*${marker}*`,
     `Deal: *${sanitizeApprovalText(dealName)}*`,
     `Person: *${sanitizeApprovalText(contact?.name || 'Unknown')}*`,
@@ -10017,7 +10017,12 @@ async function notifyInboundReplyClassified({ contact, deal, campaign, contextNa
     `Sentiment: ${sentiment} | Intent: ${intent}`,
     '',
     `They said: _${quote || 'No message body captured'}_`,
-  ].join('\n')).catch(() => {});
+  ];
+  if (classification?.hasDraft !== false) {
+    lines.push('');
+    lines.push('_Draft reply queued for approval ✓_');
+  }
+  await sendTelegram(lines.join('\n')).catch(() => {});
 }
 
 function detectResearchNeeded(content) {

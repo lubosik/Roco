@@ -10021,6 +10021,7 @@ const jarvisOrb = (() => {
   let pendingTranscript = '';
   let bargeInRecognition = null;
   let bargeInTriggered  = false;
+  let bargeInAborted    = false;
   let playbackVersion   = 0;
   let turnVersion       = 0;
   let activeDispatchController = null;
@@ -10236,6 +10237,7 @@ const jarvisOrb = (() => {
     var bargeInConfidence = 0;
     var sawFinalResult = false;
     bargeInTriggered = false;
+    bargeInAborted   = false;
     applyPlaybackDuck(true);
     r.onresult = function(e) {
       var result = e.results[e.results.length - 1];
@@ -10256,7 +10258,7 @@ const jarvisOrb = (() => {
     r.onend = function() {
       bargeInRecognition = null;
       applyPlaybackDuck(false);
-      if (!bargeInTriggered && sawFinalResult && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence, true)) {
+      if (!bargeInTriggered && !bargeInAborted && sawFinalResult && bargeInText && isActive && shouldTriggerBargeIn(bargeInText, bargeInConfidence, true)) {
         invalidatePlayback();
         stopPlayback();
         if (ackAudio)     { ackAudio.pause();     ackAudio     = null; }
@@ -10271,6 +10273,7 @@ const jarvisOrb = (() => {
   }
 
   function stopBargeIn() {
+    bargeInAborted = true;
     applyPlaybackDuck(false);
     if (bargeInRecognition) {
       try { bargeInRecognition.stop(); } catch (e) {}
@@ -10348,7 +10351,7 @@ const jarvisOrb = (() => {
     stopBargeIn();
     if (isActive) {
       // Always-on: stay in conversation loop — restart mic after speaking
-      setTimeout(() => { if (isActive) startListening(); }, 400);
+      setTimeout(() => { if (isActive) startListening(); }, 800);
     } else {
       stopPlayback();
       setOrbState(null, '');
