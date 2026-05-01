@@ -2451,7 +2451,7 @@ function countResearchFailures(contact) {
   return (contact.notes.match(/\[PERSON_RESEARCH_FAILED/g) || []).length;
 }
 
-const RESEARCH_FAILURE_CAP = 3;
+const RESEARCH_FAILURE_CAP = 1;
 
 function shouldResearchContact(contact, deal, batch) {
   const scoreThreshold = Number(deal.min_investor_score || 60);
