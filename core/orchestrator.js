@@ -6755,8 +6755,23 @@ async function phaseOutreach(deal, state) {
   const ACTIVE_PIPELINE_STAGES = ['invite_accepted', 'pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
   const ACTIVE_CONVERSATION_STATES = ['intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
 
+  // Waterfall timeout: after these windows with no response, cascade to next contact at same firm
+  const LI_INVITE_STALE_DAYS  = 2;
+  const EMAIL_STALE_DAYS      = 3;
+
+  const isOutreachStale = (c) => {
+    if (c.response_received) return false;
+    if (c.pipeline_stage === 'invite_sent' && c.invite_sent_at) {
+      return (Date.now() - new Date(c.invite_sent_at).getTime()) > LI_INVITE_STALE_DAYS * 86400000;
+    }
+    if (['Email Sent', 'email_sent'].includes(c.pipeline_stage) && c.last_email_sent_at) {
+      return (Date.now() - new Date(c.last_email_sent_at).getTime()) > EMAIL_STALE_DAYS * 86400000;
+    }
+    return false;
+  };
+
   const { data: firmGateContacts } = await sb.from('contacts')
-    .select('id, company_name, pipeline_stage, response_received, conversation_state, last_email_sent_at')
+    .select('id, company_name, pipeline_stage, response_received, conversation_state, last_email_sent_at, invite_sent_at')
     .eq('deal_id', deal.id)
     .not('company_name', 'is', null);
 
@@ -6776,7 +6791,8 @@ async function phaseOutreach(deal, state) {
     if (!firm || GENERIC_FIRM_NAMES.has(firm)) continue;
     if (c.response_received || RESPONDED_STAGES.includes(c.pipeline_stage)) {
       respondedFirms.add(firm);
-    } else if (hasExistingOutreach) {
+    } else if (hasExistingOutreach && !isOutreachStale(c)) {
+      // Only block the firm while outreach is fresh; stale contacts allow cascade to next person
       activeFirms.add(firm);
     }
   }
