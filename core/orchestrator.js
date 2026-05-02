@@ -726,6 +726,11 @@ async function runCycle(state) {
     checkMorningBriefTimer(activeDeals);
   } catch {}
 
+  // Unipile account health — alerts via Telegram if LinkedIn/Gmail/Outlook session expired
+  import('./unipileHealthCheck.js').then(({ checkUnipileAccountHealth }) => {
+    checkUnipileAccountHealth().catch(() => {});
+  }).catch(() => {});
+
   info('--- Orchestrator cycle complete ---');
 }
 
