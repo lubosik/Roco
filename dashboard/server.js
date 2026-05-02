@@ -2324,7 +2324,10 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
     dealId: contact.deal_id || null,
   });
 
-  // Fire Telegram notification in background (non-blocking)
+  // Fire Telegram notification in background (non-blocking).
+  // When approved, immediately attempt to send the DM (window-checked inside sendApprovedLinkedInDM).
+  // This covers the case where the window is already open at approval time — the orchestrator loop
+  // (up to 10 min away) must not be the only drain path.
   const _contact = contact;
   const _messageBody = messageBody;
   const _rowId = row.id;
@@ -2335,7 +2338,16 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       _messageBody,
       _contact.deal_id || null,
       { stage: 'LinkedIn DM', researchSummary: _researchSummary, queueId: _rowId }
-    ).catch(() => {});
+    ).then((decision) => {
+      if (decision?.action === 'approve') {
+        // Fire immediately — sendApprovedLinkedInDM checks the window and uses the claim
+        // mechanism to prevent double-send if the orchestrator races us.
+        sendApprovedLinkedInDM({
+          contactId: _contact.id,
+          queueId: _rowId,
+        }).catch(() => {});
+      }
+    }).catch(() => {});
   }).catch(() => {});
 
   notifyQueueUpdated();
@@ -2468,6 +2480,17 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
 
     if (!claimed?.id) {
       return { skipped: true, reason: 'queue_not_claimed' };
+    }
+
+    // Auto-fetch body from queue when caller doesn't provide text/queueItem
+    if (!text && !queueItem) {
+      try {
+        const { data: qi } = await sb.from('approval_queue')
+          .select('body, edited_body')
+          .eq('id', queueId)
+          .maybeSingle();
+        if (qi) text = qi.edited_body || qi.body;
+      } catch {}
     }
   }
 

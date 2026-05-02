@@ -17,7 +17,7 @@ const DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'satu
  */
 // Resolve schedule fields — new column names take priority over legacy ones
 function resolveSchedule(deal) {
-  const tz = deal.timezone || deal.sending_timezone || 'Europe/London';
+  const tz = deal.timezone || deal.sending_timezone || 'America/New_York';
   const startStr = deal.send_from || (deal.sending_start ? deal.sending_start.slice(0, 5) : '06:00');
   const endStr   = deal.send_until || (deal.sending_end   ? deal.sending_end.slice(0, 5)   : '18:00');
 

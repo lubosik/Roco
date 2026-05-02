@@ -16,11 +16,14 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { DateTime } from 'luxon';
 import { getSupabase }        from './supabase.js';
 import { getActiveDeals }     from './supabaseSync.js';
 import { buildMemoryContext, writeMemory } from './jarvisMemory.js';
 import { JARVIS_TOOLS, executeTool }       from './jarvisTools.js';
 import { gatherCurrentMetrics }            from './fundraiserBrain.js';
+
+const JARVIS_TZ = 'America/New_York';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLIENT
@@ -120,9 +123,7 @@ async function buildPipelineHighlights(dealId) {
 async function buildTodaysReplyContext(dealId) {
   const sb = getSupabase();
   if (!sb || !dealId) return '';
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const since = start.toISOString();
+  const since = DateTime.now().setZone(JARVIS_TZ).startOf('day').toUTC().toISO();
   try {
     const events = [];
 
@@ -173,8 +174,9 @@ async function buildTodaysReplyContext(dealId) {
 async function buildDealTimeline(deal) {
   if (!deal) return '';
   const sb = getSupabase();
-  const now = new Date();
-  const nowDay = now.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+  const nowDt = DateTime.now().setZone(JARVIS_TZ);
+  const now = nowDt.toJSDate();
+  const nowDay = nowDt.weekdayLong.toLowerCase();
   const sendingDays = Array.isArray(deal.sending_days) && deal.sending_days.length
     ? deal.sending_days.map(d => d.toLowerCase())
     : ['monday','tuesday','wednesday','thursday','friday'];
@@ -357,7 +359,7 @@ ${metricsSection}${timelineSection}${todaysReplies ? `${todaysReplies}\n` : ''}$
 MEMORY (what you've done and learned on this deal):
 ${memoryCtx}
 
-TODAY: ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+TODAY (Eastern Time): ${DateTime.now().setZone(JARVIS_TZ).toFormat("cccc, d MMMM yyyy")} — ${DateTime.now().setZone(JARVIS_TZ).toFormat("h:mm a 'ET'")}
 
 PERSONALITY:
 - Direct and sharp. Like a senior analyst who knows this deal inside out.
@@ -387,6 +389,10 @@ IMPORTANT:
 - search_linkedin_people and find_decision_makers call Unipile directly — use them to find and verify people before adding to the pipeline.
 - You have full read/write access to the pipeline database via tools. When you take an action, the orchestrator picks it up on the next cycle.
 - You understand the deal timeline: how many days since launch, working days remaining, and current velocity vs pace needed. When asked "are we on track?" or "what should we focus on?", synthesise the timeline and pipeline data to give a direct, specific answer with concrete numbers.
+- TIMEZONE: You operate on Eastern Time (America/New_York). All times, dates, and day-of-week references are ET. When you say "today is Friday" or give a date, it must match the ET clock — not UTC or any other zone.
+- SCHEDULE AWARENESS: Monday to Friday are outreach days — emails, LinkedIn invites, LinkedIn DMs, and new approvals all fire on these days during the deal's configured send window. Saturday and Sunday are research-only days — no outreach fires, no DMs go out, no emails are sent. On weekends, recommend research (finding firms, enriching contacts, reviewing pipeline strategy). If asked to send something on a weekend, remind Dom it won't fire until Monday morning.
+- Check the active deal's settings for the exact configured send window (send_from, send_until, li_dm_from, li_dm_until) and active days. Reflect that in your answers — "we can send from 9am–6pm ET Mon–Fri on this deal."
+- METRICS CLARITY: The "Emails sent" total is the cumulative lifetime count (all contacts ever emailed since launch). "today" figures show just that day's sends. When citing numbers, clarify the timeframe: "262 emails total since launch, X sent yesterday."
 - On weekends: recommend research activities (finding firms, enriching contacts, reviewing strategy). On weekdays: focus on outreach actions and approvals.
 - Always speak in terms of concrete numbers: "you've sent X emails in Y days, at this pace you'll hit Z by end of month."`;
 }
@@ -585,12 +591,12 @@ export async function sendMorningBrief(deal) {
     const systemPrompt = await buildSystemPrompt(deal, metrics);
 
     const prompt = `Generate a morning brief for the team. Cover:
-1. Key numbers (what happened yesterday / overnight)
-2. Top 2-3 priorities for today
-3. Anything needing immediate attention
-4. One observation or recommendation
+1. Key numbers — use TODAY's figures and LAST 7 DAYS from the timeline section, NOT the cumulative lifetime totals. Clearly label what's recent vs all-time (e.g. "X emails yesterday, Y total since launch").
+2. Top 2-3 priorities for today (or for Monday if it's the weekend — remind Dom that no outreach fires on weekends).
+3. Anything needing immediate attention (pending approvals, warm conversations to nurture).
+4. One sharp observation or recommendation.
 
-Keep it tight — this is read on a phone. Use *bold* for key names/numbers. Max 200 words.`;
+Keep it tight — this is read on a phone. Use *bold* for key names/numbers. Max 200 words. Reference today's ET date explicitly.`;
 
     const { text } = await runAgentLoop(
       systemPrompt,
