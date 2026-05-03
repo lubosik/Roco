@@ -83,6 +83,10 @@ export async function sendLinkedInInvite({ providerId, message, userEmail }) {
 export async function resolveLinkedInProfile(identifier) {
   const id = getLinkedInIdentifier(identifier);
   if (!id) return null;
+  // Unipile's /users/{id} endpoint only accepts internal provider_ids (ACo.../ACw.../AE...).
+  // Sending a public slug causes a 422 error — skip the API call and let the
+  // caller fall through to the search path instead.
+  if (!isValidLinkedInProviderId(id)) return null;
 
   const result = await api('GET', `/users/${encodeURIComponent(id)}?account_id=${encodeURIComponent(getLiAcct())}`);
   const profile = result?.profile || result?.user || result || {};

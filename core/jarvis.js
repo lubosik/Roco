@@ -88,14 +88,15 @@ async function buildPipelineHighlights(dealId) {
         .limit(12),
       sb.from('contacts').select('name, company_name, meeting_booked_at')
         .eq('deal_id', dealId).not('meeting_booked_at', 'is', null).limit(10),
-      sb.from('contacts').select('id', { count: 'exact', head: true })
-        .eq('deal_id', dealId).not('last_email_sent_at', 'is', null),
-      sb.from('contacts').select('id', { count: 'exact', head: true })
-        .eq('deal_id', dealId).not('dm_sent_at', 'is', null),
-      // Count by stage — invite_sent_at was historically unreliable
-      sb.from('contacts').select('id', { count: 'exact', head: true })
-        .eq('deal_id', dealId)
-        .in('pipeline_stage', ['invite_sent', 'invite_accepted', 'pending_dm_approval', 'DM Approved', 'DM Sent', 'In Conversation']),
+      // Successful sends from activity_log — only written after a confirmed API call
+      sb.from('activity_log').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).eq('event_type', 'EMAIL_SENT'),
+      // Successful sends from activity_log — only written after a confirmed API call
+      sb.from('activity_log').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).eq('event_type', 'LINKEDIN_DM_SENT'),
+      // Successful sends from activity_log — only written after a confirmed API call
+      sb.from('activity_log').select('id', { count: 'exact', head: true })
+        .eq('deal_id', dealId).eq('event_type', 'LINKEDIN_INVITE_SENT'),
     ]);
 
     const lines = [];
@@ -613,6 +614,21 @@ Keep it tight — this is read on a phone. Use *bold* for key names/numbers. Max
       content: text.slice(0, 300),
       tags:    ['morning_brief'],
     });
+
+    // On weekends, proactively flag that research/enrichment should run since
+    // no outreach fires. The orchestrator's continueResearch already runs every
+    // cycle — this makes JARVIS explicitly communicative about it.
+    const nowDay = DateTime.now().setZone(JARVIS_TZ).weekdayLong.toLowerCase();
+    if (['saturday', 'sunday'].includes(nowDay)) {
+      const { sendTelegram: tg } = await import('../approval/telegramBot.js');
+      await tg('🔍 *JARVIS* — Weekend research sweep triggered. Finding new firms to add to pipeline.').catch(() => {});
+      await writeMemory(deal.id, {
+        type:    'ACTION',
+        subject: 'Weekend research sweep',
+        content: 'JARVIS triggered weekend research — orchestrator will process new firms in next cycle',
+        tags:    ['research', 'weekend'],
+      });
+    }
   } catch (err) {
     console.error('[JARVIS] Morning brief failed:', err.message);
   }
