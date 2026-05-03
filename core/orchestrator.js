@@ -2481,9 +2481,8 @@ function shouldResearchContact(contact, deal, batch) {
   if (countResearchFailures(contact) >= RESEARCH_FAILURE_CAP) return false;
   if (!existingResearch) return true;
   if (missingCore) return true;
-  // Only re-research batch contacts that haven't been researched yet — not ones with existing data
-  if (inCurrentBatch && !existingResearch) return true;
-  if (!deepResearchOnlyForBatch() && score >= scoreThreshold) return true;
+  // Has research and nothing missing — don't re-research regardless of score or batch
+  if (existingResearch && !missingCore) return false;
   return false;
 }
 
