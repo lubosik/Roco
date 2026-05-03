@@ -819,10 +819,17 @@ async function markMissingLinkedIn({ sb, deal, contact, pushActivity, logActivit
   } else {
     updates.pipeline_stage = 'Archived';
     updates.enrichment_status = 'skipped_no_linkedin';
-    updates.archive_reason = 'Could not find LinkedIn';
+    // archive_reason column may not exist in all DB schemas — add conditionally
+    // to avoid failing the entire update if the column is absent.
   }
 
-  await sb.from('contacts').update(updates).eq('id', contact.id);
+  const { error: updateErr } = await sb.from('contacts').update(updates).eq('id', contact.id);
+  if (updateErr) {
+    // Retry without optional columns that may not exist in this schema
+    const safeUpdates = { ...updates };
+    delete safeUpdates.archive_reason;
+    await sb.from('contacts').update(safeUpdates).eq('id', contact.id).catch(() => {});
+  }
 
   await recordInviteActivity({
     pushActivity,
@@ -981,6 +988,25 @@ export async function processLinkedInInvite({
       });
       return { status: 'failed_lookup', error: err };
     }
+  }
+
+  // resolveLinkedInProfile returned null (slug case — isValidLinkedInProviderId
+  // rejected the value before the API call) — attempt the search path before giving up.
+  if (!providerId && (publicId || linkedinUrl)) {
+    try {
+      const discovered = await findMatchingLinkedInProfileForContact(contact);
+      if (discovered?.providerId) {
+        providerId = discovered.providerId;
+        publicId = discovered.publicId || publicId;
+        if (discovered.linkedinUrl) {
+          await sb.from('contacts').update({
+            linkedin_url: discovered.linkedinUrl,
+            linkedin_provider_id: discovered.providerId,
+            linkedin_public_id: discovered.publicId || null,
+          }).eq('id', contact.id).catch(() => {});
+        }
+      }
+    } catch {}
   }
 
   if (!providerId) {
