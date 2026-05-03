@@ -724,6 +724,14 @@ async function runCycle(state) {
     const activeDeals = await getActiveDeals();
     runAutonomousCheck(activeDeals).catch(() => {});
     checkMorningBriefTimer(activeDeals);
+
+    // Weekend: outreach is off but research runs all day — actively top up pipeline
+    const nowEst = DateTime.now().setZone('America/New_York');
+    if (['Saturday', 'Sunday'].includes(nowEst.weekdayLong)) {
+      for (const deal of activeDeals) {
+        triggerAutoFeedForDeal(deal, { reason: 'weekend_research_sweep', requestedCount: 30 }).catch(() => {});
+      }
+    }
   } catch {}
 
   // Unipile account health — alerts via Telegram if LinkedIn/Gmail/Outlook session expired
@@ -2473,7 +2481,8 @@ function shouldResearchContact(contact, deal, batch) {
   if (countResearchFailures(contact) >= RESEARCH_FAILURE_CAP) return false;
   if (!existingResearch) return true;
   if (missingCore) return true;
-  if (inCurrentBatch) return true;
+  // Only re-research batch contacts that haven't been researched yet — not ones with existing data
+  if (inCurrentBatch && !existingResearch) return true;
   if (!deepResearchOnlyForBatch() && score >= scoreThreshold) return true;
   return false;
 }

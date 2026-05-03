@@ -615,17 +615,14 @@ Keep it tight — this is read on a phone. Use *bold* for key names/numbers. Max
       tags:    ['morning_brief'],
     });
 
-    // On weekends, proactively flag that research/enrichment should run since
-    // no outreach fires. The orchestrator's continueResearch already runs every
-    // cycle — this makes JARVIS explicitly communicative about it.
+    // On weekends, log research intent — the orchestrator fires triggerAutoFeedForDeal
+    // directly each cycle, so no explicit trigger is needed here.
     const nowDay = DateTime.now().setZone(JARVIS_TZ).weekdayLong.toLowerCase();
     if (['saturday', 'sunday'].includes(nowDay)) {
-      const { sendTelegram: tg } = await import('../approval/telegramBot.js');
-      await tg('🔍 *JARVIS* — Weekend research sweep triggered. Finding new firms to add to pipeline.').catch(() => {});
       await writeMemory(deal.id, {
         type:    'ACTION',
-        subject: 'Weekend research sweep',
-        content: 'JARVIS triggered weekend research — orchestrator will process new firms in next cycle',
+        subject: 'Weekend research mode active',
+        content: 'No outreach today. Orchestrator running firm discovery and enrichment sweeps each cycle.',
         tags:    ['research', 'weekend'],
       });
     }
