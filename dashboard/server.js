@@ -4574,15 +4574,26 @@ function registerRoutes(app) {
       return res.status(404).json({ error: 'Approval not found — may have already been handled' });
     }
 
-    pushActivity({
-      type: 'APPROVAL',
-      action: 'Approved via Dashboard',
-      note: item
-        ? `${item.name} @ ${item.firm}`
-        : (sbItem ? `${sbItem.contact_name || 'Unknown'} @ ${sbItem.firm || 'Unknown firm'}` : 'Unknown contact'),
-    });
+    const resolvedName = item?.name || sbItem?.contact_name || 'Unknown';
+    const resolvedFirm = item?.firm || sbItem?.firm || 'Unknown firm';
+    const resolvedDealId = item?.dealId || sbItem?.deal_id || null;
+    const isLinkedIn = String(item?.stage || sbItem?.stage || '').toLowerCase().includes('linkedin');
+    const stageLabel = isLinkedIn ? 'LinkedIn DM' : 'Email';
 
-    const isLinkedIn = String(item?.stage || '').toLowerCase().includes('linkedin');
+    pushActivity({
+      type: 'approval',
+      action: `${stageLabel} approved via Dashboard`,
+      note: `${resolvedName} · ${resolvedFirm}`,
+      dealId: resolvedDealId,
+    });
+    sbLogActivity({
+      dealId: resolvedDealId,
+      contactId: item?.contactId || sbItem?.contact_id || null,
+      eventType: 'APPROVAL_APPROVED',
+      summary: `${stageLabel} approved via Dashboard: ${resolvedName} at ${resolvedFirm}`,
+      detail: { stage: stageLabel, firm: resolvedFirm, contact_name: resolvedName },
+    }).catch(() => {});
+
     res.json({
       success: true,
       message: isLinkedIn

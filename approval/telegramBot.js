@@ -11,13 +11,30 @@ import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from '../core/run
 let bot;
 let rocoState; // injected from orchestrator
 
-export async function clearTelegramApprovalControls(messageId) {
-  if (!bot || !messageId) return;
+async function telegramApiCall(method, body) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return null;
   try {
-    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
-      chat_id: process.env.TELEGRAM_CHAT_ID,
-      message_id: Number(messageId),
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
     });
+    return res.ok ? res.json() : null;
+  } catch { return null; }
+}
+
+export async function clearTelegramApprovalControls(messageId) {
+  if (!messageId) return;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!chatId) return;
+  try {
+    if (bot) {
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: Number(messageId) });
+    } else {
+      // Web service has no bot instance — call Telegram API directly
+      await telegramApiCall('editMessageReplyMarkup', { chat_id: chatId, message_id: Number(messageId), reply_markup: JSON.stringify({ inline_keyboard: [] }) });
+    }
   } catch {}
 }
 
@@ -269,21 +286,24 @@ export async function processTelegramUpdate(update) {
 }
 
 export async function sendTelegram(text) {
-  if (!bot) return null;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!chatId) return null;
   try {
-    return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-  } catch (err) {
-    if (String(err?.message || '').includes("can't parse entities")) {
-      try {
-        const plainText = String(text || '')
-          .replace(/```/g, '')
-          .replace(/[_*`]/g, '')
-          .replace(/\[(.*?)\]\((.*?)\)/g, '$1 ($2)');
-        return await bot.sendMessage(chatId, plainText);
-      } catch {}
+    if (bot) {
+      return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
     }
+    // Web service has no bot instance — call Telegram API directly
+    return await telegramApiCall('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown' });
+  } catch (err) {
+    // Retry as plain text if Markdown parse fails
+    try {
+      const plainText = String(text || '')
+        .replace(/```/g, '')
+        .replace(/[_*`]/g, '')
+        .replace(/\[(.*?)\]\((.*?)\)/g, '$1 ($2)');
+      if (bot) return await bot.sendMessage(chatId, plainText);
+      return await telegramApiCall('sendMessage', { chat_id: chatId, text: plainText });
+    } catch {}
     error('Telegram send failed', { err: err.message });
     return null;
   }
