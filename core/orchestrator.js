@@ -6646,7 +6646,7 @@ async function phaseLinkedInInvites(deal, state) {
     blockedFirms.add(firm);
   }
 
-  const perCycleLimit = Math.min(8, remainingToday);
+  const perCycleLimit = Math.min(3, remainingToday); // max 3 per 10-min cycle to avoid LinkedIn burst throttle
 
   const { data: candidates } = await sb.from('contacts')
     .select('*')
@@ -6700,6 +6700,8 @@ async function phaseLinkedInInvites(deal, state) {
       });
       if (outcome.status === 'sent') {
         logStep('LinkedIn invite sent', contact.name, 'linkedin', deal);
+        // Random 3–7s delay after each successful invite to avoid LinkedIn burst throttle
+        await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000));
       } else if (outcome.status === 'already_pending') {
         info(`[${deal.name}] ${contact.name} already has a pending LinkedIn invite`);
       } else if (outcome.status === 'already_connected') {
