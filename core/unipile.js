@@ -501,6 +501,7 @@ function companyLikelyMatches(contact, person) {
     || person?.companyName
     || person?.organization
     || person?.current_company
+    || person?.current_positions?.[0]?.company
     || ''
   );
   if (!actual) return true;
@@ -532,7 +533,9 @@ async function findMatchingLinkedInProfileForContact(contact) {
     if (!fullName || !namesLikelyMatch(name, fullName)) return;
     const exactName = personExactNameMatches(name, fullName);
     if (!exactName && !companyLikelyMatches(contact, person)) return;
-    const providerId = String(person?.provider_id || '').trim() || null;
+    // Sales Navigator returns 'id'; classic search returns 'provider_id'
+    const rawProviderId = String(person?.provider_id || person?.id || '').trim();
+    const providerId = isLikelyLinkedInProviderId(rawProviderId) ? rawProviderId : null;
     const publicId = String(person?.public_identifier || person?.provider_public_id || '').trim() || null;
     const linkedinUrl = normalizeLinkedInProfileUrl(
       person?.public_profile_url
@@ -873,6 +876,13 @@ export async function processLinkedInInvite({
   let providerId = String(contact?.linkedin_provider_id || '').trim() || null;
   let publicId = String(contact?.linkedin_public_id || '').trim() || null;
   if (!providerId && isLikelyLinkedInProviderId(rawLinkedInValue)) providerId = rawLinkedInValue;
+  // Extract provider_id from miniProfileUrn embedded in LinkedIn URL query params
+  if (!providerId && rawLinkedInValue.includes('miniProfileUrn')) {
+    const urnMatch = rawLinkedInValue.match(/miniProfileUrn=urn%3Ali%3Afs_miniProfile%3A([A-Za-z0-9_-]+)/);
+    if (urnMatch?.[1] && isLikelyLinkedInProviderId(urnMatch[1])) {
+      providerId = urnMatch[1];
+    }
+  }
   if (!publicId) publicId = extractLinkedInPublicId(rawLinkedInValue);
   const invites = Array.isArray(pendingInvites) ? pendingInvites : await fetchPendingLinkedInInvitesSafe();
   const providerLimitState = parseProviderLimitState(contact?.notes);
