@@ -124,9 +124,15 @@ export function hasPartialPersonResearch(record = {}) {
 }
 
 export function hasFreshResearch(record, ttlDays = getResearchConfig().cacheTtlDays) {
-  if (!record?.last_researched_at) return false;
-  const last = Date.parse(record.last_researched_at);
-  if (Number.isNaN(last)) return false;
+  // last_researched_at doesn't exist as a DB column — use person_researched + updated_at
+  // A contact is "fresh" if it has been successfully researched and updated recently
+  if (!record?.person_researched) return false;
+  // If notes contain a research marker, treat as fresh within TTL
+  const notes = typeof record.notes === 'string' ? record.notes : '';
+  const hasMarker = RESEARCH_MARKERS.some(m => notes.includes(m));
+  if (!hasMarker) return false;
+  const last = Date.parse(record.updated_at || record.created_at || '');
+  if (Number.isNaN(last)) return true; // has marker but no timestamp → assume fresh
   return (Date.now() - last) < ttlDays * 24 * 60 * 60 * 1000;
 }
 

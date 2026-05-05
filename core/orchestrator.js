@@ -5609,7 +5609,6 @@ function buildPersonResearchUpdates(contact, research, marker = null) {
   const updates = {
     person_researched: status === 'verified',
     notes: [notesBase, `[${effectiveMarker} ${new Date().toISOString()}]`, `Research status: ${status}`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
-    last_researched_at: new Date().toISOString(),
   };
   if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
   if (research.company_name && !contact.company_name) updates.company_name = research.company_name;

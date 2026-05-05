@@ -112,7 +112,7 @@ async function getAllContacts(dealId) {
   let from = 0;
   while (true) {
     const { data, error } = await sb.from('contacts')
-      .select('id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, linkedin_provider_id, linkedin_url, email, enrichment_status, person_researched, last_researched_at, sector_focus, past_investments, investment_thesis, notes, investor_score')
+      .select('id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, linkedin_provider_id, linkedin_url, email, enrichment_status, person_researched, updated_at, sector_focus, past_investments, investment_thesis, notes, investor_score')
       .eq('deal_id', dealId)
       .order('investor_score', { ascending: false })
       .range(from, from + PAGE - 1);
@@ -201,9 +201,14 @@ async function main() {
   const researchedButMissingSector = liveContacts.filter(c =>
     c.person_researched && !c.sector_focus
   );
+  const RESEARCH_MARKERS = ['[PERSON_RESEARCH_VERIFIED', '[PERSON_RESEARCH_PARTIAL', '[PERSON_RESEARCHED'];
   const recentlyResearched = liveContacts.filter(c => {
-    if (!c.last_researched_at) return false;
-    return (Date.now() - new Date(c.last_researched_at).getTime()) < 90 * 24 * 3600 * 1000;
+    if (!c.person_researched) return false;
+    const notes = String(c.notes || '');
+    if (!RESEARCH_MARKERS.some(m => notes.includes(m))) return false;
+    const last = Date.parse(c.updated_at || '');
+    if (Number.isNaN(last)) return true;
+    return (Date.now() - last) < 90 * 24 * 3600 * 1000;
   });
   console.log(`  Live contacts (pre-outreach stages): ${liveContacts.length}`);
   console.log(`  Researched but missing sector_focus: ${researchedButMissingSector.length}  ← caused the loop`);

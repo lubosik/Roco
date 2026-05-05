@@ -6216,7 +6216,7 @@ function registerRoutes(app) {
       let from = 0;
       while (true) {
         const { data, error: qErr } = await sb.from('contacts')
-          .select('id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, linkedin_provider_id, person_researched, last_researched_at, sector_focus, investor_score')
+          .select('id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, linkedin_provider_id, person_researched, updated_at, sector_focus, investor_score')
           .eq('deal_id', deal.id)
           .range(from, from + 999);
         if (qErr) throw new Error(qErr.message);
