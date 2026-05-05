@@ -7243,11 +7243,9 @@ async function phaseOutreach(deal, state) {
 
   await cleanupPendingFirmQueueConflicts().catch(err => warn(`[${deal.name}] cleanupPendingFirmQueueConflicts error: ${err.message}`));
   await queueInviteAcceptedLinkedInDrafts().catch(err => warn(`[${deal.name}] queueInviteAcceptedLinkedInDrafts error: ${err.message}`));
-  await flushApprovedLinkedInDms().catch(err => warn(`[${deal.name}] flushApprovedLinkedInDms error: ${err.message}`));
-  await flushApprovedEmails().catch(err => warn(`[${deal.name}] flushApprovedEmails error: ${err.message}`));
 
-  // Recovery: contacts stuck in DM Approved with no dm_sent_at and no active queue entry
-  // This happens when the process restarts between approval and send, losing the in-memory Promise.
+  // Recovery: contacts stuck in DM Approved with no dm_sent_at and no active queue entry.
+  // Runs BEFORE the flush so re-queued items are sent in the same cycle.
   await (async () => {
     try {
       const { data: orphanedDmApproved } = await sb.from('contacts')
@@ -7270,13 +7268,24 @@ async function phaseOutreach(deal, state) {
       info(`[${deal.name}] Recovery: ${needsRequeue.length} DM Approved contact(s) have no dm_sent_at and no queue entry — re-queuing`);
       for (const contact of needsRequeue) {
         try {
+          // Try to find original approved message from a prior queue entry
+          const { data: priorEntry } = await sb.from('approval_queue')
+            .select('edited_body, body')
+            .eq('contact_id', contact.id)
+            .eq('stage', 'LinkedIn DM')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          const recoveredBody = priorEntry?.edited_body || priorEntry?.body
+            || `Hi ${(contact.name || '').split(' ')[0]}, I came across your profile and thought there might be a strong fit between what you focus on and a deal we're working on. Would you be open to a quick chat?`;
+
           await sb.from('approval_queue').insert({
             deal_id: deal.id,
             contact_id: contact.id,
             contact_name: contact.name,
             firm: contact.company_name || '',
             stage: 'LinkedIn DM',
-            body: `Hi ${(contact.name || '').split(' ')[0]}, I came across your profile and thought there might be a strong fit between what you focus on and a deal we're working on. Would you be open to a quick chat?`,
+            body: recoveredBody,
             status: 'approved',
             resolved_at: new Date().toISOString(),
           });
@@ -7289,6 +7298,9 @@ async function phaseOutreach(deal, state) {
       warn(`[${deal.name}] DM Approved recovery error: ${err.message}`);
     }
   })();
+
+  await flushApprovedLinkedInDms().catch(err => warn(`[${deal.name}] flushApprovedLinkedInDms error: ${err.message}`));
+  await flushApprovedEmails().catch(err => warn(`[${deal.name}] flushApprovedEmails error: ${err.message}`));
 
   // Day-1 firm lane: send one junior / mid-level email intro per firm if we have an email,
   // even while LinkedIn connection requests are going to the rest of the firm.
