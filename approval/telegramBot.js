@@ -392,6 +392,24 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       pendingApprovals.set(sent.message_id, entry);
       info(`Email draft sent to Telegram for approval: ${name}`);
 
+      // Log to dashboard activity feed and Supabase
+      import('../dashboard/server.js').then(({ pushActivity }) => {
+        pushActivity({
+          type: 'approval',
+          action: `${stageLabel} sent for approval`,
+          note: `${name} · ${firm}`,
+          deal_name: null,
+          dealId,
+        });
+      }).catch(() => {});
+      sbLogActivity({
+        dealId,
+        contactId: contactPage?.id || null,
+        eventType: 'APPROVAL_QUEUED',
+        summary: `${stageLabel} queued for approval: ${name} at ${firm}`,
+        detail: { stage: stageLabel, score, firm, contact_name: name },
+      }).catch(() => {});
+
       // Attach action buttons (done after send so we have the message_id)
       bot.editMessageReplyMarkup(buildKeyboard(sent.message_id, queueRow?.id || null), {
         chat_id: chatId,
@@ -495,6 +513,24 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
         sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).then(null, () => {});
       }
       info(`LinkedIn DM draft sent to Telegram for approval: ${name}`);
+
+      // Log to dashboard activity feed and Supabase
+      import('../dashboard/server.js').then(({ pushActivity }) => {
+        pushActivity({
+          type: 'approval',
+          action: 'LinkedIn DM sent for approval',
+          note: `${name} · ${firm}`,
+          deal_name: null,
+          dealId,
+        });
+      }).catch(() => {});
+      sbLogActivity({
+        dealId: dealId || null,
+        contactId: contact.id || null,
+        eventType: 'APPROVAL_QUEUED',
+        summary: `LinkedIn DM queued for approval: ${name} at ${firm}`,
+        detail: { stage, score, firm, contact_name: name },
+      }).catch(() => {});
     } catch (err) {
       error('Failed to send LinkedIn DM draft to Telegram', { err: err.message });
       resolve({ action: 'error' });
