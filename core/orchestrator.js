@@ -6722,8 +6722,9 @@ async function phaseLinkedInInvites(deal, state) {
           info(`[${deal.name}] LinkedIn weekly quota confirmed — stopping invite loop until ${outcome.retryAt}`);
           break;
         }
-        // Even on first/second retry, stop the loop — provider limit means LinkedIn is throttling this session
-        break;
+        // Stored-state deferral (checked from notes before any API call) — skip this contact,
+        // keep looping to invite others. Only a live weeklyLimitHit warrants stopping the loop.
+        continue;
       } else if (outcome.status === 'suppressed_no_match') {
         info(`[${deal.name}] ${contact.name} invite retry suppressed after recent LinkedIn mismatch until ${outcome.retryAt || 'later'}`);
       } else if (outcome.status === 'routed_to_email') {
