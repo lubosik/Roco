@@ -1629,14 +1629,17 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
   ] = await Promise.all([
     sb.from('contacts')
       .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel, dm_sent_at')
-      .in('deal_id', safeIds),
+      .in('deal_id', safeIds)
+      .limit(10000),
     sb.from('emails')
       .select('id, deal_id, status')
       .eq('status', 'sent')
-      .in('deal_id', safeIds),
+      .in('deal_id', safeIds)
+      .limit(10000),
     sb.from('replies')
       .select('deal_id, contact_id, channel')
-      .in('deal_id', safeIds),
+      .in('deal_id', safeIds)
+      .limit(10000),
   ]);
 
   let outreachEvents = [];
@@ -1644,7 +1647,8 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
     const { data } = await sb.from('outreach_events')
       .select('deal_id, contact_id, event_type, status')
       .in('deal_id', safeIds)
-      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT']);
+      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT'])
+      .limit(10000);
     outreachEvents = data || [];
   } catch {}
 
@@ -6185,6 +6189,168 @@ function registerRoutes(app) {
       await sbLogActivity({ dealId: did, eventType: 'PIPELINE_CLEARED', summary: `Pipeline cleared — ${count} contacts removed` }).catch(() => {});
 
       res.json({ success: true, cleared: count });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // GET /api/deals/:id/audit — live outreach audit vs Unipile
+  app.get('/api/deals/:id/audit', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const deal = await getDeal(req.params.id);
+      if (!deal) return res.status(404).json({ error: 'Deal not found' });
+
+      const DSN     = process.env.UNIPILE_DSN || 'https://api34.unipile.com:16411';
+      const API_KEY = process.env.UNIPILE_API_KEY;
+      const LI_ACCT = process.env.UNIPILE_LINKEDIN_ACCOUNT_ID;
+
+      async function unipileGet(path) {
+        const base = DSN.startsWith('http') ? DSN : `https://${DSN}`;
+        const r = await fetch(`${base}/api/v1${path}`, { headers: { 'X-API-KEY': API_KEY, accept: 'application/json' } });
+        if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`Unipile ${r.status}: ${t.slice(0, 120)}`); }
+        return r.json();
+      }
+
+      // Fetch all contacts (paginated past 1000)
+      const allContacts = [];
+      let from = 0;
+      while (true) {
+        const { data, error: qErr } = await sb.from('contacts')
+          .select('id, name, company_name, pipeline_stage, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, linkedin_provider_id, person_researched, last_researched_at, sector_focus, investor_score')
+          .eq('deal_id', deal.id)
+          .range(from, from + 999);
+        if (qErr) throw new Error(qErr.message);
+        if (!data?.length) break;
+        allContacts.push(...data);
+        if (data.length < 1000) break;
+        from += 1000;
+      }
+
+      // Stage breakdown
+      const byStage = {};
+      for (const c of allContacts) {
+        const s = c.pipeline_stage || 'null';
+        byStage[s] = (byStage[s] || 0) + 1;
+      }
+
+      // Outreach events
+      const { data: eventsData } = await sb.from('outreach_events')
+        .select('contact_id, event_type, status')
+        .eq('deal_id', deal.id)
+        .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT'])
+        .limit(10000);
+      const events = eventsData || [];
+      const confirmedEmails  = events.filter(e => e.event_type === 'EMAIL_SENT'           && e.status !== 'failed').length;
+      const confirmedInvites = events.filter(e => e.event_type === 'LINKEDIN_INVITE_SENT' && e.status !== 'failed').length;
+      const confirmedDMs     = events.filter(e => e.event_type === 'LINKEDIN_DM_SENT'     && e.status !== 'failed').length;
+
+      // Unipile sent invitations
+      let sentInvites = [];
+      let unipileError = null;
+      try {
+        const data = await unipileGet(`/users/invite/sent?account_id=${encodeURIComponent(LI_ACCT)}&limit=100`);
+        sentInvites = data?.items || [];
+      } catch (e) { unipileError = e.message; }
+
+      const sentProviderIds = new Set(sentInvites.map(i => i.provider_id || i.attendee_provider_id || i.recipient_id || i.id).filter(Boolean).map(String));
+      const confirmedInviteContactIds = new Set(events.filter(e => e.event_type === 'LINKEDIN_INVITE_SENT' && e.status !== 'failed').map(e => String(e.contact_id)).filter(Boolean));
+
+      const dbInviteSentContacts = allContacts.filter(c => (c.pipeline_stage === 'invite_sent' || c.invite_sent_at) && c.linkedin_provider_id);
+      const unconfirmedInvites = dbInviteSentContacts.filter(c => !sentProviderIds.has(c.linkedin_provider_id) && !confirmedInviteContactIds.has(String(c.id)));
+
+      // Research loop analysis
+      const LIVE_STAGES = new Set(['Ranked', 'ranked', 'Enriched', 'enriched', 'Researched', 'researched', 'invite_sent']);
+      const researchedMissingSector = allContacts.filter(c => LIVE_STAGES.has(c.pipeline_stage) && c.person_researched && !c.sector_focus);
+
+      res.json({
+        deal: { id: deal.id, name: deal.name, status: deal.status },
+        contacts: {
+          total: allContacts.length,
+          by_stage: byStage,
+        },
+        outreach_events: {
+          confirmed_emails: confirmedEmails,
+          confirmed_li_invites: confirmedInvites,
+          confirmed_li_dms: confirmedDMs,
+        },
+        db_pipeline: {
+          invite_sent_or_accepted: dbInviteSentContacts.length,
+          email_sent: allContacts.filter(c => c.last_email_sent_at).length,
+          dm_sent: allContacts.filter(c => c.dm_sent_at).length,
+        },
+        unipile: {
+          error: unipileError,
+          pending_sent_invitations: sentInvites.length,
+          unconfirmed_db_invites: unconfirmedInvites.length,
+          unconfirmed_sample: unconfirmedInvites.slice(0, 10).map(c => ({ id: c.id, name: c.name, company: c.company_name, stage: c.pipeline_stage })),
+        },
+        research_loop: {
+          researched_missing_sector_focus: researchedMissingSector.length,
+          sample: researchedMissingSector.slice(0, 5).map(c => ({ name: c.name, company: c.company_name })),
+        },
+      });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // POST /api/deals/:id/fix-research-loop — patch sector_focus on stuck contacts
+  app.post('/api/deals/:id/fix-research-loop', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const deal = await getDeal(req.params.id);
+      if (!deal) return res.status(404).json({ error: 'Deal not found' });
+
+      // Fetch contacts in live stages with person_researched=true but no sector_focus
+      const { data: stuck } = await sb.from('contacts')
+        .select('id, name')
+        .eq('deal_id', deal.id)
+        .eq('person_researched', true)
+        .is('sector_focus', null)
+        .in('pipeline_stage', ['Ranked', 'ranked', 'Enriched', 'enriched', 'Researched', 'researched', 'invite_sent']);
+
+      if (!stuck?.length) return res.json({ fixed: 0, message: 'No stuck contacts found' });
+
+      const ids = stuck.map(c => c.id);
+      for (let i = 0; i < ids.length; i += 200) {
+        await sb.from('contacts').update({ sector_focus: 'General / Various' }).in('id', ids.slice(i, i + 200));
+      }
+
+      pushActivity({ type: 'system', action: `Fixed ${ids.length} research-loop contacts`, note: `${deal.name} · sector_focus backfilled`, deal_name: deal.name, dealId: deal.id });
+      res.json({ fixed: ids.length, names: stuck.slice(0, 10).map(c => c.name) });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // POST /api/deals/:id/reset-fake-invites — reset DB invite_sent contacts not confirmed by outreach_events
+  app.post('/api/deals/:id/reset-fake-invites', async (req, res) => {
+    try {
+      const sb = getSupabase();
+      if (!sb) return res.status(503).json({ error: 'Database unavailable' });
+      const deal = await getDeal(req.params.id);
+      if (!deal) return res.status(404).json({ error: 'Deal not found' });
+
+      const { data: eventsData } = await sb.from('outreach_events')
+        .select('contact_id')
+        .eq('deal_id', deal.id)
+        .eq('event_type', 'LINKEDIN_INVITE_SENT')
+        .neq('status', 'failed')
+        .limit(10000);
+      const confirmedIds = new Set((eventsData || []).map(e => String(e.contact_id)).filter(Boolean));
+
+      const { data: inviteSentContacts } = await sb.from('contacts')
+        .select('id, name, company_name')
+        .eq('deal_id', deal.id)
+        .eq('pipeline_stage', 'invite_sent');
+
+      const toReset = (inviteSentContacts || []).filter(c => !confirmedIds.has(String(c.id)));
+      if (!toReset.length) return res.json({ reset: 0, message: 'All invite_sent contacts are confirmed by outreach_events' });
+
+      const ids = toReset.map(c => c.id);
+      for (let i = 0; i < ids.length; i += 200) {
+        await sb.from('contacts').update({ pipeline_stage: 'Enriched', invite_sent_at: null }).in('id', ids.slice(i, i + 200));
+      }
+
+      pushActivity({ type: 'system', action: `Reset ${ids.length} unconfirmed invite_sent contacts to Enriched`, note: `${deal.name} · will be re-queued for outreach`, deal_name: deal.name, dealId: deal.id });
+      res.json({ reset: ids.length, sample: toReset.slice(0, 10).map(c => ({ name: c.name, company: c.company_name })) });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 

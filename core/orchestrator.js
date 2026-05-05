@@ -2476,7 +2476,8 @@ function shouldResearchContact(contact, deal, batch) {
     hasCoreResearchFields(contact) ||
     (isResearched(contact.notes) && !hasResearchFailureMarker(contact.notes));
 
-  if (freshResearch && !missingCore) return false;
+  // Fresh research means we already did our best within the TTL window — skip regardless of gaps
+  if (freshResearch) return false;
   // Stop retrying after repeated failures — proceed with best-copy outreach
   if (countResearchFailures(contact) >= RESEARCH_FAILURE_CAP) return false;
   if (!existingResearch) return true;
@@ -5613,7 +5614,8 @@ function buildPersonResearchUpdates(contact, research, marker = null) {
   if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
   if (research.company_name && !contact.company_name) updates.company_name = research.company_name;
   if (research.linkedin_url && !contact.linkedin_url) updates.linkedin_url = research.linkedin_url;
-  if (research.sector_focus) updates.sector_focus = research.sector_focus;
+  // Always write sector_focus so contactNeedsCoreResearch stops triggering on repeat cycles
+  updates.sector_focus = research.sector_focus || contact.sector_focus || 'General / Various';
   if (research.geography) updates.geography = research.geography;
   if (research.typical_cheque) updates.typical_cheque_size = research.typical_cheque;
   if (research.firm_aum) updates.aum_fund_size = research.firm_aum;
