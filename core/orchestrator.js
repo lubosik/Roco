@@ -5485,7 +5485,7 @@ async function phasePersonResearch(deal, batch) {
 
   const candidates = sortedForResearch
     .filter(contact => shouldResearchContact(contact, deal, batch))
-    .slice(0, 5);
+    .slice(0, 15);
 
   if (!candidates.length) {
     info(`[${deal.name}] phasePersonResearch: no shortlisted contacts need research`);
@@ -6034,7 +6034,7 @@ export async function phaseEnrich(deal, state) {
       .eq('deal_id', deal.id)
       .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Enriched', 'ENRICHED', 'enriched'])
       .is('linkedin_url', null)
-      .limit(5); // batch of 5 per cycle to stay well under LinkedIn rate limits
+      .limit(10); // batch of 10 per cycle — still safe under LinkedIn rate limits
 
     for (const contact of (needLinkedIn || [])) {
       try {
@@ -7245,6 +7245,50 @@ async function phaseOutreach(deal, state) {
   await queueInviteAcceptedLinkedInDrafts().catch(err => warn(`[${deal.name}] queueInviteAcceptedLinkedInDrafts error: ${err.message}`));
   await flushApprovedLinkedInDms().catch(err => warn(`[${deal.name}] flushApprovedLinkedInDms error: ${err.message}`));
   await flushApprovedEmails().catch(err => warn(`[${deal.name}] flushApprovedEmails error: ${err.message}`));
+
+  // Recovery: contacts stuck in DM Approved with no dm_sent_at and no active queue entry
+  // This happens when the process restarts between approval and send, losing the in-memory Promise.
+  await (async () => {
+    try {
+      const { data: orphanedDmApproved } = await sb.from('contacts')
+        .select('id, name, company_name, linkedin_provider_id, deal_id')
+        .eq('deal_id', deal.id)
+        .eq('pipeline_stage', 'DM Approved')
+        .is('dm_sent_at', null);
+      if (!orphanedDmApproved?.length) return;
+
+      // Check which have an active approval_queue entry already
+      const { data: activeQueueEntries } = await sb.from('approval_queue')
+        .select('contact_id')
+        .eq('deal_id', deal.id)
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window']);
+      const activeContactIds = new Set((activeQueueEntries || []).map(r => String(r.contact_id)));
+
+      const needsRequeue = orphanedDmApproved.filter(c => c.linkedin_provider_id && !activeContactIds.has(String(c.id)));
+      if (!needsRequeue.length) return;
+
+      info(`[${deal.name}] Recovery: ${needsRequeue.length} DM Approved contact(s) have no dm_sent_at and no queue entry — re-queuing`);
+      for (const contact of needsRequeue) {
+        try {
+          await sb.from('approval_queue').insert({
+            deal_id: deal.id,
+            contact_id: contact.id,
+            contact_name: contact.name,
+            firm: contact.company_name || '',
+            stage: 'LinkedIn DM',
+            body: `Hi ${(contact.name || '').split(' ')[0]}, I came across your profile and thought there might be a strong fit between what you focus on and a deal we're working on. Would you be open to a quick chat?`,
+            status: 'approved',
+            resolved_at: new Date().toISOString(),
+          });
+          pushActivity({ type: 'system', action: `Recovered orphaned DM Approved: ${contact.name}`, note: `${contact.company_name || ''} — re-queued for send`, deal_name: deal.name, dealId: deal.id });
+        } catch (err) {
+          warn(`[${deal.name}] Could not re-queue orphaned DM for ${contact.name}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      warn(`[${deal.name}] DM Approved recovery error: ${err.message}`);
+    }
+  })();
 
   // Day-1 firm lane: send one junior / mid-level email intro per firm if we have an email,
   // even while LinkedIn connection requests are going to the rest of the firm.
