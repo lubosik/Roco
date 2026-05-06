@@ -5598,20 +5598,25 @@ async function verifyEmailWithMillionVerifier(email) {
     const url = `https://api.millionverifier.com/api/v3/?api=${apiKey}&email=${encodeURIComponent(email)}&timeout=10`;
     const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
     if (!res.ok) {
-      console.warn(`[ENRICH] MillionVerifier returned ${res.status} for ${email} — treating as unverified`);
-      return { valid: false, apiError: true, result: `http_${res.status}`, quality: 'unverified' };
+      console.warn(`[ENRICH] MillionVerifier returned ${res.status} for ${email} — allowing email through unverified`);
+      return { valid: true, apiError: true, result: `http_${res.status}`, quality: 'unverified' };
     }
     const data = await res.json();
     console.log(`[ENRICH] MillionVerifier: ${email} → result=${data.result}, quality=${data.quality}`);
-    const isInvalid = data.result === 'invalid' || data.result === 'disposable' || data.result === 'error' || Boolean(data.error);
+    const verifierUnavailable = data.result === 'error' || Boolean(data.error);
+    if (verifierUnavailable) {
+      warn(`[ENRICH] MillionVerifier unavailable for ${email}: ${data.error || data.result} — allowing email through unverified`);
+      return { valid: true, verifierUnavailable: true, result: data.result, quality: data.quality || 'unverified', error: data.error || null };
+    }
+    const isInvalid = data.result === 'invalid' || data.result === 'disposable';
     const isBadQuality = data.quality === 'bad';
     if (isInvalid || isBadQuality) {
       return { valid: false, result: data.result, quality: data.quality || 'unverified', suggestion: data.didyoumean || null, error: data.error || null };
     }
     return { valid: true, result: data.result, quality: data.quality };
   } catch (err) {
-    console.warn(`[ENRICH] MillionVerifier error for ${email}: ${err.message} — treating as unverified`);
-    return { valid: false, apiError: true, result: 'verification_error', quality: 'unverified' };
+    console.warn(`[ENRICH] MillionVerifier error for ${email}: ${err.message} — allowing email through unverified`);
+    return { valid: true, apiError: true, result: 'verification_error', quality: 'unverified' };
   }
 }
 
