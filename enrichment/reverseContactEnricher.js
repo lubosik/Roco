@@ -11,11 +11,14 @@ import fetch from 'node-fetch';
 
 const V2_BASE_URL = 'https://api.reversecontact.com/v2';
 const LEGACY_BASE_URL = 'https://api.reversecontact.com/enrichment';
-const MIN_INTERVAL_MS = 1000;
+const MIN_INTERVAL_MS = Math.max(1000, Number(process.env.REVERSECONTACT_MIN_INTERVAL_MS || 6500));
 const ASYNC_POLL_MS = 10_000;
 const ASYNC_MAX_POLLS = 6;
 
 let lastCallAt = 0;
+let legacyReverseEmailRestricted = false;
+let v2EmailFinderRestricted = false;
+let legacyEmailFinderRestricted = false;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -41,6 +44,7 @@ function pick(...values) {
 function unwrapPayload(raw) {
   if (!raw || raw.success === false) return null;
   if (raw.data?.data && Array.isArray(raw.data.data)) return raw.data.data[0] || null;
+  if (Array.isArray(raw.data)) return raw.data[0] || null;
   if (raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)) return raw.data;
   return raw;
 }
@@ -66,12 +70,14 @@ function normalizePerson(raw) {
   const fullName = pick(
     person.fullName,
     person.name,
+    payload.results?.full_name,
     [firstName, lastName].filter(Boolean).join(' ').trim(),
   );
   const email = pick(
     payload.email,
     person.email,
     person.emailAddress,
+    payload.results?.email,
     Array.isArray(payload.data) ? payload.data[0]?.email : null,
     Array.isArray(payload.emails) ? payload.emails[0]?.email || payload.emails[0]?.value : null,
   );
@@ -163,14 +169,21 @@ export async function enrichByEmail(email) {
       throw err;
     });
     const webhookId = resolved?.data?.webhookId || resolved?.webhookId || null;
-    return normalizePerson(webhookId ? await pollWebhook(webhookId) : resolved);
+    const normalized = normalizePerson(webhookId ? await pollWebhook(webhookId) : resolved);
+    if (normalized) return normalized;
   } catch (err) {
     console.warn(`[ReverseContact] V2 email lookup failed for ${value}: ${err.message}`);
   }
 
   try {
-    const legacy = await requestLegacy({ email: value }).catch(() => null)
-      || await requestLegacy({ mail: value });
+    if (legacyReverseEmailRestricted) return null;
+    const legacy = await requestLegacy({ email: value }).catch(err => {
+      if (err.status === 403) legacyReverseEmailRestricted = true;
+      return null;
+    }) || await requestLegacy({ mail: value }).catch(err => {
+      if (err.status === 403) legacyReverseEmailRestricted = true;
+      throw err;
+    });
     return normalizePerson(legacy);
   } catch (err) {
     console.warn(`[ReverseContact] legacy email lookup failed for ${value}: ${err.message}`);
@@ -214,10 +227,20 @@ export async function searchPerson({ name, companyName, title, perPage = 5 } = {
     console.warn(`[ReverseContact] person search failed for ${name || companyName}: ${err.message}`);
     return null;
   });
-  return normalizePerson(raw);
+  const normalized = normalizePerson(raw);
+  if (normalized) return normalized;
+
+  return normalizePerson(await requestLegacy({
+    ...(firstName ? { firstName } : {}),
+    ...(lastName ? { lastName } : {}),
+    ...(companyName ? { companyName } : {}),
+  }).catch(err => {
+    console.warn(`[ReverseContact] legacy person search failed for ${name || companyName}: ${err.message}`);
+    return null;
+  }));
 }
 
-export async function findEmail({ linkedInUrl, fullName, firstName, lastName, companyDomain } = {}) {
+export async function findEmail({ linkedInUrl, fullName, firstName, lastName, companyDomain, companyName } = {}) {
   if (!getApiKey()) return null;
   const body = {};
   const url = normalizeLinkedInUrl(linkedInUrl);
@@ -230,11 +253,29 @@ export async function findEmail({ linkedInUrl, fullName, firstName, lastName, co
   }
   if (!body.url && !(body.companyDomain && (body.fullName || (body.firstName && body.lastName)))) return null;
 
-  const created = await requestV2('/contact/email', body).catch(err => {
+  const created = v2EmailFinderRestricted ? null : await requestV2('/contact/email', body).catch(err => {
+    if (err.status === 403) v2EmailFinderRestricted = true;
     console.warn(`[ReverseContact] find email failed for ${fullName || linkedInUrl}: ${err.message}`);
     return null;
   });
   const webhookId = created?.data?.webhookId || created?.webhookId || null;
   const result = webhookId ? await pollWebhook(webhookId) : created;
-  return normalizePerson(result);
+  const normalized = normalizePerson(result);
+  if (normalized?.email) return normalized;
+
+  const legacyParams = {};
+  if (fullName) legacyParams.full_name = fullName;
+  if (firstName) legacyParams.first_name = firstName;
+  if (lastName) legacyParams.last_name = lastName;
+  if (companyDomain) legacyParams.domain = companyDomain;
+  if (companyName) legacyParams.company_name = companyName;
+  if (!(legacyParams.full_name || (legacyParams.first_name && legacyParams.last_name)) || !(legacyParams.domain || legacyParams.company_name)) {
+    return normalized;
+  }
+  if (legacyEmailFinderRestricted) return normalized;
+  return normalizePerson(await requestLegacy(legacyParams, '/email-finder').catch(err => {
+    if (err.status === 403) legacyEmailFinderRestricted = true;
+    console.warn(`[ReverseContact] legacy email finder failed for ${fullName || linkedInUrl}: ${err.message}`);
+    return null;
+  }));
 }

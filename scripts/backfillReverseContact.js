@@ -18,6 +18,9 @@ import { enrichByEmail, searchPerson, findEmail } from '../enrichment/reverseCon
 
 const LIVE = process.argv.includes('--live');
 const FIND_EMAILS = process.argv.includes('--find-emails');
+const EMAILS_ONLY = process.argv.includes('--emails-only');
+const LINKEDIN_FROM_EMAIL = process.argv.includes('--linkedin-from-email');
+const SHOULD_FIND_EMAILS = FIND_EMAILS || EMAILS_ONLY;
 const limitIdx = process.argv.indexOf('--limit');
 const dealIdx = process.argv.indexOf('--deal');
 const LIMIT = limitIdx >= 0 ? Math.max(1, Number(process.argv[limitIdx + 1] || 25)) : 25;
@@ -84,10 +87,19 @@ async function main() {
   let query = sb.from('contacts')
     .select('id, deal_id, name, company_name, job_title, email, linkedin_url, pipeline_stage')
     .not('name', 'is', null)
-    .not('pipeline_stage', 'in', '("Archived","Inactive","Deleted — Do Not Contact","Suppressed — Opt Out")')
-    .or(FIND_EMAILS
+    .not('pipeline_stage', 'in', '("Archived","Inactive","Deleted — Do Not Contact","Suppressed — Opt Out")');
+
+  if (EMAILS_ONLY) {
+    query = query.is('email', null).not('linkedin_url', 'is', null);
+  } else if (LINKEDIN_FROM_EMAIL) {
+    query = query.not('email', 'is', null).is('linkedin_url', null);
+  } else {
+    query = query.or(SHOULD_FIND_EMAILS
       ? 'linkedin_url.is.null,email.is.null'
-      : 'linkedin_url.is.null')
+      : 'linkedin_url.is.null');
+  }
+
+  query = query
     .order('updated_at', { ascending: true })
     .limit(LIMIT);
   if (dealId) query = query.eq('deal_id', dealId);
@@ -95,7 +107,7 @@ async function main() {
   const { data: contacts, error } = await query;
   if (error) throw new Error(error.message);
 
-  console.log(`ReverseContact backfill: ${LIVE ? 'LIVE' : 'DRY RUN'} · contacts=${contacts?.length || 0} · findEmails=${FIND_EMAILS}`);
+  console.log(`ReverseContact backfill: ${LIVE ? 'LIVE' : 'DRY RUN'} · contacts=${contacts?.length || 0} · findEmails=${SHOULD_FIND_EMAILS} · emailsOnly=${EMAILS_ONLY} · linkedinFromEmail=${LINKEDIN_FROM_EMAIL}`);
 
   let linkedinFound = 0;
   let emailsFound = 0;
@@ -118,10 +130,11 @@ async function main() {
       }
     }
 
-    if (FIND_EMAILS && !contact.email) {
+    if (SHOULD_FIND_EMAILS && !contact.email) {
       const emailResult = await findEmail({
         linkedInUrl: patch.linkedin_url || contact.linkedin_url,
         fullName: contact.name,
+        companyName: contact.company_name,
       });
       if (emailResult?.email && profileMatches(contact, emailResult)) {
         patch.email = emailResult.email;
