@@ -4402,9 +4402,9 @@ async function runApprovedEnrichment(deal, batch, state) {
     return;
   }
 
-  // Process up to 5 firms per cycle with a 5-second rest between each.
+  // Process up to 10 firms per cycle with a 5-second rest between each.
   // Outreach runs in the same cycle for all already-enriched contacts.
-  const FIRMS_PER_CYCLE = 5;
+  const FIRMS_PER_CYCLE = 10;
   const firmsToProcess = pendingFirms.slice(0, FIRMS_PER_CYCLE);
   const total = batch.firms_target || BATCH_FIRM_TARGET;
 
@@ -4817,6 +4817,14 @@ async function runDealCycle(deal, state) {
   }
 
   console.log(`[ORCHESTRATOR] ---- Cycle: ${deal.name} ----`);
+  pushActivity({
+    type: 'system',
+    action: `Cycle running — ${deal.name}`,
+    note: `Orchestrator active · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+    persist: false,
+  });
 
   try {
 
@@ -4888,13 +4896,32 @@ async function runDealCycle(deal, state) {
       });
       await announceCycleDecision(deal, batch, 'pending_approval', 'Research target reached and the batch is ready for your approval');
       break;
-    case 'approved':
+    case 'approved': {
+      // Quick pipeline snapshot for activity log visibility
+      try {
+        const sb2 = getSupabase();
+        if (sb2) {
+          const [{ count: enriching }, { count: inviteReady }, { count: emailReady }] = await Promise.all([
+            sb2.from('batch_firms').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).eq('batch_id', batch.id).in('enrichment_status', ['pending', 'in_progress']),
+            sb2.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).in('pipeline_stage', ['Ranked', 'Enriched']).not('linkedin_url', 'is', null).is('invite_sent_at', null),
+            sb2.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).in('pipeline_stage', ['Enriched']).not('email', 'is', null).is('last_email_sent_at', null),
+          ]);
+          pushActivity({
+            type: 'system',
+            action: `Pipeline snapshot — ${deal.name}`,
+            note: `Firms enriching: ${enriching ?? 0} · Invite-ready: ${inviteReady ?? 0} · Email-ready: ${emailReady ?? 0}`,
+            deal_name: deal.name,
+            dealId: deal.id,
+          });
+        }
+      } catch {}
       await runApprovedEnrichment(deal, batch, state);
       await runApprovedOutreach(deal, batch, state, brainDirectives);
       await maybeTopUpApprovedBatch(deal, brainDirectives);
       await phaseTopUpPipeline(deal, state);  // promote archived contacts + trigger research when pipeline low
       await logDealIdleStatus(deal, batch, state);
       break;
+    }
     case 'completed':
     case 'skipped':
       await maybeStartNextBatch(deal);
@@ -6754,18 +6781,38 @@ async function phaseLinkedInInvites(deal, state) {
 
   // Reactivate any contacts deferred by weekly LinkedIn limit whose retry window has passed
   try {
+    const now = new Date().toISOString();
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
     const { data: weeklyLimitExpired } = await sb.from('contacts')
       .select('id, enrichment_status')
       .eq('deal_id', deal.id)
       .eq('pipeline_stage', 'linkedin_weekly_limit')
-      .lt('follow_up_due_at', new Date().toISOString())
+      .lt('follow_up_due_at', now)
       .not('linkedin_url', 'is', null);
-    if (weeklyLimitExpired?.length) {
-      for (const c of weeklyLimitExpired) {
+
+    const { data: weeklyLimitNullDue } = await sb.from('contacts')
+      .select('id, enrichment_status')
+      .eq('deal_id', deal.id)
+      .eq('pipeline_stage', 'linkedin_weekly_limit')
+      .is('follow_up_due_at', null)
+      .lt('updated_at', sevenDaysAgo)
+      .not('linkedin_url', 'is', null);
+
+    const toReactivate = [...(weeklyLimitExpired || []), ...(weeklyLimitNullDue || [])];
+    if (toReactivate.length) {
+      for (const c of toReactivate) {
         const stage = c.enrichment_status === 'enriched' || c.enrichment_status === 'enriched_apify' ? 'Enriched' : 'Ranked';
         await sb.from('contacts').update({ pipeline_stage: stage, follow_up_due_at: null }).eq('id', c.id);
       }
-      info(`[${deal.name}] Reactivated ${weeklyLimitExpired.length} contact(s) after LinkedIn weekly limit reset`);
+      info(`[${deal.name}] Reactivated ${toReactivate.length} contact(s) after LinkedIn weekly limit reset`);
+      pushActivity({
+        type: 'linkedin',
+        action: `LinkedIn weekly limit reset — ${toReactivate.length} contact${toReactivate.length !== 1 ? 's' : ''} reactivated`,
+        note: `${deal.name} · Re-queued for invite attempts`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
     }
   } catch {}
 
