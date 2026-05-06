@@ -7061,8 +7061,14 @@ export async function phaseOutreach(deal, state) {
       info(`[${deal.name}] phaseOutreach: ${c.name} — not scored yet, deferring`);
       return false;
     }
-    if (score < Number(deal.min_investor_score || 60)) {
-      return false;
+    const primaryMinScore = Number(deal.min_investor_score || 60);
+    if (score < primaryMinScore) {
+      const fallbackMinScore = Number(deal.min_approval_fallback_score || 50);
+      const canFallbackToApproval = score >= fallbackMinScore
+        && hasUsableEmail(c.email)
+        && hasUsableResearchBasis(c);
+      if (!canFallbackToApproval) return false;
+      info(`[${deal.name}] phaseOutreach: ${c.name} scored ${score} below primary min ${primaryMinScore}; allowing approval fallback`);
     }
     if (DEAD_STATUSES.has(c.enrichment_status)) return false; // no contact method
     if (hasUsableResearchBasis(c)) {
