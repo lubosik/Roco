@@ -7542,7 +7542,8 @@ export async function phaseOutreach(deal, state) {
       continue;
     }
     const forceChannel = contact.pipeline_stage === 'invite_accepted' ? 'linkedin_dm' : 'email';
-    await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel });
+    handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel })
+      .catch(err => warn(`[OUTREACH] Approval queueing failed for ${contact.name || contact.id}: ${err.message}`));
   }
 }
 
@@ -7628,7 +7629,8 @@ async function phaseFollowUps(deal, state) {
       });
       // Clear the LinkedIn patience timer before drafting the email
       await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id).then(null, () => {});
-      await handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' }).catch(() => {});
+      handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' })
+        .catch(err => warn(`[FOLLOW-UP] Channel-switch approval queueing failed for ${contact.name || contact.id}: ${err.message}`));
     } else {
       // Patience window expired → mark inactive and advance waterfall to next person at the firm.
       // Channel selection for the replacement contact is handled by queueNextFirmWaterfallContact
@@ -8366,7 +8368,8 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
     deal_name: deal.name,
     dealId: deal.id,
   });
-  await handleOutreachApproval(nextContact, 'INTRO', 0, deal, { forceChannel });
+  handleOutreachApproval(nextContact, 'INTRO', 0, deal, { forceChannel })
+    .catch(err => warn(`[WATERFALL] Approval queueing failed for ${nextContact.name || nextContact.id}: ${err.message}`));
 }
 
 async function fetchTemplate(type, dealId, contactId) {
