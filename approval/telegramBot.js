@@ -2323,10 +2323,15 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
         edited_body: text || null,
         resolved_at: new Date().toISOString(),
       }).eq('id', item.id);
+      if (item.telegram_msg_id) await clearTelegramApprovalControls(item.telegram_msg_id).catch(() => {});
+      await sendTelegram(
+        `✅ *LinkedIn DM approved* — queued for window\n👤 *${item.contact_name || 'contact'}* · ${item.firm || ''}\nWill send when LinkedIn window opens.`
+      ).catch(() => {});
       notifyQueueUpdated();
       return;
     }
 
+    if (item.telegram_msg_id) await clearTelegramApprovalControls(item.telegram_msg_id).catch(() => {});
     notifyQueueUpdated();
     return;
   }
@@ -2362,7 +2367,7 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
   }
 
   try {
-    const { isWithinChannelWindow } = await import('../core/scheduleChecker.js');
+    const { isWithinChannelWindow, getNextWindowOpenForChannel } = await import('../core/scheduleChecker.js');
     if (deal && !isWithinChannelWindow(deal, 'email')) {
       await sb.from('approval_queue').update({
         status: 'approved_waiting_for_window',
@@ -2370,6 +2375,11 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
         edited_body: bodyToSend || null,
         resolved_at: new Date().toISOString(),
       }).eq('id', item.id);
+      if (item.telegram_msg_id) await clearTelegramApprovalControls(item.telegram_msg_id).catch(() => {});
+      const nextWindow = deal ? getNextWindowOpenForChannel(deal, 'email') : 'next window';
+      await sendTelegram(
+        `✅ *Email approved* — queued for window\n👤 *${item.contact_name || 'contact'}* · ${item.firm || ''}\n📧 _${sanitizeApprovalText(approvedSubject)}_\nWill send ${nextWindow}.`
+      ).catch(() => {});
       notifyQueueUpdated();
       return;
     }
@@ -2442,6 +2452,7 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
     note: `${item.firm || ''} · ${approvedSubject}`,
     persist: false,
   });
+  if (item.telegram_msg_id) await clearTelegramApprovalControls(item.telegram_msg_id).catch(() => {});
   await sendTelegram(
     `✅ *Email sent* → *${item.contact_name || 'contact'}* (${item.firm || 'unknown firm'})${approvedSubject ? `\nSubject: _${sanitizeApprovalText(approvedSubject)}_` : ''}`
   ).catch(() => {});
