@@ -234,6 +234,22 @@ function hasRecentLinkedInNoMatchSuppression(notes, hours = 72) {
   return Number.isFinite(checkedAt) && (Date.now() - checkedAt) < (hours * 60 * 60 * 1000);
 }
 
+function stripLinkedInNoMatchSuppression(notes) {
+  return String(notes || '')
+    .replace(LINKEDIN_NO_MATCH_NOTE_PATTERN, '')
+    .replace(/\s+\|\s+/g, ' | ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .replace(/\|\s*$/, '')
+    .trim();
+}
+
+function appendLinkedInNoMatchSuppression(notes, reason = 'not_found') {
+  const cleaned = stripLinkedInNoMatchSuppression(notes);
+  const marker = `[LI_NO_MATCH:checked_at=${new Date().toISOString()}|reason=${String(reason).slice(0, 120)}]`;
+  return cleaned ? `${cleaned} | ${marker}` : marker;
+}
+
 function buildContactIdentityKey(contact, firmName = '') {
   const providerId = String(contact?.linkedin_provider_id || '').trim().toLowerCase();
   if (providerId) return `provider:${providerId}`;
@@ -6114,18 +6130,20 @@ export async function phaseEnrich(deal, state) {
     }
   }
 
-  // Secondary pass: find LinkedIn for contacts that have email (e.g. from CSV) but no linkedin_url
-  // phaseLinkedInInvites requires linkedin_url — without this, CSV contacts never get invites
-  // Process in batches of 5 to avoid LinkedIn 429 rate limits
+  // Secondary pass: find LinkedIn for contacts missing a URL.
+  // phaseLinkedInInvites requires linkedin_url — without this, contacts never get invites.
+  // Mark misses so future cycles rotate through the queue instead of retrying
+  // the same first page over and over.
   if (state.linkedin_enabled !== false) {
     const { data: needLinkedIn } = await sb.from('contacts')
-      .select('id, name, company_name, job_title, email, enrichment_status')
+      .select('id, name, company_name, job_title, email, enrichment_status, notes')
       .eq('deal_id', deal.id)
       .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Enriched', 'ENRICHED', 'enriched'])
       .is('linkedin_url', null)
-      .limit(10); // batch of 10 per cycle — still safe under LinkedIn rate limits
+      .order('updated_at', { ascending: true })
+      .limit(50); // fetch extra so recent no-match suppressions do not block rotation
 
-    for (const contact of (needLinkedIn || [])) {
+    for (const contact of (needLinkedIn || []).filter(c => !hasRecentLinkedInNoMatchSuppression(c.notes)).slice(0, 10)) {
       try {
         if (hasRecentLinkedInNoMatchSuppression(contact.notes)) {
           continue;
@@ -6136,6 +6154,11 @@ export async function phaseEnrich(deal, state) {
           if (found.providerId && !contact.linkedin_provider_id) patch.linkedin_provider_id = found.providerId;
           await sb.from('contacts').update(patch).eq('id', contact.id);
           logStep(`LinkedIn found: ${contact.name}${found.providerId ? ' (provider_id captured)' : ''}`, deal.name, 'enrichment', deal);
+        } else {
+          await sb.from('contacts').update({
+            notes: appendLinkedInNoMatchSuppression(contact.notes, 'unipile_person_search_not_found'),
+            updated_at: new Date().toISOString(),
+          }).eq('id', contact.id);
         }
       } catch (e) {
         console.warn(`[ENRICH] LinkedIn find failed for ${contact.name}:`, e.message);
@@ -6218,15 +6241,16 @@ export async function phaseEnrich(deal, state) {
   // Perplexity sonar-pro to find their LinkedIn URL. Capped at 3 per cycle.
   try {
     const { data: stuck } = await sb.from('contacts')
-      .select('id, name, company_name, job_title')
+      .select('id, name, company_name, job_title, notes')
       .eq('deal_id', deal.id)
       .eq('enrichment_status', 'linkedin_only')
       .is('email', null)
       .is('linkedin_url', null)
       .in('pipeline_stage', ['Enriched', 'ENRICHED', 'enriched'])
-      .limit(3);
+      .order('updated_at', { ascending: true })
+      .limit(25);
 
-    for (const contact of (stuck || [])) {
+    for (const contact of (stuck || []).filter(c => !hasRecentLinkedInNoMatchSuppression(c.notes)).slice(0, 3)) {
       try {
         const searchPrompt = `Find the LinkedIn profile URL for ${contact.name}${contact.job_title ? `, ${contact.job_title}` : ''} at ${contact.company_name || 'their company'}. Return ONLY the LinkedIn URL in format https://www.linkedin.com/in/[identifier] or 'not found'.`;
         const rawResponse = await orComplete(searchPrompt, { tier: 'web', maxTokens: 120 });
@@ -6237,6 +6261,11 @@ export async function phaseEnrich(deal, state) {
             await sb.from('contacts').update({ linkedin_url: foundUrl }).eq('id', contact.id);
             logStep(`Web search found LinkedIn for ${contact.name}`, deal.name, 'enrichment', deal);
             pushActivity({ type: 'enrichment', action: `Web search LinkedIn found`, note: `${contact.name} — ${foundUrl}`, deal_name: deal.name, dealId: deal.id });
+          } else {
+            await sb.from('contacts').update({
+              notes: appendLinkedInNoMatchSuppression(contact.notes, 'web_search_not_found'),
+              updated_at: new Date().toISOString(),
+            }).eq('id', contact.id);
           }
         }
       } catch (webErr) {
@@ -6912,7 +6941,7 @@ async function phaseLinkedInInvites(deal, state) {
 // Email for enriched contacts; DM for invite-accepted contacts
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function phaseOutreach(deal, state) {
+export async function phaseOutreach(deal, state) {
   const sb = getSupabase();
   if (!sb) return;
 

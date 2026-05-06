@@ -161,7 +161,7 @@ export function getNextWindowOpenForChannel(deal, channel) {
  * @returns {object} { isOpen, status, nextOpen, timeUntilOpen, timeUntilClose }
  */
 export function getWindowStatus(deal, globalPausedUntil = null) {
-  const { tz, endStr: dealEndStr } = deal ? resolveSchedule(deal) : { tz: 'Europe/London', endStr: '18:00' };
+  const { tz, endStr: dealEndStr } = deal ? resolveSchedule(deal) : { tz: 'America/New_York', endStr: '18:00' };
   const now = DateTime.now().setZone(tz);
 
   // Global pause check
@@ -222,7 +222,7 @@ export function isWithinChannelWindow(deal, channel) {
   if (!deal) return true;
   if (deal.paused === true || deal.status === 'PAUSED') return false;
 
-  const tz = deal.timezone || 'Europe/London';
+  const tz = deal.timezone || deal.sending_timezone || 'America/New_York';
   const now = DateTime.now().setZone(tz);
   const nowMinutes = now.hour * 60 + now.minute;
   const { sendingDays } = resolveSchedule(deal);
