@@ -6095,6 +6095,25 @@ export async function phaseEnrich(deal, state) {
     }
   }
 
+  // Consistency pass: some imported/backfilled contacts can be marked enriched
+  // even though they still have no email. If they do have LinkedIn, retry the
+  // contact-data enrichment path once; a miss will mark them linkedin_only.
+  const { data: inconsistentNoEmail } = await sb.from('contacts')
+    .select('*')
+    .eq('deal_id', deal.id)
+    .in('pipeline_stage', ['Ranked', 'RANKED', 'ranked', 'Researched', 'RESEARCHED', 'researched'])
+    .in('enrichment_status', ['enriched', 'Enriched', 'Complete', 'complete'])
+    .is('email', null)
+    .not('linkedin_url', 'is', null)
+    .limit(10);
+
+  if (inconsistentNoEmail?.length) {
+    console.log(`[ORCHESTRATOR] phaseEnrich: retrying ${inconsistentNoEmail.length} LinkedIn-known contact(s) missing email for ${deal.name}`);
+    for (const contact of inconsistentNoEmail) {
+      await enrichSingleContact(sb, { ...contact, enrichment_status: 'Pending' }, deal, state);
+    }
+  }
+
   // Secondary pass: find LinkedIn for contacts that have email (e.g. from CSV) but no linkedin_url
   // phaseLinkedInInvites requires linkedin_url — without this, CSV contacts never get invites
   // Process in batches of 5 to avoid LinkedIn 429 rate limits
@@ -6732,23 +6751,44 @@ async function phaseLinkedInInvites(deal, state) {
     return;
   }
 
-  // LinkedIn invite strategy:
-  // - connection requests are passive — send to all contacts at a firm proactively
-  // - only block a firm once someone there has ACTIVELY RESPONDED (replied, meeting booked, conversation)
-  // - don't block just because a pending approval, DM, or email is in flight — those are still cold outreach
+  const LI_INVITE_STALE_DAYS = 2;
+
+  // LinkedIn invite waterfall:
+  // - keep one fresh LinkedIn touch active per firm at a time
+  // - if an invite is not accepted after 2 days, the next cycle can try the next contact
+  // - if a DM gets no reply after 2 days, the next cycle can try the next contact
   const RESPONDED_STAGES = ['In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled'];
+  const LINKEDIN_ACTIVE_STAGES = ['invite_sent', 'invite_accepted', 'pending_dm_approval', 'DM Approved', 'DM Sent', 'dm_sent'];
+  const LINKEDIN_DEAD_STAGES = new Set(['Inactive', 'inactive', 'Archived', 'archived', 'Skipped', 'skipped', 'Declined', 'declined']);
+
+  const isFreshLinkedInTouch = (c) => {
+    if (c.response_received || c.last_reply_at) return false;
+    if (LINKEDIN_DEAD_STAGES.has(c.pipeline_stage)) return false;
+    const stage = String(c.pipeline_stage || '');
+    if (stage === 'invite_sent' && c.invite_sent_at) {
+      return (Date.now() - new Date(c.invite_sent_at).getTime()) <= LI_INVITE_STALE_DAYS * 86400000;
+    }
+    if (['DM Sent', 'dm_sent'].includes(stage) && c.dm_sent_at) {
+      return (Date.now() - new Date(c.dm_sent_at).getTime()) <= LI_INVITE_STALE_DAYS * 86400000;
+    }
+    return LINKEDIN_ACTIVE_STAGES.includes(stage);
+  };
 
   const { data: respondedContacts } = await sb.from('contacts')
-    .select('company_name, response_received')
+    .select('company_name, response_received, pipeline_stage, invite_sent_at, dm_sent_at, last_reply_at')
     .eq('deal_id', deal.id)
-    .or(`response_received.eq.true,pipeline_stage.in.(${RESPONDED_STAGES.map(s => `"${s}"`).join(',')})`)
     .not('company_name', 'is', null);
 
   const blockedFirms = new Set();
+  const activeLinkedInFirms = new Set();
   for (const c of respondedContacts || []) {
     const firm = (c.company_name || '').toLowerCase().trim();
     if (!firm || GENERIC_FIRM_NAMES.has(firm)) continue;
-    blockedFirms.add(firm);
+    if (c.response_received || RESPONDED_STAGES.includes(c.pipeline_stage)) {
+      blockedFirms.add(firm);
+    } else if (isFreshLinkedInTouch(c)) {
+      activeLinkedInFirms.add(firm);
+    }
   }
 
   const perCycleLimit = Math.min(3, remainingToday); // max 3 per 10-min cycle to avoid LinkedIn burst throttle
@@ -6772,15 +6812,16 @@ async function phaseLinkedInInvites(deal, state) {
     const firm = (c.company_name || '').toLowerCase().trim();
     const isRealFirm = firm && !GENERIC_FIRM_NAMES.has(firm);
     if (isRealFirm && blockedFirms.has(firm)) continue;
+    if (isRealFirm && activeLinkedInFirms.has(firm)) continue;
     contacts.push(c);
   }
 
   if (!contacts.length) {
-    info(`[${deal.name}] phaseLinkedInInvites: all firms already engaged or no LinkedIn candidates remain (${blockedFirms.size} blocked)`);
+    info(`[${deal.name}] phaseLinkedInInvites: all firms already engaged, waiting on fresh LinkedIn touches, or no candidates remain (${blockedFirms.size} responded, ${activeLinkedInFirms.size} active)`);
     return;
   }
 
-  console.log(`[ORCHESTRATOR] phaseLinkedInInvites: ${contacts.length} contacts for ${deal.name} (${blockedFirms.size} firms blocked, ${remainingToday} invite slots left today)`);
+  console.log(`[ORCHESTRATOR] phaseLinkedInInvites: ${contacts.length} contacts for ${deal.name} (${blockedFirms.size} responded, ${activeLinkedInFirms.size} active LinkedIn firms, ${remainingToday} invite slots left today)`);
 
   let pendingInvites = [];
   try {
@@ -6896,6 +6937,9 @@ async function phaseOutreach(deal, state) {
     if (c.pipeline_stage === 'invite_sent' && c.invite_sent_at) {
       return (Date.now() - new Date(c.invite_sent_at).getTime()) > LI_INVITE_STALE_DAYS * 86400000;
     }
+    if (['DM Sent', 'dm_sent'].includes(c.pipeline_stage) && c.dm_sent_at) {
+      return (Date.now() - new Date(c.dm_sent_at).getTime()) > LI_INVITE_STALE_DAYS * 86400000;
+    }
     if (['Email Sent', 'email_sent'].includes(c.pipeline_stage) && c.last_email_sent_at) {
       return (Date.now() - new Date(c.last_email_sent_at).getTime()) > EMAIL_STALE_DAYS * 86400000;
     }
@@ -6903,7 +6947,7 @@ async function phaseOutreach(deal, state) {
   };
 
   const { data: firmGateContacts } = await sb.from('contacts')
-    .select('id, company_name, pipeline_stage, response_received, conversation_state, last_email_sent_at, invite_sent_at')
+    .select('id, company_name, pipeline_stage, response_received, conversation_state, last_email_sent_at, invite_sent_at, dm_sent_at')
     .eq('deal_id', deal.id)
     .not('company_name', 'is', null);
 

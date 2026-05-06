@@ -13,6 +13,70 @@ function toDayRange(timezone = 'America/New_York') {
   };
 }
 
+const LINKEDIN_INVITE_STAGES = new Set([
+  'invite_sent',
+  'invite_accepted',
+  'DM Approved',
+  'DM Sent',
+  'dm_sent',
+  'Replied',
+  'In Conversation',
+  'Meeting Booked',
+  'Meeting Scheduled',
+]);
+const LINKEDIN_ACCEPTED_STAGES = new Set([
+  'invite_accepted',
+  'DM Approved',
+  'DM Sent',
+  'dm_sent',
+  'Replied',
+  'In Conversation',
+  'Meeting Booked',
+  'Meeting Scheduled',
+]);
+const CLOSED_CONTACT_STAGES = new Set([
+  'Archived',
+  'Skipped',
+  'Inactive',
+  'Suppressed — Opt Out',
+  'Deleted — Do Not Contact',
+]);
+const ACTIVE_APPROVAL_STATUSES = ['pending', 'approved', 'approved_waiting_for_window', 'sending'];
+
+async function fetchAllRows(buildQuery, pageSize = 1000) {
+  const rows = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await buildQuery().range(from, from + pageSize - 1);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return rows;
+}
+
+function hasLinkedInInviteHistory(contact) {
+  return Boolean(
+    contact?.invite_sent_at ||
+    contact?.invite_accepted_at ||
+    contact?.outreach_channel === 'linkedin_invite' ||
+    LINKEDIN_INVITE_STAGES.has(contact?.pipeline_stage)
+  );
+}
+
+function hasLinkedInAccepted(contact) {
+  return Boolean(
+    contact?.invite_accepted_at ||
+    LINKEDIN_ACCEPTED_STAGES.has(contact?.pipeline_stage)
+  );
+}
+
+function hasActivePendingLinkedInInvite(contact) {
+  if (!hasLinkedInInviteHistory(contact)) return false;
+  if (hasLinkedInAccepted(contact)) return false;
+  if (CLOSED_CONTACT_STAGES.has(contact?.pipeline_stage)) return false;
+  return true;
+}
+
 function normalizeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -102,60 +166,93 @@ export async function gatherCurrentMetrics(dealId) {
   const { data: deal } = await sb.from('deals').select('*').eq('id', dealId).limit(1).maybeSingle();
   const timezone = getDealTimezone(deal || {});
   const today = toDayRange(timezone);
+  const sevenDaysAgo = DateTime.now().setZone(timezone).minus({ days: 7 }).toUTC().toISO();
 
   const [
-    contactsRes,
-    activityRes,
-    msgRes,
+    contacts,
+    activityRows,
     pendingApprovalsRes,
+    emailRows,
+    repliesRows,
+    outreachEvents,
   ] = await Promise.all([
-    sb.from('contacts')
-      .select('id, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, pipeline_stage, conversation_state, last_reply_at, reply_channel, last_meeting_date, meeting_count')
-      .eq('deal_id', dealId),
-    sb.from('activity_log')
+    fetchAllRows(() => sb.from('contacts')
+      .select('id, deal_id, invite_sent_at, invite_accepted_at, last_email_sent_at, dm_sent_at, last_outreach_at, outreach_channel, pipeline_stage, conversation_state, response_received, last_reply_at, reply_channel, last_meeting_date, meeting_count')
+      .eq('deal_id', dealId)),
+    fetchAllRows(() => sb.from('activity_log')
       .select('event_type, created_at')
       .eq('deal_id', dealId)
       .gte('created_at', today.start)
-      .lte('created_at', today.end),
-    sb.from('conversation_messages')
-      .select('contact_id, direction, channel, received_at')
-      .eq('deal_id', dealId)
-      .eq('direction', 'inbound'),
+      .lte('created_at', today.end)),
     sb.from('approval_queue')
       .select('id', { count: 'exact', head: true })
       .eq('deal_id', dealId)
-      .eq('status', 'pending'),
+      .in('status', ACTIVE_APPROVAL_STATUSES),
+    fetchAllRows(() => sb.from('emails')
+      .select('id, deal_id, status')
+      .eq('deal_id', dealId)
+      .eq('status', 'sent')),
+    fetchAllRows(() => sb.from('replies')
+      .select('deal_id, contact_id, channel')
+      .eq('deal_id', dealId)),
+    fetchAllRows(() => sb.from('outreach_events')
+      .select('deal_id, contact_id, event_type, status, created_at')
+      .eq('deal_id', dealId)
+      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT'])),
   ]);
 
-  const contacts = contactsRes.data || [];
-  const activities = activityRes.data || [];
-  const inboundMessages = msgRes.data || [];
+  const activities = activityRows || [];
   const pendingApprovals = Number(pendingApprovalsRes.count || 0);
 
-  const liInvitesToday = contacts.filter(row => {
-    const sentAt = row.invite_sent_at || null;
-    if (!sentAt) return false;
-    const ts = DateTime.fromISO(sentAt, { zone: 'utc' }).setZone(timezone);
-    return ts.isValid && ts >= DateTime.fromISO(today.start).setZone(timezone) && ts <= DateTime.fromISO(today.end).setZone(timezone);
-  }).length;
+  const inRange = (value, rangeStart = today.start, rangeEnd = today.end) => {
+    if (!value) return false;
+    const ts = DateTime.fromISO(String(value), { zone: 'utc' }).setZone(timezone);
+    return ts.isValid
+      && ts >= DateTime.fromISO(rangeStart).setZone(timezone)
+      && ts <= DateTime.fromISO(rangeEnd).setZone(timezone);
+  };
 
-  const emailsSentToday = contacts.filter(row => {
-    const sentAt = row.last_email_sent_at || null;
-    if (!sentAt) return false;
-    const ts = DateTime.fromISO(sentAt, { zone: 'utc' }).setZone(timezone);
-    return ts.isValid && ts >= DateTime.fromISO(today.start).setZone(timezone) && ts <= DateTime.fromISO(today.end).setZone(timezone);
-  }).length;
+  const confirmedEvents = (outreachEvents || []).filter(row =>
+    String(row.status || 'confirmed').toLowerCase() === 'confirmed'
+  );
+  const hasEmailEventCoverage = confirmedEvents.some(row => row.event_type === 'EMAIL_SENT');
+  const hasInviteEventCoverage = confirmedEvents.some(row => row.event_type === 'LINKEDIN_INVITE_SENT');
+  const hasDmEventCoverage = confirmedEvents.some(row => row.event_type === 'LINKEDIN_DM_SENT');
 
-  const dmsSentToday = contacts.filter(row => {
-    const sentAt = row.dm_sent_at || null;
-    if (!sentAt) return false;
-    const ts = DateTime.fromISO(sentAt, { zone: 'utc' }).setZone(timezone);
-    return ts.isValid && ts >= DateTime.fromISO(today.start).setZone(timezone) && ts <= DateTime.fromISO(today.end).setZone(timezone);
-  }).length;
+  const emailsSent = hasEmailEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'EMAIL_SENT').length
+    : (emailRows || []).length;
+  const liInvitesSent = hasInviteEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_INVITE_SENT').length
+    : contacts.filter(hasLinkedInInviteHistory).length;
+  const dmsSent = hasDmEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_DM_SENT').length
+    : contacts.filter(row =>
+      row.dm_sent_at || ['DM Approved', 'DM Sent', 'dm_sent', 'Replied', 'In Conversation', 'Meeting Booked', 'Meeting Scheduled'].includes(row.pipeline_stage)
+    ).length;
 
-  // Use pipeline_stage as source of truth — invite_accepted_at was historically unreliable
-  const liPending = contacts.filter(row => String(row.pipeline_stage || '').toLowerCase() === 'invite_sent').length;
-  const liAccepted = contacts.filter(row => row.invite_accepted_at || ['dm sent','dm approved','pending_dm_approval','in conversation','invite_accepted'].includes(String(row.pipeline_stage || '').toLowerCase())).length;
+  const emailsSentToday = hasEmailEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'EMAIL_SENT' && inRange(row.created_at)).length
+    : contacts.filter(row => inRange(row.last_email_sent_at)).length;
+  const liInvitesToday = hasInviteEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_INVITE_SENT' && inRange(row.created_at)).length
+    : contacts.filter(row => inRange(row.invite_sent_at)).length;
+  const dmsSentToday = hasDmEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_DM_SENT' && inRange(row.created_at)).length
+    : contacts.filter(row => inRange(row.dm_sent_at)).length;
+
+  const emailsSentLast7 = hasEmailEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'EMAIL_SENT' && inRange(row.created_at, sevenDaysAgo, today.end)).length
+    : contacts.filter(row => inRange(row.last_email_sent_at, sevenDaysAgo, today.end)).length;
+  const liInvitesLast7 = hasInviteEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_INVITE_SENT' && inRange(row.created_at, sevenDaysAgo, today.end)).length
+    : contacts.filter(row => inRange(row.invite_sent_at, sevenDaysAgo, today.end)).length;
+  const dmsSentLast7 = hasDmEventCoverage
+    ? confirmedEvents.filter(row => row.event_type === 'LINKEDIN_DM_SENT' && inRange(row.created_at, sevenDaysAgo, today.end)).length
+    : contacts.filter(row => inRange(row.dm_sent_at, sevenDaysAgo, today.end)).length;
+
+  const liPending = contacts.filter(hasActivePendingLinkedInInvite).length;
+  const liAccepted = contacts.filter(hasLinkedInAccepted).length;
   const firmsInPipeline = contacts.filter(row => {
     const stage = String(row.pipeline_stage || '').toLowerCase();
     return !['inactive', 'archived', 'declined', 'suppressed - opt out', 'suppressed', 'do_not_contact'].includes(stage);
@@ -164,10 +261,52 @@ export async function gatherCurrentMetrics(dealId) {
     const stage = String(row.pipeline_stage || '').toLowerCase();
     return row.last_meeting_date || Number(row.meeting_count) > 0 || stage.includes('meeting');
   }).length;
-  // Deduplicated reply count: union of contacts flagged as replied + distinct contact_ids in inbound messages
-  const repliedContactIds = new Set(contacts.filter(row => row.last_reply_at || row.reply_channel).map(row => row.id).filter(Boolean));
-  inboundMessages.forEach(msg => { if (msg.contact_id) repliedContactIds.add(msg.contact_id); });
-  const totalReplies = repliedContactIds.size;
+
+  const seenEmailReplies = new Set();
+  const seenLinkedInReplies = new Set();
+  const seenEmailRepliesLast7 = new Set();
+  const seenLinkedInRepliesLast7 = new Set();
+  let emailReplies = 0;
+  let liDmReplies = 0;
+  let emailRepliesLast7 = 0;
+  let liDmRepliesLast7 = 0;
+
+  const addReply = (channel, key, at = null) => {
+    const normalized = String(channel || '').trim().toLowerCase();
+    if (!key) return;
+    if (normalized === 'email') {
+      if (!seenEmailReplies.has(key)) {
+        seenEmailReplies.add(key);
+        emailReplies += 1;
+      }
+      if (at && inRange(at, sevenDaysAgo, today.end) && !seenEmailRepliesLast7.has(key)) {
+        seenEmailRepliesLast7.add(key);
+        emailRepliesLast7 += 1;
+      }
+    } else if (normalized === 'linkedin') {
+      if (!seenLinkedInReplies.has(key)) {
+        seenLinkedInReplies.add(key);
+        liDmReplies += 1;
+      }
+      if (at && inRange(at, sevenDaysAgo, today.end) && !seenLinkedInRepliesLast7.has(key)) {
+        seenLinkedInRepliesLast7.add(key);
+        liDmRepliesLast7 += 1;
+      }
+    }
+  };
+
+  for (const row of contacts) {
+    const replySignal = row.response_received === true || Boolean(row.last_reply_at);
+    if (!replySignal) continue;
+    addReply(row.reply_channel, `${row.deal_id}:${row.id}`, row.last_reply_at);
+  }
+
+  for (const row of repliesRows || []) {
+    addReply(row.channel, `${row.deal_id}:${row.contact_id || `reply:${row.channel || 'unknown'}`}`);
+  }
+
+  const totalReplies = emailReplies + liDmReplies;
+  const repliesLast7 = emailRepliesLast7 + liDmRepliesLast7;
 
   // Positive replies = contacts who have replied and are NOT in a terminal negative state
   const positiveReplies = contacts.filter(row => {
@@ -199,25 +338,28 @@ export async function gatherCurrentMetrics(dealId) {
     firms_in_pipeline: firmsInPipeline,
     meetings_booked: meetingsBooked,
     total_replies: totalReplies,
+    email_replies: emailReplies,
+    li_dm_replies: liDmReplies,
+    total_responses: totalReplies + liAccepted,
     pending_approvals: pendingApprovals,
     hours_since_last_li_invite: hoursSinceLastLiInvite,
     activity_events_today: activities.length,
-    emails_sent: contacts.filter(row => row.last_email_sent_at).length,
-    dms_sent: contacts.filter(row => row.dm_sent_at).length,
-    // Stage-based count — invite_sent_at was historically unreliable
-    li_invites_sent: contacts.filter(row => {
-      if (row.invite_sent_at) return true;
-      const stage = String(row.pipeline_stage || '').toLowerCase();
-      return ['invite_sent', 'invite_accepted', 'pending_dm_approval', 'dm approved', 'dm sent', 'in conversation'].includes(stage);
-    }).length,
-    response_rate: (() => {
-      const replied = contacts.filter(row => row.last_reply_at || row.reply_channel).length;
-      const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;
-      return sent > 0 ? Math.round((replied / sent) * 100) : 0;
-    })(),
+    emails_sent: emailsSent,
+    dms_sent: dmsSent,
+    li_invites_sent: liInvitesSent,
+    emails_sent_last_7_days: emailsSentLast7,
+    li_invites_last_7_days: liInvitesLast7,
+    dms_sent_last_7_days: dmsSentLast7,
+    replies_last_7_days: repliesLast7,
+    email_replies_last_7_days: emailRepliesLast7,
+    li_dm_replies_last_7_days: liDmRepliesLast7,
+    email_response_rate: emailsSent > 0 ? Math.round((emailReplies / emailsSent) * 100) : 0,
+    li_dm_response_rate: dmsSent > 0 ? Math.round((liDmReplies / dmsSent) * 100) : 0,
+    overall_response_rate: (emailsSent + dmsSent) > 0 ? Math.round((totalReplies / (emailsSent + dmsSent)) * 100) : 0,
+    response_rate: emailsSent > 0 ? Math.round((emailReplies / emailsSent) * 100) : 0,
     positive_replies: positiveReplies,
     positive_reply_rate: (() => {
-      const sent = contacts.filter(row => row.last_email_sent_at || row.dm_sent_at).length;
+      const sent = emailsSent + dmsSent;
       return sent > 0 ? Math.round((positiveReplies / sent) * 100) : 0;
     })(),
   };

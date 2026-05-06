@@ -172,7 +172,7 @@ async function buildTodaysReplyContext(dealId) {
 // DEAL TIMELINE & VELOCITY CONTEXT
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function buildDealTimeline(deal) {
+async function buildDealTimeline(deal, metrics = null) {
   if (!deal) return '';
   const sb = getSupabase();
   const nowDt = DateTime.now().setZone(JARVIS_TZ);
@@ -230,10 +230,17 @@ async function buildDealTimeline(deal) {
     } catch {}
   }
 
-  const totalEmails   = lifetime['EMAIL_SENT'] || 0;
-  const totalInvites  = lifetime['LINKEDIN_INVITE_SENT'] || 0;
-  const totalDMs      = lifetime['LINKEDIN_DM_SENT'] || 0;
-  const totalReplies  = lifetime['REPLY_RECEIVED'] || 0;
+  const totalEmails   = Number(metrics?.emails_sent ?? lifetime['EMAIL_SENT'] ?? 0);
+  const totalInvites  = Number(metrics?.li_invites_sent ?? lifetime['LINKEDIN_INVITE_SENT'] ?? 0);
+  const totalDMs      = Number(metrics?.dms_sent ?? lifetime['LINKEDIN_DM_SENT'] ?? 0);
+  const totalReplies  = Number(metrics?.total_replies ?? lifetime['REPLY_RECEIVED'] ?? 0);
+  const totalEmailReplies = Number(metrics?.email_replies || 0);
+  const totalDmReplies = Number(metrics?.li_dm_replies || 0);
+  const acceptedInvites = Number(metrics?.li_accepted || 0);
+  const last7Emails = Number(metrics?.emails_sent_last_7_days ?? last7['EMAIL_SENT'] ?? 0);
+  const last7Invites = Number(metrics?.li_invites_last_7_days ?? last7['LINKEDIN_INVITE_SENT'] ?? 0);
+  const last7Dms = Number(metrics?.dms_sent_last_7_days ?? last7['LINKEDIN_DM_SENT'] ?? 0);
+  const last7Replies = Number(metrics?.replies_last_7_days ?? last7['REPLY_RECEIVED'] ?? 0);
 
   const emailsPerDay  = (totalEmails  / outreachDaysElapsed).toFixed(1);
   const invitesPerDay = (totalInvites / outreachDaysElapsed).toFixed(1);
@@ -259,16 +266,17 @@ DEAL TIMELINE & PACE:
   Today (${now.toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}): ${todayMode}
   Configured outreach days: ${sendingDays.map(d => d.slice(0,3)).join(', ')}
 
-LIFETIME ACTIVITY (since launch, from activity log):
+LIFETIME ACTIVITY (since launch, dashboard metric basis):
   Emails sent: ${totalEmails}
   LinkedIn invites sent: ${totalInvites}
+  LinkedIn invites accepted: ${acceptedInvites}
   LinkedIn DMs sent: ${totalDMs}
-  Replies received: ${totalReplies}
+  Actual replies received: ${totalReplies} (${totalEmailReplies} email, ${totalDmReplies} LinkedIn DM)
   Avg emails/outreach day: ${emailsPerDay}
   Avg invites/outreach day: ${invitesPerDay}
 
 LAST 7 DAYS:
-  Emails: ${last7['EMAIL_SENT'] || 0}, LI invites: ${last7['LINKEDIN_INVITE_SENT'] || 0}, DMs: ${last7['LINKEDIN_DM_SENT'] || 0}, Replies: ${last7['REPLY_RECEIVED'] || 0}
+  Emails: ${last7Emails}, LI invites: ${last7Invites}, DMs: ${last7Dms}, Actual replies: ${last7Replies}
 
 PACE PROJECTION (at current rate, ${workingDaysLeft} outreach days left):
   Additional emails: ~${projEmails} -> total ~${totalEmails + projEmails}
@@ -318,7 +326,7 @@ async function buildSystemPrompt(deal, metrics) {
   const memoryCtx    = deal ? await buildMemoryContext(deal.id) : 'No deal active.';
   const highlights   = deal ? await buildPipelineHighlights(deal.id) : '';
   const todaysReplies = deal ? await buildTodaysReplyContext(deal.id) : '';
-  const timelineSection = deal ? await buildDealTimeline(deal) : '';
+  const timelineSection = deal ? await buildDealTimeline(deal, metrics) : '';
 
   const dealSection = deal ? `
 ACTIVE DEAL: ${deal.name}
@@ -333,10 +341,12 @@ LIVE PIPELINE:
   Emails sent: ${metrics.emails_sent || 0} total (${metrics.emails_sent_today || 0} today) — includes contacts now inactive/archived after no reply
   LinkedIn invites: ${metrics.li_invites_sent || 0} sent · ${metrics.li_accepted || 0} accepted · ${metrics.li_pending || 0} still pending
   LinkedIn DMs: ${metrics.dms_sent || 0} sent
-  Total unique replies (email + LinkedIn combined): ${metrics.total_replies || 0}
-  Total replies: ${metrics.total_replies || 0}
+  Email replies: ${metrics.email_replies || 0}
+  LinkedIn DM replies: ${metrics.li_dm_replies || 0}
+  Actual replies (email + LinkedIn DM): ${metrics.total_replies || 0}
   Positive replies: ${metrics.positive_replies || 0} (${metrics.positive_reply_rate || 0}% positive reply rate)
-  Response rate: ${metrics.response_rate || 0}%
+  Email response rate: ${metrics.email_response_rate ?? metrics.response_rate ?? 0}%
+  Overall actual reply rate: ${metrics.overall_response_rate || 0}%
   Meetings booked: ${metrics.meetings_booked || 0}
   Active firms: ${metrics.firms_in_pipeline || 0}
   Pending approvals: ${metrics.pending_approvals || 0}
