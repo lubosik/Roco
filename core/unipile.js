@@ -15,11 +15,13 @@ import {
   isLinkedInRateLimited,
   is429Error as _is429Error,
 } from './linkedInRateLimit.js';
+import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from './runtimeCoordination.js';
 
 let _cachedCreds = null;
 let _credsCachedAt = 0;
 const CRED_TTL = 30_000;
 const LINKEDIN_PROVIDER_LIMIT_RETRY_HOURS = [4, 8]; // retries 1-2 only; retry 3+ defers to Monday
+const GLOBAL_INVITE_PROVIDER_LIMIT_KEY = 'GLOBAL_LINKEDIN_INVITE_PROVIDER_LIMIT';
 
 /**
  * Next Monday at 09:00 UTC — LinkedIn weekly invite quota resets on Mondays.
@@ -37,6 +39,35 @@ function nextMondayNineAmUtc() {
 }
 const PROVIDER_LIMIT_NOTE_PATTERN = /\[LI_INVITE_LIMIT:count=(\d+)\|blocked_until=([^|\]]+)(?:\|notified_at=([^\]]+))?\]/i;
 const LINKEDIN_NO_MATCH_NOTE_PATTERN = /\[LI_NO_MATCH:checked_at=([^\]|]+)(?:\|reason=([^\]]+))?\]/i;
+
+function normalizeInviteProviderLimitState(value) {
+  if (!value || typeof value !== 'object') return null;
+  const retryAt = value.retryAt || value.blockedUntil || null;
+  const retryTs = retryAt ? new Date(retryAt).getTime() : 0;
+  if (!retryTs || retryTs <= Date.now()) return null;
+  return {
+    retryAt: new Date(retryTs).toISOString(),
+    retryCount: Number(value.retryCount || value.count || 0),
+    weeklyLimitHit: value.weeklyLimitHit === true,
+    source: value.source || 'unknown',
+  };
+}
+
+export async function getLinkedInInviteProviderLimit() {
+  try {
+    return normalizeInviteProviderLimitState(await readGlobalRuntimeSetting(GLOBAL_INVITE_PROVIDER_LIMIT_KEY));
+  } catch {
+    return null;
+  }
+}
+
+async function setLinkedInInviteProviderLimit(state) {
+  const normalized = normalizeInviteProviderLimitState(state);
+  try {
+    await writeGlobalRuntimeSetting(GLOBAL_INVITE_PROVIDER_LIMIT_KEY, normalized || {});
+  } catch {}
+  return normalized;
+}
 
 export async function getLiveCredentials() {
   if (_cachedCreds && Date.now() - _credsCachedAt < CRED_TTL) return _cachedCreds;
@@ -608,6 +639,47 @@ function extractLinkedInPublicId(value) {
   return null;
 }
 
+function collectInviteIdentityValues(invite) {
+  const providerIds = new Set();
+  const publicIds = new Set();
+  const urls = new Set();
+  const visit = (value, key = '') => {
+    if (value == null) return;
+    if (typeof value === 'string' || typeof value === 'number') {
+      const text = String(value).trim();
+      if (!text) return;
+      const lowerKey = String(key || '').toLowerCase();
+      if (isLikelyLinkedInProviderId(text) || /(provider|urn|member|user).*id/.test(lowerKey)) {
+        if (isLikelyLinkedInProviderId(text)) providerIds.add(text);
+      }
+      const publicId = extractLinkedInPublicId(text);
+      if (publicId) {
+        publicIds.add(publicId.toLowerCase());
+        if (isLikelyLinkedInProfileUrl(text)) urls.add(normalizeLinkedInProfileUrl(text).toLowerCase());
+      }
+      if (/(public|profile|vanity|identifier|slug)/.test(lowerKey) && /^[a-z0-9][a-z0-9-]{2,}$/i.test(text)) {
+        publicIds.add(text.toLowerCase());
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(item => visit(item, key));
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
+    }
+  };
+  visit(invite);
+  return { providerIds, publicIds, urls };
+}
+
+function getInviteCreatedAt(invite) {
+  const value = invite?.created_at || invite?.createdAt || invite?.sent_at || invite?.sentAt || invite?.invited_at || invite?.date;
+  const ts = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString() : null;
+}
+
 function summarizeInviteError(err) {
   return String(err?.message || err || 'Unknown LinkedIn invite error').slice(0, 300);
 }
@@ -887,6 +959,18 @@ export async function processLinkedInInvite({
   const invites = Array.isArray(pendingInvites) ? pendingInvites : await fetchPendingLinkedInInvitesSafe();
   const providerLimitState = parseProviderLimitState(contact?.notes);
   const noMatchState = parseLinkedInNoMatchState(contact?.notes);
+  const globalProviderLimit = await getLinkedInInviteProviderLimit();
+  if (globalProviderLimit?.retryAt) {
+    return {
+      status: 'deferred_provider_limit',
+      providerId,
+      publicId,
+      retryAt: globalProviderLimit.retryAt,
+      retryCount: globalProviderLimit.retryCount || providerLimitState?.count || 0,
+      weeklyLimitHit: globalProviderLimit.weeklyLimitHit,
+      globalProviderLimitHit: true,
+    };
+  }
   if (providerLimitState?.blockedUntil && new Date(providerLimitState.blockedUntil).getTime() > Date.now()) {
     return {
       status: 'deferred_provider_limit',
@@ -1128,10 +1212,14 @@ export async function processLinkedInInvite({
     }
   }
 
+  let pendingInviteCreatedAt = null;
   const inviteAlreadyPending = invites.some(inv => {
-    const invitedProviderId = String(inv?.invited_user_id || '').trim();
-    const invitedPublicId = String(inv?.invited_user_public_id || '').trim().toLowerCase();
-    return invitedProviderId === providerId || (!!publicId && invitedPublicId === publicId.toLowerCase());
+    const ids = collectInviteIdentityValues(inv);
+    const matched = (!!providerId && ids.providerIds.has(providerId))
+      || (!!publicId && ids.publicIds.has(publicId.toLowerCase()))
+      || (!!linkedinUrl && ids.urls.has(linkedinUrl.toLowerCase()));
+    if (matched) pendingInviteCreatedAt = getInviteCreatedAt(inv);
+    return matched;
   });
 
   const liFollowupDays = deal?.followup_days_li || 2; // 2-day default: if ignored, move on
@@ -1140,6 +1228,7 @@ export async function processLinkedInInvite({
   if (inviteAlreadyPending) {
     await sb.from('contacts').update({
       pipeline_stage: 'invite_sent',
+      invite_sent_at: contact.invite_sent_at || pendingInviteCreatedAt || new Date().toISOString(),
       outreach_channel: 'linkedin_invite',
       follow_up_due_at: followUpDueAt,
     }).eq('id', contact.id);
@@ -1184,6 +1273,7 @@ export async function processLinkedInInvite({
   if (relationship === 'pending') {
     await sb.from('contacts').update({
       pipeline_stage: 'invite_sent',
+      invite_sent_at: contact.invite_sent_at || new Date().toISOString(),
       outreach_channel: 'linkedin_invite',
       follow_up_due_at: followUpDueAt,
     }).eq('id', contact.id);
@@ -1281,6 +1371,7 @@ export async function processLinkedInInvite({
     if (isPendingInviteError(message)) {
       await sb.from('contacts').update({
         pipeline_stage: 'invite_sent',
+        invite_sent_at: contact.invite_sent_at || new Date().toISOString(),
         outreach_channel: 'linkedin_invite',
         follow_up_due_at: followUpDueAt,
       }).eq('id', contact.id);
@@ -1317,6 +1408,12 @@ export async function processLinkedInInvite({
         count: retryCount,
         blockedUntil: retryAt,
         notifiedAt: shouldNotify ? new Date().toISOString() : providerLimitState?.notifiedAt || null,
+      });
+      await setLinkedInInviteProviderLimit({
+        retryAt,
+        retryCount,
+        weeklyLimitHit,
+        source,
       });
 
       try {
@@ -1370,7 +1467,7 @@ export async function processLinkedInInvite({
         } catch {}
       }
 
-      return { status: 'deferred_provider_limit', providerId, publicId, error: err, retryAt, retryCount, weeklyLimitHit };
+      return { status: 'deferred_provider_limit', providerId, publicId, error: err, retryAt, retryCount, weeklyLimitHit, globalProviderLimitHit: true };
     }
 
     await recordInviteActivity({

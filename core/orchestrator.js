@@ -22,7 +22,7 @@ import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } fro
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
 import { findLinkedInUrl, findLinkedInProfile } from '../enrichment/linkedinFinder.js';
-import { enrichByEmail as rcEnrichByEmail } from '../enrichment/reverseContactEnricher.js';
+import { enrichByEmail as rcEnrichByEmail, searchPerson as rcSearchPerson } from '../enrichment/reverseContactEnricher.js';
 import { orComplete } from './openRouterClient.js';
 import {
   sendLinkedInDM,
@@ -31,7 +31,7 @@ import {
   canonicalizeLinkedInProfileUrl,
   retrieveLinkedInProfile,
 } from '../integrations/unipileClient.js';
-import { enrichFirmViaLinkedIn, processLinkedInInvite } from './unipile.js';
+import { enrichFirmViaLinkedIn, processLinkedInInvite, getLinkedInInviteProviderLimit } from './unipile.js';
 import { sendEmailForApproval, sendLinkedInDMForApproval, sendTelegram, sendTelegramVoiceNote } from '../approval/telegramBot.js';
 import { draftEmail } from '../outreach/emailDrafter.js';
 import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
@@ -130,6 +130,36 @@ function normalizeFirmIdentity(value) {
     .replace(/\b(inc|llc|ltd|lp|llp|plc|corp|corporation|partners|partner|capital|holdings|group|ventures|management|advisors)\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeComparableContactName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\b(cfa|cpa|mba|phd|md|jr|sr|ii|iii|iv)\b/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function reverseContactProfileMatches(contact, result) {
+  if (!result?.linkedInUrl) return false;
+  const expectedName = normalizeComparableContactName(contact?.name || '');
+  const actualName = normalizeComparableContactName(result.fullName || [result.firstName, result.lastName].filter(Boolean).join(' '));
+  if (expectedName && actualName && expectedName !== actualName) {
+    const expectedTokens = expectedName.split(/\s+/).filter(Boolean);
+    const actualTokens = new Set(actualName.split(/\s+/).filter(Boolean));
+    const shared = expectedTokens.filter(token => actualTokens.has(token)).length;
+    if (shared < Math.min(2, expectedTokens.length)) return false;
+  }
+
+  const expectedFirm = normalizeFirmIdentity(contact?.company_name || '');
+  const actualFirm = normalizeFirmIdentity(result.company || '');
+  if (!expectedFirm || !actualFirm) return true;
+  const expectedTokens = expectedFirm.split(/\s+/).filter(Boolean);
+  const actualTokens = new Set(actualFirm.split(/\s+/).filter(Boolean));
+  return expectedTokens.some(token => actualTokens.has(token));
 }
 
 function tokenizeContactName(name) {
@@ -5825,6 +5855,46 @@ async function enrichSingleContact(sb, contact, deal, state) {
         }
       }
 
+      if (!linkedinUrl && process.env.REVERSECONTACT_API_KEY) {
+        const rcResult = contact.email
+          ? await rcEnrichByEmail(contact.email).catch(err => {
+              warn(`[ENRICH] ReverseContact email lookup failed for ${contact.name}: ${err.message}`);
+              return null;
+            })
+          : await rcSearchPerson({
+              name: contact.name,
+              companyName: contact.company_name,
+              title: contact.job_title,
+              perPage: 3,
+            }).catch(err => {
+              warn(`[ENRICH] ReverseContact person search failed for ${contact.name}: ${err.message}`);
+              return null;
+            });
+
+        if (reverseContactProfileMatches(contact, rcResult)) {
+          linkedinUrl = rcResult.linkedInUrl;
+          await sb.from('contacts').update({
+            linkedin_url: linkedinUrl,
+            enrichment_source: 'reversecontact',
+          }).eq('id', contact.id);
+          pushActivity({
+            type: 'enrichment',
+            action: 'ReverseContact LinkedIn found',
+            note: `${contact.name} — ${linkedinUrl}`,
+            deal_name: deal.name,
+            dealId: deal.id,
+          });
+        } else if (rcResult?.linkedInUrl) {
+          pushActivity({
+            type: 'warning',
+            action: '[MATCH] ReverseContact profile ignored',
+            note: `${contact.name} — result did not match name/company strongly enough`,
+            deal_name: deal.name,
+            dealId: deal.id,
+          });
+        }
+      }
+
       // Pre-enrichment validation: skip contacts with no valid name
       if (!contact.name || contact.name.trim() === '' || contact.name.toLowerCase() === 'null') {
         warn(`[ENRICH] Skipping contact ${contact.id} — no valid name`);
@@ -6105,13 +6175,16 @@ export async function phaseEnrich(deal, state) {
       for (const contact of (emailNoLinkedIn || [])) {
         try {
           const rcResult = await rcEnrichByEmail(contact.email);
-          if (rcResult?.linkedInUrl) {
+          if (reverseContactProfileMatches(contact, rcResult)) {
             await sb.from('contacts').update({
               linkedin_url: rcResult.linkedInUrl,
+              enrichment_source: 'reversecontact',
               enrichment_status: 'enriched',
             }).eq('id', contact.id);
             logStep(`ReverseContact found LinkedIn for ${contact.name}`, deal.name, 'enrichment', deal);
             pushActivity({ type: 'enrichment', action: `ReverseContact LinkedIn found`, note: `${contact.name} — ${rcResult.linkedInUrl}`, deal_name: deal.name, dealId: deal.id });
+          } else if (rcResult?.linkedInUrl) {
+            pushActivity({ type: 'warning', action: `[MATCH] ReverseContact profile ignored`, note: `${contact.name} — result did not match name/company strongly enough`, deal_name: deal.name, dealId: deal.id });
           }
         } catch (rcErr) {
           console.warn(`[ENRICH] ReverseContact email lookup failed for ${contact.name}:`, rcErr.message);
@@ -6594,6 +6667,12 @@ async function phaseLinkedInInvites(deal, state) {
     return;
   }
 
+  const providerLimit = await getLinkedInInviteProviderLimit().catch(() => null);
+  if (providerLimit?.retryAt) {
+    info(`[${deal.name}] phaseLinkedInInvites: LinkedIn invite provider limit active until ${providerLimit.retryAt}`);
+    return;
+  }
+
   // Reactivate any contacts deferred by weekly LinkedIn limit whose retry window has passed
   try {
     const { data: weeklyLimitExpired } = await sb.from('contacts')
@@ -6722,6 +6801,10 @@ async function phaseLinkedInInvites(deal, state) {
         }
         if (outcome.weeklyLimitHit) {
           info(`[${deal.name}] LinkedIn weekly quota confirmed — stopping invite loop until ${outcome.retryAt}`);
+          break;
+        }
+        if (outcome.globalProviderLimitHit) {
+          info(`[${deal.name}] LinkedIn invite provider limit active — stopping invite loop until ${outcome.retryAt || 'later'}`);
           break;
         }
         // Stored-state deferral (checked from notes before any API call) — skip this contact,

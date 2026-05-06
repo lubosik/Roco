@@ -38,7 +38,7 @@ import {
 } from '../core/supabaseSync.js';
 import { getWindowStatus, getWindowVisualization, isWithinChannelWindow, getNextWindowOpenForChannel } from '../core/scheduleChecker.js';
 import { getBatchSummary } from '../core/batchManager.js';
-import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply, getConnectedEmailAccounts, getExistingChatWithContact, getChatMessages, processLinkedInInvite } from '../core/unipile.js';
+import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply, getConnectedEmailAccounts, getExistingChatWithContact, getChatMessages, processLinkedInInvite, getLinkedInInviteProviderLimit } from '../core/unipile.js';
 import { handleLinkedInMessage as handleLiMsg, handleLinkedInRelation as handleLiRelation } from '../core/unipileWebhooks.js';
 import { startInboxMonitor } from '../core/inboxMonitor.js';
 import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
@@ -1389,6 +1389,21 @@ async function getDealNameMap(sb, dealIds = []) {
   return Object.fromEntries((data || []).map(deal => [String(deal.id), deal.name || 'Unknown Project']));
 }
 
+async function fetchAllRows(buildQuery, pageSize = 1000) {
+  const all = [];
+  let from = 0;
+  while (true) {
+    const { data, error } = await buildQuery()
+      .range(from, from + pageSize - 1);
+    if (error) throw new Error(error.message);
+    if (!data?.length) break;
+    all.push(...data);
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
 async function buildInvestorDbSummary(sb) {
   const { count: total, error: totalError } = await sb.from('investors_db')
     .select('id', { count: 'exact', head: true });
@@ -1623,32 +1638,28 @@ async function computeDealChannelMetrics(sb, dealIds = []) {
 
   const safeIds = ids.length ? ids : ['00000000-0000-0000-0000-000000000000'];
   const [
-    { data: contactsData },
-    { data: emailsData },
-    { data: repliesData },
+    contactsData,
+    emailsData,
+    repliesData,
   ] = await Promise.all([
-    sb.from('contacts')
+    fetchAllRows(() => sb.from('contacts')
       .select('id, deal_id, email, name, pipeline_stage, response_received, last_reply_at, reply_channel, last_email_sent_at, invite_sent_at, invite_accepted_at, outreach_channel, dm_sent_at')
-      .in('deal_id', safeIds)
-      .limit(10000),
-    sb.from('emails')
+      .in('deal_id', safeIds)),
+    fetchAllRows(() => sb.from('emails')
       .select('id, deal_id, status')
       .eq('status', 'sent')
-      .in('deal_id', safeIds)
-      .limit(10000),
-    sb.from('replies')
+      .in('deal_id', safeIds)),
+    fetchAllRows(() => sb.from('replies')
       .select('deal_id, contact_id, channel')
-      .in('deal_id', safeIds)
-      .limit(10000),
+      .in('deal_id', safeIds)),
   ]);
 
   let outreachEvents = [];
   try {
-    const { data } = await sb.from('outreach_events')
+    const data = await fetchAllRows(() => sb.from('outreach_events')
       .select('deal_id, contact_id, event_type, status')
       .in('deal_id', safeIds)
-      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT'])
-      .limit(10000);
+      .in('event_type', ['EMAIL_SENT', 'LINKEDIN_INVITE_SENT', 'LINKEDIN_DM_SENT']));
     outreachEvents = data || [];
   } catch {}
 
@@ -3953,18 +3964,19 @@ function registerRoutes(app) {
         let q = sb.from('contacts')
           .select(select)
           .not('pipeline_stage', 'in', `(${EXCLUDED.map(s => `"${s}"`).join(',')})`)
-          .order('investor_score', { ascending: false })
-          .limit(500);
+          .order('investor_score', { ascending: false });
         if (dealId) q = q.eq('deal_id', dealId);
         return q;
       };
 
-      let { data, error: dbErr } = await buildQuery(richSelect);
-      // Fall back if sentiment columns not yet added via SQL migration
-      if (dbErr?.code === '42703') {
-        ({ data, error: dbErr } = await buildQuery(baseSelect));
+      let data = [];
+      try {
+        data = await fetchAllRows(() => buildQuery(richSelect));
+      } catch (err) {
+        // Fall back if sentiment columns not yet added via SQL migration
+        if (!String(err.message || '').includes('last_intent')) throw err;
+        data = await fetchAllRows(() => buildQuery(baseSelect));
       }
-      if (dbErr) throw new Error(dbErr.message);
 
       // Build deal name lookup
       const dealIds = [...new Set((data || []).map(c => c.deal_id).filter(Boolean))];
@@ -5376,9 +5388,9 @@ function registerRoutes(app) {
       const batchIds = Object.values(batchByDeal).map(b => b.id).filter(Boolean);
       const firmCountByBatch = {};
       if (batchIds.length) {
-        const { data: batchFirmRows } = await sb.from('batch_firms')
+        const batchFirmRows = await fetchAllRows(() => sb.from('batch_firms')
           .select('batch_id')
-          .in('batch_id', batchIds);
+          .in('batch_id', batchIds));
         for (const row of (batchFirmRows || [])) {
           firmCountByBatch[row.batch_id] = (firmCountByBatch[row.batch_id] || 0) + 1;
         }
@@ -6084,6 +6096,15 @@ function registerRoutes(app) {
       const deal = await getDeal(req.params.id);
       if (!deal) return res.status(404).json({ error: 'Deal not found' });
 
+      const providerLimit = await getLinkedInInviteProviderLimit().catch(() => null);
+      if (providerLimit?.retryAt) {
+        return res.status(429).json({
+          error: 'LinkedIn invite provider limit active',
+          retry_at: providerLimit.retryAt,
+          weekly_limit: providerLimit.weeklyLimitHit,
+        });
+      }
+
       const { data: contacts } = await sb.from('contacts')
         .select('*')
         .eq('deal_id', req.params.id)
@@ -6599,30 +6620,28 @@ function registerRoutes(app) {
 
       // Get all firms for this batch
       // Note: select('*') avoids the `rank` reserved-word clash in PostgREST
-      const { data: firmRows, error: firmErr } = await sb.from('batch_firms')
+      const firmRows = await fetchAllRows(() => sb.from('batch_firms')
         .select('*')
         .eq('batch_id', batch.id)
-        .order('score', { ascending: false });
-
-      if (firmErr) throw firmErr;
+        .order('score', { ascending: false }));
 
       info(`[kanban] deal=${dealId} batch=${batch.id} status=${batch.status} firms=${firmRows?.length ?? 0}`);
 
       // Try contacts filtered by batch_id first; fall back to deal_id only
       // (contacts pre-dating batch tracking may lack batch_id)
       let contacts = [];
-      const { data: batchContacts } = await sb.from('contacts')
+      const batchContacts = await fetchAllRows(() => sb.from('contacts')
         .select('id, name, job_title, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at, investor_score')
         .eq('deal_id', dealId)
-        .eq('batch_id', batch.id);
+        .eq('batch_id', batch.id));
 
       if (batchContacts?.length) {
         contacts = batchContacts;
       } else {
         // Fallback: all contacts for this deal (ignore batch_id)
-        const { data: dealContacts } = await sb.from('contacts')
+        const dealContacts = await fetchAllRows(() => sb.from('contacts')
           .select('id, name, job_title, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at, investor_score')
-          .eq('deal_id', dealId);
+          .eq('deal_id', dealId));
         contacts = dealContacts || [];
         info(`[kanban] batch_id contact lookup returned 0 — fell back to deal-level contacts (${contacts.length})`);
       }
@@ -6722,14 +6741,24 @@ function registerRoutes(app) {
         firmQuery = firmQuery.range(offset, offset + limit - 1);
       }
 
-      const { data, error, count } = await firmQuery;
-      if (error) return res.status(500).json({ error: error.message });
+      let data = [];
+      let count = null;
+      if (wantsPagination) {
+        const result = await firmQuery;
+        if (result.error) return res.status(500).json({ error: result.error.message });
+        data = result.data || [];
+        count = result.count;
+      } else {
+        data = await fetchAllRows(() => sb.from('batch_firms')
+          .select('*')
+          .eq('batch_id', req.params.batchId)
+          .order('score', { ascending: false }));
+      }
 
-      const { data: contacts, error: contactsError } = await sb.from('contacts')
+      const contacts = await fetchAllRows(() => sb.from('contacts')
         .select('id, company_name, pipeline_stage, response_received, last_reply_at, last_email_sent_at, last_outreach_at, invite_sent_at, invite_accepted_at')
         .eq('deal_id', req.params.id)
-        .eq('batch_id', req.params.batchId);
-      if (contactsError) return res.status(500).json({ error: contactsError.message });
+        .eq('batch_id', req.params.batchId));
 
       const contactsByFirm = new Map();
       for (const contact of (contacts || [])) {

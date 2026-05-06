@@ -1,126 +1,240 @@
 /**
  * enrichment/reverseContactEnricher.js
- * ReverseContact API integration — reverse email lookup and LinkedIn profile extraction.
+ * ReverseContact integration for profile enrichment and contact discovery.
  *
- * API base: https://api.reversecontact.com/enrichment
- * Auth: query param apikey=<REVERSECONTACT_API_KEY>
- * Rate limit: 15 req/s — we cap at 1 req/s to be conservative.
- *
- * Exports:
- *   enrichByEmail(email)      → { linkedInUrl, firstName, lastName, headline, company } | null
- *   enrichByLinkedIn(linkedInUrl) → same shape | null
+ * V2 uses Authorization: Bearer rc_* and JSON POST endpoints. The legacy
+ * enrichment endpoints are kept as a fallback because older accounts/docs still
+ * expose them.
  */
 
 import fetch from 'node-fetch';
 
-const BASE_URL = 'https://api.reversecontact.com/enrichment';
-const MIN_INTERVAL_MS = 1000; // 1 req/s conservative cap
+const V2_BASE_URL = 'https://api.reversecontact.com/v2';
+const LEGACY_BASE_URL = 'https://api.reversecontact.com/enrichment';
+const MIN_INTERVAL_MS = 1000;
+const ASYNC_POLL_MS = 10_000;
+const ASYNC_MAX_POLLS = 6;
 
-let _lastCallAt = 0;
+let lastCallAt = 0;
 
-async function _rateLimit() {
-  const now = Date.now();
-  const elapsed = now - _lastCallAt;
-  if (elapsed < MIN_INTERVAL_MS) {
-    await new Promise(r => setTimeout(r, MIN_INTERVAL_MS - elapsed));
-  }
-  _lastCallAt = Date.now();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function getApiKey() {
+  return process.env.REVERSECONTACT_API_KEY || process.env.REVERSE_CONTACT_API_KEY || null;
 }
 
-async function _fetchWithRetry(url, retries = 2) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
-    if (res.status !== 503 && res.status !== 504) return res;
-    if (attempt < retries) await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
-  }
-  return await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
+async function rateLimit() {
+  const elapsed = Date.now() - lastCallAt;
+  if (elapsed < MIN_INTERVAL_MS) await sleep(MIN_INTERVAL_MS - elapsed);
+  lastCallAt = Date.now();
 }
 
-/**
- * Normalise raw API response into a consistent shape.
- * Returns null if the response does not contain useful data.
- */
-function _normalise(raw) {
+function normalizeLinkedInUrl(value) {
+  const match = String(value || '').trim().match(/^https?:\/\/([a-z]{2,3}\.)?linkedin\.com\/in\/([^/?#\s]+)/i);
+  return match ? `https://${match[1] || 'www.'}linkedin.com/in/${match[2].replace(/\/+$/, '')}` : null;
+}
+
+function pick(...values) {
+  return values.find(value => value !== undefined && value !== null && String(value).trim() !== '') || null;
+}
+
+function unwrapPayload(raw) {
   if (!raw || raw.success === false) return null;
-
-  const person = raw.person || {};
-  const company = raw.company || {};
-
-  const linkedInUrl = person.linkedInUrl || null;
-  const firstName = person.firstName || null;
-  const lastName = person.lastName || null;
-  const headline = person.headline || null;
-  const companyName = company.name || null;
-
-  // Require at least a LinkedIn URL or a name to be useful
-  if (!linkedInUrl && !firstName && !lastName) return null;
-
-  return { linkedInUrl, firstName, lastName, headline, company: companyName };
+  if (raw.data?.data && Array.isArray(raw.data.data)) return raw.data.data[0] || null;
+  if (raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)) return raw.data;
+  return raw;
 }
 
-/**
- * Lookup a person by their email address.
- * Returns enrichment data or null.
- */
+function normalizePerson(raw) {
+  const payload = unwrapPayload(raw);
+  if (!payload) return null;
+
+  const person = payload.person || payload.profile || payload;
+  const company = payload.company || person.company || person.currentCompany || {};
+  const linkedInUrl = normalizeLinkedInUrl(pick(
+    person.linkedinUrl,
+    person.linkedInUrl,
+    person.linkedin_url,
+    person.public_profile_url,
+    person.profile_url,
+    person.publicId ? `https://www.linkedin.com/in/${person.publicId}` : null,
+    person.publicIdentifier ? `https://www.linkedin.com/in/${person.publicIdentifier}` : null,
+  ));
+
+  const firstName = pick(person.firstName, person.first_name);
+  const lastName = pick(person.lastName, person.last_name);
+  const fullName = pick(
+    person.fullName,
+    person.name,
+    [firstName, lastName].filter(Boolean).join(' ').trim(),
+  );
+  const email = pick(
+    payload.email,
+    person.email,
+    person.emailAddress,
+    Array.isArray(payload.data) ? payload.data[0]?.email : null,
+    Array.isArray(payload.emails) ? payload.emails[0]?.email || payload.emails[0]?.value : null,
+  );
+  const headline = pick(person.headline, person.currentPositionTitle, person.job_title, person.title);
+  const companyName = pick(
+    company.name,
+    company.companyName,
+    person.currentCompanyName,
+    person.companyName,
+  );
+
+  if (!linkedInUrl && !email && !fullName) return null;
+
+  return {
+    linkedInUrl,
+    email: email || null,
+    firstName: firstName || null,
+    lastName: lastName || null,
+    fullName: fullName || null,
+    headline: headline || null,
+    company: companyName || null,
+    raw,
+  };
+}
+
+async function requestV2(path, body = null, { method = 'POST', allow404 = true } = {}) {
+  const apiKey = getApiKey();
+  if (!apiKey) return null;
+  await rateLimit();
+
+  const res = await fetch(`${V2_BASE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (allow404 && res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`ReverseContact ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function requestLegacy(params, endpoint = '') {
+  const apiKey = getApiKey();
+  if (!apiKey) return null;
+  await rateLimit();
+
+  const query = new URLSearchParams({ apikey: apiKey, ...params });
+  const res = await fetch(`${LEGACY_BASE_URL}${endpoint}?${query.toString()}`, {
+    headers: { Accept: 'application/json' },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`ReverseContact legacy${endpoint} -> ${res.status}: ${text.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function pollWebhook(webhookId) {
+  if (!webhookId) return null;
+  for (let i = 0; i < ASYNC_MAX_POLLS; i++) {
+    await sleep(i === 0 ? ASYNC_POLL_MS : Math.min(ASYNC_POLL_MS * 1.5, 20_000));
+    const raw = await requestV2(`/webhooks/${encodeURIComponent(webhookId)}`, null, { method: 'GET' }).catch(() => null);
+    const status = String(raw?.status || raw?.data?.status || '').toLowerCase();
+    if (['succeeded', 'success', 'completed', 'done'].includes(status)) return raw;
+    if (['errored', 'error', 'failed'].includes(status)) return raw;
+  }
+  return null;
+}
+
 export async function enrichByEmail(email) {
-  const apiKey = process.env.REVERSECONTACT_API_KEY;
-  if (!apiKey) {
-    console.warn('[ReverseContact] REVERSECONTACT_API_KEY not set — skipping enrichByEmail');
-    return null;
-  }
-  if (!email || typeof email !== 'string') return null;
-
-  await _rateLimit();
+  const value = String(email || '').trim();
+  if (!getApiKey() || !value) return null;
 
   try {
-    const url = `${BASE_URL}?apikey=${encodeURIComponent(apiKey)}&mail=${encodeURIComponent(email.trim())}`;
-    const res = await _fetchWithRetry(url);
-
-    if (!res.ok) {
-      console.warn(`[ReverseContact] enrichByEmail HTTP ${res.status} for ${email}`);
-      return null;
-    }
-
-    const raw = await res.json();
-    return _normalise(raw);
+    const resolved = await requestV2('/resolve/persons/email', { email: value }).catch(err => {
+      if ([400, 403, 404, 422].includes(err.status)) return null;
+      throw err;
+    });
+    const webhookId = resolved?.data?.webhookId || resolved?.webhookId || null;
+    return normalizePerson(webhookId ? await pollWebhook(webhookId) : resolved);
   } catch (err) {
-    console.warn(`[ReverseContact] enrichByEmail error for ${email}:`, err.message);
+    console.warn(`[ReverseContact] V2 email lookup failed for ${value}: ${err.message}`);
+  }
+
+  try {
+    const legacy = await requestLegacy({ email: value }).catch(() => null)
+      || await requestLegacy({ mail: value });
+    return normalizePerson(legacy);
+  } catch (err) {
+    console.warn(`[ReverseContact] legacy email lookup failed for ${value}: ${err.message}`);
     return null;
   }
 }
 
-/**
- * Lookup a person by their LinkedIn profile URL.
- * Returns enrichment data or null.
- */
 export async function enrichByLinkedIn(linkedInUrl) {
-  const apiKey = process.env.REVERSECONTACT_API_KEY;
-  if (!apiKey) {
-    console.warn('[ReverseContact] REVERSECONTACT_API_KEY not set — skipping enrichByLinkedIn');
-    return null;
-  }
-  if (!linkedInUrl || typeof linkedInUrl !== 'string') return null;
-
-  await _rateLimit();
+  const url = normalizeLinkedInUrl(linkedInUrl);
+  if (!getApiKey() || !url) return null;
 
   try {
-    // LinkedIn-by-URL requires paid PAYG plan — trial key returns 403
-    const url = `${BASE_URL}/profile?apikey=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(linkedInUrl.trim())}`;
-    const res = await _fetchWithRetry(url);
-
-    if (res.status === 403) {
-      console.info('[ReverseContact] enrichByLinkedIn: trial plan does not support LinkedIn URL lookup — upgrade to PAYG');
-      return null;
-    }
-    if (!res.ok) {
-      console.warn(`[ReverseContact] enrichByLinkedIn HTTP ${res.status} for ${linkedInUrl}`);
-      return null;
-    }
-
-    const raw = await res.json();
-    return _normalise(raw);
+    return normalizePerson(await requestV2('/fetch/persons', { url }));
   } catch (err) {
-    console.warn(`[ReverseContact] enrichByLinkedIn error for ${linkedInUrl}:`, err.message);
+    console.warn(`[ReverseContact] V2 LinkedIn lookup failed for ${url}: ${err.message}`);
+  }
+
+  try {
+    return normalizePerson(await requestLegacy({ url }, '/profile'));
+  } catch (err) {
+    console.warn(`[ReverseContact] legacy LinkedIn lookup failed for ${url}: ${err.message}`);
     return null;
   }
+}
+
+export async function searchPerson({ name, companyName, title, perPage = 5 } = {}) {
+  if (!getApiKey()) return null;
+  const [firstName, ...rest] = String(name || '').trim().split(/\s+/).filter(Boolean);
+  const lastName = rest.length ? rest[rest.length - 1] : null;
+  if (!firstName && !companyName && !title) return null;
+
+  const body = {
+    firstName: firstName || undefined,
+    lastName: lastName || undefined,
+    currentCompanyName: companyName || undefined,
+    currentPositionTitle: title || undefined,
+    perPage: Math.min(Math.max(Number(perPage) || 5, 1), 10),
+    page: 1,
+  };
+  const raw = await requestV2('/search/persons', body).catch(err => {
+    console.warn(`[ReverseContact] person search failed for ${name || companyName}: ${err.message}`);
+    return null;
+  });
+  return normalizePerson(raw);
+}
+
+export async function findEmail({ linkedInUrl, fullName, firstName, lastName, companyDomain } = {}) {
+  if (!getApiKey()) return null;
+  const body = {};
+  const url = normalizeLinkedInUrl(linkedInUrl);
+  if (url) body.url = url;
+  else {
+    if (fullName) body.fullName = fullName;
+    if (firstName) body.firstName = firstName;
+    if (lastName) body.lastName = lastName;
+    if (companyDomain) body.companyDomain = companyDomain;
+  }
+  if (!body.url && !(body.companyDomain && (body.fullName || (body.firstName && body.lastName)))) return null;
+
+  const created = await requestV2('/contact/email', body).catch(err => {
+    console.warn(`[ReverseContact] find email failed for ${fullName || linkedInUrl}: ${err.message}`);
+    return null;
+  });
+  const webhookId = created?.data?.webhookId || created?.webhookId || null;
+  const result = webhookId ? await pollWebhook(webhookId) : created;
+  return normalizePerson(result);
 }
