@@ -39,7 +39,7 @@ export async function readGlobalRuntimeSetting(key) {
 
   try {
     const { data } = await sb.from('deal_settings')
-      .select('id, value, updated_at')
+      .select('key, value, updated_at')
       .eq('key', key)
       .order('updated_at', { ascending: false })
       .limit(5);
@@ -60,22 +60,16 @@ export async function writeGlobalRuntimeSetting(key, value) {
   try {
     const encoded = stringifyValue(value);
     const { data: rows } = await sb.from('deal_settings')
-      .select('id')
+      .select('key')
       .eq('key', key)
       .order('updated_at', { ascending: false })
       .limit(5);
-    const [primary, ...duplicates] = rows || [];
+    const hasExisting = Boolean((rows || [])[0]?.key);
 
-    if (primary?.id) {
+    if (hasExisting) {
       await sb.from('deal_settings')
         .update({ value: encoded, updated_at: new Date().toISOString() })
-        .eq('id', primary.id);
-      if (duplicates.length) {
-        const duplicateIds = duplicates.map(row => row.id).filter(Boolean);
-        if (duplicateIds.length) {
-          await sb.from('deal_settings').delete().in('id', duplicateIds).then(null, () => {});
-        }
-      }
+        .eq('key', key);
     } else {
       await sb.from('deal_settings').insert({
         key,

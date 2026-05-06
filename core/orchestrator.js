@@ -6673,6 +6673,32 @@ async function phaseLinkedInInvites(deal, state) {
     return;
   }
 
+  // Manual DB-level safety pause: live workers also respect linkedin_daily_limit,
+  // so we can set it to 0 during a provider-wide LinkedIn throttle and restore
+  // the prior cap automatically once the throttle window expires.
+  try {
+    const pauseKey = `LINKEDIN_DAILY_LIMIT_PAUSE:${deal.id}`;
+    const dailyLimitPause = await readGlobalRuntimeSetting(pauseKey);
+    const originalDailyLimit = Number(dailyLimitPause?.originalDailyLimit || 0);
+    const retryAtMs = dailyLimitPause?.retryAt ? new Date(dailyLimitPause.retryAt).getTime() : 0;
+    if (Number(deal.linkedin_daily_limit || 0) <= 0
+      && originalDailyLimit > 0
+      && retryAtMs > 0
+      && retryAtMs <= Date.now()
+      && !dailyLimitPause?.restoredAt) {
+      const restoredAt = new Date().toISOString();
+      await sb.from('deals').update({
+        linkedin_daily_limit: originalDailyLimit,
+        updated_at: restoredAt,
+      }).eq('id', deal.id);
+      deal.linkedin_daily_limit = originalDailyLimit;
+      await writeGlobalRuntimeSetting(pauseKey, { ...dailyLimitPause, restoredAt, active: false });
+      info(`[${deal.name}] Restored LinkedIn daily invite limit to ${originalDailyLimit} after provider pause`);
+    }
+  } catch (err) {
+    warn(`[${deal.name}] LinkedIn daily limit restore check failed: ${err.message}`);
+  }
+
   // Reactivate any contacts deferred by weekly LinkedIn limit whose retry window has passed
   try {
     const { data: weeklyLimitExpired } = await sb.from('contacts')
