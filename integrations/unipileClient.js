@@ -287,10 +287,22 @@ export async function checkUnipileStatus() {
     const li = accounts.find(a => a.id === getLiAcct());
     const gm = accounts.find(a => a.id === getGmAcct());
     const outlook = accounts.find(a => a.id === getOutlookAcct());
+    const accountStatus = (account) => {
+      if (!account) return 'disconnected';
+      const explicit = String(account.connection_status || account.status || account.state || '').toLowerCase();
+      if (['ok', 'connected', 'running', 'valid'].includes(explicit)) return 'connected';
+      if (['ko', 'error', 'expired', 'expired_credentials', 'disconnected', 'invalid'].includes(explicit)) return 'disconnected';
+      const sources = Array.isArray(account.sources) ? account.sources : [];
+      if (sources.some(source => String(source?.status || '').toLowerCase() === 'ok')) return 'connected';
+      // Current Unipile account payloads omit connection_status but only list live
+      // accounts. If the configured ID is returned and no bad status is present,
+      // treat it as connected instead of showing a false alarm.
+      return 'connected';
+    };
     return {
-      linkedin: li?.connection_status === 'OK' ? 'connected' : 'disconnected',
-      gmail: gm?.connection_status === 'OK' ? 'connected' : 'disconnected',
-      outlook: outlook?.connection_status === 'OK' ? 'connected' : 'disconnected',
+      linkedin: accountStatus(li),
+      gmail: accountStatus(gm),
+      outlook: accountStatus(outlook),
       email_default: getOutlookAcct() ? 'outlook' : 'gmail',
     };
   } catch {
