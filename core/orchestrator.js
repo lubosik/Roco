@@ -4922,6 +4922,7 @@ async function runDealCycle(deal, state) {
       } catch {}
       await runApprovedEnrichment(deal, batch, state);
       await runApprovedOutreach(deal, batch, state, brainDirectives);
+      await maybeTopUpPipelineFromBatchFirms(deal, batch);  // self-heal: re-queue pending batch_firms when pipeline is dry
       await maybeTopUpApprovedBatch(deal, brainDirectives);
       await phaseTopUpPipeline(deal, state);  // promote archived contacts + trigger research when pipeline low
       await logDealIdleStatus(deal, batch, state);
@@ -4956,6 +4957,74 @@ async function runDealCycle(deal, state) {
     }
   } finally {
     dealCycleLocks.delete(deal.id);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SELF-HEALING — when email-ready pipeline is dry, reactivate pending batch_firms
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function maybeTopUpPipelineFromBatchFirms(deal, batch) {
+  const sb = getSupabase();
+  if (!sb || !deal?.id || !batch?.id) return;
+
+  try {
+    // Count contacts that are email-ready (enriched with email, not yet contacted)
+    const { count: emailReady } = await sb.from('contacts')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_id', deal.id)
+      .not('email', 'is', null)
+      .in('pipeline_stage', ['Enriched', 'Ranked'])
+      .is('last_email_sent_at', null);
+
+    // Count contacts currently going through enrichment
+    const { count: inEnrichment } = await sb.from('contacts')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_id', deal.id)
+      .in('pipeline_stage', ['Researched'])
+      .is('last_email_sent_at', null);
+
+    if ((emailReady || 0) > 3 || (inEnrichment || 0) > 0) return; // pipeline is fine
+
+    // Pipeline is dry — check for batch_firms that have not been enriched yet
+    const { data: toActivate } = await sb.from('batch_firms')
+      .select('id, firm_name, enrichment_status, status')
+      .eq('deal_id', deal.id)
+      .eq('batch_id', batch.id)
+      .not('status', 'eq', 'exhausted')
+      .not('status', 'eq', 'suppressed')
+      .in('enrichment_status', ['pending', 'to_research', 'failed'])
+      .limit(10);
+
+    if (!toActivate?.length) {
+      console.log(`[ORCHESTRATOR] ${deal.name} pipeline dry but no unprocessed batch_firms remain`);
+      pushActivity({
+        type: 'system',
+        action: 'Pipeline dry — no firms left to enrich',
+        note: `${deal.name} · All batch firms exhausted — phaseTopUpPipeline will run new research`,
+        deal_name: deal.name,
+        dealId: deal.id,
+      });
+      return;
+    }
+
+    // Reset these firms to pending so runApprovedEnrichment picks them up next cycle
+    const firmIds = toActivate.map(f => f.id);
+    await sb.from('batch_firms')
+      .update({ enrichment_status: 'pending', updated_at: new Date().toISOString() })
+      .in('id', firmIds);
+
+    const firmNames = toActivate.map(f => f.firm_name).slice(0, 5).join(', ');
+    console.log(`[ORCHESTRATOR] ${deal.name} pipeline dry — re-queued ${toActivate.length} batch_firms for enrichment: ${firmNames}`);
+    pushActivity({
+      type: 'research',
+      action: `Pipeline dry — re-queuing ${toActivate.length} batch firm${toActivate.length !== 1 ? 's' : ''} for enrichment`,
+      note: `${deal.name} · ${firmNames}${toActivate.length > 5 ? ` +${toActivate.length - 5} more` : ''}`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+  } catch (err) {
+    console.warn(`[ORCHESTRATOR] maybeTopUpPipelineFromBatchFirms error for ${deal.name}:`, err.message);
   }
 }
 

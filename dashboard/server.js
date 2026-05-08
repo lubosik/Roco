@@ -107,11 +107,30 @@ function buildActivityFingerprint(entry) {
   ].join('|');
 }
 
+function normalizeDbActivityEntry(entry) {
+  // DB rows use {event_type, summary, detail} — normalize to the display shape
+  // {type, action, note} so the activity feed renders them correctly.
+  if (!entry) return entry;
+  const normalized = { ...entry };
+  if (!normalized.type && normalized.event_type) {
+    normalized.type = String(normalized.event_type).toLowerCase();
+  }
+  if (!normalized.action && normalized.summary) {
+    normalized.action = normalized.summary;
+  }
+  if (!normalized.note && normalized.detail) {
+    normalized.note = normalized.detail?.note || '';
+  }
+  return normalized;
+}
+
 function mergeActivityEntries(dbEntries = [], liveEntries = []) {
   const merged = [];
   const seen = new Set();
 
-  for (const entry of [...dbEntries, ...liveEntries]) {
+  const normalizedDb = (dbEntries || []).map(normalizeDbActivityEntry);
+
+  for (const entry of [...normalizedDb, ...liveEntries]) {
     const key = buildActivityFingerprint(entry);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -9202,24 +9221,19 @@ export function pushActivity(entry, legacyType) {
   // Console log for PM2 visibility
   console.log(`[${type.toUpperCase()}] ${action}${note ? ' — ' + note : ''}`);
 
-  // Persist to Supabase activity_log — try new schema, fall back to old
+  // Persist to Supabase activity_log using the correct schema:
+  // id, deal_id, contact_id, event_type, summary, detail, api_used, fallback_used, created_at
   const sb = getSupabase();
   if (sb && entry.persist !== false) {
     sb.from('activity_log').insert({
-      deal_id,
-      type,
-      action:       action || message,
-      note:         note || null,
-      full_content: full_content,
-    }).then(() => {}).catch(() => {
-      // Fall back to old schema (event_type, summary, detail)
-      sb.from('activity_log').insert({
-        deal_id,
-        event_type: type.toUpperCase(),
-        summary:    message,
-        detail:     note ? { note } : null,
-      }).then(() => {}).catch(err => console.warn('[pushActivity] activity_log fallback error:', err.message));
-    });
+      deal_id:    deal_id || null,
+      contact_id: entry.contact_id || null,
+      event_type: (type || 'system').toUpperCase(),
+      summary:    message,
+      detail:     (note || full_content)
+        ? { note: note || null, full_content: full_content ? String(full_content).slice(0, 2000) : null }
+        : null,
+    }).then(() => {}).catch(err => console.warn('[pushActivity] activity_log insert error:', err.message));
   }
 }
 
@@ -9715,24 +9729,164 @@ async function queueInboundWithDebounce({ fromEmail, fromUrn, fromName, subject,
     });
 
     if (!ctx.contact) {
-      console.log(`[REPLY] No active deal/contact context for ${contactKey} — logged receipt only`);
-      pushActivity({
-        type: channel === 'linkedin' ? 'linkedin' : 'email',
-        activity_badge: channel === 'linkedin' ? 'linkedin' : 'email',
-        activity_key: messageId ? `unmatched_inbound:${channel}:${messageId}` : null,
-        action: `${channel === 'linkedin' ? 'Inbound LinkedIn DM received' : 'Inbound email received'}: ${fromName || normalizedEmail || fromUrn || contactKey}`,
-        note: buildInboundMessageNote([
-          subject ? `Subject: "${subject}"` : null,
-          bodyText || null,
-        ]),
-        full_content: bodyText || null,
-        meta: {
-          matched_active_deal: false,
-          from_email: normalizedEmail || null,
-          provider_id: fromUrn || null,
-          subject: subject || null,
-        },
-      });
+      // ── Colleague / forwarded-reply detection ─────────────────────────────
+      // When an unknown sender replies on behalf of a known contact at the same
+      // firm (e.g. Molly responds on the same thread that was opened with Sarah),
+      // we create a new contact for the colleague and mark the original contact
+      // as having replied.
+      let handledAsColleague = false;
+      if (channel === 'email' && (threadId || normalizedEmail)) {
+        try {
+          const sbColleague = getSupabase();
+          if (sbColleague) {
+            // 1. Try to find the original contact via thread_id
+            let originalContact = null;
+            if (threadId) {
+              for (const field of ['thread_id', 'gmail_thread_id']) {
+                const { data: emailRow } = await sbColleague.from('emails')
+                  .select('contact_id')
+                  .eq(field, threadId)
+                  .not('contact_id', 'is', null)
+                  .order('sent_at', { ascending: false })
+                  .limit(1)
+                  .maybeSingle();
+                if (emailRow?.contact_id) {
+                  originalContact = await fetchInvestorContactById(emailRow.contact_id);
+                  if (originalContact) break;
+                }
+              }
+              // Also check conversation_messages for the thread
+              if (!originalContact) {
+                const { data: cmRow } = await sbColleague.from('conversation_messages')
+                  .select('contact_id')
+                  .eq('thread_id', threadId)
+                  .not('contact_id', 'is', null)
+                  .order('created_at', { ascending: false })
+                  .limit(1)
+                  .maybeSingle();
+                if (cmRow?.contact_id) {
+                  originalContact = await fetchInvestorContactById(cmRow.contact_id);
+                }
+              }
+            }
+
+            // 2. If no thread match, try domain match against active contacts
+            if (!originalContact && normalizedEmail) {
+              const senderDomain = normalizedEmail.split('@')[1]?.toLowerCase();
+              if (senderDomain) {
+                const { data: domainCandidates } = await sbColleague.from('contacts')
+                  .select('*, deals(*)')
+                  .ilike('email', `%@${senderDomain}`)
+                  .not('deals', 'is', null)
+                  .limit(20);
+                // Pick the one from an active deal
+                originalContact = pickBestInvestorContact(domainCandidates || [], { requireActiveDeal: true });
+              }
+            }
+
+            if (originalContact && originalContact.id && originalContact.deal_id) {
+              const activeDealOk = String(originalContact.deals?.status || '').toUpperCase() === 'ACTIVE';
+              if (activeDealOk) {
+                const originalName = originalContact.name || 'unknown';
+                const originalDealId = originalContact.deal_id;
+                const originalCompany = originalContact.company_name || null;
+                const originalFirmId = originalContact.firm_id || null;
+
+                // 3. Create the colleague as a new contact
+                const { data: newContact, error: insertErr } = await sbColleague.from('contacts').insert({
+                  deal_id: originalDealId,
+                  name: fromName || normalizedEmail || 'Unknown Colleague',
+                  email: normalizedEmail || null,
+                  company_name: originalCompany,
+                  firm_id: originalFirmId || null,
+                  pipeline_stage: 'In Conversation',
+                  enrichment_status: 'colleague_reply',
+                  response_received: true,
+                  last_reply_at: new Date().toISOString(),
+                  notes: `Auto-created: responded on behalf of ${originalName}`,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                }).select().maybeSingle();
+
+                if (insertErr) {
+                  console.warn('[REPLY] Colleague contact insert failed:', insertErr.message);
+                } else if (newContact) {
+                  // 4. Log the inbound message under the new contact
+                  await logConversationMessage({
+                    contactId: newContact.id,
+                    dealId: originalDealId,
+                    direction: 'inbound',
+                    channel: 'email',
+                    subject: subject || null,
+                    body: bodyText,
+                    unipileMessageId: messageId || null,
+                  }).catch(() => {});
+
+                  // 5. Update the original contact (Sarah) — mark as replied
+                  await sbColleague.from('contacts').update({
+                    pipeline_stage: 'Replied',
+                    response_received: true,
+                    last_reply_at: new Date().toISOString(),
+                  }).eq('id', originalContact.id);
+
+                  // 6. Log the event to activity_log
+                  await sbColleague.from('activity_log').insert({
+                    deal_id: originalDealId,
+                    contact_id: newContact.id,
+                    event_type: 'COLLEAGUE_REPLY',
+                    summary: `Colleague reply: ${fromName || normalizedEmail} responded on behalf of ${originalName} at ${originalCompany || 'their firm'}`,
+                    detail: {
+                      original_contact_id: originalContact.id,
+                      original_contact_name: originalName,
+                      from_email: normalizedEmail,
+                      subject: subject || null,
+                      content_preview: bodyText?.slice(0, 240) || null,
+                    },
+                  }).then(null, () => {});
+
+                  // 7. Push activity to live feed
+                  pushActivity({
+                    type: 'reply',
+                    activity_badge: 'email',
+                    action: `Colleague reply received: ${fromName || normalizedEmail} (on behalf of ${originalName} at ${originalCompany || 'their firm'})`,
+                    note: truncateInline(bodyText, 140),
+                    full_content: bodyText || null,
+                    dealId: originalDealId,
+                    deal_name: originalContact.deals?.name || null,
+                    contact_id: newContact.id,
+                  });
+
+                  console.log(`[REPLY] Colleague detected — created new contact ${newContact.id} for ${fromName || normalizedEmail}, updated original ${originalContact.id} (${originalName})`);
+                  handledAsColleague = true;
+                }
+              }
+            }
+          }
+        } catch (colleagueErr) {
+          console.warn('[REPLY] Colleague detection error:', colleagueErr.message);
+        }
+      }
+
+      if (!handledAsColleague) {
+        console.log(`[REPLY] No active deal/contact context for ${contactKey} — logged receipt only`);
+        pushActivity({
+          type: channel === 'linkedin' ? 'linkedin' : 'email',
+          activity_badge: channel === 'linkedin' ? 'linkedin' : 'email',
+          activity_key: messageId ? `unmatched_inbound:${channel}:${messageId}` : null,
+          action: `${channel === 'linkedin' ? 'Inbound LinkedIn DM received' : 'Inbound email received'}: ${fromName || normalizedEmail || fromUrn || contactKey}`,
+          note: buildInboundMessageNote([
+            subject ? `Subject: "${subject}"` : null,
+            bodyText || null,
+          ]),
+          full_content: bodyText || null,
+          meta: {
+            matched_active_deal: false,
+            from_email: normalizedEmail || null,
+            provider_id: fromUrn || null,
+            subject: subject || null,
+          },
+        });
+      }
       return;
     }
 
