@@ -4986,18 +4986,29 @@ async function maybeTopUpPipelineFromBatchFirms(deal, batch) {
 
     if ((emailReady || 0) > 3 || (inEnrichment || 0) > 0) return; // pipeline is fine
 
-    // Pipeline is dry — check for batch_firms that have not been enriched yet
-    const { data: toActivate } = await sb.from('batch_firms')
+    // Pipeline is dry — first look for firms never enriched (enrichment_status pending/failed)
+    let { data: toActivate } = await sb.from('batch_firms')
       .select('id, firm_name, enrichment_status, status')
       .eq('deal_id', deal.id)
       .eq('batch_id', batch.id)
-      .not('status', 'eq', 'exhausted')
-      .not('status', 'eq', 'suppressed')
-      .in('enrichment_status', ['pending', 'to_research', 'failed'])
-      .limit(10);
+      .not('status', 'in', '("exhausted","suppressed")')
+      .in('enrichment_status', ['pending', 'failed'])
+      .limit(20);
+
+    // Second wave: if all firms already enriched, re-queue firms with status='to_research'
+    // so runApprovedEnrichment runs a fresh Apify pass on their contacts
+    if (!toActivate?.length) {
+      const { data: toResearch } = await sb.from('batch_firms')
+        .select('id, firm_name, enrichment_status, status')
+        .eq('deal_id', deal.id)
+        .eq('batch_id', batch.id)
+        .eq('status', 'to_research')
+        .limit(20);
+      toActivate = toResearch || [];
+    }
 
     if (!toActivate?.length) {
-      console.log(`[ORCHESTRATOR] ${deal.name} pipeline dry but no unprocessed batch_firms remain`);
+      console.log(`[ORCHESTRATOR] ${deal.name} pipeline dry but no re-queuable batch_firms remain`);
       pushActivity({
         type: 'system',
         action: 'Pipeline dry — no firms left to enrich',
@@ -5011,7 +5022,7 @@ async function maybeTopUpPipelineFromBatchFirms(deal, batch) {
     // Reset these firms to pending so runApprovedEnrichment picks them up next cycle
     const firmIds = toActivate.map(f => f.id);
     await sb.from('batch_firms')
-      .update({ enrichment_status: 'pending', updated_at: new Date().toISOString() })
+      .update({ enrichment_status: 'pending' })
       .in('id', firmIds);
 
     const firmNames = toActivate.map(f => f.firm_name).slice(0, 5).join(', ');
