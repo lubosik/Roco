@@ -8,6 +8,7 @@
  *   node scripts/backfillReverseContact.js --limit 25
  *   node scripts/backfillReverseContact.js --live --limit 50
  *   node scripts/backfillReverseContact.js --live --find-emails --limit 10
+ *   node scripts/backfillReverseContact.js --live --find-emails --mark-inactive-no-contact --limit 500
  */
 
 import dotenv from 'dotenv';
@@ -23,6 +24,8 @@ const LIVE = process.argv.includes('--live');
 const FIND_EMAILS = process.argv.includes('--find-emails');
 const EMAILS_ONLY = process.argv.includes('--emails-only');
 const LINKEDIN_FROM_EMAIL = process.argv.includes('--linkedin-from-email');
+const MISSING_BOTH_ONLY = process.argv.includes('--missing-both-only');
+const MARK_INACTIVE_NO_CONTACT = process.argv.includes('--mark-inactive-no-contact');
 const SHOULD_FIND_EMAILS = FIND_EMAILS || EMAILS_ONLY;
 const limitIdx = process.argv.indexOf('--limit');
 const dealIdx = process.argv.indexOf('--deal');
@@ -69,13 +72,20 @@ function profileMatches(contact, result) {
   return expectedFirm.split(/\s+/).filter(Boolean).some(token => actualTokens.has(token));
 }
 
+function hasAnyContactMethod(contact, patch = {}) {
+  return Boolean(contact.email || contact.linkedin_url || patch.email || patch.linkedin_url);
+}
+
 async function resolveDealId() {
   if (!DEAL) return null;
-  const { data, error } = await sb.from('deals')
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(DEAL);
+  let query = sb.from('deals')
     .select('id, name')
-    .or(`id.eq.${DEAL},name.ilike.%${DEAL}%`)
-    .limit(1)
-    .maybeSingle();
+    .limit(1);
+  query = isUuid
+    ? query.eq('id', DEAL)
+    : query.ilike('name', `%${DEAL}%`);
+  const { data, error } = await query.maybeSingle();
   if (error) throw new Error(error.message);
   if (!data) throw new Error(`Deal not found: ${DEAL}`);
   return data.id;
@@ -88,11 +98,13 @@ async function main() {
 
   const dealId = await resolveDealId();
   let query = sb.from('contacts')
-    .select('id, deal_id, name, company_name, job_title, email, linkedin_url, pipeline_stage')
+    .select('id, deal_id, name, company_name, job_title, email, linkedin_url, pipeline_stage, notes')
     .not('name', 'is', null)
     .not('pipeline_stage', 'in', '("Archived","Inactive","Deleted — Do Not Contact","Suppressed — Opt Out")');
 
-  if (EMAILS_ONLY) {
+  if (MISSING_BOTH_ONLY) {
+    query = query.is('email', null).is('linkedin_url', null);
+  } else if (EMAILS_ONLY) {
     query = query.is('email', null).not('linkedin_url', 'is', null);
   } else if (LINKEDIN_FROM_EMAIL) {
     query = query.not('email', 'is', null).is('linkedin_url', null);
@@ -110,20 +122,29 @@ async function main() {
   const { data: contacts, error } = await query;
   if (error) throw new Error(error.message);
 
-  console.log(`ReverseContact backfill: ${LIVE ? 'LIVE' : 'DRY RUN'} · contacts=${contacts?.length || 0} · findEmails=${SHOULD_FIND_EMAILS} · emailsOnly=${EMAILS_ONLY} · linkedinFromEmail=${LINKEDIN_FROM_EMAIL}`);
+  console.log(`ReverseContact backfill: ${LIVE ? 'LIVE' : 'DRY RUN'} · contacts=${contacts?.length || 0} · findEmails=${SHOULD_FIND_EMAILS} · emailsOnly=${EMAILS_ONLY} · linkedinFromEmail=${LINKEDIN_FROM_EMAIL} · missingBothOnly=${MISSING_BOTH_ONLY} · markInactiveNoContact=${MARK_INACTIVE_NO_CONTACT}`);
 
   let linkedinFound = 0;
   let emailsFound = 0;
   let skippedMismatch = 0;
+  let markedInactive = 0;
+  let providerErrors = 0;
 
   for (const contact of contacts || []) {
     const patch = {};
     let rc = null;
+    let lookupHadProviderError = false;
 
     if (!contact.linkedin_url) {
-      rc = contact.email
-        ? await enrichByEmail(contact.email)
-        : await searchPerson({ name: contact.name, companyName: contact.company_name, title: contact.job_title, perPage: 3 });
+      try {
+        rc = contact.email
+          ? await enrichByEmail(contact.email)
+          : await searchPerson({ name: contact.name, companyName: contact.company_name, title: contact.job_title, perPage: 3, throwOnProviderError: true });
+      } catch (err) {
+        lookupHadProviderError = true;
+        providerErrors++;
+        console.warn(`PROVIDER ERROR ${contact.name} @ ${contact.company_name || '-'}: ${String(err.message || err).slice(0, 160)}`);
+      }
       if (rc?.linkedInUrl && profileMatches(contact, rc)) {
         patch.linkedin_url = rc.linkedInUrl;
         patch.enrichment_source = 'reversecontact';
@@ -152,10 +173,30 @@ async function main() {
       patch.updated_at = new Date().toISOString();
       console.log(`${LIVE ? 'UPDATE' : 'WOULD UPDATE'} ${contact.name} @ ${contact.company_name || '-'}: ${JSON.stringify(patch)}`);
       if (LIVE) await sb.from('contacts').update(patch).eq('id', contact.id);
+    } else if (MARK_INACTIVE_NO_CONTACT && !lookupHadProviderError && !hasAnyContactMethod(contact, patch)) {
+      const marker = `[REVERSECONTACT_NO_CONTACT ${new Date().toISOString()}] no email or LinkedIn found`;
+      const notes = `${String(contact.notes || '').trim()}\n${marker}`.trim().slice(0, 4000);
+      const inactivePatch = {
+        pipeline_stage: 'Inactive',
+        enrichment_status: 'no_contact_found',
+        notes,
+        updated_at: new Date().toISOString(),
+      };
+      console.log(`${LIVE ? 'MARK INACTIVE' : 'WOULD MARK INACTIVE'} ${contact.name} @ ${contact.company_name || '-'}: no email or LinkedIn found`);
+      if (LIVE) {
+        const { error: updateError } = await sb.from('contacts').update(inactivePatch).eq('id', contact.id);
+        if (updateError) {
+          console.warn(`MARK INACTIVE FAILED ${contact.name}: ${updateError.message}`);
+        } else {
+          markedInactive++;
+        }
+      } else {
+        markedInactive++;
+      }
     }
   }
 
-  console.log(`Done. linkedinFound=${linkedinFound} emailsFound=${emailsFound} skippedMismatch=${skippedMismatch}`);
+  console.log(`Done. linkedinFound=${linkedinFound} emailsFound=${emailsFound} skippedMismatch=${skippedMismatch} markedInactive=${markedInactive} providerErrors=${providerErrors}`);
 }
 
 main().catch(err => {

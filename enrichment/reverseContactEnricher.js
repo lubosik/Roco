@@ -103,6 +103,16 @@ function normalizePerson(raw) {
   };
 }
 
+function isProviderFailure(err) {
+  const status = Number(err?.status || err?.code || 0);
+  const message = String(err?.message || '').toLowerCase();
+  return status === 408 || status === 429 || status >= 500
+    || message.includes('timeout')
+    || message.includes('internal server error')
+    || message.includes('bad gateway')
+    || message.includes('gateway timeout');
+}
+
 async function requestV2(path, body = null, { method = 'POST', allow404 = true } = {}) {
   const apiKey = getApiKey();
   if (!apiKey) return null;
@@ -125,7 +135,18 @@ async function requestV2(path, body = null, { method = 'POST', allow404 = true }
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  const json = await res.json();
+  // Treat application-level errors (timeout, server error) as throwable provider failures
+  if (json && json.success === false && json.error) {
+    const code = String(json.error.code || '').toUpperCase();
+    const msg = String(json.error.message || '').toLowerCase();
+    if (code === 'REQUEST_ERROR' || msg.includes('timeout') || msg.includes('server error') || msg.includes('bad gateway')) {
+      const err = new Error(`ReverseContact ${method} ${path} -> app error: ${json.error.message}`);
+      err.status = 503;
+      throw err;
+    }
+  }
+  return json;
 }
 
 async function requestLegacy(params, endpoint = '') {
@@ -209,7 +230,7 @@ export async function enrichByLinkedIn(linkedInUrl) {
   }
 }
 
-export async function searchPerson({ name, companyName, title, perPage = 5 } = {}) {
+export async function searchPerson({ name, companyName, title, perPage = 5, throwOnProviderError = false } = {}) {
   if (!getApiKey()) return null;
   const [firstName, ...rest] = String(name || '').trim().split(/\s+/).filter(Boolean);
   const lastName = rest.length ? rest[rest.length - 1] : null;
@@ -223,21 +244,28 @@ export async function searchPerson({ name, companyName, title, perPage = 5 } = {
     perPage: Math.min(Math.max(Number(perPage) || 5, 1), 10),
     page: 1,
   };
+  let providerError = null;
   const raw = await requestV2('/search/persons', body).catch(err => {
     console.warn(`[ReverseContact] person search failed for ${name || companyName}: ${err.message}`);
+    if (isProviderFailure(err)) providerError = err;
     return null;
   });
   const normalized = normalizePerson(raw);
   if (normalized) return normalized;
 
-  return normalizePerson(await requestLegacy({
+  const legacy = await requestLegacy({
     ...(firstName ? { firstName } : {}),
     ...(lastName ? { lastName } : {}),
     ...(companyName ? { companyName } : {}),
   }).catch(err => {
     console.warn(`[ReverseContact] legacy person search failed for ${name || companyName}: ${err.message}`);
+    if (isProviderFailure(err)) providerError = err;
     return null;
-  }));
+  });
+  const legacyNormalized = normalizePerson(legacy);
+  if (legacyNormalized) return legacyNormalized;
+  if (throwOnProviderError && providerError) throw providerError;
+  return null;
 }
 
 export async function findEmail({ linkedInUrl, fullName, firstName, lastName, companyDomain, companyName } = {}) {
