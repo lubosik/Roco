@@ -56,6 +56,7 @@ import { writeMemory } from './rocoMemory.js';
 import { searchInvestorsWithGrok, scanInvestorNewsForDeal, saveDealNewsLeads, scanGeneralInvestorSignals, storeGeneralInvestorSignals, buildDealNewsScan, summarizePortfolioNewsDigest, scrapePublicInvestorDirectories } from './newsScanner.js';
 import { buildDailyActivityReport, persistDailyActivityReport, renderDailyVoiceNoteFromText } from './analyticsEngine.js';
 import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from './runtimeCoordination.js';
+import { getFirmWaterfallBlock, formatFirmWaterfallBlock } from './firmWaterfall.js';
 
 export const rocoState = {
   status: 'ACTIVE',
@@ -7013,6 +7014,22 @@ async function phaseLinkedInInvites(deal, state) {
   for (const contact of contacts) {
     if (contactsInFlight.has(contact.id)) continue;
     try {
+      const firmBlock = await getFirmWaterfallBlock({
+        sb,
+        dealId: deal.id,
+        contactId: contact.id,
+        firm: contact.company_name,
+        emailDays: Number(deal?.followup_days_email) || 3,
+        linkedinDays: Number(deal?.followup_days_li) || 2,
+      }).catch(err => {
+        warn(`[${deal.name}] LinkedIn invite firm waterfall guard failed for ${contact.name}: ${err.message}`);
+        return null;
+      });
+      if (firmBlock) {
+        info(`[${deal.name}] ${contact.name} held from LinkedIn invite by firm waterfall — ${formatFirmWaterfallBlock(firmBlock)}`);
+        continue;
+      }
+
       const outcome = await processLinkedInInvite({
         sb,
         deal,
@@ -7437,6 +7454,25 @@ export async function phaseOutreach(deal, state) {
       if (isLinkedInStageLabel(item.stage)) continue;
       if (!item.contact_id) continue;
 
+      const firmBlock = await getFirmWaterfallBlock({
+        sb,
+        dealId: deal.id,
+        contactId: item.contact_id,
+        firm: item.firm,
+        emailDays: Number(deal?.followup_days_email) || 3,
+        linkedinDays: Number(deal?.followup_days_li) || 2,
+      }).catch(err => {
+        warn(`[OUTREACH] Firm waterfall guard failed for approved email ${item.contact_name || item.contact_id}: ${err.message}`);
+        return null;
+      });
+      if (firmBlock) {
+        await sb.from('approval_queue').update({
+          status: 'approved_waiting_for_window',
+          edit_instructions: `Firm waterfall hold: ${formatFirmWaterfallBlock(firmBlock)}`,
+        }).eq('id', item.id).then(null, () => {});
+        continue;
+      }
+
       const { data: claimed } = await sb.from('approval_queue').update({
         status: 'sending',
       }).eq('id', item.id)
@@ -7692,7 +7728,7 @@ export async function phaseOutreach(deal, state) {
       continue;
     }
     const forceChannel = contact.pipeline_stage === 'invite_accepted' ? 'linkedin_dm' : 'email';
-    handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel })
+    await handleOutreachApproval(contact, 'INTRO', 0, deal, { forceChannel })
       .catch(err => warn(`[OUTREACH] Approval queueing failed for ${contact.name || contact.id}: ${err.message}`));
   }
 }
@@ -7779,7 +7815,7 @@ async function phaseFollowUps(deal, state) {
       });
       // Clear the LinkedIn patience timer before drafting the email
       await sb.from('contacts').update({ follow_up_due_at: null }).eq('id', contact.id).then(null, () => {});
-      handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' })
+      await handleOutreachApproval(contact, 'email_intro', 0, deal, { forceChannel: 'email' })
         .catch(err => warn(`[FOLLOW-UP] Channel-switch approval queueing failed for ${contact.name || contact.id}: ${err.message}`));
     } else {
       // Patience window expired → mark inactive and advance waterfall to next person at the firm.
@@ -7846,6 +7882,22 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
 
   if (forceChannel === 'linkedin_dm' && !contact.linkedin_provider_id) {
     info(`[OUTREACH] ${contact.name} has no LinkedIn provider ID — skipping LinkedIn DM approval`);
+    return;
+  }
+
+  const firmBlock = await getFirmWaterfallBlock({
+    sb,
+    dealId: deal.id,
+    contactId: contact.id,
+    firm: contact.company_name,
+    emailDays: Number(deal?.followup_days_email) || 3,
+    linkedinDays: Number(deal?.followup_days_li) || 2,
+  }).catch(err => {
+    warn(`[OUTREACH] Firm waterfall guard failed for ${contact.name}: ${err.message}`);
+    return null;
+  });
+  if (firmBlock) {
+    info(`[OUTREACH] ${contact.name} held by firm waterfall — ${formatFirmWaterfallBlock(firmBlock)}`);
     return;
   }
 
@@ -8518,7 +8570,7 @@ async function queueNextFirmWaterfallContact(deal, sourceContact) {
     deal_name: deal.name,
     dealId: deal.id,
   });
-  handleOutreachApproval(nextContact, 'INTRO', 0, deal, { forceChannel })
+  await handleOutreachApproval(nextContact, 'INTRO', 0, deal, { forceChannel })
     .catch(err => warn(`[WATERFALL] Approval queueing failed for ${nextContact.name || nextContact.id}: ${err.message}`));
 }
 

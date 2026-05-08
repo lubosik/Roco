@@ -7,6 +7,7 @@ import {
 import { getSupabase } from '../core/supabase.js';
 import { aiComplete } from '../core/aiClient.js';
 import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from '../core/runtimeCoordination.js';
+import { getFirmWaterfallBlock, formatFirmWaterfallBlock } from '../core/firmWaterfall.js';
 
 let bot;
 let rocoState; // injected from orchestrator
@@ -2358,6 +2359,38 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
       deal = await getDeal(dealId);
     }
   } catch {}
+
+  if (dealId && deal) {
+    const firmBlock = await getFirmWaterfallBlock({
+      sb,
+      dealId,
+      contactId: item.contact_id,
+      firm: item.firm,
+      emailDays: Number(deal?.followup_days_email) || 3,
+      linkedinDays: Number(deal?.followup_days_li) || 2,
+    }).catch(() => null);
+    if (firmBlock) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        approved_subject: approvedSubject || null,
+        edited_body: bodyToSend || null,
+        resolved_at: new Date().toISOString(),
+        edit_instructions: `Firm waterfall hold: ${formatFirmWaterfallBlock(firmBlock)}`,
+      }).eq('id', item.id);
+      if (item.contact_id) {
+        await sb.from('contacts').update({
+          pipeline_stage: 'Email Approved',
+          updated_at: new Date().toISOString(),
+        }).eq('id', item.contact_id).then(null, () => {});
+      }
+      if (item.telegram_msg_id) await clearTelegramApprovalControls(item.telegram_msg_id).catch(() => {});
+      await sendTelegram(
+        `✅ *Email approved* — held by firm waterfall\n👤 *${item.contact_name || 'contact'}* · ${item.firm || ''}\n_${formatFirmWaterfallBlock(firmBlock)}_`
+      ).catch(() => {});
+      notifyQueueUpdated();
+      return;
+    }
+  }
 
   if (item.contact_id) {
     await sb.from('contacts').update({

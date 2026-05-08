@@ -37,6 +37,7 @@ import {
   getBatches, deleteApprovalFromQueue, addApprovalToQueue,
 } from '../core/supabaseSync.js';
 import { getWindowStatus, getWindowVisualization, isWithinChannelWindow, getNextWindowOpenForChannel } from '../core/scheduleChecker.js';
+import { getFirmWaterfallBlock, formatFirmWaterfallBlock } from '../core/firmWaterfall.js';
 import { getBatchSummary } from '../core/batchManager.js';
 import { recreateLinkedInWebhooks, startLinkedInDM, sendLinkedInDM as sendLinkedInDMReply, getConnectedEmailAccounts, getExistingChatWithContact, getChatMessages, processLinkedInInvite, getLinkedInInviteProviderLimit } from '../core/unipile.js';
 import { handleLinkedInMessage as handleLiMsg, handleLinkedInRelation as handleLiRelation } from '../core/unipileWebhooks.js';
@@ -2213,7 +2214,7 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
 
   // Check 2: do not open a LinkedIn DM lane for a contact already in an email sequence.
   const { data: currentContact } = await sb.from('contacts')
-    .select('id, name, pipeline_stage, investor_score, last_email_sent_at, conversation_state, pending_linkedin_dm')
+    .select('id, deal_id, name, company_name, pipeline_stage, investor_score, last_email_sent_at, conversation_state, pending_linkedin_dm')
     .eq('id', contactId)
     .maybeSingle()
     .then(result => result, () => ({ data: null }));
@@ -2229,6 +2230,25 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       updated_at: new Date().toISOString(),
     }).eq('id', contactId).then(null, () => {});
     return { deferred: true, reason: 'missing_score' };
+  }
+
+  if (currentContact?.deal_id) {
+    const { data: deal } = await sb.from('deals')
+      .select('followup_days_email, followup_days_li')
+      .eq('id', currentContact.deal_id)
+      .maybeSingle()
+      .then(result => result, () => ({ data: null }));
+    const firmBlock = await getFirmWaterfallBlock({
+      sb,
+      dealId: currentContact.deal_id,
+      contactId,
+      firm: currentContact.company_name,
+      emailDays: Number(deal?.followup_days_email) || 3,
+      linkedinDays: Number(deal?.followup_days_li) || 2,
+    }).catch(() => null);
+    if (firmBlock) {
+      return { deferred: true, reason: `firm_waterfall:${firmBlock.reason || 'active'}` };
+    }
   }
 
   // Check 3: existing pending queue row
@@ -2565,6 +2585,33 @@ export async function sendApprovedLinkedInDM({ contactId, text, queueId = null, 
     });
     notifyQueueUpdated();
     return { skipped: true, duplicate: true, sentAt };
+  }
+
+  if (deal) {
+    const firmBlock = await getFirmWaterfallBlock({
+      sb,
+      dealId: contact.deal_id,
+      contactId: contact.id,
+      firm: contact.company_name || queueItem?.firm,
+      emailDays: Number(deal?.followup_days_email) || 3,
+      linkedinDays: Number(deal?.followup_days_li) || 2,
+    }).catch(() => null);
+    if (firmBlock) {
+      await sb.from('contacts').update({
+        pipeline_stage: 'DM Approved',
+        updated_at: new Date().toISOString(),
+      }).eq('id', contact.id);
+      if (queueId) {
+        await sb.from('approval_queue').update({
+          status: 'approved_waiting_for_window',
+          edited_body: sanitizeApprovalText(text || queueItem?.edited_body || queueItem?.body || '') || null,
+          resolved_at: new Date().toISOString(),
+          edit_instructions: `Firm waterfall hold: ${formatFirmWaterfallBlock(firmBlock)}`,
+        }).eq('id', queueId);
+      }
+      notifyQueueUpdated();
+      return { deferred: true, waterfallHold: true, reason: formatFirmWaterfallBlock(firmBlock) };
+    }
   }
 
   if (deal && !isWithinChannelWindow(deal, 'linkedin_dm')) {
@@ -4442,6 +4489,37 @@ function registerRoutes(app) {
                 const { data } = await sb.from('deals').select('*').eq('id', queueDealId).single();
                 deal = data || null;
               } catch {}
+            }
+
+            if (queueDealId && deal) {
+              const firmBlock = await getFirmWaterfallBlock({
+                sb,
+                dealId: queueDealId,
+                contactId: queueItem.contact_id,
+                firm: queueItem.firm || contactRow?.company_name,
+                emailDays: Number(deal?.followup_days_email) || 3,
+                linkedinDays: Number(deal?.followup_days_li) || 2,
+              }).catch(() => null);
+              if (firmBlock) {
+                await sb.from('approval_queue').update({
+                  status: 'approved_waiting_for_window',
+                  resolved_at: new Date().toISOString(),
+                  approved_subject: finalSubject || null,
+                  edited_body: bodyToSend || null,
+                  deal_id: queueDealId,
+                  edit_instructions: `Firm waterfall hold: ${formatFirmWaterfallBlock(firmBlock)}`,
+                }).eq('id', queueItem.id);
+                await sb.from('contacts').update({
+                  pipeline_stage: 'Email Approved',
+                  updated_at: new Date().toISOString(),
+                }).eq('id', queueItem.contact_id).then(null, () => {});
+                notifyQueueUpdated();
+                return res.json({
+                  success: true,
+                  deferred: true,
+                  message: `Email approved but held by firm waterfall: ${formatFirmWaterfallBlock(firmBlock)}`,
+                });
+              }
             }
 
             if (!sendNow && deal && !isWithinChannelWindow(deal, 'email')) {

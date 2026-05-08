@@ -8,6 +8,7 @@
  */
 
 import { getSupabase } from './supabase.js';
+import { getFirmWaterfallBlock } from './firmWaterfall.js';
 
 /**
  * Execute an approval queue item — same logic as executeReloadedApproval
@@ -54,6 +55,35 @@ export async function executeApprovalById(item) {
 
   const subject    = item.subject_a || item.subject || '';
   const body       = item.edited_body || item.body || '';
+
+  if (dealId) {
+    const { data: contact } = item.contact_id
+      ? await sb.from('contacts').select('company_name').eq('id', item.contact_id).maybeSingle().then(result => result, () => ({ data: null }))
+      : { data: null };
+    const { data: deal } = await sb.from('deals')
+      .select('followup_days_email, followup_days_li')
+      .eq('id', dealId)
+      .maybeSingle()
+      .then(result => result, () => ({ data: null }));
+    const firmBlock = await getFirmWaterfallBlock({
+      sb,
+      dealId,
+      contactId: item.contact_id,
+      firm: item.firm || contact?.company_name,
+      emailDays: Number(deal?.followup_days_email) || 3,
+      linkedinDays: Number(deal?.followup_days_li) || 2,
+    });
+    if (firmBlock) {
+      await sb.from('approval_queue').update({
+        status: 'approved_waiting_for_window',
+        approved_subject: subject || null,
+        edited_body: body || null,
+        resolved_at: new Date().toISOString(),
+        edit_instructions: `Firm waterfall hold: ${firmBlock.name || firmBlock.firm || 'same firm'} is active`,
+      }).eq('id', item.id);
+      return;
+    }
+  }
 
   await sendEmail({ to: toEmail, toName: item.contact_name || '', subject, body });
 
