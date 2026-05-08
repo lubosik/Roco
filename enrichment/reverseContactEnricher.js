@@ -12,8 +12,8 @@ import fetch from 'node-fetch';
 const V2_BASE_URL = 'https://api.reversecontact.com/v2';
 const LEGACY_BASE_URL = 'https://api.reversecontact.com/enrichment';
 const MIN_INTERVAL_MS = Math.max(1000, Number(process.env.REVERSECONTACT_MIN_INTERVAL_MS || 6500));
-const ASYNC_POLL_MS = 10_000;
-const ASYNC_MAX_POLLS = 6;
+const ASYNC_POLL_MS = Math.max(1000, Number(process.env.REVERSECONTACT_ASYNC_POLL_MS || 10_000));
+const ASYNC_MAX_POLLS = Math.max(0, Number(process.env.REVERSECONTACT_ASYNC_MAX_POLLS || 6));
 
 let lastCallAt = 0;
 let legacyReverseEmailRestricted = false;

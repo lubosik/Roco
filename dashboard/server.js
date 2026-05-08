@@ -4536,7 +4536,7 @@ function registerRoutes(app) {
                 const sentAt = emailSentActivityAt;
                 const nextFollowUpDueAt = nextFollowUpPlan?.delayDays
                   ? new Date(Date.now() + nextFollowUpPlan.delayDays * 24 * 60 * 60 * 1000).toISOString()
-                  : null;
+                  : new Date(Date.now() + (Number(dealRow?.followup_days_email) || 3) * 24 * 60 * 60 * 1000).toISOString();
 
                 await sb.from('contacts').update({
                   pipeline_stage:     'Email Sent',

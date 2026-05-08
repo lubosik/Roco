@@ -13,6 +13,9 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+process.env.REVERSECONTACT_ASYNC_MAX_POLLS ||= '2';
+process.env.REVERSECONTACT_ASYNC_POLL_MS ||= '6000';
+
 import { createClient } from '@supabase/supabase-js';
 import { enrichByEmail, searchPerson, findEmail } from '../enrichment/reverseContactEnricher.js';
 

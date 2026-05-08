@@ -22,7 +22,7 @@ import { isWithinEmailWindow, describeNextEmailWindow, isActiveOutreachDay } fro
 import { rankInvestor } from '../research/investorRanker.js';
 import { enrichWithApify } from '../enrichment/apifyEnricher.js';
 import { findLinkedInUrl, findLinkedInProfile } from '../enrichment/linkedinFinder.js';
-import { enrichByEmail as rcEnrichByEmail, searchPerson as rcSearchPerson } from '../enrichment/reverseContactEnricher.js';
+import { enrichByEmail as rcEnrichByEmail, searchPerson as rcSearchPerson, findEmail as rcFindEmail } from '../enrichment/reverseContactEnricher.js';
 import { orComplete } from './openRouterClient.js';
 import {
   sendLinkedInDM,
@@ -2448,6 +2448,10 @@ function stripPersonResearchMarkers(notes) {
     .replace(/\n?\[PERSON_RESEARCH_PARTIAL[^\n]*\]/g, '')
     .replace(/\n?\[PERSON_RESEARCH_VERIFIED[^\n]*\]/g, '')
     .trim();
+}
+
+function hasRecentPartialResearch(contact, ttlDays = 7) {
+  return classifyPersonResearch(contact) === 'partial' && hasFreshResearch(contact, ttlDays);
 }
 
 function hasRecentResearchVerificationFailure(contact, hours = 6) {
@@ -5673,6 +5677,87 @@ async function buildDraftLinkedInProfileContext(contactPage) {
   ].filter(Boolean).join('\n');
 }
 
+async function findAndSaveReverseContactEmail(sb, contact, deal, linkedInUrl = null) {
+  if (!process.env.REVERSECONTACT_API_KEY || !contact?.id || hasUsableEmail(contact.email)) return null;
+
+  let emailResult = null;
+  try {
+    emailResult = await rcFindEmail({
+      linkedInUrl,
+      fullName: contact.name,
+      companyName: contact.company_name,
+    });
+  } catch (err) {
+    warn(`[ENRICH] ReverseContact email finder failed for ${contact.name}: ${err.message}`);
+    return null;
+  }
+
+  if (!emailResult?.email) return null;
+  if (!reverseContactProfileMatches(contact, { ...emailResult, linkedInUrl: emailResult.linkedInUrl || linkedInUrl })) {
+    pushActivity({
+      type: 'warning',
+      action: '[MATCH] ReverseContact email ignored',
+      note: `${contact.name} — result did not match name/company strongly enough`,
+      deal_name: deal.name,
+      dealId: deal.id,
+    });
+    return null;
+  }
+
+  const verification = await verifyEmailWithMillionVerifier(emailResult.email);
+  if (!verification.valid) {
+    await sbLogActivity({
+      dealId: deal.id,
+      contactId: contact.id,
+      eventType: 'EMAIL_INVALID',
+      summary: `ReverseContact email for ${contact.name} failed MillionVerifier (${verification.result}, quality: ${verification.quality})`,
+      detail: { email: emailResult.email, result: verification.result, quality: verification.quality },
+      apiUsed: 'reversecontact',
+    }).catch(() => {});
+    return null;
+  }
+
+  const { data: duplicate } = await sb.from('contacts')
+    .select('id, name')
+    .eq('deal_id', deal.id)
+    .eq('email', emailResult.email)
+    .neq('id', contact.id)
+    .limit(1);
+  if (duplicate?.length) {
+    warn(`[ENRICH] ReverseContact duplicate email ${emailResult.email} — already assigned to ${duplicate[0].name}`);
+    return null;
+  }
+
+  const patch = {
+    email: emailResult.email,
+    enrichment_status: 'enriched',
+    enrichment_source: 'reversecontact',
+    pipeline_stage: 'Enriched',
+    updated_at: new Date().toISOString(),
+  };
+  if ((emailResult.linkedInUrl || linkedInUrl) && !contact.linkedin_url) {
+    patch.linkedin_url = emailResult.linkedInUrl || linkedInUrl;
+  }
+
+  await sb.from('contacts').update(patch).eq('id', contact.id);
+  pushActivity({
+    type: 'enrichment',
+    action: 'ReverseContact email found',
+    note: `${contact.name} — ${emailResult.email}`,
+    deal_name: deal.name,
+    dealId: deal.id,
+  });
+  await sbLogActivity({
+    dealId: deal.id,
+    contactId: contact.id,
+    eventType: 'REVERSECONTACT_EMAIL_FOUND',
+    summary: `ReverseContact found email for ${contact.name}`,
+    detail: { email: emailResult.email, linkedInUrl: emailResult.linkedInUrl || linkedInUrl || null },
+    apiUsed: 'reversecontact',
+  }).catch(() => {});
+  return { ...contact, ...patch };
+}
+
 function buildPersonResearchUpdates(contact, research, marker = null) {
   const mergedForStatus = { ...contact, ...research };
   const status = classifyPersonResearch(mergedForStatus);
@@ -5686,6 +5771,7 @@ function buildPersonResearchUpdates(contact, research, marker = null) {
   ].filter(Boolean);
   const updates = {
     person_researched: status === 'verified',
+    updated_at: new Date().toISOString(),
     notes: [notesBase, `[${effectiveMarker} ${new Date().toISOString()}]`, `Research status: ${status}`, ...summaryLines].filter(Boolean).join('\n').slice(0, 4000),
   };
   if (research.job_title && !contact.job_title) updates.job_title = research.job_title;
@@ -5774,6 +5860,11 @@ async function ensureVerifiedResearchBeforeDraft(contact, deal, reason = 'outrea
 
   const sb = getSupabase();
   if (!sb || !contact?.id || !deal?.id) return null;
+
+  if (hasRecentPartialResearch(contact)) {
+    info(`[${deal.name}] ${contact.name} has recent partial research — proceeding with best available copy`);
+    return contact;
+  }
 
   if (hasRecentResearchVerificationFailure(contact)) {
     info(`[${deal.name}] ${contact.name} has recent failed verification — proceeding with best available copy`);
@@ -5961,6 +6052,9 @@ async function enrichSingleContact(sb, contact, deal, state) {
       // No LinkedIn URL found yet — defer to linkedin_only + Enriched so phaseLinkedInInvites
       // can attempt profile discovery via Unipile search when processing the invite
       if (!linkedinUrl) {
+        const rcEmailContact = await findAndSaveReverseContactEmail(sb, contact, deal, null);
+        if (rcEmailContact) return;
+
         warn(`[ENRICH] No LinkedIn URL found for ${contact.name} — deferring to invite-phase discovery`);
         await sb.from('contacts').update({ enrichment_status: 'linkedin_only', pipeline_stage: 'Enriched' }).eq('id', contact.id);
         pushActivity({ type: 'enrichment', action: `LinkedIn not found yet`, note: `${contact.name} — will attempt via Unipile invite phase`, deal_name: deal.name, dealId: deal.id });
@@ -5979,6 +6073,9 @@ async function enrichSingleContact(sb, contact, deal, state) {
           logStep(`Apify found email for ${contact.name}`, deal.name, 'enrichment', deal);
           pushActivity({ type: 'enrichment', action: `Apify found email`, note: `${contact.name} — ${apifyResult?.email || ''}`, deal_name: deal.name, dealId: deal.id });
         } else {
+          const rcEmailContact = await findAndSaveReverseContactEmail(sb, { ...contact, linkedin_url: linkedinUrl }, deal, linkedinUrl);
+          if (rcEmailContact) return;
+
           const profileUpdates = { enrichment_status: 'linkedin_only', enrichment_source: null, pipeline_stage: 'Enriched' };
           if (apifyResult?.headline && !contact.job_title)     profileUpdates.job_title = apifyResult.headline;
           if (apifyResult?.company_name && !contact.company_name) profileUpdates.company_name = apifyResult.company_name;

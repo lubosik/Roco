@@ -2400,11 +2400,15 @@ Return ONLY the revised email body. No subject line. No labels. No explanation. 
   }).eq('id', item.id);
 
   if (item.contact_id) {
+    const sentAt = new Date().toISOString();
+    const cascadeDays = Number(deal?.followup_days_email) || 3;
+    const followUpDueAt = new Date(Date.now() + cascadeDays * 24 * 60 * 60 * 1000).toISOString();
     await sb.from('contacts').update({
       pipeline_stage: 'Email Sent',
-      last_email_sent_at: new Date().toISOString(),
+      last_email_sent_at: sentAt,
       outreach_channel: 'email',
-      last_outreach_at: new Date().toISOString(),
+      last_outreach_at: sentAt,
+      follow_up_due_at: followUpDueAt,
     }).eq('id', item.contact_id);
 
     try {

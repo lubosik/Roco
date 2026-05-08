@@ -64,11 +64,22 @@ export async function executeApprovalById(item) {
   }).eq('id', item.id);
 
   if (item.contact_id) {
+    let cascadeDays = 3;
+    if (dealId) {
+      const { data: deal } = await sb.from('deals')
+        .select('followup_days_email')
+        .eq('id', dealId)
+        .maybeSingle()
+        .then(result => result, () => ({ data: null }));
+      cascadeDays = Number(deal?.followup_days_email) || cascadeDays;
+    }
+    const sentAt = new Date().toISOString();
     await sb.from('contacts').update({
       pipeline_stage:   'Email Sent',
-      last_email_sent_at: new Date().toISOString(),
+      last_email_sent_at: sentAt,
       outreach_channel:   'email',
-      last_outreach_at:   new Date().toISOString(),
+      last_outreach_at:   sentAt,
+      follow_up_due_at:   new Date(Date.now() + cascadeDays * 24 * 60 * 60 * 1000).toISOString(),
     }).eq('id', item.contact_id);
   }
 

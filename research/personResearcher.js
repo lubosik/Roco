@@ -124,14 +124,19 @@ export function hasPartialPersonResearch(record = {}) {
 }
 
 export function hasFreshResearch(record, ttlDays = getResearchConfig().cacheTtlDays) {
-  // last_researched_at doesn't exist as a DB column — use person_researched + updated_at
-  // A contact is "fresh" if it has been successfully researched and updated recently
-  if (!record?.person_researched) return false;
-  // If notes contain a research marker, treat as fresh within TTL
+  // last_researched_at doesn't exist as a DB column. Treat any recent
+  // person-research marker, including partial research, as fresh so contacts do
+  // not cycle through grounded research every orchestrator pass.
   const notes = typeof record.notes === 'string' ? record.notes : '';
-  const hasMarker = RESEARCH_MARKERS.some(m => notes.includes(m));
-  if (!hasMarker) return false;
-  const last = Date.parse(record.updated_at || record.created_at || '');
+  const markerRegex = /\[(PERSON_RESEARCH_VERIFIED|PERSON_RESEARCH_PARTIAL|PERSON_RESEARCHED|PERSON_RESEARCHED_FOR_RANKING|LINKEDIN_PROFILE_RESEARCHED)\s+([^\]]+)\]/g;
+  const markerTimes = [...notes.matchAll(markerRegex)]
+    .map(match => Date.parse(match[2]))
+    .filter(Number.isFinite);
+  const hasMarker = markerTimes.length > 0 || RESEARCH_MARKERS.some(m => notes.includes(m));
+  if (!hasMarker && !record?.person_researched) return false;
+  const last = markerTimes.length
+    ? Math.max(...markerTimes)
+    : Date.parse(record.updated_at || record.created_at || '');
   if (Number.isNaN(last)) return true; // has marker but no timestamp → assume fresh
   return (Date.now() - last) < ttlDays * 24 * 60 * 60 * 1000;
 }
