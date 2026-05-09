@@ -332,8 +332,10 @@ function findMatchingExistingContact(existingContacts, incoming, firmName = '') 
 
 const STALE_BATCH_FIRM_ENRICHMENT_MS = 20 * 60 * 1000;
 const MAX_FIRM_ENRICHMENT_ATTEMPTS = 3;
+const DEAL_STATUS_REPEAT_MS = 3 * 60 * 60 * 1000;
+const WEEKEND_RESEARCH_RUNWAY_DAYS = Math.max(3, Number(process.env.WEEKEND_RESEARCH_RUNWAY_DAYS || 10));
 const ACTIVE_MONITORING_STAGES = ['pending_email_approval', 'pending_dm_approval', 'Email Approved', 'DM Approved', 'Email Sent', 'DM Sent', 'email_sent', 'dm_sent', 'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed'];
-const lastDealStatusActivity = new Map();
+const lastDealStatusActivityByKey = new Map();
 const dailyNewsScanState = new Map();
 const dailyActivityDigestState = new Map();
 const dailyLogRecommendationState = new Map();
@@ -492,9 +494,13 @@ function pushDealStatusOnce(deal, statusKey, entry) {
     pushActivity(entry);
     return;
   }
-  const previous = lastDealStatusActivity.get(String(deal.id));
-  if (previous === statusKey) return;
-  lastDealStatusActivity.set(String(deal.id), statusKey);
+  const dealKey = String(deal.id);
+  const now = Date.now();
+  const repeatKey = `${dealKey}:${statusKey}`;
+  const lastRepeatedAt = lastDealStatusActivityByKey.get(repeatKey) || 0;
+  if (lastRepeatedAt && now - lastRepeatedAt < DEAL_STATUS_REPEAT_MS) return;
+
+  lastDealStatusActivityByKey.set(repeatKey, now);
   pushActivity(entry);
 }
 
@@ -2310,38 +2316,43 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
   // How many of those are at truly unblocked firms (no one else there already engaged)?
   // Approximate this as: if invite-ready count is < daily target, we need fresh firms.
   const dailyTarget = deal.linkedin_daily_limit || DAILY_INVITE_TARGET;
-  const pipelineGap = Math.max(0, dailyTarget * 3 - Number(inviteReadyCount || 0)); // need 3x buffer
+  const runwayDays = estNow.weekday >= 6 ? WEEKEND_RESEARCH_RUNWAY_DAYS : 3;
+  const targetReadyContacts = dailyTarget * runwayDays;
+  const pipelineGap = Math.max(0, targetReadyContacts - Number(inviteReadyCount || 0));
+  const topUpLimit = Math.min(estNow.weekday >= 6 ? 30 : 20, pipelineGap);
   if (pipelineGap <= 0) {
-    info(`[${deal.name}] Top-up skipped — ${inviteReadyCount} invite-ready contacts (≥ ${dailyTarget * 3} needed)`);
+    info(`[${deal.name}] Top-up skipped — ${inviteReadyCount} invite-ready contacts (≥ ${targetReadyContacts} needed for ${runwayDays} day runway)`);
     return;
   }
   // Don't trigger a new Grok search if there are already firms queued for enrichment.
   // The enrichment pipeline will convert those to invite-ready contacts soon enough.
-  const { count: pendingFirms } = await sb.from('batch_firms')
+  const { count: pendingFirmsCount } = await sb.from('batch_firms')
     .select('id', { count: 'exact', head: true })
     .eq('deal_id', deal.id)
-    .in('status', ['pending', 'processing', 'researched', 'enriching']);
-  if (Number(pendingFirms || 0) >= 10) {
+    .in('enrichment_status', ['pending', 'in_progress', 'failed']);
+  const pendingFirms = Number(pendingFirmsCount || 0);
+  if (pendingFirms >= 10) {
     info(`[${deal.name}] Top-up skipped — ${pendingFirms} firms already in enrichment queue`);
-    approvedBatchTopUpState.set(topUpKey, true); // don't recheck today
     return;
   }
 
-  info(`[${deal.name}] Top-up triggered — only ${inviteReadyCount} invite-ready contacts, ${pendingFirms || 0} firms in queue (gap: ${pipelineGap})`);
+  info(`[${deal.name}] Top-up triggered — ${inviteReadyCount} invite-ready contacts vs ${targetReadyContacts} runway target, ${pendingFirms} firms in queue (gap: ${pipelineGap})`);
 
   // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
   approvedBatchTopUpState.set(topUpKey, true);
 
   pushActivity({
     type: 'research',
-    action: `Pipeline low — checking attached priority lists for ${deal.name}`,
-    note: `${inviteReadyCount} invite-ready contacts · target gap ${pipelineGap}`,
+    action: estNow.weekday >= 6
+      ? `Weekend research runway low — checking attached priority lists for ${deal.name}`
+      : `Pipeline low — checking attached priority lists for ${deal.name}`,
+    note: `${inviteReadyCount} invite-ready contacts · target ${targetReadyContacts} · gap ${pipelineGap}`,
     deal_name: deal.name,
     dealId: deal.id,
   });
 
   const priorityTopUp = await getPriorityListShortlist(deal, {
-    limit: Math.min(20, pipelineGap),
+    limit: topUpLimit,
     emitActivity: true,
   }).catch(() => ({ shortlisted: [], activePriorityList: null }));
 
@@ -2364,7 +2375,7 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
   const grokLeads = await searchInvestorsWithGrok(deal, existingNames, pushActivity).catch(() => []);
   if (!grokLeads.length) return;
 
-  const topUpLeads = grokLeads.slice(0, Math.min(20, pipelineGap)).map(lead => ({
+  const topUpLeads = grokLeads.slice(0, topUpLimit).map(lead => ({
     firm_name: lead.firm_name || lead.name,
     news_event: truncateForNote(lead.description || 'Fresh investor activity identified via Grok top-up scan', 160),
     why_relevant: truncateForNote(lead.description || `${lead.firm_name || lead.name} appears to fit ${deal.name}`, 180),
@@ -2393,7 +2404,7 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
     const msg = [
       `🔍 *Top-up: ${result.added} new firm${result.added === 1 ? '' : 's'} added — ${deal.name}*`,
       ``,
-      `Pipeline ran low (${inviteReadyCount} invite-ready contacts). Found ${grokLeads.length} matches, adding the best ${result.added}:`,
+      `${estNow.weekday >= 6 ? 'Weekend research runway' : 'Pipeline'} ran low (${inviteReadyCount}/${targetReadyContacts} invite-ready contacts). Found ${grokLeads.length} matches, adding the best ${result.added}:`,
       ``,
       firmLines,
       ``,
@@ -4911,7 +4922,7 @@ async function runDealCycle(deal, state) {
             sb2.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).in('pipeline_stage', ['Ranked', 'Enriched']).not('linkedin_url', 'is', null).is('invite_sent_at', null),
             sb2.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).in('pipeline_stage', ['Enriched']).not('email', 'is', null).is('last_email_sent_at', null),
           ]);
-          pushActivity({
+          pushDealStatusOnce(deal, `pipeline-snapshot:${batch.id}:${enriching ?? 0}:${inviteReady ?? 0}:${emailReady ?? 0}`, {
             type: 'system',
             action: `Pipeline snapshot — ${deal.name}`,
             note: `Firms enriching: ${enriching ?? 0} · Invite-ready: ${inviteReady ?? 0} · Email-ready: ${emailReady ?? 0}`,
