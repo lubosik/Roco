@@ -10,6 +10,7 @@ const REFRESH_MS        = 30_000;
 const HEALTH_REFRESH_MS = 10_000;
 const WS_RECONNECT_MS   = 5_000;
 const POLL_FALLBACK_MS  = 8_000;
+const ACTIVITY_REFRESH_MS = 2_000;
 const API_BASE          = '';
 
 
@@ -64,6 +65,8 @@ let wsConnected      = false;
 let pollTimer        = null;
 let refreshTimer     = null;
 let healthTimer      = null;
+let activityRefreshTimer = null;
+let activityRefreshInFlight = false;
 let clockTimer       = null;
 let pauseCountTimer  = null;
 let previewDebounce  = null;
@@ -108,11 +111,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.hidden) {
       clearInterval(refreshTimer); clearInterval(healthTimer);
       refreshTimer = null; healthTimer = null;
+      stopActivityAutoRefresh();
     } else {
       // Tab became visible again — refresh immediately then restart timers
       fullRefresh();
       refreshTimer = setInterval(fullRefresh, REFRESH_MS);
       healthTimer  = setInterval(refreshHealth, HEALTH_REFRESH_MS);
+      if (['#overview', '#activity'].includes(window.location.hash || '#overview')) startActivityAutoRefresh();
     }
   });
 });
@@ -144,6 +149,8 @@ function navigate(hash) {
 
   // Close sidebar on mobile
   if (window.innerWidth <= 860) closeSidebar();
+  if (view === 'overview' || view === 'activity') startActivityAutoRefresh();
+  else stopActivityAutoRefresh();
 
   // Section loaders
   switch (view) {
@@ -338,6 +345,35 @@ function startPollFallback() {
 
 function stopPollFallback() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function startActivityAutoRefresh() {
+  if (activityRefreshTimer || document.hidden) return;
+  activityRefreshTimer = setInterval(async () => {
+    const currentView = (window.location.hash || '#overview').replace('#', '');
+    if (document.hidden || !['overview', 'activity'].includes(currentView)) {
+      stopActivityAutoRefresh();
+      return;
+    }
+    if (activityRefreshInFlight) return;
+    activityRefreshInFlight = true;
+    try {
+      if (currentView === 'overview') {
+        await loadActivityLog(true);
+      } else if (_activityPage === 1) {
+        await loadActivity(1);
+      }
+    } finally {
+      activityRefreshInFlight = false;
+    }
+  }, ACTIVITY_REFRESH_MS);
+}
+
+function stopActivityAutoRefresh() {
+  if (activityRefreshTimer) {
+    clearInterval(activityRefreshTimer);
+    activityRefreshTimer = null;
+  }
 }
 
 function setConnStatus(state, label) {
