@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { readGlobalRuntimeSetting, writeGlobalRuntimeSetting } from './runtimeCoordination.js';
+import { sendTelegram } from '../approval/telegramBot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '..', 'linkedin_ratelimit.json');
@@ -78,7 +79,12 @@ export function markLinkedInRateLimited(source = 'LINKEDIN') {
   sharedState = { rateLimitedUntil: until };
   lastSharedSyncAt = Date.now();
   writeGlobalRuntimeSetting(GLOBAL_KEY, { rateLimitedUntil: until }).catch(() => {});
-  console.warn(`[${source}] LinkedIn rate limited — pausing all searches for 15 minutes (until ${new Date(until).toISOString()})`);
+  const untilStr = new Date(until).toISOString();
+  console.warn(`[${source}] LinkedIn rate limited — pausing all searches for 15 minutes (until ${untilStr})`);
+  // Notify Telegram so the rate limit is visible without checking Railway logs
+  sendTelegram(
+    `⚠️ LinkedIn rate limited (source: ${source}) — cooling down for 15 minutes until ${new Date(until).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET. Outreach continues via email.`
+  ).catch(() => {});
 }
 
 /**

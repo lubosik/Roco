@@ -659,6 +659,11 @@ async function runLoop() {
           await runCycle(state);
         } else {
           info(`Orchestrator ${state.roco_status} — waiting...`);
+          pushActivity({
+            type: 'system',
+            action: `Roco is paused — waiting for ACTIVE status`,
+            note: `Current status: ${state.roco_status}`,
+          });
         }
       }
     } catch (err) {
@@ -2011,11 +2016,15 @@ async function triggerAutoFeedForDeal(deal, { reason = 'pipeline_depth', request
 
 async function runDailyNewsScanCycle(deals) {
   const estNow = DateTime.now().setZone('America/New_York');
-  if (estNow.hour !== 7) return;
   const sb = getSupabase();
 
   const todayKey = estNow.toISODate();
   const existingState = dailyNewsScanState.get(todayKey);
+  // Run at 7am ET, OR as a catch-up if today's scan has not yet run (handles Railway restarts
+  // that occur during the 7am window — the scan will fire on the next cycle regardless of hour).
+  const isScheduledWindow = estNow.hour === 7;
+  const isMissedToday = !existingState && estNow.hour > 7;
+  if (!isScheduledWindow && !isMissedToday) return;
   if (existingState === 'running' || existingState === 'done') return;
   dailyNewsScanState.set(todayKey, 'running');
 
@@ -2301,7 +2310,9 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
     }
   }
 
-  if (approvedBatchTopUpState.get(topUpKey)) return;
+  // Skip if we locked for the full day (results found) OR if the 2-hour hour-slot is locked (zero results)
+  const hourKey = `${topUpKey}:h${estNow.hour}`;
+  if (approvedBatchTopUpState.get(topUpKey) || approvedBatchTopUpState.get(hourKey)) return;
 
   // Use invite-ready count at unblocked firms as the real pipeline health signal.
   // "Total contacts" overstates health — contacts waiting for invite-accepts block their firm
@@ -2338,9 +2349,6 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   info(`[${deal.name}] Top-up triggered — ${inviteReadyCount} invite-ready contacts vs ${targetReadyContacts} runway target, ${pendingFirms} firms in queue (gap: ${pipelineGap})`);
 
-  // Mark as done for today BEFORE searching — prevents repeated firing on empty results or restarts
-  approvedBatchTopUpState.set(topUpKey, true);
-
   pushActivity({
     type: 'research',
     action: estNow.weekday >= 6
@@ -2360,6 +2368,8 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
     const inserted = await addPriorityInvestorsToBatch(deal, priorityTopUp.shortlisted, priorityTopUp.activePriorityList)
       .catch(() => ({ added: 0, skipped: priorityTopUp.shortlisted.length }));
     if (inserted.added > 0) {
+      // Lock for the full day only when we actually added firms
+      approvedBatchTopUpState.set(topUpKey, true);
       pushActivity({
         type: 'research',
         action: 'Priority-list top-up added fresh firms',
@@ -2373,7 +2383,13 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   const existingNames = await getExcludedFirmNames(deal.id);
   const grokLeads = await searchInvestorsWithGrok(deal, existingNames, pushActivity).catch(() => []);
-  if (!grokLeads.length) return;
+  if (!grokLeads.length) {
+    // Zero results — use a 2-hour TTL key so we retry rather than staying locked all day
+    const hourKey = `${topUpKey}:h${estNow.hour}`;
+    approvedBatchTopUpState.set(hourKey, true);
+    info(`[${deal.name}] Top-up search returned zero results — will retry after 2 hours (key: ${hourKey})`);
+    return;
+  }
 
   const topUpLeads = grokLeads.slice(0, topUpLimit).map(lead => ({
     firm_name: lead.firm_name || lead.name,
@@ -2387,6 +2403,8 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
 
   const result = await addNewsLeadsToBatch(deal, topUpLeads).catch(() => ({ added: 0 }));
   if (result.added > 0) {
+    // Lock for the full day — successful top-up
+    approvedBatchTopUpState.set(topUpKey, true);
     pushActivity({
       type: 'research',
       action: 'Approved campaign top-up added fresh firms',
@@ -2412,6 +2430,11 @@ async function maybeTopUpApprovedBatch(deal, brainDirectives) {
     ].join('\n');
 
     sendTelegram(msg).catch(() => {});
+  } else {
+    // Leads found but none were inserted — 2-hour retry
+    const hourKey = `${topUpKey}:h${estNow.hour}`;
+    approvedBatchTopUpState.set(hourKey, true);
+    info(`[${deal.name}] Top-up: ${grokLeads.length} leads found but none inserted — will retry after 2 hours`);
   }
 }
 
@@ -6841,78 +6864,20 @@ async function phaseTempCloseCheck(deal, state) {
         const contactPage = buildContactPage(contact);
         const fakeDraft   = { body: followUp, subject: `Re: ${deal.name}`, alternativeSubject: null };
 
-        contactsInFlight.add(contact.id);
+        // Mark pending before sending so the DB gate prevents re-selection on restart
         try {
-          const decision = await sendEmailForApproval(contactPage, fakeDraft, contact.notes || '', contact.investor_score || 0, 'FOLLOW-UP', deal.id);
+          await sb.from('contacts').update({
+            pipeline_stage: 'pending_email_approval',
+            updated_at: new Date().toISOString(),
+          }).eq('id', contact.id);
+        } catch {}
+        contactsInFlight.add(contact.id);
 
-          if (decision.action === 'approve') {
-            const channel = contact.email ? 'email' : 'linkedin_dm';
-            let sent = null;
-
-            if (channel === 'email' && contact.email) {
-              sent = await unipileSendEmail({
-                to:      contact.email,
-                toName:  contact.name,
-                subject: decision.subject || fakeDraft.subject,
-                body:    followUp,
-              });
-            } else if (channel === 'linkedin_dm' && contact.linkedin_provider_id) {
-              sent = await sendLinkedInDM({
-                attendeeProviderId: contact.linkedin_provider_id,
-                message: followUp,
-              });
-            }
-
-            if (sent) {
-              const newFollowUpCount = (contact.follow_up_count || 0) + 1;
-              const followupDays     = deal?.followup_days_email || 3;
-
-              // If they've ghosted 2+ times, move to ghosted and let phaseOutreach pick up next person
-              if (newFollowUpCount >= 2) {
-                await setConversationState(contact.id, 'ghosted', {
-                  pipeline_stage:   'Inactive',
-                  follow_up_due_at: null,
-                });
-                info(`[TEMP_CLOSE] ${contact.name} ghosted after ${newFollowUpCount} touches — marked Inactive`);
-              } else {
-                await setConversationState(contact.id, 'awaiting_response', {
-                  follow_up_count:   newFollowUpCount,
-                  follow_up_due_at:  new Date(Date.now() + followupDays * 24 * 60 * 60 * 1000).toISOString(),
-                  temp_closed_at:    null,
-                  next_follow_up_due: null,
-                });
-              }
-
-              // Log to conversation_messages
-              await logConversationMessage({
-                contactId: contact.id,
-                dealId:    deal.id,
-                direction: 'outbound',
-                channel,
-                body:      followUp,
-              }).catch(() => {});
-
-              pushActivity({
-                type:      channel === 'email' ? 'email' : 'dm',
-                action:    `Re-engagement sent`,
-                note:      `${contact.name} @ ${contact.company_name || ''} (temp_close follow-up)`,
-                deal_name: deal.name,
-                dealId:    deal.id,
-              });
-
-              await sbLogActivity({
-                dealId:    deal.id,
-                contactId: contact.id,
-                eventType: 'TEMP_CLOSE_FOLLOWUP_SENT',
-                summary:   `Re-engagement sent to ${contact.name} after temp close`,
-                apiUsed:   'unipile',
-              });
-            }
-          } else {
-            await handleNonApproval(contact, decision.action);
-          }
-        } finally {
+        // Fire-and-forget: execution handled by executeReloadedApproval when user acts in Telegram
+        const sendResult = await sendEmailForApproval(contactPage, fakeDraft, contact.notes || '', contact.investor_score || 0, 'FOLLOW-UP', deal.id);
+        if (!sendResult?.queued) {
           contactsInFlight.delete(contact.id);
+          warn(`[TEMP_CLOSE] Failed to queue ${contact.name} for Telegram approval`);
         }
       } catch (err) {
         warn(`[TEMP_CLOSE] Failed to process ${contact.name}: ${err.message}`);
@@ -7809,7 +7774,17 @@ export async function phaseOutreach(deal, state) {
     .slice(0, 5);
 
   const contacts = [...emailContacts];
-  if (!contacts.length) { info(`[${deal.name}] phaseOutreach: no contacts ready (${respondedFirms.size} firms responded, ${activeFirms.size} firms active)`); return; }
+  if (!contacts.length) {
+    info(`[${deal.name}] phaseOutreach: no contacts ready (${respondedFirms.size} firms responded, ${activeFirms.size} firms active)`);
+    pushDealStatusOnce(deal, `outreach-no-contacts:${respondedFirms.size}:${activeFirms.size}`, {
+      type: 'system',
+      action: 'Pipeline: no email-ready contacts — checking if top-up needed',
+      note: `${deal.name} · ${respondedFirms.size} firms responded · ${activeFirms.size} firms active`,
+      deal_name: deal.name,
+      dealId: deal?.id,
+    });
+    return;
+  }
 
   console.log(`[ORCHESTRATOR] phaseOutreach: ${contacts.length} contacts for ${deal.name} (${emailContacts.length} email, ${respondedFirms.size} responded, ${activeFirms.size} active)`);
 
@@ -7884,7 +7859,16 @@ async function phaseFollowUps(deal, state) {
     return true;
   }).slice(0, 5);
 
-  if (!contacts?.length) return;
+  if (!contacts?.length) {
+    pushDealStatusOnce(deal, `followups-none-due`, {
+      type: 'system',
+      action: 'Follow-ups: no contacts due this cycle',
+      note: `${deal.name} · all follow-up timers pending`,
+      deal_name: deal.name,
+      dealId: deal?.id,
+    });
+    return;
+  }
 
   console.log(`[ORCHESTRATOR] phaseFollowUps: ${contacts.length} contacts due follow-up for ${deal.name}`);
 
@@ -8056,43 +8040,24 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
     dealId: deal?.id,
   });
 
-  try {
-    let decision = forceChannel === 'linkedin_dm'
-      ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
-          stage: linkedInApprovalStage,
-          researchSummary: researchSummary || null,
-        })
-      : await sendEmailForApproval(contactPage, draft, researchSummary || '', contact.investor_score || 0, stage, deal.id);
+  // Fire-and-forget: send to Telegram and return immediately.
+  // The contact is already marked pending_*_approval in DB and is in contactsInFlight.
+  // When the user approves/skips/edits in Telegram, handleCallbackQuery → resolveApproval
+  // → executeReloadedApproval handles execution without blocking this loop.
+  const sendResult = forceChannel === 'linkedin_dm'
+    ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
+        stage: linkedInApprovalStage,
+        researchSummary: researchSummary || null,
+      })
+    : await sendEmailForApproval(contactPage, draft, researchSummary || '', contact.investor_score || 0, stage, deal.id);
 
-    let editCount = 0;
-    while (decision.action === 'edit' && editCount < 3) {
-      editCount++;
-      draft = forceChannel === 'linkedin_dm'
-        ? await draftLinkedInDM(contactPage, researchContext, stage === 'INTRO' ? 'intro' : 'followup', {
-            deal,
-            conversationHistory: linkedinConversationHistory,
-            sequenceStepLabel,
-          })
-        : await draftEmail(contactPage, researchContext, stage, decision.instructions, { deal });
-      if (!draft) return;
-      decision = forceChannel === 'linkedin_dm'
-          ? await sendLinkedInDMForApproval(contact, draft.body, deal.id, {
-            stage: linkedInApprovalStage,
-            researchSummary: researchSummary || null,
-          })
-        : await sendEmailForApproval(contactPage, draft, researchSummary || '', contact.investor_score || 0, stage, deal.id);
-    }
-
-    if (decision.action === 'approve') {
-      await executeOutreach(contact, contactPage, draft, decision, stage, followUpNumber, deal, { forceChannel });
-    } else if (decision.action === 'missing_email') {
-      info(`[OUTREACH] ${contact.name} email approval suppressed — no usable email on record`);
-    } else {
-      await handleNonApproval(contact, decision.action);
-    }
-  } finally {
+  if (!sendResult?.queued) {
+    // Send failed — remove from in-flight so it can be retried next cycle
     contactsInFlight.delete(contact.id);
+    warn(`[OUTREACH] Failed to queue ${contact.name} for Telegram approval — will retry next cycle`);
   }
+  // Return immediately; contactsInFlight entry stays until executeReloadedApproval clears it
+  // (or until the next restart, at which point the DB pending_*_approval stage is the gate).
 }
 
 async function executeOutreach(contact, contactPage, draft, decision, stage, followUpNumber, deal, options = {}) {

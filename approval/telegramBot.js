@@ -421,62 +421,74 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       : `Reply: *APPROVE* | *EDIT [instructions]* | *SKIP* | *STOP*`,
   ].join('\n');
 
-  return new Promise(async (resolve) => {
-    try {
-      let queueRow = null;
-      queueRow = await addApprovalToQueue({
-        telegramMsgId: null,
+  // Non-blocking: send to Telegram and return immediately with { queued: true }.
+  // Approval resolution happens via handleCallbackQuery → resolveApproval → executeReloadedApproval.
+  try {
+    let queueRow = null;
+    queueRow = await addApprovalToQueue({
+      telegramMsgId: null,
+      dealId,
+      contactId: contactPage?.id,
+      contactName: name,
+      contactEmail,
+      firm,
+      stage,
+      score,
+      subjectA: emailDraft.subject,
+      subjectB: emailDraft.alternativeSubject,
+      body: emailDraft.body,
+      researchSummary: researchSummary || null,
+    }).catch(() => null);
+
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+    if (!sent?.message_id) throw new Error('Telegram approval message was not sent');
+
+    const queueId = queueRow?.id || null;
+    // Register with a no-op resolve — actual execution is handled by executeReloadedApproval
+    const entry = {
+      contactPage, contactEmail, emailDraft,
+      resolve: () => {},
+      score, stage, firm, name, dealId,
+      queuedAt: new Date().toISOString(),
+      queueId,
+      contactId: contactPage?.id || null,
+    };
+    pendingApprovals.set(sent.message_id, entry);
+    info(`Email draft sent to Telegram for approval: ${name}`);
+
+    // Log to dashboard activity feed and Supabase
+    import('../dashboard/server.js').then(({ pushActivity }) => {
+      pushActivity({
+        type: 'approval',
+        action: `${stageLabel} sent for approval`,
+        note: `${name} · ${firm}`,
+        deal_name: null,
         dealId,
-        contactId: contactPage?.id,
-        contactName: name,
-        contactEmail,
-        firm,
-        stage,
-        score,
-        subjectA: emailDraft.subject,
-        subjectB: emailDraft.alternativeSubject,
-        body: emailDraft.body,
-        researchSummary: researchSummary || null,
-      }).catch(() => null);
+      });
+    }).catch(() => {});
+    sbLogActivity({
+      dealId,
+      contactId: contactPage?.id || null,
+      eventType: 'APPROVAL_QUEUED',
+      summary: `${stageLabel} queued for approval: ${name} at ${firm}`,
+      detail: { stage: stageLabel, score, firm, contact_name: name },
+    }).catch(() => {});
 
-      const chatId = process.env.TELEGRAM_CHAT_ID;
-      const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
-      if (!sent?.message_id) throw new Error('Telegram approval message was not sent');
-      const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: queueRow?.id || null, contactId: contactPage?.id || null };
-      pendingApprovals.set(sent.message_id, entry);
-      info(`Email draft sent to Telegram for approval: ${name}`);
+    // Attach action buttons (done after send so we have the message_id)
+    editTelegramReplyMarkup(chatId, sent.message_id, buildKeyboard(sent.message_id, queueId)).catch(() => {});
 
-      // Log to dashboard activity feed and Supabase
-      import('../dashboard/server.js').then(({ pushActivity }) => {
-        pushActivity({
-          type: 'approval',
-          action: `${stageLabel} sent for approval`,
-          note: `${name} · ${firm}`,
-          deal_name: null,
-          dealId,
-        });
-      }).catch(() => {});
-      sbLogActivity({
-        dealId,
-        contactId: contactPage?.id || null,
-        eventType: 'APPROVAL_QUEUED',
-        summary: `${stageLabel} queued for approval: ${name} at ${firm}`,
-        detail: { stage: stageLabel, score, firm, contact_name: name },
-      }).catch(() => {});
-
-      // Attach action buttons (done after send so we have the message_id)
-      editTelegramReplyMarkup(chatId, sent.message_id, buildKeyboard(sent.message_id, queueRow?.id || null)).catch(() => {});
-
-      if (sb && queueRow?.id) {
-        await sb.from('approval_queue').update({
-          telegram_msg_id: sent.message_id,
-        }).eq('id', queueRow.id);
-      }
-    } catch (err) {
-      error('Failed to send draft to Telegram', { err: err.message });
-      resolve({ action: 'error' });
+    if (sb && queueId) {
+      sb.from('approval_queue').update({
+        telegram_msg_id: sent.message_id,
+      }).eq('id', queueId).then(null, () => {});
     }
-  });
+
+    return { queued: true, queueId };
+  } catch (err) {
+    error('Failed to send draft to Telegram', { err: err.message });
+    return { queued: false, action: 'error' };
+  }
 }
 
 /**
@@ -516,74 +528,78 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
     `Reply: *APPROVE* | *EDIT [instructions]* | *MANUAL* | *CLOSE*`,
   ].filter(Boolean).join('\n');
 
-  return new Promise(async (resolve) => {
-    try {
-      const sb = getSupabase();
-      if (!queueId && contact?.id) {
-        try {
-          const queueRow = await addApprovalToQueue({
-            dealId: dealId || null,
-            contactId: contact.id,
-            contactName: name,
-            contactEmail: contact.email || null,
-            firm,
-            stage,
-            body: body || '',
-            score,
-            researchSummary,
-            outreachMode: 'investor_outreach',
-          });
-          queueId = queueRow?.id || null;
-        } catch (err) {
-          warn('Could not create LinkedIn approval queue row', { err: err.message, contactId: contact.id });
-        }
-      }
-
-      const chatId = process.env.TELEGRAM_CHAT_ID;
-      const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
-      if (!sent?.message_id) throw new Error('Telegram LinkedIn approval message was not sent');
-      pendingApprovals.set(sent.message_id, {
-        name, firm, score, dealId,
-        isLinkedInDM: true,
-        contactId: contact.id || null,
-        stage,
-        emailDraft: { body, subject: null, alternativeSubject: null },
-        resolve,
-        contactPage: null,
-        queuedAt: new Date().toISOString(),
-        queueId,
-      });
-      editTelegramReplyMarkup(chatId, sent.message_id, buildLinkedInDMKeyboard(sent.message_id, queueId)).catch(() => {});
-      // Persist the Telegram message ID so that after a server restart the item
-      // can be found in the in-memory map (via reloadPendingInvestorApprovals) and
-      // reloadApprovalForTelegramMessage can match button presses on old messages.
-      if (sb && queueId) {
-        sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).then(null, () => {});
-      }
-      info(`LinkedIn DM draft sent to Telegram for approval: ${name}`);
-
-      // Log to dashboard activity feed and Supabase
-      import('../dashboard/server.js').then(({ pushActivity }) => {
-        pushActivity({
-          type: 'approval',
-          action: 'LinkedIn DM sent for approval',
-          note: `${name} · ${firm}`,
-          deal_name: null,
-          dealId,
+  // Non-blocking: send to Telegram and return immediately with { queued: true }.
+  // Approval resolution happens via handleCallbackQuery → resolveApproval → executeReloadedApproval.
+  try {
+    const sb = getSupabase();
+    if (!queueId && contact?.id) {
+      try {
+        const queueRow = await addApprovalToQueue({
+          dealId: dealId || null,
+          contactId: contact.id,
+          contactName: name,
+          contactEmail: contact.email || null,
+          firm,
+          stage,
+          body: body || '',
+          score,
+          researchSummary,
+          outreachMode: 'investor_outreach',
         });
-      }).catch(() => {});
-      sbLogActivity({
-        dealId: dealId || null,
-        contactId: contact.id || null,
-        eventType: 'APPROVAL_QUEUED',
-        summary: `LinkedIn DM queued for approval: ${name} at ${firm}`,
-        detail: { stage, score, firm, contact_name: name },
-      }).catch(() => {});
-    } catch (err) {
-      error('Failed to send LinkedIn DM draft to Telegram', { err: err.message });
-      resolve({ action: 'error' });
+        queueId = queueRow?.id || null;
+      } catch (err) {
+        warn('Could not create LinkedIn approval queue row', { err: err.message, contactId: contact.id });
+      }
     }
-  });
+
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+    if (!sent?.message_id) throw new Error('Telegram LinkedIn approval message was not sent');
+
+    // Register with a no-op resolve — actual execution is handled by executeReloadedApproval
+    pendingApprovals.set(sent.message_id, {
+      name, firm, score, dealId,
+      isLinkedInDM: true,
+      contactId: contact.id || null,
+      stage,
+      emailDraft: { body, subject: null, alternativeSubject: null },
+      resolve: () => {},
+      contactPage: null,
+      queuedAt: new Date().toISOString(),
+      queueId,
+    });
+    editTelegramReplyMarkup(chatId, sent.message_id, buildLinkedInDMKeyboard(sent.message_id, queueId)).catch(() => {});
+    // Persist the Telegram message ID so that after a server restart the item
+    // can be found in the in-memory map (via reloadPendingInvestorApprovals) and
+    // reloadApprovalForTelegramMessage can match button presses on old messages.
+    if (sb && queueId) {
+      sb.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueId).then(null, () => {});
+    }
+    info(`LinkedIn DM draft sent to Telegram for approval: ${name}`);
+
+    // Log to dashboard activity feed and Supabase
+    import('../dashboard/server.js').then(({ pushActivity }) => {
+      pushActivity({
+        type: 'approval',
+        action: 'LinkedIn DM sent for approval',
+        note: `${name} · ${firm}`,
+        deal_name: null,
+        dealId,
+      });
+    }).catch(() => {});
+    sbLogActivity({
+      dealId: dealId || null,
+      contactId: contact.id || null,
+      eventType: 'APPROVAL_QUEUED',
+      summary: `LinkedIn DM queued for approval: ${name} at ${firm}`,
+      detail: { stage, score, firm, contact_name: name },
+    }).catch(() => {});
+
+    return { queued: true, queueId };
+  } catch (err) {
+    error('Failed to send LinkedIn DM draft to Telegram', { err: err.message });
+    return { queued: false, action: 'error' };
+  }
 }
 
 function buildPriorChatKeyboard(approvalId) {
