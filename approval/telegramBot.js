@@ -25,6 +25,38 @@ async function telegramApiCall(method, body) {
   } catch { return null; }
 }
 
+function normalizeTelegramMessage(response) {
+  if (!response) return null;
+  if (response.message_id) return response;
+  if (response.result?.message_id) return response.result;
+  return null;
+}
+
+async function sendTelegramMessage(chatId, text, options = {}) {
+  if (!chatId) return null;
+  if (bot) return bot.sendMessage(chatId, text, options);
+
+  const payload = { chat_id: chatId, text };
+  if (options.parse_mode) payload.parse_mode = options.parse_mode;
+  if (options.reply_markup) payload.reply_markup = options.reply_markup;
+  return normalizeTelegramMessage(await telegramApiCall('sendMessage', payload));
+}
+
+async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
+  if (!chatId || !messageId || !replyMarkup) return null;
+  if (bot) {
+    return bot.editMessageReplyMarkup(replyMarkup, {
+      chat_id: chatId,
+      message_id: Number(messageId),
+    });
+  }
+  return telegramApiCall('editMessageReplyMarkup', {
+    chat_id: chatId,
+    message_id: Number(messageId),
+    reply_markup: JSON.stringify(replyMarkup),
+  });
+}
+
 export async function clearTelegramApprovalControls(messageId) {
   if (!messageId) return;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -34,7 +66,7 @@ export async function clearTelegramApprovalControls(messageId) {
       await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: Number(messageId) });
     } else {
       // Web service has no bot instance — call Telegram API directly
-      await telegramApiCall('editMessageReplyMarkup', { chat_id: chatId, message_id: Number(messageId), reply_markup: JSON.stringify({ inline_keyboard: [] }) });
+      await editTelegramReplyMarkup(chatId, messageId, { inline_keyboard: [] });
     }
   } catch {}
 }
@@ -408,7 +440,8 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       }).catch(() => null);
 
       const chatId = process.env.TELEGRAM_CHAT_ID;
-      const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+      if (!sent?.message_id) throw new Error('Telegram approval message was not sent');
       const entry = { contactPage, contactEmail, emailDraft, resolve, score, stage, firm, name, dealId, queuedAt: new Date().toISOString(), queueId: queueRow?.id || null, contactId: contactPage?.id || null };
       pendingApprovals.set(sent.message_id, entry);
       info(`Email draft sent to Telegram for approval: ${name}`);
@@ -432,10 +465,7 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
       }).catch(() => {});
 
       // Attach action buttons (done after send so we have the message_id)
-      bot.editMessageReplyMarkup(buildKeyboard(sent.message_id, queueRow?.id || null), {
-        chat_id: chatId,
-        message_id: sent.message_id,
-      }).catch(() => {});
+      editTelegramReplyMarkup(chatId, sent.message_id, buildKeyboard(sent.message_id, queueRow?.id || null)).catch(() => {});
 
       if (sb && queueRow?.id) {
         await sb.from('approval_queue').update({
@@ -454,7 +484,6 @@ export async function sendEmailForApproval(contactPage, emailDraft, researchSumm
  * Returns a Promise resolving to { action: 'approve'|'skip'|'error', body }.
  */
 export async function sendLinkedInDMForApproval(contact, body, dealId = null, options = {}) {
-  if (!bot) return { action: 'error' };
   const name = contact.name || 'Contact';
   const firm = contact.company_name || 'Unknown Firm';
   const score = contact.investor_score ?? null;
@@ -511,7 +540,8 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
       }
 
       const chatId = process.env.TELEGRAM_CHAT_ID;
-      const sent = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      const sent = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+      if (!sent?.message_id) throw new Error('Telegram LinkedIn approval message was not sent');
       pendingApprovals.set(sent.message_id, {
         name, firm, score, dealId,
         isLinkedInDM: true,
@@ -523,10 +553,7 @@ export async function sendLinkedInDMForApproval(contact, body, dealId = null, op
         queuedAt: new Date().toISOString(),
         queueId,
       });
-      bot.editMessageReplyMarkup(buildLinkedInDMKeyboard(sent.message_id, queueId), {
-        chat_id: chatId,
-        message_id: sent.message_id,
-      }).catch(() => {});
+      editTelegramReplyMarkup(chatId, sent.message_id, buildLinkedInDMKeyboard(sent.message_id, queueId)).catch(() => {});
       // Persist the Telegram message ID so that after a server restart the item
       // can be found in the in-memory map (via reloadPendingInvestorApprovals) and
       // reloadApprovalForTelegramMessage can match button presses on old messages.
@@ -575,7 +602,6 @@ function buildPriorChatKeyboard(approvalId) {
  * Decision is stored in DB; no Promise needed — handled via callback or dashboard.
  */
 export async function sendPriorChatForApproval({ contactName, firm, dealName, summary, messageCount, approvalId }) {
-  if (!bot) return;
   const msg = [
     `🔁 *Prior LinkedIn Chat Found*`,
     ``,
@@ -590,7 +616,8 @@ export async function sendPriorChatForApproval({ contactName, firm, dealName, su
 
   try {
     const chatId = process.env.TELEGRAM_CHAT_ID;
-    const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    const sent   = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+    if (!sent?.message_id) throw new Error('Telegram prior chat message was not sent');
     const sb = getSupabase();
     if (sb && approvalId) {
       try {
@@ -599,9 +626,7 @@ export async function sendPriorChatForApproval({ contactName, firm, dealName, su
         }).eq('id', approvalId);
       } catch {}
     }
-    await bot.editMessageReplyMarkup(buildPriorChatKeyboard(approvalId), {
-      chat_id: chatId, message_id: sent.message_id,
-    }).catch(() => {});
+    await editTelegramReplyMarkup(chatId, sent.message_id, buildPriorChatKeyboard(approvalId)).catch(() => {});
     info(`Prior chat review sent to Telegram for ${contactName} (approvalId: ${approvalId})`);
   } catch (err) {
     error('sendPriorChatForApproval failed', { err: err.message });
@@ -701,7 +726,6 @@ function buildReplyKeyboard(msgId) {
  * When approved, sends via Unipile automatically.
  */
 export async function sendReplyForApproval(queueItemId, contact, replyBody, contextName, channel, replyToId, emailAccountId, options = {}) {
-  if (!bot) return;
   const name        = contact?.name || 'Contact';
   const company     = contact?.company_name || '';
   const channelLbl  = channel === 'linkedin' ? 'LinkedIn' : 'Email';
@@ -731,7 +755,8 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
 
   try {
     const chatId = process.env.TELEGRAM_CHAT_ID;
-    const sent   = await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    const sent   = await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+    if (!sent?.message_id) throw new Error('Telegram reply approval message was not sent');
     if (queueItemId) {
       const sb = getSupabase();
       await sb?.from('approval_queue').update({ telegram_msg_id: sent.message_id }).eq('id', queueItemId).then(null, () => {});
@@ -760,9 +785,7 @@ export async function sendReplyForApproval(queueItemId, contact, replyBody, cont
       },
     });
 
-    await bot.editMessageReplyMarkup(buildReplyKeyboard(sent.message_id), {
-      chat_id: chatId, message_id: sent.message_id,
-    }).catch(() => {});
+    await editTelegramReplyMarkup(chatId, sent.message_id, buildReplyKeyboard(sent.message_id)).catch(() => {});
 
     info(`Reply draft sent to Telegram for approval: ${name}`);
   } catch (err) {

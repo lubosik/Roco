@@ -94,8 +94,48 @@ function extractJSONArray(text) {
 }
 
 function extractJSONObject(text) {
-  const match = String(text || '').match(/\{[\s\S]*\}/);
-  return match ? JSON.parse(match[0]) : null;
+  const str = String(text || '');
+  const cleaned = str.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+  if (!cleaned) return null;
+
+  const attempts = [];
+  if (cleaned.startsWith('{')) attempts.push(cleaned, repairJSON(cleaned));
+
+  const matches = [];
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (cleaned[i] === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        matches.push(cleaned.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  matches.sort((a, b) => b.length - a.length);
+  for (const candidate of matches) {
+    attempts.push(candidate, repairJSON(candidate));
+  }
+
+  for (const attempt of attempts) {
+    try {
+      return JSON.parse(attempt);
+    } catch {}
+  }
+
+  const findings = extractJSONArray(cleaned);
+  const summaryMatch = cleaned.match(/"search_summary"\s*:\s*"([^"]+)"/i);
+  if (findings.length || summaryMatch) {
+    return {
+      search_summary: summaryMatch?.[1]?.trim() || '',
+      findings,
+    };
+  }
+  return null;
 }
 
 function truncate(value, max = 180) {
