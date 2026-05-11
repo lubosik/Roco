@@ -308,7 +308,6 @@ export async function gatherCurrentMetrics(dealId) {
   const totalReplies = emailReplies + liDmReplies;
   const repliesLast7 = emailRepliesLast7 + liDmRepliesLast7;
 
-  // Positive replies = contacts who have replied and are NOT in a terminal negative state
   const positiveReplies = contacts.filter(row => {
     if (!row.last_reply_at && !row.reply_channel) return false;
     const stage = String(row.pipeline_stage || '').toLowerCase();
