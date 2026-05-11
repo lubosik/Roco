@@ -5988,6 +5988,7 @@ let _activityTotal   = 0;
 let _activityPages   = 1;
 let _activityLastServerEvents = [];
 let _activityLivePending = [];
+let _activityRenderSignature = '';
 
 function activityEventKey(event) {
   if (!event) return '';
@@ -6032,6 +6033,15 @@ function reconcilePendingActivity(events = []) {
   _activityLivePending = _activityLivePending.filter(event => !persistedKeys.has(activityEventKey(event)));
 }
 
+function getOpenActivityMessageKeys(container) {
+  if (!container) return new Set();
+  return new Set(
+    [...container.querySelectorAll('details[data-activity-full-message][open]')]
+      .map(node => node.dataset.activityFullMessage)
+      .filter(Boolean)
+  );
+}
+
 async function loadActivity(page = 1) {
   _activityPage = page;
   const dealId = document.getElementById('activity-deal-filter')?.value || activeDeal || '';
@@ -6067,6 +6077,14 @@ async function loadActivity(page = 1) {
 function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
   const container = document.getElementById('activity-feed');
   if (!container) return;
+  const openMessageKeys = getOpenActivityMessageKeys(container);
+  const renderSignature = JSON.stringify({
+    page: currentPage,
+    totalPages,
+    total,
+    keys: (events || []).map(activityEventKey),
+  });
+  if (renderSignature === _activityRenderSignature) return;
 
   const typeColors = {
     thinking: '#A78BFA', research: '#60A5FA', email: '#C9A84C',
@@ -6121,6 +6139,8 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     const fullContent = stringifyActivityField(event.full_content || '');
     const showFullMessage = fullContent && !isExpandedType && fullContent !== mainText && fullContent !== note;
 
+    const eventKey = activityEventKey(event);
+
     return `<div style="padding:10px 14px;background:rgba(${color === '#A78BFA' ? '167,139,250' : '138,134,128'},0.06);
                         border-left:3px solid ${color};border-radius:0 4px 4px 0;margin-bottom:5px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
@@ -6137,7 +6157,7 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
         ${esc(mainText)}
       </div>
       ${note ? `<div style="margin-top:3px;font-size:10px;color:#6b7280;font-family:'DM Mono',monospace">${esc(note)}</div>` : ''}
-      ${showFullMessage ? `<details style="margin-top:8px">
+      ${showFullMessage ? `<details data-activity-full-message="${esc(eventKey)}" ${openMessageKeys.has(eventKey) ? 'open' : ''} style="margin-top:8px">
         <summary style="cursor:pointer;color:#C9A84C;font-size:10px;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">View full message</summary>
         <div style="margin-top:6px;padding:8px;background:rgba(0,0,0,0.22);border:1px solid #242424;border-radius:6px;color:#D8D2C8;font-size:11px;line-height:1.55;white-space:pre-wrap;max-height:320px;overflow:auto">${esc(fullContent)}</div>
       </details>` : ''}
@@ -6165,6 +6185,7 @@ function renderPaginatedActivityLog(events, currentPage, totalPages, total) {
     ${eventsHtml}
     ${paginationHtml}
   `;
+  _activityRenderSignature = renderSignature;
 }
 
 // Live WS: prepend new event to activity page when on page 1

@@ -419,13 +419,18 @@ export async function runFundraiserReasoning(deal, context = {}, pushActivity = 
   const goalAnalysis = calculateGoalTracking(deal, metrics);
   const lowPipeline = normalizeNumber(metrics.firms_in_pipeline, 0) < 25;
   const waitingOnReplies = normalizeNumber(metrics.li_pending, 0) > 40 && normalizeNumber(metrics.firms_in_pipeline, 0) >= 100;
+  const outreachDay = !goalAnalysis.is_weekend_local;
 
   const directives = {
     allowResearch: true,
-    allowOutreach: !waitingOnReplies,
+    allowOutreach: true,
     allowFollowUps: true,
     researchReason: lowPipeline ? 'Pipeline needs more qualified firms' : 'Maintain research flow',
-    outreachReason: waitingOnReplies ? 'Waiting on outstanding LinkedIn accepts and replies before adding more outbound' : 'Outreach can proceed',
+    outreachReason: waitingOnReplies
+      ? (outreachDay
+        ? 'Weekday outreach remains active while outstanding LinkedIn accepts and replies are worked in parallel'
+        : 'Outstanding LinkedIn accepts and replies are accumulating')
+      : 'Outreach can proceed',
     followUpReason: 'Follow-ups remain active',
   };
 
