@@ -7317,13 +7317,19 @@ export async function phaseOutreach(deal, state) {
     if (['Email Sent', 'email_sent'].includes(c.pipeline_stage) && c.last_email_sent_at) {
       return (Date.now() - new Date(c.last_email_sent_at).getTime()) > EMAIL_STALE_DAYS * 86400000;
     }
+    // Catch-all: any contact with a recorded email send date (regardless of current stage)
+    // that's older than the patience window is stale — don't block the firm's email lane
+    if (c.last_email_sent_at) {
+      return (Date.now() - new Date(c.last_email_sent_at).getTime()) > EMAIL_STALE_DAYS * 86400000;
+    }
     return false;
   };
 
   const { data: firmGateContacts } = await sb.from('contacts')
     .select('id, company_name, pipeline_stage, response_received, conversation_state, last_email_sent_at, invite_sent_at, dm_sent_at')
     .eq('deal_id', deal.id)
-    .not('company_name', 'is', null);
+    .not('company_name', 'is', null)
+    .limit(5000);
 
   const respondedFirms = new Set();
   const activeFirms    = new Set(); // email-channel blocks only
@@ -8054,10 +8060,14 @@ async function phaseFollowUps(deal, state) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function handleOutreachApproval(contact, stage, followUpNumber, deal, options = {}) {
-  if (contactsInFlight.has(contact.id)) return;
+  if (contactsInFlight.has(contact.id)) {
+    info(`[OUTREACH GATE] ${contact.name} — blocked: contactsInFlight`);
+    return;
+  }
   const sb = getSupabase();
   if (!sb) return;
   const forceChannel = options.forceChannel || 'email';
+  info(`[OUTREACH GATE] ${contact.name} (${contact.company_name || 'no firm'}) — attempting ${forceChannel} approval`);
 
   // DB-level dedup: if there's already an active approval for this contact+deal,
   // don't draft again. This survives restarts (contactsInFlight is in-memory only).
@@ -8073,7 +8083,7 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
         .limit(1)
         .maybeSingle();
       if (existingApproval) {
-        info(`[OUTREACH] Skipping ${contact.name} — active approval already in queue (${existingApproval.stage} / ${existingApproval.status})`);
+        info(`[OUTREACH GATE] ${contact.name} — blocked: DB approval exists (${existingApproval.stage}/${existingApproval.status})`);
         contactsInFlight.add(contact.id); // keep in-memory gate consistent
         return;
       }
@@ -8090,7 +8100,7 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
         .select('id', { count: 'exact', head: true })
         .eq('status', 'pending');
       if (globalPendingCount > 0) {
-        info(`[OUTREACH] Telegram gate — ${globalPendingCount} approval(s) pending, holding ${contact.name} until resolved`);
+        info(`[OUTREACH GATE] ${contact.name} — blocked: Telegram gate (${globalPendingCount} pending approval(s))`);
         return;
       }
     }
@@ -8124,13 +8134,13 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
     return null;
   });
   if (firmBlock) {
-    info(`[OUTREACH] ${contact.name} held by firm waterfall — ${formatFirmWaterfallBlock(firmBlock)}`);
+    info(`[OUTREACH GATE] ${contact.name} — blocked: firm waterfall (${formatFirmWaterfallBlock(firmBlock)})`);
     return;
   }
 
   const verifiedContact = await ensureVerifiedResearchBeforeDraft(contact, deal, forceChannel);
   if (!verifiedContact) {
-    info(`[OUTREACH] ${contact.name} not verified enough to draft yet — deferring`);
+    info(`[OUTREACH GATE] ${contact.name} — blocked: research not verified enough`);
     return;
   }
   contact = verifiedContact;
@@ -8158,6 +8168,7 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
   const researchContext = buildContactResearchContext(contact);
   const researchSummary = buildResearchSummary(contact);
 
+  info(`[OUTREACH GATE] ${contact.name} — all gates passed, drafting ${forceChannel}`);
   let draft = forceChannel === 'linkedin_dm'
     ? await draftLinkedInDM(contactPage, researchContext, stage === 'INTRO' ? 'intro' : 'followup', {
         deal,
@@ -8166,7 +8177,7 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
       })
     : await draftEmailWithTemplate(contactPage, researchContext, stage, deal, effectiveInstructions);
   if (!draft) {
-    error(`[OUTREACH] Draft generation failed for ${contact.name}`);
+    error(`[OUTREACH GATE] ${contact.name} — draft generation failed`);
     return;
   }
 

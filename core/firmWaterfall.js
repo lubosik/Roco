@@ -74,7 +74,8 @@ export async function getFirmWaterfallBlock({
     }
     if (SENT_LINKEDIN_STAGES.has(row.pipeline_stage)) {
       const sentAt = row.dm_sent_at || row.invite_accepted_at || row.invite_sent_at || row.last_outreach_at;
-      if (!sentAt || newerThan(sentAt, linkedinDays, now)) {
+      // null sentAt = no date recorded → treat as stale, do not block
+      if (sentAt && newerThan(sentAt, linkedinDays, now)) {
         return { ...describeContactBlock(row), reason: 'linkedin_patience_window' };
       }
     }
