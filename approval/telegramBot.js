@@ -1286,15 +1286,23 @@ function resolveApproval(msgId, approval, action, extra = {}) {
     setTimeout(() => recentlyResolvedQueueIds.delete(String(approval.queueId)), 12_000);
     updateApprovalStatus(approval.queueId, status, subject).catch(() => {});
   }
-  if (action !== 'approve' && approval.isLinkedInDM && approval.contactId) {
+  if (action !== 'approve' && approval.contactId) {
     const sb = getSupabase();
     if (sb) {
-      sb.from('contacts').update({
-        pipeline_stage: 'Skipped',
-        pending_linkedin_dm: false,
-        follow_up_due_at: null,
-        updated_at: new Date().toISOString(),
-      }).eq('id', approval.contactId).then(null, () => {});
+      if (approval.isLinkedInDM) {
+        sb.from('contacts').update({
+          pipeline_stage: 'Skipped',
+          pending_linkedin_dm: false,
+          follow_up_due_at: null,
+          updated_at: new Date().toISOString(),
+        }).eq('id', approval.contactId).then(null, () => {});
+      } else {
+        // Email skip: reset to Enriched so it can be re-drafted next cycle
+        sb.from('contacts').update({
+          pipeline_stage: 'Enriched',
+          updated_at: new Date().toISOString(),
+        }).eq('id', approval.contactId).then(null, () => {});
+      }
     }
   }
   import('../dashboard/server.js').then(({ pushActivity, notifyQueueUpdated }) => {

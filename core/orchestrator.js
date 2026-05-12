@@ -4632,10 +4632,77 @@ async function enrichSingleFirm(firm, deal, batch, state) {
   }
 }
 
+async function selfHealPipeline(deal) {
+  const sb = getSupabase();
+  if (!sb) return;
+  const now = new Date().toISOString();
+  const stuckSendingCutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+
+  try {
+    // A: DM Approved with no linkedin_provider_id — can never send, reset to Skipped
+    const { data: orphanedDMs } = await sb.from('contacts')
+      .select('id, name, company_name')
+      .eq('deal_id', deal.id)
+      .eq('pipeline_stage', 'DM Approved')
+      .is('linkedin_provider_id', null)
+      .is('dm_sent_at', null);
+    for (const c of orphanedDMs || []) {
+      await sb.from('contacts').update({ pipeline_stage: 'Skipped', updated_at: now }).eq('id', c.id);
+      await sb.from('approval_queue')
+        .update({ status: 'failed', edit_instructions: 'Self-healed: DM Approved with no linkedin_provider_id' })
+        .eq('contact_id', c.id).eq('deal_id', deal.id)
+        .in('status', ['sending', 'approved', 'approved_waiting_for_window', 'pending']);
+      contactsInFlight.delete(c.id);
+      warn(`[SELF-HEAL] ${c.name} (${c.company_name}): DM Approved, no provider ID → Skipped`);
+    }
+
+    // B: Email Approved with no active queue row — reset to Enriched
+    const { data: orphanedEmails } = await sb.from('contacts')
+      .select('id, name, company_name')
+      .eq('deal_id', deal.id)
+      .eq('pipeline_stage', 'Email Approved')
+      .is('last_email_sent_at', null);
+    for (const c of orphanedEmails || []) {
+      const { count: activeQueueCount } = await sb.from('approval_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('contact_id', c.id)
+        .in('status', ['approved', 'approved_waiting_for_window', 'sending']);
+      if ((activeQueueCount || 0) > 0) continue;
+      await sb.from('contacts').update({ pipeline_stage: 'Enriched', updated_at: now }).eq('id', c.id);
+      contactsInFlight.delete(c.id);
+      warn(`[SELF-HEAL] ${c.name} (${c.company_name}): Email Approved, no active queue row → Enriched`);
+    }
+
+    // C: Queue rows stuck in 'sending' > 15 min — fail them + reset contact stage
+    const { data: stuckSending } = await sb.from('approval_queue')
+      .select('id, contact_id, contact_name, firm, stage')
+      .eq('deal_id', deal.id)
+      .eq('status', 'sending')
+      .lt('updated_at', stuckSendingCutoff);
+    for (const row of stuckSending || []) {
+      await sb.from('approval_queue')
+        .update({ status: 'failed', edit_instructions: 'Self-healed: stuck in sending > 15 min' })
+        .eq('id', row.id);
+      if (row.contact_id) {
+        await sb.from('contacts')
+          .update({ pipeline_stage: 'Enriched', updated_at: now })
+          .eq('id', row.contact_id)
+          .in('pipeline_stage', ['DM Approved', 'Email Approved', 'pending_dm_approval', 'pending_email_approval']);
+        contactsInFlight.delete(row.contact_id);
+      }
+      warn(`[SELF-HEAL] Queue ${row.id} for ${row.contact_name} (${row.firm}): stuck sending > 15 min → failed, contact reset`);
+    }
+
+  } catch (err) {
+    warn(`[SELF-HEAL] selfHealPipeline error: ${err.message}`);
+  }
+}
+
 async function runApprovedOutreach(deal, batch, state, directives = null) {
   const sb = getSupabase();
   if (!sb) return;
 
+  await selfHealPipeline(deal);
   await repairUnqualifiedOutreachQueue(deal);
   await phaseRank(deal, state);
   await phaseArchive(deal, state);
