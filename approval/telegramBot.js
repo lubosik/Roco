@@ -1064,10 +1064,12 @@ async function handleCallbackQuery(query) {
     resolveApproval(msgId, approval, 'approve', { variant, subject });
     processingApprovals.delete(msgId);
     await bot.sendMessage(chatId, `✅ Email approved for *${approval.name}* with Subject ${variant}. Sending now…`, { parse_mode: 'Markdown' });
-    // Trigger immediate send — don't wait for the 60s flush timer
-    import('../core/orchestrator.js').then(({ flushApprovedEmailsNow }) => {
-      flushApprovedEmailsNow?.().catch(() => {});
-    }).catch(() => {});
+    // Trigger immediate send — 500ms delay ensures DB write commits before flush reads
+    setTimeout(() => {
+      import('../core/orchestrator.js').then(({ flushApprovedEmailsNow }) => {
+        flushApprovedEmailsNow?.().catch(() => {});
+      }).catch(() => {});
+    }, 500);
 
   } else if (action === 'sa') {
     // LinkedIn DM — single approve button

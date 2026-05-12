@@ -776,6 +776,16 @@ export async function flushApprovedEmailsNow() {
   const sb = getSupabase();
   if (!sb) return;
 
+  // Reset any items stuck in 'sending' for > 5 min (crashed mid-send, claim never completed)
+  await sb.from('approval_queue').update({
+    status: 'approved_waiting_for_window',
+    edit_instructions: 'Auto-recovered from stuck sending state',
+  })
+    .eq('status', 'sending')
+    .is('message_type', null)
+    .lt('updated_at', new Date(Date.now() - 5 * 60 * 1000).toISOString())
+    .catch(() => {});
+
   // Fetch all deals with approved emails pending
   const { data: pendingItems } = await sb.from('approval_queue')
     .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
@@ -828,13 +838,18 @@ export async function flushApprovedEmailsNow() {
 
       try {
         const { data: contact } = await sb.from('contacts').select('*').eq('id', item.contact_id).maybeSingle();
-        if (!contact || String(contact.deal_id || '') !== String(deal.id)) continue;
-        if (!contact?.email) throw new Error('No email on contact');
+        if (!contact || String(contact.deal_id || '') !== String(deal.id)) {
+          // Reset so it's not stuck forever as 'sending'
+          await sb.from('approval_queue').update({ status: 'approved_waiting_for_window' }).eq('id', item.id).catch(() => {});
+          continue;
+        }
+        const toEmail = contact?.email || item.contact_email;
+        if (!toEmail) throw new Error('No email on contact or approval queue item');
 
         const subject = item.approved_subject || item.subject_a || item.subject || '';
         const body = item.edited_body || item.body || '';
         const emailResult = await unipileSendEmail({
-          to: contact.email,
+          to: toEmail,
           toName: contact.name,
           subject,
           body,
@@ -865,7 +880,7 @@ export async function flushApprovedEmailsNow() {
         await persistOutboundEmailRecord({ sb, deal, contact, subject, result: emailResult, stage: item.stage, status: 'sent' }).catch(() => {});
 
         pushActivity({ type: 'email', action: 'Email sent', note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}${subject ? ` · "${sanitizeOutreach(subject)}"` : ''}`, deal_name: deal?.name, dealId: deal?.id });
-        await sbLogActivity({ dealId: deal?.id, contactId: contact.id, eventType: 'EMAIL_SENT', summary: `Email sent to ${contact.name} @ ${contact.company_name || ''}`, detail: { subject, stage: item.stage, channel: 'email', to: contact.email } }).catch(() => {});
+        await sbLogActivity({ dealId: deal?.id, contactId: contact.id, eventType: 'EMAIL_SENT', summary: `Email sent to ${contact.name} @ ${contact.company_name || ''}`, detail: { subject, stage: item.stage, channel: 'email', to: toEmail } }).catch(() => {});
         sendTelegram(`✅ *Email sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subject ? `\nSubject: _${sanitizeOutreach(subject)}_` : ''}`).catch(() => {});
         notifyQueueUpdated();
 
