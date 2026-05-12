@@ -70,7 +70,7 @@ const ORCHESTRATOR_INSTANCE_ID = process.env.ROCO_INSTANCE_ID
   || process.env.RAILWAY_REPLICA_ID
   || process.env.RAILWAY_DEPLOYMENT_ID
   || `local-${process.pid}`;
-const ORCHESTRATOR_LEASE_MS = Math.max(ORCHESTRATOR_INTERVAL_MS * 3, 90_000);
+const ORCHESTRATOR_LEASE_MS = Math.max(ORCHESTRATOR_INTERVAL_MS * 2, 90_000);
 
 /** Strip em-dashes (and similar fancy punctuation) from outreach text. */
 function sanitizeOutreach(text) {
@@ -716,7 +716,7 @@ async function flushApprovedEmailsNow() {
     .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
     .in('status', ['approved', 'approved_waiting_for_window'])
     .is('message_type', null)  // plain email approvals only (not replies, not linkedin)
-    .order('resolved_at', { ascending: true })
+    .order('resolved_at', { ascending: true, nullsFirst: true })
     .limit(10);
 
   if (!pendingItems?.length) return;
@@ -726,13 +726,21 @@ async function flushApprovedEmailsNow() {
   const deals = await getActiveDeals().catch(() => []);
 
   for (const dealId of dealIds) {
-    const deal = deals.find(d => String(d.id) === String(dealId));
+    let deal = deals.find(d => String(d.id) === String(dealId));
+    if (!deal) {
+      // getActiveDeals() may have failed — fetch this specific deal directly
+      try {
+        const { data } = await sb.from('deals').select('*').eq('id', dealId).maybeSingle();
+        deal = data || null;
+      } catch {}
+    }
     if (!deal) continue;
     if (!isWithinChannelWindow(deal, 'email')) continue;
 
     const items = pendingItems.filter(i => String(i.deal_id) === String(dealId));
     for (const item of items) {
       if (isLinkedInStageLabel(item.stage)) continue;
+      if (String(item.channel || '').toLowerCase() === 'linkedin') continue;
       if (!item.contact_id) continue;
 
       const firmBlock = await getFirmWaterfallBlock({
@@ -7817,7 +7825,7 @@ export async function phaseOutreach(deal, state) {
       .select('id, contact_id, candidate_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
       .or(`deal_id.eq.${deal.id},deal_id.is.null`)
       .in('status', ['approved', 'approved_waiting_for_window'])
-      .order('resolved_at', { ascending: true })
+      .order('resolved_at', { ascending: true, nullsFirst: true })
       .limit(10);
 
     for (const item of approvedEmails || []) {
@@ -7834,6 +7842,7 @@ export async function phaseOutreach(deal, state) {
         continue;
       }
       if (isLinkedInStageLabel(item.stage)) continue;
+      if (String(item.channel || '').toLowerCase() === 'linkedin') continue;
       if (!item.contact_id) continue;
 
       const firmBlock = await getFirmWaterfallBlock({

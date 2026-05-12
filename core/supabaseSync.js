@@ -846,7 +846,7 @@ export async function updateApprovalStatus(id, status, approvedSubject = null) {
   const sb = getSupabase();
   if (!sb) return;
   try {
-    const updates = { status };
+    const updates = { status, resolved_at: new Date().toISOString() };
     if (approvedSubject) updates.approved_subject = approvedSubject;
     // Only transition from 'pending' → approved/skipped.  Never overwrite
     // 'approved_waiting_for_window', 'sending', or 'sent' — those are
