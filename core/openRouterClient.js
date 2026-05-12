@@ -51,6 +51,9 @@ function recordFailure(tier) {
   }
 }
 
+// Hard timeout per API attempt — prevents a hung fetch from stalling the orchestrator cycle
+const API_TIMEOUT_MS = 90_000;
+
 // ── Retry helper ──────────────────────────────────────────────────────────────
 async function withRetry(fn, label, maxAttempts = 3) {
   const delays = [5_000, 15_000, 45_000];
@@ -86,6 +89,7 @@ async function anthropicDirect(messages, { maxTokens = 500, model = 'claude-haik
   if (systemPrompt) body.system = systemPrompt;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
@@ -130,6 +134,7 @@ export async function orComplete(prompt, {
       const text = await withRetry(async () => {
         const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
+          signal: AbortSignal.timeout(API_TIMEOUT_MS),
           headers: {
             'Authorization': `Bearer ${orKey}`,
             'Content-Type': 'application/json',

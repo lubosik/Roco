@@ -4985,6 +4985,19 @@ async function runDealCycle(deal, state) {
     persist: false,
   });
 
+  // Hard wall: if the full deal cycle takes longer than 8 minutes, abort it and
+  // let the next orchestrator interval start fresh. Prevents a single hung API
+  // call from blocking the entire loop for hours.
+  const CYCLE_TIMEOUT_MS = 8 * 60 * 1000;
+  let cycleTimedOut = false;
+  const cycleTimeoutHandle = setTimeout(() => {
+    cycleTimedOut = true;
+    const msg = `[${deal.name}] Deal cycle exceeded ${CYCLE_TIMEOUT_MS / 60000}min hard limit — aborting to unblock loop`;
+    console.error(msg);
+    pushActivity({ type: 'error', action: 'Cycle Timeout', note: `${deal.name} — cycle exceeded 8min, auto-recovered`, deal_name: deal.name, dealId: deal.id });
+    dealCycleLocks.delete(deal.id);
+  }, CYCLE_TIMEOUT_MS);
+
   try {
 
   // ── 1. FUNDRAISER BRAIN — reason first, then act ──────────────────────────
@@ -5110,7 +5123,8 @@ async function runDealCycle(deal, state) {
       sendTelegram(`⚠️ *${deal.name} auto-paused*\n5 consecutive cycle errors. Cooling down for 5 minutes.\n\nLast error: ${cycleErr.message.substring(0, 200)}`).catch(() => {});
     }
   } finally {
-    dealCycleLocks.delete(deal.id);
+    clearTimeout(cycleTimeoutHandle);
+    if (!cycleTimedOut) dealCycleLocks.delete(deal.id);
   }
 }
 
