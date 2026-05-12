@@ -815,7 +815,22 @@ async function runLoop() {
       } else {
         const state = await loadState();
         if (state.roco_status === 'ACTIVE') {
+          const prior = await readGlobalRuntimeSetting('CYCLE_STATUS').catch(() => ({}));
+          const cycleStart = Date.now();
+          writeGlobalRuntimeSetting('CYCLE_STATUS', {
+            ...(prior || {}),
+            running: true,
+            started_at: new Date(cycleStart).toISOString(),
+            next_cycle_at: null,
+          }).catch(() => {});
           await runCycle(state);
+          const nextAt = cycleStart + ORCHESTRATOR_INTERVAL_MS;
+          writeGlobalRuntimeSetting('CYCLE_STATUS', {
+            running: false,
+            started_at: new Date(cycleStart).toISOString(),
+            last_completed_at: new Date().toISOString(),
+            next_cycle_at: new Date(nextAt).toISOString(),
+          }).catch(() => {});
         } else {
           info(`Orchestrator ${state.roco_status} — waiting...`);
           pushActivity({

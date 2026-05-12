@@ -49,6 +49,7 @@ import {
   classifyPersonResearch,
   hasVerifiedPersonResearch,
 } from '../research/personResearcher.js';
+import { readGlobalRuntimeSetting } from '../core/runtimeCoordination.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, '../state.json');
@@ -4781,6 +4782,16 @@ function registerRoutes(app) {
 
     notifyQueueUpdated();
     res.json({ success: true, message: 'Draft updated' });
+  });
+
+  // GET /api/cycle-status — orchestrator cycle timing (cross-service via Supabase)
+  app.get('/api/cycle-status', requireAuth, async (req, res) => {
+    try {
+      const status = await readGlobalRuntimeSetting('CYCLE_STATUS').catch(() => null);
+      res.json(status || { running: false, next_cycle_at: null, last_completed_at: null });
+    } catch (err) {
+      res.json({ running: false, next_cycle_at: null, last_completed_at: null });
+    }
   });
 
   // GET /api/health — API health status + process diagnostics

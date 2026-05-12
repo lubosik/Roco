@@ -94,10 +94,70 @@ let investorProfileContactId = null;
 let investorProfileDealId = null;
 let transcriptDealContacts = [];
 
+/* ─── Cycle countdown ─────────────────────────────────────────────────────── */
+let _cycleNextAt = null;
+let _cycleRunning = false;
+let _cycleCountdownTimer = null;
+
+async function fetchCycleStatus() {
+  try {
+    const res = await fetch('/api/cycle-status');
+    if (!res.ok) return;
+    const data = await res.json();
+    _cycleRunning = !!data.running;
+    _cycleNextAt = data.next_cycle_at ? new Date(data.next_cycle_at).getTime() : null;
+    updateCycleDisplay();
+  } catch (_) {}
+}
+
+function updateCycleDisplay() {
+  const dot = document.getElementById('cycle-dot');
+  const label = document.getElementById('cycle-label');
+  if (!dot || !label) return;
+
+  if (_cycleRunning) {
+    dot.className = 'cycle-dot running';
+    label.textContent = 'Cycle running…';
+    return;
+  }
+
+  if (!_cycleNextAt) {
+    dot.className = 'cycle-dot idle';
+    label.textContent = 'Waiting for cycle';
+    return;
+  }
+
+  const remaining = _cycleNextAt - Date.now();
+  if (remaining <= 0) {
+    const overdueSec = Math.abs(Math.round(remaining / 1000));
+    if (overdueSec > 120) {
+      dot.className = 'cycle-dot stale';
+      label.textContent = `Cycle overdue ${Math.round(overdueSec / 60)}m`;
+    } else {
+      dot.className = 'cycle-dot running';
+      label.textContent = 'Cycle starting…';
+    }
+    return;
+  }
+
+  const totalSec = Math.round(remaining / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  dot.className = 'cycle-dot idle';
+  label.textContent = `Next cycle ${m}:${String(s).padStart(2, '0')}`;
+}
+
+function startCycleCountdown() {
+  fetchCycleStatus();
+  setInterval(fetchCycleStatus, 15_000);
+  _cycleCountdownTimer = setInterval(updateCycleDisplay, 1000);
+}
+
 /* ─── INIT ───────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   initRouter();
   startClock();
+  startCycleCountdown();
   connectWebSocket();
   loadState();
   refreshStats();

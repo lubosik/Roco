@@ -2319,3 +2319,39 @@ body.jarvis-engaged #jarvis-orb {
   #jarvis-orb            { bottom: 16px; right: 16px; }
   #jarvis-status-label   { right: 16px; }
 }
+
+/* ── Cycle status countdown ───────────────────────────── */
+.cycle-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 20px;
+  font-family: 'DM Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: rgba(232, 228, 217, 0.45);
+  white-space: nowrap;
+}
+.cycle-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(232, 228, 217, 0.2);
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+.cycle-dot.running {
+  background: #d4a847;
+  box-shadow: 0 0 6px rgba(212, 168, 71, 0.6);
+  animation: cyclePulse 1.2s ease-in-out infinite;
+}
+.cycle-dot.idle {
+  background: rgba(232, 228, 217, 0.3);
+}
+.cycle-dot.stale {
+  background: #c0392b;
+}
+@keyframes cyclePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

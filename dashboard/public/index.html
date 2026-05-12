@@ -110,6 +110,10 @@
       <div class="topbar-left">
         <div class="topbar-clock" id="clock">--:--:--</div>
         <div class="topbar-date" id="topbar-date"></div>
+        <div class="cycle-status" id="cycle-status" title="Orchestrator cycle timing">
+          <span class="cycle-dot" id="cycle-dot"></span>
+          <span class="cycle-label" id="cycle-label">Loading…</span>
+        </div>
         <button onclick="fetch('/logout',{method:'POST'}).then(()=>window.location.href='/')" style="background:none;border:1px solid rgba(212,168,71,0.2);border-radius:3px;color:rgba(232,228,217,0.35);font-family:'DM Mono',monospace;font-size:10px;letter-spacing:0.12em;text-transform:uppercase;padding:4px 10px;cursor:pointer;margin-left:16px;transition:color 0.2s,border-color 0.2s;flex-shrink:0" onmouseover="this.style.color='#d4a847';this.style.borderColor='rgba(212,168,71,0.45)'" onmouseout="this.style.color='rgba(232,228,217,0.35)';this.style.borderColor='rgba(212,168,71,0.2)'">Sign out</button>
       </div>
       <div class="topbar-center">
