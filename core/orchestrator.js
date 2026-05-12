@@ -806,8 +806,13 @@ async function flushApprovedEmailsNow() {
   }
 }
 
+// Hard wall on the ENTIRE cycle (not just runDealCycle) — prevents runDailyNewsScanCycle,
+// runDailyActivityDigestCycle, or any other phase from hanging the loop indefinitely.
+const GLOBAL_CYCLE_TIMEOUT_MS = 9 * 60 * 1000; // 9 minutes — loop sleeps 10min after
+
 async function runLoop() {
   while (true) {
+    let cycleStart = Date.now();
     try {
       const hasLease = await acquireOrchestratorLease();
       if (!hasLease) {
@@ -815,22 +820,37 @@ async function runLoop() {
       } else {
         const state = await loadState();
         if (state.roco_status === 'ACTIVE') {
+          cycleStart = Date.now();
           const prior = await readGlobalRuntimeSetting('CYCLE_STATUS').catch(() => ({}));
-          const cycleStart = Date.now();
           writeGlobalRuntimeSetting('CYCLE_STATUS', {
             ...(prior || {}),
             running: true,
             started_at: new Date(cycleStart).toISOString(),
             next_cycle_at: null,
           }).catch(() => {});
-          await runCycle(state);
-          const nextAt = cycleStart + ORCHESTRATOR_INTERVAL_MS;
-          writeGlobalRuntimeSetting('CYCLE_STATUS', {
-            running: false,
-            started_at: new Date(cycleStart).toISOString(),
-            last_completed_at: new Date().toISOString(),
-            next_cycle_at: new Date(nextAt).toISOString(),
-          }).catch(() => {});
+
+          try {
+            // Race the full cycle against a hard 9-minute wall so runLoop always
+            // continues even if a sub-phase (news scan, digest, brain) hangs.
+            await Promise.race([
+              runCycle(state),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Global cycle timeout (9min)')), GLOBAL_CYCLE_TIMEOUT_MS)
+              ),
+            ]);
+          } catch (cycleErr) {
+            error(`[ORCHESTRATOR] Cycle error/timeout: ${cycleErr.message}`);
+          } finally {
+            // Always mark cycle complete and set next_cycle_at from NOW (not from cycleStart)
+            // so the countdown is accurate regardless of how long the cycle took.
+            const nextAt = Date.now() + ORCHESTRATOR_INTERVAL_MS;
+            writeGlobalRuntimeSetting('CYCLE_STATUS', {
+              running: false,
+              started_at: new Date(cycleStart).toISOString(),
+              last_completed_at: new Date().toISOString(),
+              next_cycle_at: new Date(nextAt).toISOString(),
+            }).catch(() => {});
+          }
         } else {
           info(`Orchestrator ${state.roco_status} — waiting...`);
           pushActivity({
@@ -841,7 +861,15 @@ async function runLoop() {
         }
       }
     } catch (err) {
-      error('Orchestrator cycle threw unexpectedly', { err: err.message, stack: err.stack });
+      error('Orchestrator loop threw unexpectedly', { err: err.message, stack: err.stack });
+      // Still write a next_cycle_at so the dashboard doesn't show "stale" after an error
+      const nextAt = Date.now() + ORCHESTRATOR_INTERVAL_MS;
+      writeGlobalRuntimeSetting('CYCLE_STATUS', {
+        running: false,
+        started_at: new Date(cycleStart).toISOString(),
+        last_completed_at: new Date().toISOString(),
+        next_cycle_at: new Date(nextAt).toISOString(),
+      }).catch(() => {});
     }
     await sleep(ORCHESTRATOR_INTERVAL_MS);
   }
@@ -896,8 +924,9 @@ async function runCycle(state) {
   try {
     const deals = await getActiveDeals();
     await implementPendingDailyLogActions(deals);
-    await runDailyNewsScanCycle(deals);
-    await runDailyActivityDigestCycle(deals);
+    // 2-minute individual caps so neither phase can eat the full cycle budget
+    await Promise.race([runDailyNewsScanCycle(deals), new Promise((_, r) => setTimeout(() => r(new Error('newsScan timeout')), 2 * 60_000))]).catch(e => console.warn('[runCycle] newsScan:', e.message));
+    await Promise.race([runDailyActivityDigestCycle(deals), new Promise((_, r) => setTimeout(() => r(new Error('activityDigest timeout')), 2 * 60_000))]).catch(e => console.warn('[runCycle] activityDigest:', e.message));
 
     if (deals.length > 0) {
       const ordered = [...deals].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
