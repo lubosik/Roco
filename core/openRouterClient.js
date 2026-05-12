@@ -14,6 +14,22 @@
 
 import { pushActivity } from '../dashboard/server.js';
 
+// ── Telegram alert helpers ────────────────────────────────────────────────────
+const ALERT_COOLDOWN_MS = 2 * 60 * 60 * 1000; // max one alert per event type per 2 hours
+const _lastAlerted = new Map();
+function canAlert(key) {
+  const last = _lastAlerted.get(key) || 0;
+  if (Date.now() - last < ALERT_COOLDOWN_MS) return false;
+  _lastAlerted.set(key, Date.now());
+  return true;
+}
+async function tgAlert(message) {
+  try {
+    const { sendTelegram } = await import('../approval/telegramBot.js');
+    await sendTelegram(message);
+  } catch {}
+}
+
 const MODELS = {
   draft:        process.env.OR_DRAFT_MODEL    || 'anthropic/claude-haiku-4-5',
   classify:     process.env.OR_CLASSIFY_MODEL || 'google/gemini-2.5-flash',
@@ -47,7 +63,16 @@ function recordFailure(tier) {
   const cooldown  = tier === 'web' ? 30_000 : 60_000;
   if (b.failures >= threshold) {
     b.openUntil = Date.now() + cooldown;
-    console.warn(`[OR] Circuit breaker open: ${tier} — ${cooldown / 1000}s cooldown`);
+    const model = MODELS[tier] || tier;
+    console.warn(`[OR] Circuit breaker open: ${tier} (${model}) — ${cooldown / 1000}s cooldown`);
+    if (canAlert(`breaker:${tier}`)) {
+      tgAlert(
+        `⚠️ *OpenRouter circuit breaker open*\n\n` +
+        `Tier: \`${tier}\` (${model})\n` +
+        `After ${threshold} consecutive failures — pausing calls for ${cooldown / 1000}s.\n\n` +
+        `Roco is falling back to Anthropic direct where possible. Research/web calls on the \`${tier}\` tier will be skipped until OpenRouter recovers.`
+      );
+    }
   }
 }
 
@@ -191,7 +216,21 @@ export async function orComplete(prompt, {
 
   // Anthropic direct fallback (non-web tiers only)
   const fallbackModel = 'claude-haiku-4-5-20251001';
-  return anthropicDirect(messages, { maxTokens, model: fallbackModel, systemPrompt });
+  try {
+    return await anthropicDirect(messages, { maxTokens, model: fallbackModel, systemPrompt });
+  } catch (fallbackErr) {
+    // Both OpenRouter and Anthropic direct are down — alert immediately
+    if (canAlert(`total-outage:${tier}`)) {
+      tgAlert(
+        `🚨 *AI outage — both OpenRouter and Anthropic are down*\n\n` +
+        `Tier: \`${tier}\`\n` +
+        `OpenRouter error: ${openRouterErr?.message?.substring(0, 120) || 'circuit breaker open'}\n` +
+        `Anthropic fallback error: ${fallbackErr.message?.substring(0, 120)}\n\n` +
+        `Outreach drafting and research are paused until one API recovers. No action needed — Roco will auto-resume.`
+      );
+    }
+    throw fallbackErr;
+  }
 }
 
 /**
