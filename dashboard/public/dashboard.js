@@ -98,6 +98,7 @@ let transcriptDealContacts = [];
 let _cycleNextAt = null;
 let _cycleRunning = false;
 let _cycleCountdownTimer = null;
+let _lastActivityAt = 0; // timestamp of last meaningful WS activity event
 
 async function fetchCycleStatus() {
   try {
@@ -115,9 +116,14 @@ function updateCycleDisplay() {
   const label = document.getElementById('cycle-label');
   if (!dot || !label) return;
 
-  if (_cycleRunning) {
+  // If an outreach activity event arrived in the last 3 minutes, show active
+  // regardless of what CYCLE_STATUS says — sends/approvals/research ARE happening.
+  const recentActivitySec = (Date.now() - _lastActivityAt) / 1000;
+  const hasRecentActivity = _lastActivityAt > 0 && recentActivitySec < 180;
+
+  if (_cycleRunning || hasRecentActivity) {
     dot.className = 'cycle-dot running';
-    label.textContent = 'Cycle running…';
+    label.textContent = _cycleRunning ? 'Cycle running…' : 'Active — sending…';
     return;
   }
 
@@ -132,7 +138,7 @@ function updateCycleDisplay() {
     const overdueSec = Math.abs(Math.round(remaining / 1000));
     if (overdueSec > 120) {
       dot.className = 'cycle-dot stale';
-      label.textContent = `Cycle overdue ${Math.round(overdueSec / 60)}m`;
+      label.textContent = `Waiting for next cycle`;
     } else {
       dot.className = 'cycle-dot running';
       label.textContent = 'Cycle starting…';
@@ -332,6 +338,12 @@ function handleWsMessage(msg) {
       const isOnActivityPage = window.location.hash === '#activity';
       if (isOnActivityPage && _activityPage === 1) {
         handleLiveActivityForPage(entry);
+      }
+      // Stamp last activity time so cycle indicator shows "active" during outreach bursts
+      const activeTypes = ['email', 'approval', 'linkedin', 'research', 'enrich'];
+      if (activeTypes.includes(String(entry?.type || '').toLowerCase())) {
+        _lastActivityAt = Date.now();
+        updateCycleDisplay();
       }
       break;
     }

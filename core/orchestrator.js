@@ -759,16 +759,20 @@ async function topUpOutreachApprovals(deal) {
     const state = await loadState().catch(() => ({ outreach_enabled: true }));
     if (state.outreach_enabled === false) return;
     if (state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until)) return;
+    writeGlobalRuntimeSetting('CYCLE_STATUS', { running: true, started_at: new Date().toISOString(), next_cycle_at: null }).catch(() => {});
     await phaseOutreach(deal, state);
+    writeGlobalRuntimeSetting('CYCLE_STATUS', { running: false, last_completed_at: new Date().toISOString(), next_cycle_at: new Date(Date.now() + ORCHESTRATOR_INTERVAL_MS).toISOString() }).catch(() => {});
   } catch (err) {
     warn(`[OUTREACH TOPUP] phaseOutreach top-up failed for ${deal.name}: ${err.message}`);
+    writeGlobalRuntimeSetting('CYCLE_STATUS', { running: false, last_completed_at: new Date().toISOString(), next_cycle_at: new Date(Date.now() + ORCHESTRATOR_INTERVAL_MS).toISOString() }).catch(() => {});
   }
 }
 
 // Standalone email flush — runs every 60s independent of the main cycle.
 // Ensures approved emails always send even when a deal cycle times out before
 // reaching phaseOutreach (which is where the closure version lives).
-async function flushApprovedEmailsNow() {
+// Also exported so Telegram/dashboard can trigger it immediately after approval.
+export async function flushApprovedEmailsNow() {
   const sb = getSupabase();
   if (!sb) return;
 
