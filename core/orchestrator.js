@@ -347,6 +347,11 @@ const decisionTelegramState = new Map();
 // Contacts currently in the approval flow — prevents duplicate approval drafts per cycle
 const contactsInFlight = new Set();
 
+// Top-up cooldown: after an approval is sent, trigger a phaseOutreach top-up
+// to refill the queue — but no more than once per 2 min per deal.
+const outreachTopUpCooldown = new Map(); // dealId → lastRunMs
+const OUTREACH_TOPUP_COOLDOWN_MS = 2 * 60 * 1000;
+
 function normalizeActionLabel(value) {
   return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -624,6 +629,11 @@ export async function startOrchestrator() {
   // timeout or long research phase never leaves an approved email unsent.
   setInterval(() => { flushApprovedEmailsNow().catch(err => warn(`[EMAIL FLUSH] ${err.message}`)); }, 60_000);
 
+  // LinkedIn DM top-up: every 90s check if the DM queue is empty and queue the next one.
+  // This is what makes sequential LinkedIn DMs feel instant — after Dom approves one,
+  // the next appears within 90s without waiting for a full 10-min cycle.
+  setInterval(() => { topUpLinkedInApprovals().catch(err => warn(`[LI TOPUP] ${err.message}`)); }, 90_000);
+
   // One-time backfill: copy past_investments + person_researched from investors_db → contacts
   backfillContactsFromInvestorsDb().catch(e =>
     console.warn('[BACKFILL] past_investments backfill failed:', e.message)
@@ -701,6 +711,57 @@ async function autoApproveExpiredApprovals() {
     }
   } catch (err) {
     warn(`[AUTO-APPROVE] Check failed: ${err.message}`);
+  }
+}
+
+// Check all active deals: if any have 0 pending LinkedIn DM approvals but contacts
+// waiting (invite_accepted), queue the next DM immediately (sequential mode).
+async function topUpLinkedInApprovals() {
+  const sb = getSupabase();
+  if (!sb) return;
+  const deals = await getActiveDeals().catch(() => []);
+  for (const deal of deals) {
+    try {
+      const { count } = await sb.from('approval_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('deal_id', deal.id)
+        .eq('stage', 'LinkedIn DM')
+        .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending']);
+      if ((count || 0) > 0) continue; // DM already pending — wait for it to be resolved
+
+      const { count: pendingAccepted } = await sb.from('contacts')
+        .select('id', { count: 'exact', head: true })
+        .eq('deal_id', deal.id)
+        .eq('pipeline_stage', 'invite_accepted')
+        .not('linkedin_provider_id', 'is', null)
+        .not('response_received', 'eq', true);
+      if ((pendingAccepted || 0) === 0) continue; // nobody waiting
+
+      const state = await loadState().catch(() => ({ outreach_enabled: true, linkedin_enabled: true }));
+      if (state.outreach_enabled === false || state.linkedin_enabled === false) continue;
+      // Run only the LinkedIn DM queuing sub-phase (not the full phaseOutreach)
+      // by calling phaseOutreach which contains queueInviteAcceptedLinkedInDrafts
+      await phaseOutreach(deal, state);
+    } catch (err) {
+      warn(`[LI TOPUP] Top-up failed for ${deal.name}: ${err.message}`);
+    }
+  }
+}
+
+// Top-up the outreach approval queue for a deal immediately after an approval is sent.
+// Calls phaseOutreach so the next batch of contacts gets drafted and sent to Telegram
+// without waiting for the next 10-min orchestrator cycle.
+async function topUpOutreachApprovals(deal) {
+  const last = outreachTopUpCooldown.get(deal.id) || 0;
+  if (Date.now() - last < OUTREACH_TOPUP_COOLDOWN_MS) return;
+  outreachTopUpCooldown.set(deal.id, Date.now());
+  try {
+    const state = await loadState().catch(() => ({ outreach_enabled: true }));
+    if (state.outreach_enabled === false) return;
+    if (state.outreach_paused_until && isGloballyPaused(state.outreach_paused_until)) return;
+    await phaseOutreach(deal, state);
+  } catch (err) {
+    warn(`[OUTREACH TOPUP] phaseOutreach top-up failed for ${deal.name}: ${err.message}`);
   }
 }
 
@@ -803,6 +864,20 @@ async function flushApprovedEmailsNow() {
         await sbLogActivity({ dealId: deal?.id, contactId: contact.id, eventType: 'EMAIL_SENT', summary: `Email sent to ${contact.name} @ ${contact.company_name || ''}`, detail: { subject, stage: item.stage, channel: 'email', to: contact.email } }).catch(() => {});
         sendTelegram(`✅ *Email sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subject ? `\nSubject: _${sanitizeOutreach(subject)}_` : ''}`).catch(() => {});
         notifyQueueUpdated();
+
+        // If pending email approvals for this deal drop below 5, immediately
+        // top up the queue so Dom never has to wait for the next 10-min cycle.
+        sb.from('approval_queue')
+          .select('id', { count: 'exact', head: true })
+          .eq('deal_id', deal.id)
+          .in('status', ['pending'])
+          .is('message_type', null)
+          .neq('channel', 'linkedin')
+          .then(({ count }) => {
+            if ((count || 0) < 5) {
+              topUpOutreachApprovals(deal).catch(() => {});
+            }
+          }).catch(() => {});
       } catch (err) {
         await sb.from('approval_queue').update({
           status: 'approved_waiting_for_window',
@@ -7725,18 +7800,28 @@ export async function phaseOutreach(deal, state) {
       .order('created_at', { ascending: true })
       .limit(25);
 
+    // Sequential LinkedIn DMs: only queue 1 at a time globally.
+    // Once it's approved and sent, the next one appears within ~90s via the top-up interval.
     const linkedInFirmSlots = new Set();
+    let existingLinkedInQueueCount = 0;
     try {
       const { data: existingLinkedInQueue } = await sb.from('approval_queue')
         .select('firm')
         .eq('deal_id', deal.id)
         .eq('stage', 'LinkedIn DM')
         .in('status', ['pending', 'approved', 'approved_waiting_for_window', 'sending']);
+      existingLinkedInQueueCount = existingLinkedInQueue?.length || 0;
       for (const row of existingLinkedInQueue || []) {
         const firm = (row.firm || '').toLowerCase().trim();
         if (firm && !GENERIC_FIRM_NAMES.has(firm)) linkedInFirmSlots.add(firm);
       }
     } catch {}
+
+    // If there's already a LinkedIn DM pending approval, hold off — wait until it's resolved
+    if (existingLinkedInQueueCount >= 1) {
+      info(`[${deal.name}] LinkedIn DM pending in queue — sequential mode: holding next DM`);
+      return;
+    }
 
     for (const contact of acceptedContacts || []) {
       if (contact.conversation_state === 'manual') continue;
@@ -7765,6 +7850,8 @@ export async function phaseOutreach(deal, state) {
           );
         }
         if (hasFirm) linkedInFirmSlots.add(firm);
+        // Sequential: queue only 1 DM then stop — next appears after this one is approved
+        break;
       } catch (err) {
         warn(`[OUTREACH] Failed to queue LinkedIn DM approval for ${contact.name || contact.id}: ${err.message}`);
       }
@@ -8106,7 +8193,7 @@ export async function phaseOutreach(deal, state) {
       if (scoreDiff !== 0) return scoreDiff;
       return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
     })
-    .slice(0, 5);
+    .slice(0, 10);
 
   const contacts = [...emailContacts];
   if (!contacts.length) {
