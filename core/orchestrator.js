@@ -2073,12 +2073,27 @@ async function runDailyNewsScanCycle(deals) {
 
   const todayKey = estNow.toISODate();
   const existingState = dailyNewsScanState.get(todayKey);
-  // Run at 7am ET, OR as a catch-up if today's scan has not yet run (handles Railway restarts
-  // that occur during the 7am window — the scan will fire on the next cycle regardless of hour).
   const isScheduledWindow = estNow.hour === 7;
   const isMissedToday = !existingState && estNow.hour > 7;
   if (!isScheduledWindow && !isMissedToday) return;
   if (existingState === 'running' || existingState === 'done') return;
+
+  // Persist-backed gate: check DB so Railway restarts don't re-run today's scan.
+  // In-memory state alone is cleared on every deploy — this prevents repeated re-runs.
+  if (sb && (isMissedToday || isScheduledWindow)) {
+    try {
+      const dealId = deals?.[0]?.id || null;
+      const query = sb.from('news_scans').select('id').eq('log_date' in {} ? 'log_date' : 'created_at', todayKey).order('created_at', { ascending: false }).limit(1);
+      const { data: todayRows } = dealId
+        ? await sb.from('news_scans').select('id').eq('deal_id', dealId).gte('created_at', `${todayKey}T00:00:00Z`).limit(1)
+        : await sb.from('news_scans').select('id').gte('created_at', `${todayKey}T00:00:00Z`).limit(1);
+      if (todayRows?.length) {
+        dailyNewsScanState.set(todayKey, 'done');
+        return;
+      }
+    } catch { /* non-fatal — proceed with scan if DB check fails */ }
+  }
+
   dailyNewsScanState.set(todayKey, 'running');
 
   try {
@@ -2175,8 +2190,10 @@ async function runDailyNewsScanCycle(deals) {
 
     dailyNewsScanState.set(todayKey, 'done');
   } catch (err) {
-    dailyNewsScanState.delete(todayKey);
-    throw err;
+    // Mark as done even on error so a failed scan doesn't re-run every cycle all day.
+    // A genuine failure (bad API response etc.) should not burn every orchestrator cycle.
+    dailyNewsScanState.set(todayKey, 'done');
+    console.error('[NEWS SCAN] Daily scan failed:', err.message);
   }
 }
 
