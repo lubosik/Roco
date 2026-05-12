@@ -32,7 +32,7 @@ import {
   retrieveLinkedInProfile,
 } from '../integrations/unipileClient.js';
 import { enrichFirmViaLinkedIn, processLinkedInInvite, getLinkedInInviteProviderLimit } from './unipile.js';
-import { sendEmailForApproval, sendLinkedInDMForApproval, sendTelegram, sendTelegramVoiceNote } from '../approval/telegramBot.js';
+import { sendEmailForApproval, sendLinkedInDMForApproval, sendTelegram, sendTelegramVoiceNote, clearTelegramApprovalControls } from '../approval/telegramBot.js';
 import { draftEmail } from '../outreach/emailDrafter.js';
 import { draftLinkedInDM } from '../outreach/linkedinDrafter.js';
 import { isExcluded } from './exclusionCheck.js';
@@ -617,6 +617,9 @@ export async function startOrchestrator() {
     console.log(`[ORCHESTRATOR] Heartbeat — ${now} — status: ${rocoState.status}`);
   }, 5 * 60 * 1000);
 
+  // Auto-approve stale Telegram approvals every 60s
+  setInterval(autoApproveExpiredApprovals, 60_000);
+
   // One-time backfill: copy past_investments + person_researched from investors_db → contacts
   backfillContactsFromInvestorsDb().catch(e =>
     console.warn('[BACKFILL] past_investments backfill failed:', e.message)
@@ -644,6 +647,56 @@ export async function triggerImmediateRun(dealId) {
     console.log(`[ORCHESTRATOR] Immediate run complete for: ${deal.name}`);
   } catch (err) {
     error('[ORCHESTRATOR] Immediate run error', { err: err.message });
+  }
+}
+
+// Auto-approve: if an approval sits in Telegram for > 5 min with no response,
+// mark it approved and send a notification so the pipeline keeps moving.
+const AUTO_APPROVE_MS = 5 * 60 * 1000;
+async function autoApproveExpiredApprovals() {
+  const sb = getSupabase();
+  if (!sb) return;
+  const cutoff = new Date(Date.now() - AUTO_APPROVE_MS).toISOString();
+  try {
+    const { data: expired } = await sb
+      .from('approval_queue')
+      .select('id, contact_id, contact_name, firm, stage, telegram_msg_id, deal_id, subject_a')
+      .eq('status', 'pending')
+      .lt('created_at', cutoff)
+      .limit(3);
+
+    if (!expired?.length) return;
+
+    for (const row of expired) {
+      const name = row.contact_name || 'Unknown';
+      const firm = row.firm || 'Unknown Firm';
+      const approvedStage = isLinkedInStageLabel(row.stage) ? 'DM Approved' : 'Email Approved';
+
+      await sb.from('approval_queue').update({
+        status: 'approved',
+        approved_subject: row.subject_a || null,
+        resolved_at: new Date().toISOString(),
+      }).eq('id', row.id);
+
+      if (row.contact_id) {
+        await sb.from('contacts').update({
+          pipeline_stage: approvedStage,
+          updated_at: new Date().toISOString(),
+        }).eq('id', row.contact_id).catch(() => {});
+      }
+
+      if (row.telegram_msg_id) {
+        clearTelegramApprovalControls(row.telegram_msg_id).catch(() => {});
+      }
+
+      sendTelegram(
+        `⏱ *Auto-approved* — no response for 5 min\n*${name}* · ${firm}\nSending on next cycle. Reply /stop to pause.`
+      ).catch(() => {});
+
+      info(`[AUTO-APPROVE] ${name} at ${firm} — auto-approved after 5 min (queue ID: ${row.id})`);
+    }
+  } catch (err) {
+    warn(`[AUTO-APPROVE] Check failed: ${err.message}`);
   }
 }
 
@@ -7939,6 +7992,22 @@ async function handleOutreachApproval(contact, stage, followUpNumber, deal, opti
       if (existingApproval) {
         info(`[OUTREACH] Skipping ${contact.name} — active approval already in queue (${existingApproval.stage} / ${existingApproval.status})`);
         contactsInFlight.add(contact.id); // keep in-memory gate consistent
+        return;
+      }
+    }
+  }
+
+  // Global Telegram gate: only one approval pending at a time.
+  // Prevents 36 notifications flooding Telegram in one cycle.
+  {
+    const gateSb = getSupabase();
+    if (gateSb) {
+      const { count: globalPendingCount } = await gateSb
+        .from('approval_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'pending');
+      if (globalPendingCount > 0) {
+        info(`[OUTREACH] Telegram gate — ${globalPendingCount} approval(s) pending, holding ${contact.name} until resolved`);
         return;
       }
     }

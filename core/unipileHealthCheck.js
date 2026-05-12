@@ -25,10 +25,14 @@ function canAlert(accountId) {
 
 async function fetchAccountStatus(dsn, apiKey, accountId) {
   const url = `${dsn}/api/v1/accounts/${accountId}`;
+  const doFetch = () => fetch(url, { headers: { 'X-API-KEY': apiKey, accept: 'application/json' } });
   try {
-    const res = await fetch(url, {
-      headers: { 'X-API-KEY': apiKey, accept: 'application/json' },
-    });
+    let res = await doFetch();
+    // Retry once on transient 5xx before treating as unhealthy
+    if (res.status >= 500) {
+      await new Promise(r => setTimeout(r, 8000));
+      res = await doFetch();
+    }
     if (res.status === 401) return { id: accountId, healthy: false, reason: 'API key invalid (401)' };
     if (res.status === 404) return { id: accountId, healthy: false, reason: 'Account not found (404)' };
     if (!res.ok) return { id: accountId, healthy: false, reason: `HTTP ${res.status}` };
