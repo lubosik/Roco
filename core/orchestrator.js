@@ -620,6 +620,10 @@ export async function startOrchestrator() {
   // Auto-approve stale Telegram approvals every 60s
   setInterval(autoApproveExpiredApprovals, 60_000);
 
+  // Flush approved emails every 60s — independent of the main cycle so a cycle
+  // timeout or long research phase never leaves an approved email unsent.
+  setInterval(() => { flushApprovedEmailsNow().catch(err => warn(`[EMAIL FLUSH] ${err.message}`)); }, 60_000);
+
   // One-time backfill: copy past_investments + person_researched from investors_db → contacts
   backfillContactsFromInvestorsDb().catch(e =>
     console.warn('[BACKFILL] past_investments backfill failed:', e.message)
@@ -697,6 +701,108 @@ async function autoApproveExpiredApprovals() {
     }
   } catch (err) {
     warn(`[AUTO-APPROVE] Check failed: ${err.message}`);
+  }
+}
+
+// Standalone email flush — runs every 60s independent of the main cycle.
+// Ensures approved emails always send even when a deal cycle times out before
+// reaching phaseOutreach (which is where the closure version lives).
+async function flushApprovedEmailsNow() {
+  const sb = getSupabase();
+  if (!sb) return;
+
+  // Fetch all deals with approved emails pending
+  const { data: pendingItems } = await sb.from('approval_queue')
+    .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
+    .in('status', ['approved', 'approved_waiting_for_window'])
+    .is('message_type', null)  // plain email approvals only (not replies, not linkedin)
+    .order('resolved_at', { ascending: true })
+    .limit(10);
+
+  if (!pendingItems?.length) return;
+
+  // Group by deal so we can load each deal once and check window
+  const dealIds = [...new Set(pendingItems.map(i => i.deal_id).filter(Boolean))];
+  const deals = await getActiveDeals().catch(() => []);
+
+  for (const dealId of dealIds) {
+    const deal = deals.find(d => String(d.id) === String(dealId));
+    if (!deal) continue;
+    if (!isWithinChannelWindow(deal, 'email')) continue;
+
+    const items = pendingItems.filter(i => String(i.deal_id) === String(dealId));
+    for (const item of items) {
+      if (isLinkedInStageLabel(item.stage)) continue;
+      if (!item.contact_id) continue;
+
+      const firmBlock = await getFirmWaterfallBlock({
+        sb, dealId: deal.id, contactId: item.contact_id, firm: item.firm,
+        emailDays: Number(deal?.followup_days_email) || 3,
+        linkedinDays: Number(deal?.followup_days_li) || 2,
+      }).catch(() => null);
+      if (firmBlock) {
+        await sb.from('approval_queue').update({
+          status: 'approved_waiting_for_window',
+          edit_instructions: `Firm waterfall hold: ${formatFirmWaterfallBlock(firmBlock)}`,
+        }).eq('id', item.id).catch(() => {});
+        continue;
+      }
+
+      const { data: claimed } = await sb.from('approval_queue').update({ status: 'sending' })
+        .eq('id', item.id).in('status', ['approved', 'approved_waiting_for_window'])
+        .select('id').maybeSingle();
+      if (!claimed?.id) continue;
+
+      try {
+        const { data: contact } = await sb.from('contacts').select('*').eq('id', item.contact_id).maybeSingle();
+        if (!contact || String(contact.deal_id || '') !== String(deal.id)) continue;
+        if (!contact?.email) throw new Error('No email on contact');
+
+        const subject = item.approved_subject || item.subject_a || item.subject || '';
+        const body = item.edited_body || item.body || '';
+        const emailResult = await unipileSendEmail({
+          to: contact.email,
+          toName: contact.name,
+          subject,
+          body,
+          accountId: deal?.sending_account_id || null,
+          trackingLabel: `deal:${deal.id}|contact:${contact.id}|stage:${String(item.stage || 'email').toLowerCase().replace(/\s+/g, '_')}`,
+        });
+
+        await sb.from('approval_queue').update({
+          status: 'sent',
+          sent_at: new Date().toISOString(),
+          approved_subject: subject || null,
+          deal_id: item.deal_id || deal.id,
+        }).eq('id', item.id);
+
+        const nextPlan = await getNextFollowUpPlanForChannel(deal, 'email', /follow/i.test(String(item.stage || '')) ? 1 : 0).catch(() => ({ delayDays: 3 }));
+        const followUpDueAt = nextPlan.delayDays ? new Date(Date.now() + nextPlan.delayDays * 24 * 60 * 60 * 1000).toISOString() : null;
+
+        await sb.from('contacts').update({
+          pipeline_stage: 'Email Sent',
+          last_email_sent_at: new Date().toISOString(),
+          outreach_channel: 'email',
+          last_outreach_at: new Date().toISOString(),
+          follow_up_due_at: followUpDueAt,
+        }).eq('id', item.contact_id);
+
+        await logConversationMessage({ contactId: contact.id, dealId: deal.id, direction: 'outbound', channel: 'email', subject, body, unipileMessageId: emailResult?.emailId || null, templateName: null }).catch(() => {});
+        await setConversationState(contact.id, /follow/i.test(String(item.stage || '')) ? 'follow_up_sent' : 'intro_sent').catch(() => {});
+        await persistOutboundEmailRecord({ sb, deal, contact, subject, result: emailResult, stage: item.stage, status: 'sent' }).catch(() => {});
+
+        pushActivity({ type: 'email', action: 'Email sent', note: `${contact.name}${contact.company_name ? ` @ ${contact.company_name}` : ''}${subject ? ` · "${sanitizeOutreach(subject)}"` : ''}`, deal_name: deal?.name, dealId: deal?.id });
+        await sbLogActivity({ dealId: deal?.id, contactId: contact.id, eventType: 'EMAIL_SENT', summary: `Email sent to ${contact.name} @ ${contact.company_name || ''}`, detail: { subject, stage: item.stage, channel: 'email', to: contact.email } }).catch(() => {});
+        sendTelegram(`✅ *Email sent* → *${contact.name}* (${contact.company_name || 'unknown firm'})${subject ? `\nSubject: _${sanitizeOutreach(subject)}_` : ''}`).catch(() => {});
+        notifyQueueUpdated();
+      } catch (err) {
+        await sb.from('approval_queue').update({
+          status: 'approved_waiting_for_window',
+          edit_instructions: `Send retry pending: ${String(err.message || err).slice(0, 160)}`,
+        }).eq('id', item.id).catch(() => {});
+        warn(`[EMAIL FLUSH] Failed to send approved email for ${item.contact_name}: ${err.message}`);
+      }
+    }
   }
 }
 
@@ -5826,9 +5932,11 @@ async function phasePersonResearch(deal, batch) {
     return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
   });
 
+  // 3 per cycle max — each contact can consume up to 90s (API timeout) and the
+  // cycle has an 8-min hard wall shared with enrichment, brain, and outreach.
   const candidates = sortedForResearch
     .filter(contact => shouldResearchContact(contact, deal, batch))
-    .slice(0, 15);
+    .slice(0, 3);
 
   if (!candidates.length) {
     info(`[${deal.name}] phasePersonResearch: no shortlisted contacts need research`);
