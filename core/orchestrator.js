@@ -7149,7 +7149,7 @@ async function phaseLinkedInInvites(deal, state) {
         source: 'orchestrator',
       });
       if (outcome.status === 'sent') {
-        logStep('LinkedIn invite sent', contact.name, 'linkedin', deal);
+        logStep(`LinkedIn invite sent: ${contact.name}`, `${contact.company_name || 'Unknown Firm'} · Score ${contact.investor_score ?? '?'}`, 'linkedin', deal);
         // Random 3–7s delay after each successful invite to avoid LinkedIn burst throttle
         await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000));
       } else if (outcome.status === 'already_pending') {
@@ -7199,10 +7199,13 @@ async function phaseLinkedInInvites(deal, state) {
         }
       } else if (outcome.status === 'failed_lookup' || outcome.status === 'failed_send') {
         warn(`[${deal.name}] LinkedIn invite path failed for ${contact.name}: ${outcome.error?.message || 'unknown error'}`);
+        pushActivity({ type: 'system', action: `LinkedIn invite failed: ${contact.name}`, note: `${outcome.error?.message || 'unknown error'}`, deal_name: deal.name, dealId: deal.id });
         // Defer this contact for 4 hours so it doesn't re-enter the queue every cycle
         await sb.from('contacts').update({
           follow_up_due_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
         }).eq('id', contact.id).then(null, () => {});
+      } else {
+        info(`[${deal.name}] ${contact.name} LinkedIn invite outcome: ${outcome.status || 'unknown'}`);
       }
     } catch (e) {
       warn(`[${deal.name}] Unexpected LinkedIn invite processing error for ${contact.name}: ${e.message}`);
@@ -7256,13 +7259,26 @@ export async function phaseOutreach(deal, state) {
     .not('company_name', 'is', null);
 
   const respondedFirms = new Set();
-  const activeFirms    = new Set();
+  const activeFirms    = new Set(); // email-channel blocks only
   const outreachedContacts = new Set();
+
+  // Channel-aware: only EMAIL stages block new email to same firm.
+  // LinkedIn-only activity (invite_sent, DM Sent, etc.) does NOT block email.
+  // This allows email to person A + LinkedIn invite to person B at same firm simultaneously.
+  const EMAIL_BLOCKING_STAGES = new Set([
+    'pending_email_approval', 'Email Approved', 'Email Sent', 'email_sent',
+    'intro_sent', 'follow_up_sent', 'awaiting_response', 'temp_closed',
+    'In Conversation', 'Replied', 'Meeting Booked', 'Meeting Scheduled',
+  ]);
 
   for (const c of firmGateContacts || []) {
     const firm = (c.company_name || '').toLowerCase().trim();
     const hasExistingOutreach = !!c.last_email_sent_at
       || ACTIVE_PIPELINE_STAGES.includes(c.pipeline_stage)
+      || ACTIVE_CONVERSATION_STATES.includes(c.conversation_state);
+    // Email-specific: only blocks same firm from getting another email
+    const hasEmailOutreach = !!c.last_email_sent_at
+      || EMAIL_BLOCKING_STAGES.has(c.pipeline_stage)
       || ACTIVE_CONVERSATION_STATES.includes(c.conversation_state);
 
     if (hasExistingOutreach && c.id) {
@@ -7271,8 +7287,8 @@ export async function phaseOutreach(deal, state) {
     if (!firm || GENERIC_FIRM_NAMES.has(firm)) continue;
     if (c.response_received || RESPONDED_STAGES.includes(c.pipeline_stage)) {
       respondedFirms.add(firm);
-    } else if (hasExistingOutreach && !isOutreachStale(c)) {
-      // Only block the firm while outreach is fresh; stale contacts allow cascade to next person
+    } else if (hasEmailOutreach && !isOutreachStale(c)) {
+      // Only block the firm's EMAIL lane while email outreach is fresh
       activeFirms.add(firm);
     }
   }
