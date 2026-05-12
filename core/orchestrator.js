@@ -924,9 +924,10 @@ async function runCycle(state) {
   try {
     const deals = await getActiveDeals();
     await implementPendingDailyLogActions(deals);
-    // 2-minute individual caps so neither phase can eat the full cycle budget
-    await Promise.race([runDailyNewsScanCycle(deals), new Promise((_, r) => setTimeout(() => r(new Error('newsScan timeout')), 2 * 60_000))]).catch(e => console.warn('[runCycle] newsScan:', e.message));
-    await Promise.race([runDailyActivityDigestCycle(deals), new Promise((_, r) => setTimeout(() => r(new Error('activityDigest timeout')), 2 * 60_000))]).catch(e => console.warn('[runCycle] activityDigest:', e.message));
+    // Run non-blocking so they complete fully in the background without
+    // delaying the deal cycle. Each handles its own once-per-day gate internally.
+    runDailyNewsScanCycle(deals).catch(e => console.warn('[runCycle] newsScan error:', e.message));
+    runDailyActivityDigestCycle(deals).catch(e => console.warn('[runCycle] activityDigest error:', e.message));
 
     if (deals.length > 0) {
       const ordered = [...deals].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
