@@ -2258,12 +2258,15 @@ export async function queueLinkedInDmApproval(contactId, { reason = 'acceptance'
       .eq('id', currentContact.deal_id)
       .maybeSingle()
       .then(result => result, () => ({ data: null }));
+    // invite_accepted contacts already engaged — bypass email patience window so
+    // a cold email to a colleague doesn't block their warm DM
+    const isAccepted = currentContact?.pipeline_stage === 'invite_accepted';
     const firmBlock = await getFirmWaterfallBlock({
       sb,
       dealId: currentContact.deal_id,
       contactId,
       firm: currentContact.company_name,
-      emailDays: Number(deal?.followup_days_email) || 3,
+      emailDays: isAccepted ? 0 : (Number(deal?.followup_days_email) || 3),
       linkedinDays: Number(deal?.followup_days_li) || 2,
     }).catch(() => null);
     if (firmBlock) {
