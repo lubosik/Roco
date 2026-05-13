@@ -7,6 +7,15 @@ import { getLiveCredentials, isWithinSendingWindow, getExistingChatWithContact, 
 import { aiComplete } from './aiClient.js';
 import { normalizeComparableName } from './hardeningHelpers.js';
 
+/** Extract LinkedIn provider_id from a miniProfileUrn embedded in a profile URL. */
+function extractProviderIdFromUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/miniProfileUrn=urn%3Ali%3Afs_miniProfile%3A([A-Za-z0-9_-]+)/);
+  const id = match?.[1];
+  return id && /^(ACo|ACw|AE)[A-Za-z0-9_-]+$/.test(id) ? id : null;
+}
+
 // In-memory dedupe cache — cleared every 5 minutes
 const recentlyProcessed = new Map();
 setInterval(() => {
@@ -762,11 +771,17 @@ export async function handleLinkedInRelation(raw, pushActivity, queueForApproval
   // Mark connection accepted without regressing a contact that is already
   // further along in the post-acceptance workflow.
   try {
+    const resolvedUrl = payload.profile_url || contact.linkedin_url || null;
+    const resolvedProviderId =
+      payload.provider_id ||
+      contact.linkedin_provider_id ||
+      extractProviderIdFromUrl(resolvedUrl) ||
+      null;
     const patch = {
-      invite_accepted_at:  new Date().toISOString(),
-      linkedin_provider_id: payload.provider_id || contact.linkedin_provider_id || null,
-      linkedin_public_id: payload.public_identifier || contact.linkedin_public_id || null,
-      linkedin_url: payload.profile_url || contact.linkedin_url || null,
+      invite_accepted_at:   new Date().toISOString(),
+      linkedin_provider_id: resolvedProviderId,
+      linkedin_public_id:   payload.public_identifier || contact.linkedin_public_id || null,
+      linkedin_url:         resolvedUrl,
     };
     if (!preserveStage) patch.pipeline_stage = 'invite_accepted';
     await sb.from('contacts').update(patch).eq('id', contact.id);

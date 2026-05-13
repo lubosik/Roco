@@ -4964,7 +4964,27 @@ async function selfHealPipeline(deal) {
       warn(`[SELF-HEAL] Queue ${row.id} for ${row.contact_name} (${row.firm}): stuck sending > 15 min → failed, contact reset`);
     }
 
-    // D: Queue rows stuck in 'processing' > 5 min — reset to 'approved' so the
+    // D: invite_accepted contacts missing linkedin_provider_id but having a
+    // miniProfileUrn in their URL — extract and save so DMs can be sent.
+    const { data: missingProviderContacts } = await sb.from('contacts')
+      .select('id, name, company_name, linkedin_url')
+      .eq('deal_id', deal.id)
+      .eq('pipeline_stage', 'invite_accepted')
+      .is('linkedin_provider_id', null)
+      .not('linkedin_url', 'is', null);
+    for (const c of missingProviderContacts || []) {
+      const urlStr = String(c.linkedin_url || '');
+      const urnMatch = urlStr.match(/miniProfileUrn=urn%3Ali%3Afs_miniProfile%3A([A-Za-z0-9_-]+)/);
+      const extracted = urnMatch?.[1];
+      if (extracted && /^(ACo|ACw|AE)[A-Za-z0-9_-]+$/.test(extracted)) {
+        await sb.from('contacts')
+          .update({ linkedin_provider_id: extracted, updated_at: now })
+          .eq('id', c.id);
+        info(`[SELF-HEAL] ${c.name} (${c.company_name}): extracted linkedin_provider_id from miniProfileUrn`);
+      }
+    }
+
+    // F: Queue rows stuck in 'processing' > 5 min — reset to 'approved' so the
     // email flush loop picks them up and resends. 'processing' is a transient state
     // set just before promise resolution; if still set after 5 min the worker
     // crashed mid-send and the email was never delivered.
@@ -7868,16 +7888,34 @@ export async function phaseOutreach(deal, state) {
   };
 
   const queueInviteAcceptedLinkedInDrafts = async () => {
+    // Include contacts missing provider_id — we'll attempt to extract from miniProfileUrn below
     const { data: acceptedContacts } = await sb.from('contacts')
-      .select('id, name, company_name, linkedin_provider_id, email, last_email_sent_at, response_received, conversation_state, invite_accepted_at, investor_score, created_at, unipile_chat_id, reply_channel')
+      .select('id, name, company_name, linkedin_provider_id, linkedin_url, email, last_email_sent_at, response_received, conversation_state, invite_accepted_at, investor_score, created_at, unipile_chat_id, reply_channel')
       .eq('deal_id', deal.id)
       .eq('pipeline_stage', 'invite_accepted')
-      .not('linkedin_provider_id', 'is', null)
       .not('response_received', 'eq', true)
       .order('invite_accepted_at', { ascending: true })
       .order('investor_score', { ascending: false })
       .order('created_at', { ascending: true })
       .limit(25);
+
+    // Self-heal: extract linkedin_provider_id from miniProfileUrn for any accepted contact missing it
+    for (const contact of acceptedContacts || []) {
+      if (contact.linkedin_provider_id) continue;
+      const urlStr = String(contact.linkedin_url || '');
+      const urnMatch = urlStr.match(/miniProfileUrn=urn%3Ali%3Afs_miniProfile%3A([A-Za-z0-9_-]+)/);
+      const extracted = urnMatch?.[1];
+      if (extracted && /^(ACo|ACw|AE)[A-Za-z0-9_-]+$/.test(extracted)) {
+        await sb.from('contacts')
+          .update({ linkedin_provider_id: extracted, updated_at: new Date().toISOString() })
+          .eq('id', contact.id).catch(() => {});
+        contact.linkedin_provider_id = extracted;
+        info(`[${deal.name}] Extracted linkedin_provider_id for ${contact.name} from miniProfileUrn`);
+      }
+    }
+
+    // Only proceed with contacts that now have a usable provider_id
+    const readyContacts = (acceptedContacts || []).filter(c => c.linkedin_provider_id);
 
     // Sequential LinkedIn DMs: only queue 1 at a time globally.
     // Once it's approved and sent, the next one appears within ~90s via the top-up interval.
@@ -7902,7 +7940,7 @@ export async function phaseOutreach(deal, state) {
       return;
     }
 
-    for (const contact of acceptedContacts || []) {
+    for (const contact of readyContacts) {
       if (contact.conversation_state === 'manual') continue;
       const firm = (contact.company_name || '').toLowerCase().trim();
       const hasFirm = firm && !GENERIC_FIRM_NAMES.has(firm);
