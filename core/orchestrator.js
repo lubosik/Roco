@@ -786,10 +786,11 @@ export async function flushApprovedEmailsNow() {
     .lt('updated_at', new Date(Date.now() - 5 * 60 * 1000).toISOString())
     .catch(() => {});
 
-  // Fetch all deals with approved emails pending
+  // Fetch all deals with approved emails pending (includes 'processing' to recover
+  // items that were approved but crashed before the actual send completed)
   const { data: pendingItems } = await sb.from('approval_queue')
     .select('id, contact_id, contact_name, contact_email, firm, body, edited_body, subject_a, subject, approved_subject, deal_id, resolved_at, stage, message_type, channel, reply_to_id')
-    .in('status', ['approved', 'approved_waiting_for_window'])
+    .in('status', ['approved', 'approved_waiting_for_window', 'processing'])
     .is('message_type', null)  // plain email approvals only (not replies, not linkedin)
     .order('resolved_at', { ascending: true, nullsFirst: true })
     .limit(10);
@@ -832,7 +833,7 @@ export async function flushApprovedEmailsNow() {
       }
 
       const { data: claimed } = await sb.from('approval_queue').update({ status: 'sending' })
-        .eq('id', item.id).in('status', ['approved', 'approved_waiting_for_window'])
+        .eq('id', item.id).in('status', ['approved', 'approved_waiting_for_window', 'processing'])
         .select('id').maybeSingle();
       if (!claimed?.id) continue;
 
@@ -4963,6 +4964,30 @@ async function selfHealPipeline(deal) {
       warn(`[SELF-HEAL] Queue ${row.id} for ${row.contact_name} (${row.firm}): stuck sending > 15 min → failed, contact reset`);
     }
 
+    // D: Queue rows stuck in 'processing' > 5 min — reset to 'approved' so the
+    // email flush loop picks them up and resends. 'processing' is a transient state
+    // set just before promise resolution; if still set after 5 min the worker
+    // crashed mid-send and the email was never delivered.
+    const stuckProcessingCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: stuckProcessing } = await sb.from('approval_queue')
+      .select('id, contact_id, contact_name, firm, stage')
+      .eq('deal_id', deal.id)
+      .eq('status', 'processing')
+      .lt('resolved_at', stuckProcessingCutoff);
+    for (const row of stuckProcessing || []) {
+      await sb.from('approval_queue')
+        .update({ status: 'approved', edit_instructions: 'Self-healed: stuck in processing > 5 min — re-queued for send' })
+        .eq('id', row.id);
+      if (row.contact_id) {
+        await sb.from('contacts')
+          .update({ pipeline_stage: 'Email Approved', updated_at: now })
+          .eq('id', row.contact_id)
+          .in('pipeline_stage', ['pending_email_approval']);
+        contactsInFlight.delete(row.contact_id);
+      }
+      warn(`[SELF-HEAL] Queue ${row.id} for ${row.contact_name} (${row.firm}): stuck processing > 5 min → approved for resend`);
+    }
+
   } catch (err) {
     warn(`[SELF-HEAL] selfHealPipeline error: ${err.message}`);
   }
@@ -5375,6 +5400,41 @@ async function runDealCycle(deal, state) {
   }
 
   console.log(`[ORCHESTRATOR] ---- Cycle complete: ${deal.name} ----`);
+
+  // Persist a cycle heartbeat so the activity log always shows the pipeline is alive,
+  // even when no new work happened this cycle.
+  try {
+    const hbSb = getSupabase();
+    if (hbSb) {
+      const [
+        { count: pending },
+        { count: approved },
+        { count: emailSentTotal },
+        { count: enriched },
+        { count: ranked },
+      ] = await Promise.all([
+        hbSb.from('approval_queue').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).eq('status', 'pending'),
+        hbSb.from('approval_queue').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).in('status', ['approved', 'approved_waiting_for_window']),
+        hbSb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).not('last_email_sent_at', 'is', null),
+        hbSb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).eq('pipeline_stage', 'Enriched'),
+        hbSb.from('contacts').select('id', { count: 'exact', head: true }).eq('deal_id', deal.id).eq('pipeline_stage', 'Ranked'),
+      ]);
+      const windowOpen = isWithinEmailWindow(deal);
+      const parts = [];
+      if ((pending || 0) > 0) parts.push(`${pending} pending approval`);
+      if ((approved || 0) > 0) parts.push(`${approved} approved ready to send`);
+      if ((enriched || 0) > 0) parts.push(`${enriched} enriched`);
+      if ((ranked || 0) > 0) parts.push(`${ranked} ranked`);
+      parts.push(`${emailSentTotal || 0} emails sent all-time`);
+      parts.push(`window ${windowOpen ? 'OPEN' : 'CLOSED'}`);
+      sbLogActivity({
+        dealId: deal.id,
+        eventType: 'CYCLE_HEARTBEAT',
+        summary: `Cycle complete · ${deal.name} · ${parts.join(' · ')}`,
+        detail: { pending, approved, emailSentTotal, enriched, ranked, windowOpen },
+      }).catch(() => {});
+    }
+  } catch {}
 
   // Success — reset error counter
   errTrack.count = 0;
